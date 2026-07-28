@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useMemo, useState } from "react";
+import { AppNavigation } from "./components/DemoShell";
 
 type QueryType = "text" | "image" | "image_text";
 type AssetType = "image" | "video_segment" | "markdown_block";
@@ -760,23 +761,7 @@ export default function Home() {
           <strong>CAPSULE</strong>
           <em>多模态记忆检索</em>
         </a>
-        <nav className="view-tabs" aria-label="工作区">
-          <button
-            className={activeView === "search" ? "active" : ""}
-            onClick={() => setActiveView("search")}
-          >
-            检索
-          </button>
-          <button
-            className={activeView === "capsules" ? "active" : ""}
-            onClick={() => {
-              setActiveView("capsules");
-              void loadCapsules();
-            }}
-          >
-            Search Capsule
-          </button>
-        </nav>
+        <AppNavigation active="search" compact />
         <div className="topbar-meta">
           <span className={`connection-dot ${viewMode}`} />
           <span>{viewMode === "live" ? "实时服务" : "演示数据"}</span>

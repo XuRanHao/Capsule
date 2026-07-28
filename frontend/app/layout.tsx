@@ -23,30 +23,30 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase,
-    title: "Capsule · 多模态记忆检索",
+    title: "Capsule · 个人多模态素材工作台",
     description:
-      "用文字、图片或图文组合，从个人素材库中检索 Asset、来源文件与关联段落。",
+      "导入、处理、浏览、聚类与检索个人多模态素材，并把发现保存成可回放的 Capsule。",
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
     },
     openGraph: {
-      title: "Capsule · 多模态记忆检索",
-      description: "搜到你记得的那一幕。",
+      title: "Capsule · 个人多模态素材工作台",
+      description: "从散落素材到可检索、可聚类、可回放的个人记忆库。",
       images: [
         {
-          url: new URL("/og.png", metadataBase).toString(),
-          width: 1792,
-          height: 909,
-          alt: "Capsule 多模态记忆检索",
+          url: new URL("/og-workspace.png", metadataBase).toString(),
+          width: 1761,
+          height: 893,
+          alt: "Capsule 个人多模态素材工作台",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "Capsule · 多模态记忆检索",
-      description: "搜到你记得的那一幕。",
-      images: [new URL("/og.png", metadataBase).toString()],
+      title: "Capsule · 个人多模态素材工作台",
+      description: "从散落素材到可检索、可聚类、可回放的个人记忆库。",
+      images: [new URL("/og-workspace.png", metadataBase).toString()],
     },
   };
 }

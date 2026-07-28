@@ -1,7 +1,8 @@
-# Capsule Search Web
+# Capsule Web
 
-角色 B 的多模态检索工作台，直接调用 Capsule FastAPI 的
-`POST /api/v1/search`。
+Capsule 完整 POC 前端工作台，覆盖飞书需求中的导入、处理任务、Asset、
+Cluster、搜索与 Capsule 页面。搜索页直接调用 Capsule FastAPI 的
+`POST /api/v1/search`；其余页面内置完整可操作的演示数据，便于后端接口逐步接入。
 
 ## 本地运行
 
@@ -29,6 +30,13 @@ npm run dev
 
 ## 页面能力
 
+- `/import`：文件/文件夹导入、格式校验、待导入清单与任务创建
+- `/tasks`：处理阶段、实时日志、统计、失败原因与重试
+- `/assets`：Asset 网格/列表、搜索过滤、状态与来源信息
+- `/assets/:id`：原始定位、关联文字段落、Feature、Embedding 与 Cluster
+- `/clusters`：Cluster Run 参数、2D 分布、代表素材、成员与噪声点
+- `/search`：完整多模态搜索链路
+- `/capsules`：Cluster/Search Capsule 列表、详情、快照、刷新与收藏
 - 文字、图片上传/URL、图文组合检索
 - 图片快速/精搜、Weighted RRF/Normalized Similarity、可选豆包重排
 - Asset、Project、文件、Source File、模型版本、收藏和 Cluster Capsule 过滤
