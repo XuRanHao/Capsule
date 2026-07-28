@@ -16,6 +16,7 @@ dependencies = [
   "alembic>=1.14,<2",
   "asyncpg>=0.30,<1",
   "boto3>=1.35,<2",
+  "fastapi>=0.116,<1",
   "hdbscan>=0.8.40,<1",
   "httpx>=0.28,<1",
   "markdown-it-py>=3.0,<4",
@@ -29,6 +30,7 @@ dependencies = [
   "scikit-learn>=1.6,<2",
   "sqlalchemy>=2.0,<3",
   "typer>=0.15,<1",
+  "uvicorn>=0.35,<1",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +52,9 @@ packages = ["src/capsule"]
 addopts = "-q"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "integration: requires locally running PostgreSQL/Milvus services",
+]
 
 [tool.ruff]
 line-length = 100
