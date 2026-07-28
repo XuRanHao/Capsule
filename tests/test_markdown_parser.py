@@ -1,4 +1,13 @@
+from collections.abc import Sequence
+
+import pytest
+
 from capsule.parsers.markdown import MarkdownParser
+
+
+class CharacterTokenCounter:
+    async def count_many(self, texts: Sequence[str]) -> list[int]:
+        return [len(text) for text in texts]
 
 
 def test_images_in_group_inherit_preceding_heading() -> None:
@@ -32,3 +41,73 @@ def test_image_caption_precedes_document_context() -> None:
         "preceding_heading",
     ]
     assert [context.text for context in contexts] == ["银发角色", "角色设定"]
+
+
+@pytest.mark.asyncio
+async def test_long_heading_section_recurses_to_child_heading() -> None:
+    source = f"# 第一章\n\n{'甲' * 700}\n\n## 第二节\n\n{'乙' * 700}\n"
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "notes.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 2
+    assert assets[0].source_locator["heading_path"] == ["第一章"]
+    assert assets[1].source_locator["heading_path"] == ["第一章", "第二节"]
+    for asset in assets:
+        start = asset.source_locator["char_start"]
+        end = asset.source_locator["char_end"]
+        assert asset.raw_content == source[start:end]
+        assert asset.file_info["token_count"] <= 1200
+
+
+@pytest.mark.asyncio
+async def test_oversized_code_fence_is_not_split() -> None:
+    code = "x" * 1300
+    source = f"# Code\n\n```python\n{code}\n```\n"
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "code.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 1
+    assert assets[0].raw_content == f"```python\n{code}\n```\n"
+    assert assets[0].file_info["oversized"] is True
+    assert assets[0].file_info["oversized_reason"] == "indivisible_code_fence"
+
+
+@pytest.mark.asyncio
+async def test_long_list_splits_only_between_top_level_items() -> None:
+    items = [f"- {letter * 500}\n" for letter in ("甲", "乙", "丙")]
+    source = "# List\n\n" + "".join(items)
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "list.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 2
+    assert assets[0].raw_content == "".join(items[:2])
+    assert assets[1].raw_content == items[2]
+    assert all(asset.raw_content.startswith("- ") for asset in assets)
+
+
+@pytest.mark.asyncio
+async def test_adjacent_short_child_sections_merge_under_same_parent() -> None:
+    source = f"# Root\n\n{'长' * 1180}\n\n## A\n\na\n\n## B\n\nb\n"
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "short.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 2
+    assert assets[1].source_locator["heading_path"] == ["Root"]
+    assert "## A" in assets[1].raw_content
+    assert "## B" in assets[1].raw_content

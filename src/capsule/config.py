@@ -28,14 +28,15 @@ class Settings(BaseSettings):
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
-    understanding_model: str = "doubao-seed-2-0-lite-260215"
+    understanding_model: str = "doubao-seed-2-0-mini-260215"
     embedding_model: str = "doubao-embedding-vision-250615"
     embedding_dimension: int = Field(default=1024, ge=1)
+    tokenization_batch_size: int = Field(default=64, ge=1, le=256)
 
-    understanding_concurrency: int = Field(default=6, ge=1)
-    embedding_concurrency: int = Field(default=16, ge=1)
+    understanding_concurrency: int = Field(default=32, ge=1)
+    embedding_concurrency: int = Field(default=64, ge=1)
     search_embedding_concurrency: int = Field(default=16, ge=1)
-    capsule_concurrency: int = Field(default=4, ge=1)
+    capsule_concurrency: int = Field(default=8, ge=1)
     file_parse_concurrency: int = Field(default=4, ge=1)
     ffmpeg_concurrency: int = Field(default=2, ge=1)
     model_max_retries: int = Field(default=4, ge=1, le=10)

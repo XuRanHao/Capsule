@@ -2,6 +2,7 @@
 .env
 .idea/
 .vscode/
+.codex/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

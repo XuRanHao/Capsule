@@ -47,7 +47,11 @@ class Workspace(Base, TimestampMixin):
 class SourceFile(Base, TimestampMixin):
     __tablename__ = "source_files"
     __table_args__ = (
-        UniqueConstraint("workspace_id", "sha256", name="uq_source_file_workspace_sha256"),
+        UniqueConstraint(
+            "workspace_id",
+            "relative_path",
+            name="uq_source_file_workspace_relative_path",
+        ),
     )
 
     source_file_id: Mapped[str] = mapped_column(
@@ -84,6 +88,9 @@ class SourceFile(Base, TimestampMixin):
 
 class Asset(Base, TimestampMixin):
     __tablename__ = "assets"
+    __table_args__ = (
+        UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),
+    )
 
     asset_id: Mapped[str] = mapped_column(
         String(64),
@@ -106,7 +113,11 @@ class Asset(Base, TimestampMixin):
     )
     asset_type: Mapped[str] = mapped_column(String(32), index=True)
     file_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    asset_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     asset_name: Mapped[str | None] = mapped_column(String(1024))
+    asset_name_source: Mapped[str | None] = mapped_column(String(32))
     asset_description: Mapped[str | None] = mapped_column(Text)
     asset_features: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     source_contexts: Mapped[list[dict[str, Any]]] = mapped_column(
@@ -116,7 +127,7 @@ class Asset(Base, TimestampMixin):
     )
     file_info: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     source_locator: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
-    raw_content: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    raw_content: Mapped[str | None] = mapped_column(Text)
     derived_file_uri: Mapped[str | None] = mapped_column(Text)
     preview_uri: Mapped[str | None] = mapped_column(Text)
     processing_status: Mapped[str] = mapped_column(
@@ -128,6 +139,35 @@ class Asset(Base, TimestampMixin):
     feature_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     embedding_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class ProcessingJob(Base, TimestampMixin):
+    __tablename__ = "processing_jobs"
+
+    job_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("job"),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    job_type: Mapped[str] = mapped_column(String(64), default="assetization", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    current_stage: Mapped[str] = mapped_column(
+        String(32), default="discovering", nullable=False, index=True
+    )
+    input_path: Mapped[str] = mapped_column(Text, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_info: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EmbeddingRecord(Base):

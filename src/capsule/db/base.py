@@ -1,7 +1,7 @@
 from collections.abc import Callable
-from uuid import uuid4
 
 from sqlalchemy.orm import DeclarativeBase
+from ulid import ULID
 
 
 class Base(DeclarativeBase):
@@ -10,6 +10,6 @@ class Base(DeclarativeBase):
 
 def id_factory(prefix: str) -> Callable[[], str]:
     def create_id() -> str:
-        return f"{prefix}_{uuid4().hex}"
+        return f"{prefix}_{ULID()}"
 
     return create_id

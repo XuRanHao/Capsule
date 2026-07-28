@@ -113,10 +113,13 @@ def pipeline_command(
         return
 
     try:
-        asyncio.run(runner.run(input_path, workspace))
+        result = asyncio.run(runner.run(input_path, workspace))
     except PipelineNotReadyError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
+    typer.echo(result.model_dump_json(indent=2))
+    if result.failed_count:
+        raise typer.Exit(code=2)
 
 
 @app.command(name="evaluate-search")

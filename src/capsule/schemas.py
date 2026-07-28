@@ -1,8 +1,9 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from capsule.enums import AssetType, FeatureStatus
+from capsule.enums import AssetType, FeatureStatus, ProcessingStatus
 
 
 class SourceContext(BaseModel):
@@ -23,10 +24,60 @@ class AssetDraft(BaseModel):
     file_name: str
     source_locator: dict[str, Any] = Field(default_factory=dict)
     source_contexts: list[SourceContext] = Field(default_factory=list)
-    raw_content: dict[str, Any] | None = None
+    raw_content: str | None = None
     file_info: dict[str, Any] = Field(default_factory=dict)
     derived_file_uri: str | None = None
     preview_uri: str | None = None
+
+
+class AssetCreate(BaseModel):
+    asset_id: str
+    workspace_id: str
+    source_file_id: str
+    asset_type: AssetType
+    file_name: str
+    file_type: str
+    asset_key: str
+    content_hash: str
+    asset_name: str | None = None
+    asset_description: str | None = None
+    asset_features: dict[str, Any] = Field(default_factory=dict)
+    source_contexts: list[SourceContext] = Field(default_factory=list)
+    file_info: dict[str, Any] = Field(default_factory=dict)
+    source_locator: dict[str, Any] = Field(default_factory=dict)
+    raw_content: str | None = None
+    derived_file_uri: str | None = None
+    preview_uri: str | None = None
+    processing_status: ProcessingStatus = ProcessingStatus.PENDING
+    feature_revision: int = 1
+    embedding_revision: int = 1
+
+
+class AssetRecord(BaseModel):
+    asset_id: str
+    workspace_id: str
+    source_file_id: str
+    asset_type: AssetType
+    file_name: str
+    file_type: str
+    asset_name: str | None = None
+    asset_description: str | None = None
+    asset_features: dict[str, Any] = Field(default_factory=dict)
+    file_info: dict[str, Any] = Field(default_factory=dict)
+    source_locator: dict[str, Any] = Field(default_factory=dict)
+    raw_content: str | None = None
+    derived_file_uri: str | None = None
+    preview_uri: str | None = None
+    processing_status: ProcessingStatus
+    feature_revision: int = 1
+    embedding_revision: int = 1
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoredFileResult(BaseModel):
+    source_file_id: str
+    asset_ids: list[str] = Field(default_factory=list)
 
 
 class FeatureValue(BaseModel):

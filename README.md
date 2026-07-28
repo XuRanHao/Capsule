@@ -80,6 +80,10 @@ make test         # backend and frontend quality gates
 make down         # stop containers without deleting persisted data
 ```
 
+The assetization CLI persists Markdown and image assets to PostgreSQL. A failed
+file is recorded without aborting the batch. Video files remain explicitly
+unsupported until the MPS visual Worker and its segmentation parameters land.
+
 To reset persisted PostgreSQL/Milvus/MinIO data, use
 `docker compose down -v` deliberately; `make down` preserves it.
 

@@ -29,6 +29,7 @@ dependencies = [
   "python-multipart>=0.0.20,<1",
   "scenedetect>=0.7,<1",
   "python-dotenv>=1.0,<2",
+  "python-ulid>=3.2,<4",
   "scikit-learn>=1.6,<2",
   "sqlalchemy>=2.0,<3",
   "typer>=0.15,<1",

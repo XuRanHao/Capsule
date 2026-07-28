@@ -1,6 +1,30 @@
 name: capsule
 
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CAPSULE_DATABASE_URL: postgresql+asyncpg://capsule:capsule@postgres:5432/capsule
+      CAPSULE_MILVUS_URI: http://milvus:19530
+      CAPSULE_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+    volumes:
+      - .:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+
   postgres:
     image: postgres:17-alpine
     environment:

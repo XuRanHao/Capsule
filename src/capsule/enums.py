@@ -16,6 +16,34 @@ class ProcessingStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    RETRYING = "retrying"
+    COMPLETED = "completed"
+    PARTIAL_FAILED = "partial_failed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class PipelineStage(StrEnum):
+    DISCOVERING = "discovering"
+    PARSING = "parsing"
+    SEGMENTING = "segmenting"
+    ASSET_STORED = "asset_stored"
+    UNDERSTANDING = "understanding"
+    FEATURE_READY = "feature_ready"
+    EMBEDDING = "embedding"
+    INDEXING = "indexing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class AssetNameSource(StrEnum):
+    MODEL = "model"
+    USER = "user"
+
+
 class EmbeddingType(StrEnum):
     NATIVE_MULTIMODAL = "native_multimodal"
     ASSET_DESCRIPTION = "asset_description"

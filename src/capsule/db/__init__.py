@@ -6,6 +6,7 @@ from capsule.db.models import (
     ClusterRun,
     EmbeddingRecord,
     ModelCallLog,
+    ProcessingJob,
     SourceFile,
     Workspace,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ClusterRun",
     "EmbeddingRecord",
     "ModelCallLog",
+    "ProcessingJob",
     "SourceFile",
     "Workspace",
 ]
