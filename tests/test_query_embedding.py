@@ -56,7 +56,7 @@ def settings() -> Settings:
     )
 
 
-async def test_text_query_builds_four_normalized_channels() -> None:
+async def test_text_query_builds_fallback_six_normalized_channels() -> None:
     client = FakeEmbeddingClient()
     service = QueryEmbeddingService(client, settings())
 
@@ -69,13 +69,15 @@ async def test_text_query_builds_four_normalized_channels() -> None:
     )
 
     assert [item.embedding_type for item in plan.vectors] == [
-        EmbeddingType.NATIVE_MULTIMODAL,
         EmbeddingType.ASSET_DESCRIPTION,
+        EmbeddingType.NATIVE_MULTIMODAL,
         EmbeddingType.SUBJECT_CONTENT,
+        EmbeddingType.SCENE_THEME,
         EmbeddingType.VISUAL_STYLE,
+        EmbeddingType.MOOD_ATMOSPHERE,
     ]
     assert all(math.isclose(sum(value**2 for value in item.vector), 1.0) for item in plan.vectors)
-    assert client.calls == ["text:蓝紫色黄昏"]
+    assert len(client.calls) == 6
     assert plan.degraded is False
 
 
@@ -97,9 +99,11 @@ async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None
         "asset_description",
         "subject_content",
         "visual_style",
+        "mood_atmosphere",
+        "target_audience",
     ]
     assert plan.degraded is False
-    assert len(client.calls) == 2
+    assert len(client.calls) == 6
 
 
 async def test_image_text_falls_back_to_separate_vectors() -> None:
@@ -115,12 +119,8 @@ async def test_image_text_falls_back_to_separate_vectors() -> None:
         )
     )
 
-    assert [item.channel for item in plan.vectors[:2]] == [
-        "native_multimodal:image",
-        "native_multimodal:text",
-    ]
-    assert plan.vectors[0].weight == 0.5
-    assert plan.vectors[1].weight == 0.5
+    assert plan.vectors[0].channel == "native_multimodal"
+    assert plan.vectors[0].weight == 0.35
     assert plan.degraded is True
     assert "image:https://example.com/query.png" in client.calls
 

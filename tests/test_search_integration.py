@@ -3,6 +3,7 @@ import os
 import pytest
 
 from capsule.config import Settings
+from capsule.search.models import SearchFilters
 from capsule.vectorstore.milvus import MilvusVectorStore
 
 
@@ -19,7 +20,7 @@ async def test_real_milvus_collection_accepts_scoped_search() -> None:
         vector=[1.0] + [0.0] * (settings.embedding_dimension - 1),
         workspace_id=os.getenv("CAPSULE_TEST_WORKSPACE_ID", "workspace_demo"),
         embedding_type="native_multimodal",
-        asset_types=(),
+        filters=SearchFilters(),
         limit=1,
     )
 

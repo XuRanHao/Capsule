@@ -5,12 +5,16 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from alembic import command
+from alembic.config import Config
 
 from capsule import __version__
+from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
 from capsule.pipeline.runner import PipelineNotReadyError, PipelineRunner
+from capsule.search.evaluation import evaluate_search_file
 
 app = typer.Typer(no_args_is_help=True, help="Capsule multimodal clustering pipeline")
 
@@ -25,20 +29,49 @@ def main(
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    require_model: Annotated[
+        bool,
+        typer.Option(
+            "--require-model/--allow-missing-model",
+            help="Fail when CAPSULE_ARK_API_KEY is not configured.",
+        ),
+    ] = False,
+) -> None:
     """Inspect local configuration and external binary availability."""
     settings = get_settings()
     checks = {
         "database_url": bool(settings.database_url),
         "milvus_uri": bool(settings.milvus_uri),
         "object_storage_endpoint": bool(settings.object_storage_endpoint),
-        "ark_api_key": settings.ark_api_key is not None,
         "ffmpeg": "ffmpeg" not in VideoParser.check_dependencies(),
         "ffprobe": "ffprobe" not in VideoParser.check_dependencies(),
+        "ark_api_key": settings.ark_api_key is not None,
     }
     typer.echo(json.dumps(checks, ensure_ascii=False, indent=2))
-    if not all(checks.values()):
+    required_checks = {key: value for key, value in checks.items() if key != "ark_api_key"}
+    if require_model:
+        required_checks["ark_api_key"] = checks["ark_api_key"]
+    if not all(required_checks.values()):
         raise typer.Exit(code=1)
+
+
+@app.command()
+def bootstrap(
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+    workspace_name: Annotated[str, typer.Option("--workspace-name")] = "Capsule Demo",
+) -> None:
+    """Migrate PostgreSQL and initialize the local workspace, bucket, and Milvus."""
+    alembic_config = Config("alembic.ini")
+    command.upgrade(alembic_config, "head")
+    result = asyncio.run(
+        bootstrap_runtime(
+            get_settings(),
+            workspace_id=workspace,
+            workspace_name=workspace_name,
+        )
+    )
+    typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
 
 
 @app.command()
@@ -84,3 +117,29 @@ def pipeline_command(
     except PipelineNotReadyError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
+
+
+@app.command(name="evaluate-search")
+def evaluate_search_command(
+    dataset: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    api_base_url: Annotated[
+        str,
+        typer.Option("--api-base-url"),
+    ] = "http://localhost:8010",
+    concurrency: Annotated[int, typer.Option(min=1, max=32)] = 4,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict/--report-only"),
+    ] = False,
+) -> None:
+    """Measure Precision@5 and Recall@10 from a labeled JSONL dataset."""
+    report = asyncio.run(
+        evaluate_search_file(
+            dataset,
+            api_base_url=api_base_url,
+            concurrency=concurrency,
+        )
+    )
+    typer.echo(report.model_dump_json(indent=2))
+    if strict and not report.passed:
+        raise typer.Exit(code=1)

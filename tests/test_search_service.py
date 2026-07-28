@@ -7,6 +7,7 @@ from capsule.config import Settings
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     SearchAssetRecord,
+    SearchFilters,
     SearchRequest,
     VectorSearchHit,
 )
@@ -36,14 +37,14 @@ class FakeVectorRepository:
         vector: list[float],
         workspace_id: str,
         embedding_type: str,
-        asset_types: tuple[str, ...],
+        filters: SearchFilters,
         limit: int,
     ) -> Sequence[VectorSearchHit]:
         self.calls.append(
             {
                 "workspace_id": workspace_id,
                 "embedding_type": embedding_type,
-                "asset_types": asset_types,
+                "asset_types": tuple(item.value for item in filters.asset_type),
                 "limit": limit,
             }
         )
@@ -71,6 +72,8 @@ class FakeAssetRepository:
         *,
         workspace_id: str,
         asset_ids: Sequence[str],
+        created_by: str = "user_demo",
+        filters: SearchFilters | None = None,
     ) -> Mapping[str, SearchAssetRecord]:
         self.calls += 1
         return {
@@ -146,7 +149,7 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
     ]
     assert all(item.source_contexts for item in response.results)
     assert assets.calls == 1
-    assert len(vectors.calls) == 4
+    assert len(vectors.calls) == 6
     assert all(call["limit"] == 12 for call in vectors.calls)
     assert all(call["workspace_id"] == "workspace_demo" for call in vectors.calls)
 

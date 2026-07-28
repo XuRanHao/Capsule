@@ -3,7 +3,7 @@ from collections.abc import Sequence
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
-from capsule.search.models import QueryEmbeddingPlan, QueryVector, VectorSearchHit
+from capsule.search.models import QueryEmbeddingPlan, QueryVector, SearchFilters, VectorSearchHit
 from capsule.search.recall import MultiChannelRecall
 
 
@@ -18,7 +18,7 @@ class ConcurrentVectorRepository:
         vector: list[float],
         workspace_id: str,
         embedding_type: str,
-        asset_types: tuple[str, ...],
+        filters: SearchFilters,
         limit: int,
     ) -> Sequence[VectorSearchHit]:
         self.active += 1
@@ -46,9 +46,9 @@ async def test_recall_channels_run_concurrently() -> None:
     result = await recall.search(
         plan=plan,
         workspace_id="workspace_demo",
-        asset_types=(),
+        filters=SearchFilters(),
         top_k=20,
     )
 
-    assert len(result.channels) == 4
-    assert repository.max_observed == 4
+    assert len(result.channels) == 12
+    assert repository.max_observed == 12

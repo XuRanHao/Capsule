@@ -9,6 +9,7 @@ from capsule.search.models import (
     QueryEmbeddingPlan,
     QueryVector,
     RecallBatch,
+    SearchFilters,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class MultiChannelRecall:
         *,
         plan: QueryEmbeddingPlan,
         workspace_id: str,
-        asset_types: tuple[str, ...],
+        filters: SearchFilters,
         top_k: int,
     ) -> RecallBatch:
         channel_limit = min(
@@ -36,7 +37,7 @@ class MultiChannelRecall:
                 self._search_channel(
                     query_vector=query_vector,
                     workspace_id=workspace_id,
-                    asset_types=asset_types,
+                    filters=filters,
                     limit=channel_limit,
                 )
                 for query_vector in plan.vectors
@@ -63,7 +64,7 @@ class MultiChannelRecall:
         *,
         query_vector: QueryVector,
         workspace_id: str,
-        asset_types: tuple[str, ...],
+        filters: SearchFilters,
         limit: int,
     ) -> ChannelRecall:
         started = perf_counter()
@@ -71,7 +72,7 @@ class MultiChannelRecall:
             vector=query_vector.vector,
             workspace_id=workspace_id,
             embedding_type=query_vector.embedding_type.value,
-            asset_types=asset_types,
+            filters=filters,
             limit=limit,
         )
         logger.info(

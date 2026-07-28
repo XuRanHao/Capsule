@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from capsule.config import Settings
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
+from capsule.search.models import ParsedQuery, RerankBatch, SearchRequest
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -85,6 +86,93 @@ class DoubaoClient:
         return await self._chat_json(
             messages=messages,
             output_type=ClusterSummary,
+            pool=self.capsule_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+        )
+
+    async def parse_search_query(
+        self,
+        request: SearchRequest,
+        *,
+        image_url: str | None,
+    ) -> ParsedQuery:
+        """Parse a text/image query into the weighted routes frozen in the POC spec."""
+        system = {
+            "role": "system",
+            "content": (
+                "你是多模态素材检索 Query Parser。只输出 JSON。返回 query_summary、"
+                "dimension_queries、negative_terms、parser_mode。dimension_queries 每项必须含"
+                " embedding_type、query、weight、source、constraint；weight 总和必须为 1，"
+                "embedding_type 只能从 native_multimodal、asset_description、"
+                "subject_content、scene_theme、visual_style、color_composition、"
+                "mood_atmosphere、character_state_or_psychology、asset_usage、"
+                "target_audience、provenance、rights_version_authorship 中选择且不得重复。"
+                "source 只能是 text/image/joint，constraint 只能是 match/maintain/add/"
+                "exclude/modify。图片精搜优先 native=.45、subject=.15、scene=.10、"
+                "visual=.10、color=.10、mood=.10。图文检索要识别保持、更像、排除、"
+                "只看、风格相似等约束，使用 Late Fusion，不要把约束丢掉。"
+            ),
+        }
+        instruction = (
+            f"query_type={request.query_type.value}; "
+            f"precision_mode={request.precision_mode}; "
+            f"query_text={request.query_text or ''}"
+        )
+        content: list[dict[str, object]] = [{"type": "text", "text": instruction}]
+        if image_url:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+            )
+        return await self._chat_json(
+            messages=[system, {"role": "user", "content": content}],
+            output_type=ParsedQuery,
+            pool=self.understanding_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+        )
+
+    async def rerank_search_results(
+        self,
+        request: SearchRequest,
+        *,
+        image_url: str | None,
+        candidates: Sequence[Mapping[str, object]],
+    ) -> RerankBatch:
+        """Rerank at most 30 hydrated candidates and provide an explainable reason."""
+        system = {
+            "role": "system",
+            "content": (
+                "你是素材检索重排器。只输出 JSON："
+                '{"items":[{"asset_id":"...","relevance_score":0.0,"reason":"..."}]}。'
+                "必须只使用候选中的 asset_id，每个候选恰好一次；按相关度降序。"
+                "同时遵守用户的保持、增加、修改和排除约束；排除项应给极低分。"
+                "relevance_score 范围为 0 到 1，reason 简洁说明命中的内容、场景、"
+                "风格、色彩或情绪。"
+            ),
+        }
+        query = {
+            "query_type": request.query_type.value,
+            "query_text": request.query_text,
+            "candidates": list(candidates)[:30],
+        }
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": json.dumps(query, ensure_ascii=False),
+            }
+        ]
+        if image_url:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+            )
+        return await self._chat_json(
+            messages=[system, {"role": "user", "content": content}],
+            output_type=RerankBatch,
             pool=self.capsule_pool,
             timeout_seconds=self._settings.understanding_timeout_seconds,
         )

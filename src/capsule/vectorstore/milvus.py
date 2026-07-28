@@ -4,16 +4,17 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from pymilvus import MilvusClient
+from pymilvus import DataType, MilvusClient
 
 from capsule.config import Settings
-from capsule.search.models import VectorSearchHit
+from capsule.search.models import SearchFilters, VectorSearchHit
 
 
 @dataclass(slots=True, frozen=True)
 class VectorRecord:
     embedding_id: str
     workspace_id: str
+    project_id: str
     asset_id: str
     source_file_id: str
     asset_type: str
@@ -31,6 +32,146 @@ class MilvusVectorStore:
         self._collection = settings.milvus_collection
         self._dimension = settings.embedding_dimension
         self._batch_size = settings.milvus_batch_size
+        self._search_ef = settings.search_hnsw_ef
+
+    async def ensure_collection(self) -> bool:
+        """Create and load the frozen Seed-1.6 collection when it is missing.
+
+        Returns ``True`` when a collection was created and ``False`` when the
+        existing collection already matched the configured vector dimension.
+        """
+
+        return await asyncio.to_thread(self._ensure_collection_sync)
+
+    def _ensure_collection_sync(self) -> bool:
+        if self._client.has_collection(collection_name=self._collection):
+            description = self._client.describe_collection(
+                collection_name=self._collection,
+            )
+            fields = description.get("fields") or []
+            field_names = {
+                str(field.get("name"))
+                for field in fields
+                if isinstance(field, dict) and field.get("name")
+            }
+            required_fields = {
+                "embedding_id",
+                "workspace_id",
+                "project_id",
+                "asset_id",
+                "source_file_id",
+                "asset_type",
+                "embedding_type",
+                "model_version",
+                "embedding_revision",
+                "created_at_ts",
+                "vector",
+            }
+            missing_fields = required_fields - field_names
+            if missing_fields:
+                stats = self._client.get_collection_stats(
+                    collection_name=self._collection,
+                )
+                row_count = int((stats or {}).get("row_count") or 0)
+                if row_count:
+                    raise ValueError(
+                        f"Milvus collection {self._collection!r} misses fields "
+                        f"{sorted(missing_fields)} and contains {row_count} rows; "
+                        "migrate it before starting search"
+                    )
+                self._client.drop_collection(collection_name=self._collection)
+                return self._ensure_collection_sync()
+            vector_field = next(
+                (
+                    field
+                    for field in fields
+                    if isinstance(field, dict) and field.get("name") == "vector"
+                ),
+                None,
+            )
+            configured_dimension = _field_dimension(vector_field)
+            if configured_dimension is not None and configured_dimension != self._dimension:
+                raise ValueError(
+                    f"Milvus collection {self._collection!r} has dimension "
+                    f"{configured_dimension}, expected {self._dimension}"
+                )
+            self._client.load_collection(collection_name=self._collection)
+            return False
+
+        schema = MilvusClient.create_schema(
+            auto_id=False,
+            enable_dynamic_field=False,
+            description="Capsule multimodal asset embeddings",
+        )
+        schema.add_field(
+            field_name="embedding_id",
+            datatype=DataType.VARCHAR,
+            is_primary=True,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="workspace_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="project_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="asset_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="source_file_id",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="asset_type",
+            datatype=DataType.VARCHAR,
+            max_length=32,
+        )
+        schema.add_field(
+            field_name="embedding_type",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name="model_version",
+            datatype=DataType.VARCHAR,
+            max_length=255,
+        )
+        schema.add_field(
+            field_name="embedding_revision",
+            datatype=DataType.INT64,
+        )
+        schema.add_field(
+            field_name="created_at_ts",
+            datatype=DataType.INT64,
+        )
+        schema.add_field(
+            field_name="vector",
+            datatype=DataType.FLOAT_VECTOR,
+            dim=self._dimension,
+        )
+        index_params = MilvusClient.prepare_index_params()
+        index_params.add_index(
+            field_name="vector",
+            index_name="vector_hnsw",
+            index_type="HNSW",
+            metric_type="COSINE",
+            params={"M": 16, "efConstruction": 200},
+        )
+        self._client.create_collection(
+            collection_name=self._collection,
+            schema=schema,
+            index_params=index_params,
+        )
+        self._client.load_collection(collection_name=self._collection)
+        return True
 
     def validate_vector(self, vector: list[float]) -> None:
         if len(vector) != self._dimension:
@@ -51,6 +192,7 @@ class MilvusVectorStore:
                     {
                         "embedding_id": record.embedding_id,
                         "workspace_id": record.workspace_id,
+                        "project_id": record.project_id,
                         "asset_id": record.asset_id,
                         "source_file_id": record.source_file_id,
                         "asset_type": record.asset_type,
@@ -70,7 +212,7 @@ class MilvusVectorStore:
         vector: list[float],
         workspace_id: str,
         embedding_type: str,
-        asset_types: tuple[str, ...],
+        filters: SearchFilters,
         limit: int,
     ) -> list[VectorSearchHit]:
         """Search one embedding channel without blocking the event loop."""
@@ -78,7 +220,7 @@ class MilvusVectorStore:
         expression = self.build_filter_expression(
             workspace_id=workspace_id,
             embedding_type=embedding_type,
-            asset_types=asset_types,
+            filters=filters,
         )
         raw = await asyncio.to_thread(
             self._client.search,
@@ -87,7 +229,7 @@ class MilvusVectorStore:
             anns_field="vector",
             filter=expression,
             limit=limit,
-            search_params={"metric_type": "COSINE", "params": {}},
+            search_params={"metric_type": "COSINE", "params": {"ef": self._search_ef}},
             output_fields=[
                 "embedding_id",
                 "asset_id",
@@ -103,15 +245,30 @@ class MilvusVectorStore:
         *,
         workspace_id: str,
         embedding_type: str,
-        asset_types: tuple[str, ...] = (),
+        filters: SearchFilters | None = None,
     ) -> str:
         clauses = [
             f"workspace_id == {json.dumps(workspace_id)}",
             f"embedding_type == {json.dumps(embedding_type)}",
         ]
-        if asset_types:
-            encoded_types = ", ".join(json.dumps(item) for item in asset_types)
+        filters = filters or SearchFilters()
+        if filters.project_id:
+            clauses.append(f"project_id == {json.dumps(filters.project_id)}")
+        if filters.asset_type:
+            encoded_types = ", ".join(json.dumps(item.value) for item in filters.asset_type)
             clauses.append(f"asset_type in [{encoded_types}]")
+        if filters.source_file_id:
+            encoded_sources = ", ".join(json.dumps(item) for item in filters.source_file_id)
+            clauses.append(f"source_file_id in [{encoded_sources}]")
+        if filters.embedding_model_version:
+            encoded_versions = ", ".join(
+                json.dumps(item) for item in filters.embedding_model_version
+            )
+            clauses.append(f"model_version in [{encoded_versions}]")
+        if filters.created_at_from:
+            clauses.append(f"created_at_ts >= {int(filters.created_at_from.timestamp())}")
+        if filters.created_at_to:
+            clauses.append(f"created_at_ts <= {int(filters.created_at_to.timestamp())}")
         return " and ".join(clauses)
 
 
@@ -141,3 +298,14 @@ def _parse_search_hits(raw: Any) -> list[VectorSearchHit]:
             )
         )
     return parsed
+
+
+def _field_dimension(field: Any) -> int | None:
+    if not isinstance(field, dict):
+        return None
+    params = field.get("params")
+    if isinstance(params, dict) and params.get("dim") is not None:
+        return int(params["dim"])
+    if field.get("dim") is not None:
+        return int(field["dim"])
+    return None

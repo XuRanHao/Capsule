@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     milvus_collection: str = "asset_embeddings_seed16_1024"
 
     object_storage_endpoint: str = "http://localhost:9000"
+    object_storage_public_endpoint: str | None = None
     object_storage_bucket: str = "capsule"
     object_storage_access_key: SecretStr = SecretStr("minioadmin")
     object_storage_secret_key: SecretStr = SecretStr("minioadmin")
@@ -47,6 +48,10 @@ class Settings(BaseSettings):
     search_candidate_cap: int = Field(default=300, ge=1)
     search_same_source_limit: int = Field(default=3, ge=1)
     search_rrf_k: int = Field(default=60, ge=1)
+    search_hnsw_ef: int = Field(default=128, ge=1)
+    search_engine_version: str = "search-v1"
+    search_capsule_recent_limit: int = Field(default=10, ge=1)
+    query_image_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
     search_native_weight: float = Field(default=1.0, gt=0)
     search_description_weight: float = Field(default=0.8, gt=0)
     search_subject_weight: float = Field(default=0.8, gt=0)
@@ -57,6 +62,13 @@ class Settings(BaseSettings):
             "https://capsule-search-workspace.ranhaoxu212.chatgpt.site",
         ]
     )
+
+    @field_validator("ark_api_key", "milvus_token", mode="before")
+    @classmethod
+    def empty_secret_is_unset(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @lru_cache

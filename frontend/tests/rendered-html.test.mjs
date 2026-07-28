@@ -4,13 +4,16 @@ import test from "node:test";
 
 const templateRoot = new URL("../", import.meta.url);
 
-async function render() {
+async function render(pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerUrl.searchParams.set(
+    "test",
+    `${process.pid}-${Date.now()}-${pathname.replaceAll("/", "-")}`,
+  );
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(new URL(pathname, "http://localhost/"), {
       headers: { accept: "text/html" },
     }),
     {
@@ -31,28 +34,76 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>Capsule · 多模态记忆检索<\/title>/i);
+  assert.match(html, /<title>Capsule · 个人多模态素材工作台<\/title>/i);
   assert.match(html, /CAPSULE/);
   assert.match(html, /搜到你记得的/);
-  assert.match(html, /多模态记忆检索/);
+  assert.match(html, /个人多模态素材库/);
   assert.match(html, /演示数据/);
   assert.match(html, /关联段落/);
+  assert.match(html, /QUERY PLAN/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
+test("server-renders every POC workspace page", async () => {
+  const routes = [
+    ["/import", /把散落的素材/],
+    ["/tasks", /每一步，都看得见/],
+    ["/assets", /所有素材，都有语义/],
+    ["/assets/asset_twilight_01", /ASSET DETAIL/],
+    ["/clusters", /从相似中，看见结构/],
+    ["/search", /搜到你记得的/],
+    ["/capsules", /把一次发现，变成可复用的入口/],
+  ];
+
+  for (const [pathname, expectedCopy] of routes) {
+    const response = await render(pathname);
+    assert.equal(response.status, 200, `${pathname} should render`);
+    const html = await response.text();
+    assert.match(html, /CAPSULE/);
+    assert.match(html, expectedCopy);
+    assert.match(html, /导入/);
+    assert.match(html, /处理任务/);
+    assert.match(html, /Assets/);
+    assert.match(html, /Cluster/);
+    assert.match(html, /搜索/);
+    assert.match(html, /Capsule/);
+    assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
+  }
+});
+
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/DemoShell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/import/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/tasks/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/assets/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/assets/[id]/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/clusters/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/capsules/page.tsx", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/v1\/search/);
   assert.match(page, /source_contexts/);
   assert.match(page, /Weighted RRF/);
-  assert.match(layout, /Capsule · 多模态记忆检索/);
+  assert.match(page, /normalized_weighted_similarity/);
+  assert.match(page, /\/api\/v1\/search-capsules/);
+  assert.match(page, /\/api\/v1\/query-images/);
+  assert.match(page, /ProductTopbar/);
+  assert.match(shell, /ProductTopbar/);
+  assert.match(shell, /product-nav-compact/);
+  assert.doesNotMatch(shell, /demo-sidebar/);
+  assert.match(importPage, /选择文件夹/);
+  assert.match(tasksPage, /失败与重试/);
+  assert.match(assetsPage, /sourceFile/);
+  assert.match(detailPage, /sourceContext/);
+  assert.match(clustersPage, /embedding/);
+  assert.match(capsulesPage, /Search Capsule/);
+  assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(
-    `${page}\n${layout}\n${packageJson}`,
+    `${page}\n${layout}\n${packageJson}\n${shell}\n${importPage}\n${tasksPage}\n${assetsPage}\n${detailPage}\n${clustersPage}\n${capsulesPage}`,
     /codex-preview|react-loading-skeleton|_sites-preview/i,
   );
 
