@@ -120,6 +120,33 @@ class DoubaoClient:
 
         return await self.embedding_pool.run(request)
 
+    async def embed_text(self, text: str) -> EmbeddingResult:
+        """Embed text in the same multimodal space used by indexed assets."""
+        return await self.embed_multimodal([{"type": "text", "text": text}])
+
+    async def embed_image(self, image_url: str) -> EmbeddingResult:
+        """Embed one remotely accessible image."""
+        return await self.embed_multimodal(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+            ]
+        )
+
+    async def embed_image_text(self, image_url: str, text: str) -> EmbeddingResult:
+        """Generate a joint image-and-text query embedding."""
+        return await self.embed_multimodal(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+                {"type": "text", "text": text},
+            ]
+        )
+
     async def _chat_json(
         self,
         *,
