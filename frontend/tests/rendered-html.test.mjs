@@ -37,7 +37,7 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /<title>Capsule · 个人多模态素材工作台<\/title>/i);
   assert.match(html, /CAPSULE/);
   assert.match(html, /搜到你记得的/);
-  assert.match(html, /多模态记忆检索/);
+  assert.match(html, /个人多模态素材库/);
   assert.match(html, /演示数据/);
   assert.match(html, /关联段落/);
   assert.match(html, /QUERY PLAN/);
@@ -72,10 +72,11 @@ test("server-renders every POC workspace page", async () => {
 });
 
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/DemoShell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/import/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/tasks/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/assets/page.tsx", import.meta.url), "utf8"),
@@ -90,6 +91,10 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /normalized_weighted_similarity/);
   assert.match(page, /\/api\/v1\/search-capsules/);
   assert.match(page, /\/api\/v1\/query-images/);
+  assert.match(page, /ProductTopbar/);
+  assert.match(shell, /ProductTopbar/);
+  assert.match(shell, /product-nav-compact/);
+  assert.doesNotMatch(shell, /demo-sidebar/);
   assert.match(importPage, /选择文件夹/);
   assert.match(tasksPage, /失败与重试/);
   assert.match(assetsPage, /sourceFile/);
@@ -98,7 +103,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(
-    `${page}\n${layout}\n${packageJson}\n${importPage}\n${tasksPage}\n${assetsPage}\n${detailPage}\n${clustersPage}\n${capsulesPage}`,
+    `${page}\n${layout}\n${packageJson}\n${shell}\n${importPage}\n${tasksPage}\n${assetsPage}\n${detailPage}\n${clustersPage}\n${capsulesPage}`,
     /codex-preview|react-loading-skeleton|_sites-preview/i,
   );
 

@@ -49,6 +49,36 @@ export function AppNavigation({
   );
 }
 
+export function ProductTopbar({
+  active,
+  connection = "live",
+  status = "Workspace Demo",
+  workspace = "workspace_demo",
+}: {
+  active: DemoSection;
+  connection?: "live" | "demo";
+  status?: string;
+  workspace?: string;
+}) {
+  return (
+    <header className="topbar product-topbar">
+      <Link className="brand" href="/search" aria-label="Capsule 搜索">
+        <span className="brand-orbit" aria-hidden="true">
+          <i />
+        </span>
+        <strong>CAPSULE</strong>
+        <em>个人多模态素材库</em>
+      </Link>
+      <AppNavigation active={active} compact />
+      <div className="topbar-meta">
+        <span className={`connection-dot ${connection}`} />
+        <span>{status}</span>
+        <b>{workspace}</b>
+      </div>
+    </header>
+  );
+}
+
 export default function DemoShell({
   active,
   eyebrow,
@@ -66,29 +96,8 @@ export default function DemoShell({
 }) {
   return (
     <main className="demo-app-shell">
-      <header className="demo-topbar">
-        <Link className="brand" href="/search" aria-label="Capsule 搜索">
-          <span className="brand-orbit" aria-hidden="true">
-            <i />
-          </span>
-          <strong>CAPSULE</strong>
-          <em>个人多模态素材库</em>
-        </Link>
-        <div className="demo-topbar-meta">
-          <span className="connection-dot live" />
-          <span>Workspace Demo</span>
-          <b>许然豪</b>
-        </div>
-      </header>
+      <ProductTopbar active={active} />
       <div className="demo-layout">
-        <aside className="demo-sidebar">
-          <AppNavigation active={active} />
-          <div className="sidebar-footnote">
-            <span>POC BUILD</span>
-            <strong>2026.07 / V2</strong>
-            <small>PostgreSQL · Milvus · Seed</small>
-          </div>
-        </aside>
         <section className="demo-main">
           <header className="demo-page-header">
             <div>

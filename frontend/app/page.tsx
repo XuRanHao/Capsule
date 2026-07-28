@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useMemo, useState } from "react";
-import { AppNavigation } from "./components/DemoShell";
+import { ProductTopbar } from "./components/DemoShell";
 
 type QueryType = "text" | "image" | "image_text";
 type AssetType = "image" | "video_segment" | "markdown_block";
@@ -753,21 +753,12 @@ export default function Home() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="#top" aria-label="Capsule 首页">
-          <span className="brand-orbit" aria-hidden="true">
-            <i />
-          </span>
-          <strong>CAPSULE</strong>
-          <em>多模态记忆检索</em>
-        </a>
-        <AppNavigation active="search" compact />
-        <div className="topbar-meta">
-          <span className={`connection-dot ${viewMode}`} />
-          <span>{viewMode === "live" ? "实时服务" : "演示数据"}</span>
-          <b>{workspaceId || "未选择 Workspace"}</b>
-        </div>
-      </header>
+      <ProductTopbar
+        active="search"
+        connection={viewMode}
+        status={viewMode === "live" ? "实时服务" : "演示数据"}
+        workspace={workspaceId || "未选择 Workspace"}
+      />
 
       {activeView === "search" ? (
         <div className="workspace" id="top">
