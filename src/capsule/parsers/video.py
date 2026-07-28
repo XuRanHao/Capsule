@@ -8,6 +8,7 @@ does not need to carry PyTorch or access macOS MPS.
 
 import asyncio
 import json
+import platform
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -115,7 +116,7 @@ class VideoParser:
         return [
             executable
             for executable in ("ffmpeg", "ffprobe")
-            if shutil.which(executable) is None
+            if _resolve_video_tool(executable) is None
         ]
 
     async def assetize(self, source_file: DiscoveredFile) -> list[AssetDraft]:
@@ -369,7 +370,7 @@ def _detect_scenes(
 
 def _probe_metadata(source: Path) -> VideoMetadata:
     command = [
-        "ffprobe",
+        str(_require_video_tool("ffprobe")),
         "-v",
         "error",
         "-select_streams",
@@ -537,3 +538,19 @@ def _require_video_tools() -> None:
     missing = VideoParser.check_dependencies()
     if missing:
         raise VideoToolingError(f"missing video dependencies: {', '.join(missing)}")
+
+
+def _require_video_tool(executable: str) -> Path:
+    resolved = _resolve_video_tool(executable)
+    if resolved is None:
+        raise VideoToolingError(f"missing video dependency: {executable}")
+    return resolved
+
+
+def _resolve_video_tool(executable: str) -> Path | None:
+    if found := shutil.which(executable):
+        return Path(found)
+    if platform.system() != "Darwin":
+        return None
+    project_tool = Path.cwd() / "tmp" / "tools" / "ffmpeg" / "bin" / executable
+    return project_tool if project_tool.is_file() and project_tool.stat().st_mode & 0o111 else None

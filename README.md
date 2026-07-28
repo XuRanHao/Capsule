@@ -147,6 +147,10 @@ The MobileCLIP-S0 checkpoint defaults to
 FFprobe, MobileCLIP or the checkpoint is unavailable; it never silently uses
 Docker CPU.
 
+Without Homebrew, this checkout can use the ignored project-local binaries at
+`tmp/tools/ffmpeg/bin/`; the macOS parser discovers them automatically. Docker
+continues to use its Linux FFmpeg instead.
+
 6. Start the search API after configuring `CAPSULE_ARK_API_KEY`.
 
    ```bash
