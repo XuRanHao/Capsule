@@ -59,6 +59,12 @@ class SourceFile(Base, TimestampMixin):
         ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
         index=True,
     )
+    project_id: Mapped[str] = mapped_column(
+        String(64),
+        default="project_default",
+        nullable=False,
+        index=True,
+    )
     original_file_name: Mapped[str] = mapped_column(String(1024), nullable=False)
     file_type: Mapped[str] = mapped_column(String(32), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -86,6 +92,12 @@ class Asset(Base, TimestampMixin):
     )
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(64),
+        default="project_default",
+        nullable=False,
         index=True,
     )
     source_file_id: Mapped[str] = mapped_column(
@@ -138,6 +150,12 @@ class EmbeddingRecord(Base):
     )
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(64),
+        default="project_default",
+        nullable=False,
         index=True,
     )
     asset_id: Mapped[str] = mapped_column(
@@ -293,3 +311,158 @@ class ClusterMembership(Base):
     membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
     is_noise: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     distance_to_representative: Mapped[float | None] = mapped_column(Float)
+
+
+class UserFavorite(Base):
+    __tablename__ = "user_favorites"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "created_by",
+            "asset_id",
+            name="uq_user_favorite_workspace_user_asset",
+        ),
+    )
+
+    favorite_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("favorite"),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    created_by: Mapped[str] = mapped_column(String(128), index=True)
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class SearchCapsule(Base, TimestampMixin):
+    __tablename__ = "search_capsules"
+
+    capsule_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("search_capsule"),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    created_by: Mapped[str] = mapped_column(String(128), index=True)
+    query_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    query_text: Mapped[str | None] = mapped_column(Text)
+    query_image_uri: Mapped[str | None] = mapped_column(Text)
+    parsed_query: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    filters: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    fusion_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    rerank_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    search_engine_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+
+class SearchExecution(Base):
+    __tablename__ = "search_executions"
+
+    execution_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("search_exec"),
+    )
+    capsule_id: Mapped[str] = mapped_column(
+        ForeignKey("search_capsules.capsule_id", ondelete="CASCADE"),
+        index=True,
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    request_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    parsed_query: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    degraded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    degraded_reasons: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+
+class SearchResultSnapshot(Base):
+    __tablename__ = "search_result_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_id",
+            "result_rank",
+            name="uq_search_snapshot_execution_rank",
+        ),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("snapshot"),
+    )
+    execution_id: Mapped[str] = mapped_column(
+        ForeignKey("search_executions.execution_id", ondelete="CASCADE"),
+        index=True,
+    )
+    capsule_id: Mapped[str] = mapped_column(
+        ForeignKey("search_capsules.capsule_id", ondelete="CASCADE"),
+        index=True,
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="SET NULL"),
+        index=True,
+    )
+    result_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    final_score: Mapped[float] = mapped_column(Float, nullable=False)
+    component_scores: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    result_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+
+class QueryImageUpload(Base):
+    __tablename__ = "query_image_uploads"
+
+    upload_id: Mapped[str] = mapped_column(
+        String(128),
+        primary_key=True,
+        default=id_factory("query_image"),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    object_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )

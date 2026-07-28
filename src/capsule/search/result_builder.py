@@ -30,14 +30,15 @@ class SearchResultBuilder:
         workspace_id: str,
         allowed_asset_types: tuple[str, ...],
         top_k: int,
+        rerank_items: Mapping[str, tuple[float, str]] | None = None,
     ) -> list[SearchResult]:
-        results: list[SearchResult] = []
-        source_counts: Counter[str] = Counter()
+        candidates: list[SearchResult] = []
+        rerank_items = rerank_items or {}
         for hit in ranked_hits:
             asset = assets.get(hit.asset_id)
             if asset is None:
-                logger.error(
-                    "Milvus asset is missing from PostgreSQL",
+                logger.info(
+                    "Milvus candidate was rejected by PostgreSQL hydration or filters",
                     extra={"asset_id": hit.asset_id, "workspace_id": workspace_id},
                 )
                 continue
@@ -53,8 +54,6 @@ class SearchResultBuilder:
                     extra={"asset_id": hit.asset_id, "asset_type": asset.asset_type},
                 )
                 continue
-            if source_counts[asset.source_file_id] >= self._same_source_limit:
-                continue
             try:
                 asset_type = AssetType(asset.asset_type)
             except ValueError:
@@ -63,12 +62,12 @@ class SearchResultBuilder:
                     extra={"asset_id": asset.asset_id, "asset_type": asset.asset_type},
                 )
                 continue
-            source_counts[asset.source_file_id] += 1
             ordered_channels = sorted(
                 hit.matched_channels,
-                key=lambda item: (-item.rrf_contribution, item.rank, item.channel),
+                key=lambda item: (-item.fusion_contribution, item.rank, item.channel),
             )
-            results.append(
+            rerank_score, reason = rerank_items.get(asset.asset_id, (None, None))
+            candidates.append(
                 SearchResult(
                     asset_id=asset.asset_id,
                     asset_type=asset_type,
@@ -76,7 +75,7 @@ class SearchResultBuilder:
                     asset_description=asset.asset_description,
                     asset_features=asset.asset_features,
                     source_contexts=asset.source_contexts,
-                    source_locator=asset.source_locator,
+                    source_locator=dict(asset.source_locator),
                     preview_uri=asset.preview_uri,
                     source_file=SourceFileResult(
                         source_file_id=asset.source_file_id,
@@ -91,6 +90,7 @@ class SearchResultBuilder:
                             embedding_type=match.embedding_type,
                             rank=match.rank,
                             similarity=match.similarity,
+                            fusion_contribution=match.fusion_contribution,
                             rrf_contribution=match.rrf_contribution,
                         )
                         for match in ordered_channels
@@ -99,11 +99,163 @@ class SearchResultBuilder:
                         asset.asset_features,
                         ordered_channels,
                     ),
+                    matched_reason=reason or _default_reason(ordered_channels),
+                    rerank_score=rerank_score,
+                    folded_asset_ids=[asset.asset_id],
                 )
             )
-            if len(results) >= top_k:
-                break
-        return results
+        return _fold_and_limit(
+            candidates,
+            same_source_limit=self._same_source_limit,
+            top_k=top_k,
+        )
+
+
+def _fold_and_limit(
+    candidates: list[SearchResult],
+    *,
+    same_source_limit: int,
+    top_k: int,
+) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    source_counts: Counter[str] = Counter()
+    for candidate in candidates:
+        source_id = (
+            candidate.source_file.source_file_id if candidate.source_file is not None else ""
+        )
+        folded_into = next(
+            (
+                existing
+                for existing in results
+                if existing.source_file is not None
+                and existing.source_file.source_file_id == source_id
+                and _can_fold(existing, candidate)
+            ),
+            None,
+        )
+        if folded_into is not None:
+            folded_into.folded_asset_ids.extend(candidate.folded_asset_ids)
+            folded_into.group_kind = (
+                "video_segments"
+                if candidate.asset_type is AssetType.VIDEO_SEGMENT
+                else "markdown_blocks"
+            )
+            folded_into.source_contexts = _merge_contexts(
+                folded_into.source_contexts,
+                candidate.source_contexts,
+            )
+            _expand_locator(folded_into.source_locator, candidate.source_locator)
+            continue
+        if source_counts[source_id] >= same_source_limit:
+            continue
+        source_counts[source_id] += 1
+        results.append(candidate)
+        if len(results) >= top_k:
+            break
+    return results
+
+
+def _can_fold(left: SearchResult, right: SearchResult) -> bool:
+    if left.asset_type is not right.asset_type:
+        return False
+    if left.asset_type is AssetType.MARKDOWN_BLOCK:
+        left_index = _number(left.source_locator, "block_index")
+        right_index = _number(right.source_locator, "block_index")
+        return (
+            left_index is not None
+            and right_index is not None
+            and abs(left_index - right_index) <= 1
+        )
+    if left.asset_type is not AssetType.VIDEO_SEGMENT:
+        return False
+    left_start = _first_number(
+        left.source_locator,
+        "start_ms",
+        "start_time_ms",
+        "start_seconds",
+        "start_time_seconds",
+    )
+    left_end = _first_number(
+        left.source_locator,
+        "end_ms",
+        "end_time_ms",
+        "end_seconds",
+        "end_time_seconds",
+    )
+    right_start = _first_number(
+        right.source_locator,
+        "start_ms",
+        "start_time_ms",
+        "start_seconds",
+        "start_time_seconds",
+    )
+    right_end = _first_number(
+        right.source_locator,
+        "end_ms",
+        "end_time_ms",
+        "end_seconds",
+        "end_time_seconds",
+    )
+    if None in (left_start, left_end, right_start, right_end):
+        return False
+    assert left_start is not None and left_end is not None
+    assert right_start is not None and right_end is not None
+    uses_milliseconds = any(
+        key in left.source_locator or key in right.source_locator
+        for key in ("start_ms", "end_ms", "start_time_ms", "end_time_ms")
+    )
+    gap_limit = 2_000.0 if uses_milliseconds else 2.0
+    gap = max(right_start - left_end, left_start - right_end, 0.0)
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    shortest_duration = min(left_end - left_start, right_end - right_start)
+    overlap_ratio = overlap / shortest_duration if shortest_duration > 0 else 0.0
+    return gap < gap_limit or overlap_ratio > 0.30
+
+
+def _expand_locator(target: dict[str, Any], incoming: Mapping[str, Any]) -> None:
+    for start_key, end_key in (
+        ("start_ms", "end_ms"),
+        ("start_time_ms", "end_time_ms"),
+        ("start_seconds", "end_seconds"),
+        ("start_time_seconds", "end_time_seconds"),
+        ("block_index", "block_index"),
+    ):
+        left_start = _number(target, start_key)
+        right_start = _number(incoming, start_key)
+        left_end = _number(target, end_key)
+        right_end = _number(incoming, end_key)
+        if left_start is not None and right_start is not None:
+            target[start_key] = min(left_start, right_start)
+        if left_end is not None and right_end is not None:
+            target[end_key] = max(left_end, right_end)
+
+
+def _number(locator: Mapping[str, Any], key: str) -> float | None:
+    value = locator.get(key)
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def _first_number(locator: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = _number(locator, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _merge_contexts(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = list(left)
+    seen = {repr(item) for item in merged}
+    for item in right:
+        if repr(item) not in seen:
+            merged.append(item)
+            seen.add(repr(item))
+    return merged
 
 
 def _matched_feature(
@@ -111,8 +263,13 @@ def _matched_feature(
     channels: list[ChannelMatch],
 ) -> str | None:
     feature_types = {
-        EmbeddingType.SUBJECT_CONTENT: "subject_content",
-        EmbeddingType.VISUAL_STYLE: "visual_style",
+        item: item.value
+        for item in EmbeddingType
+        if item
+        not in {
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.ASSET_DESCRIPTION,
+        }
     }
     for channel in channels:
         key = feature_types.get(channel.embedding_type)
@@ -122,7 +279,15 @@ def _matched_feature(
         if isinstance(raw, str) and raw:
             return raw
         if isinstance(raw, Mapping):
-            value = raw.get("value")
-            if isinstance(value, str) and value:
-                return value
+            for value_key in ("effective_value", "value", "user_value", "model_value"):
+                value = raw.get(value_key)
+                if isinstance(value, str) and value:
+                    return value
     return None
+
+
+def _default_reason(channels: list[ChannelMatch]) -> str | None:
+    if not channels:
+        return None
+    names = "、".join(item.embedding_type.value for item in channels[:3])
+    return f"命中检索维度：{names}"

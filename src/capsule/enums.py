@@ -20,7 +20,15 @@ class EmbeddingType(StrEnum):
     NATIVE_MULTIMODAL = "native_multimodal"
     ASSET_DESCRIPTION = "asset_description"
     SUBJECT_CONTENT = "subject_content"
+    SCENE_THEME = "scene_theme"
     VISUAL_STYLE = "visual_style"
+    COLOR_COMPOSITION = "color_composition"
+    MOOD_ATMOSPHERE = "mood_atmosphere"
+    CHARACTER_STATE_OR_PSYCHOLOGY = "character_state_or_psychology"
+    ASSET_USAGE = "asset_usage"
+    TARGET_AUDIENCE = "target_audience"
+    PROVENANCE = "provenance"
+    RIGHTS_VERSION_AUTHORSHIP = "rights_version_authorship"
 
 
 class EmbeddingStatus(StrEnum):
@@ -42,6 +50,7 @@ class FeatureStatus(StrEnum):
     OBSERVED = "observed"
     INFERRED = "inferred"
     METADATA = "metadata"
+    USER_SUPPLIED = "user_supplied"
     UNKNOWN = "unknown"
     NOT_APPLICABLE = "not_applicable"
 

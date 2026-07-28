@@ -37,6 +37,8 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /多模态记忆检索/);
   assert.match(html, /演示数据/);
   assert.match(html, /关联段落/);
+  assert.match(html, /Search Capsule/);
+  assert.match(html, /QUERY PLAN/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -50,6 +52,9 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /\/api\/v1\/search/);
   assert.match(page, /source_contexts/);
   assert.match(page, /Weighted RRF/);
+  assert.match(page, /normalized_weighted_similarity/);
+  assert.match(page, /\/api\/v1\/search-capsules/);
+  assert.match(page, /\/api\/v1\/query-images/);
   assert.match(layout, /Capsule · 多模态记忆检索/);
   assert.doesNotMatch(
     `${page}\n${layout}\n${packageJson}`,

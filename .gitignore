@@ -16,3 +16,4 @@ __pycache__/
 reports/
 data/
 tmp/
+.env.local
