@@ -13,7 +13,7 @@ from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
-from capsule.pipeline.runner import PipelineNotReadyError, PipelineRunner
+from capsule.pipeline.runner import PipelineRunner
 from capsule.search.evaluation import evaluate_search_file
 
 app = typer.Typer(no_args_is_help=True, help="Capsule multimodal clustering pipeline")
@@ -112,11 +112,22 @@ def pipeline_command(
         typer.echo(runner.build_plan(input_path, workspace).model_dump_json(indent=2))
         return
 
-    try:
-        result = asyncio.run(runner.run(input_path, workspace))
-    except PipelineNotReadyError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2) from exc
+    result = asyncio.run(runner.run(input_path, workspace))
+    typer.echo(result.model_dump_json(indent=2))
+    if result.failed_count:
+        raise typer.Exit(code=2)
+
+
+@app.command(name="mps-video")
+def mps_video_command(
+    input_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+) -> None:
+    """Import one MP4/MOV using the macOS-host MPS MobileCLIP runtime."""
+    if input_path.suffix.lower() not in {".mp4", ".mov"}:
+        raise typer.BadParameter("mps-video accepts a single .mp4 or .mov file")
+
+    result = asyncio.run(PipelineRunner().run(input_path, workspace))
     typer.echo(result.model_dump_json(indent=2))
     if result.failed_count:
         raise typer.Exit(code=2)

@@ -16,12 +16,9 @@ from capsule.parsers.assetizer import Assetizer
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.image import ImageParser
 from capsule.parsers.markdown import MarkdownParser
+from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
 from capsule.schemas import AssetDraft, DiscoveredFile
-
-
-class PipelineNotReadyError(RuntimeError):
-    pass
 
 
 class PipelinePlan(BaseModel):
@@ -51,10 +48,12 @@ class PipelineRunner:
         settings: Settings | None = None,
         database: Database | None = None,
         token_counter: TokenCounter | None = None,
+        video_embedder: VisualEmbedder | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._database = database
         self._token_counter = token_counter
+        self._video_embedder = video_embedder
 
     def build_plan(self, input_path: Path, workspace_id: str) -> PipelinePlan:
         files = discover_files(input_path)
@@ -82,7 +81,7 @@ class PipelineRunner:
 
         repository = AssetRepository(database)
         factory = AssetFactory()
-        assetizer = _build_assetizer(counter)
+        assetizer = _build_assetizer(counter, self._settings, self._video_embedder)
         job_id = await repository.create_job(
             workspace_id=workspace_id,
             input_path=input_path,
@@ -147,19 +146,33 @@ class PipelineRunner:
                 await database.dispose()
 
 
-def _build_assetizer(counter: TokenCounter | None) -> Assetizer:
+def _build_assetizer(
+    counter: TokenCounter | None,
+    settings: Settings,
+    video_embedder: VisualEmbedder | None,
+) -> Assetizer:
     markdown = MarkdownParser()
     image = ImageParser()
+    video = VideoParser(
+        concurrency=settings.ffmpeg_concurrency,
+        config=VideoSegmentationConfig(
+            scene_threshold=settings.video_scene_threshold,
+            min_scene_seconds=settings.video_min_scene_seconds,
+            max_shot_seconds=settings.video_max_shot_seconds,
+            window_seconds=settings.video_window_seconds,
+            sample_interval_seconds=settings.video_sample_interval_seconds,
+            max_candidate_frames=settings.video_max_candidate_frames,
+            max_representative_frames=settings.video_max_representative_frames,
+        ),
+        embedder=video_embedder,
+        mobileclip_model_path=Path(settings.mobileclip_model_path),
+        mobileclip_batch_size=settings.mobileclip_batch_size,
+    )
 
     async def markdown_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
             raise ValueError("CAPSULE_ARK_API_KEY is required to split Markdown")
         return await markdown.assetize_file(Path(source_file.path), counter)
-
-    async def video_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
-        raise PipelineNotReadyError(
-            f"video visual segmentation is not implemented yet: {source_file.relative_path}"
-        )
 
     return Assetizer(
         {
@@ -168,8 +181,8 @@ def _build_assetizer(counter: TokenCounter | None) -> Assetizer:
             ".jpeg": image.assetize,
             ".png": image.assetize,
             ".webp": image.assetize,
-            ".mp4": video_handler,
-            ".mov": video_handler,
+            ".mp4": video.assetize,
+            ".mov": video.assetize,
         }
     )
 

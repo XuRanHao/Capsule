@@ -122,8 +122,30 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    capsule pipeline ./test-data --workspace workspace_demo --dry-run
    ```
 
-The non-dry-run pipeline command is intentionally guarded until concrete
-storage, model, and vector-store adapters are wired in.
+The non-dry-run pipeline persists Markdown and image assets to PostgreSQL.
+Video input requires the host MPS worker described below; a video failure is
+recorded without aborting the rest of the batch.
+
+## Video MPS worker
+
+Video visual features run only on the macOS host because Docker cannot access
+MPS. The first pass uses scene detection, 45-second long-shot splitting into
+20-second windows, end-inclusive 5-second frame sampling (maximum 12), quality
+filtering, and up to three MobileCLIP-S0 representative frames.
+
+Run the command from a native Apple-silicon Python environment that has the
+Capsule dependencies plus PyTorch, Apple `ml-mobileclip`, FFmpeg and FFprobe:
+
+```bash
+uv run capsule mps-video data/dev-fixtures/nature/hiking-trip.mp4 \
+  --workspace workspace_demo
+```
+
+The MobileCLIP-S0 checkpoint defaults to
+`data/models/mobileclip-s0/mobileclip_s0.pt` and can be changed with
+`CAPSULE_MOBILECLIP_MODEL_PATH`. The command fails clearly when MPS, FFmpeg,
+FFprobe, MobileCLIP or the checkpoint is unavailable; it never silently uses
+Docker CPU.
 
 6. Start the search API after configuring `CAPSULE_ARK_API_KEY`.
 
