@@ -390,15 +390,28 @@ export default function ClustersPage() {
               </button>
             </div>
           </header>
+          <div className="cluster-member-summary">
+            <span>
+              已加载 <strong>{selectedMembers.length}</strong> /{" "}
+              {selectedCapsule.member_count} 个 Assets
+            </span>
+            {selectedMembers.length !== selectedCapsule.member_count && (
+              <small>成员数据仍在加载，请稍候…</small>
+            )}
+          </div>
           <div className="representative-strip">
-            {selectedMembers.slice(0, 6).map((asset, index) => (
+            {selectedMembers.map((asset, index) => (
               <article key={asset.asset_id}>
                 <AssetThumb
                   preview={asset.preview_url}
                   name={asset.asset_name || asset.file_name}
                   type={asset.asset_type}
                 />
-                <span>{index === 0 ? "MEDOID" : `MEMBER ${index + 1}`}</span>
+                <span>
+                  {asset.asset_id === selectedCapsule.medoid_asset_id
+                    ? "MEDOID"
+                    : `MEMBER ${index + 1}`}
+                </span>
                 <strong>{asset.asset_name || asset.file_name}</strong>
               </article>
             ))}

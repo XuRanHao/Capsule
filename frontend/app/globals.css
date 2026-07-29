@@ -3342,6 +3342,25 @@ blockquote p {
   font-size: 16px;
 }
 
+.cluster-member-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 15px 0;
+  color: var(--muted-ink);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+}
+
+.cluster-member-summary strong {
+  color: var(--ink);
+}
+
+.cluster-member-summary small {
+  color: var(--orange);
+  font-size: inherit;
+}
+
 .representative-strip {
   display: grid;
   padding: 15px;
