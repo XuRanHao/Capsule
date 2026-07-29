@@ -5,65 +5,70 @@ import { useRouter } from "next/navigation";
 import DemoShell from "../components/DemoShell";
 
 type QueuedFile = {
+  file: File;
   name: string;
   path: string;
   type: "markdown" | "image" | "video";
   size: number;
 };
 
-const EXAMPLE_FILES: QueuedFile[] = [
-  {
-    name: "2026-夏日情绪板.md",
-    path: "灵感库/视觉参考/2026-夏日情绪板.md",
-    type: "markdown",
-    size: 128_400,
-  },
-  {
-    name: "street-twilight.jpg",
-    path: "灵感库/视觉参考/images/street-twilight.jpg",
-    type: "image",
-    size: 4_820_000,
-  },
-  {
-    name: "田野参考.mp4",
-    path: "项目/短片A/参考/田野参考.mp4",
-    type: "video",
-    size: 186_400_000,
-  },
-  {
-    name: "导演阐述.md",
-    path: "项目/短片A/导演阐述.md",
-    type: "markdown",
-    size: 84_200,
-  },
-];
-
 const folderInputProps = {
   webkitdirectory: "",
   directory: "",
 } as React.InputHTMLAttributes<HTMLInputElement>;
 
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+};
+
+type DirectoryHandleWithValues = FileSystemDirectoryHandle & {
+  values: () => AsyncIterable<FileSystemHandle>;
+};
+
+function asQueuedFile(file: File, path: string): QueuedFile | null {
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  const type =
+    extension === "md"
+      ? "markdown"
+      : ["mp4", "mov"].includes(extension)
+        ? "video"
+        : ["jpg", "jpeg", "png", "webp"].includes(extension)
+          ? "image"
+          : null;
+  if (!type) return null;
+  return { file, name: file.name, path, type, size: file.size };
+}
+
 function normalizeFiles(files: FileList | File[]): QueuedFile[] {
   return Array.from(files)
-    .map((file) => {
-      const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
-      const type =
-        ["md", "markdown"].includes(extension)
-          ? "markdown"
-          : ["mp4", "mov", "mkv", "webm"].includes(extension)
-            ? "video"
-            : ["jpg", "jpeg", "png", "webp", "gif"].includes(extension)
-              ? "image"
-              : null;
-      if (!type) return null;
-      return {
-        name: file.name,
-        path: file.webkitRelativePath || file.name,
-        type,
-        size: file.size,
-      };
-    })
+    .map((file) => asQueuedFile(file, file.webkitRelativePath || file.name))
     .filter((item): item is QueuedFile => item !== null);
+}
+
+async function collectDirectoryFiles(
+  directory: FileSystemDirectoryHandle,
+  parentPath = directory.name,
+): Promise<QueuedFile[]> {
+  const files: QueuedFile[] = [];
+  const entries = (directory as DirectoryHandleWithValues).values();
+  for await (const entry of entries) {
+    const relativePath = `${parentPath}/${entry.name}`;
+    if (entry.kind === "file") {
+      const queued = asQueuedFile(
+        await (entry as FileSystemFileHandle).getFile(),
+        relativePath,
+      );
+      if (queued) files.push(queued);
+    } else {
+      files.push(
+        ...(await collectDirectoryFiles(
+          entry as FileSystemDirectoryHandle,
+          relativePath,
+        )),
+      );
+    }
+  }
+  return files;
 }
 
 function formatBytes(bytes: number) {
@@ -71,13 +76,20 @@ function formatBytes(bytes: number) {
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
+function endpoint(path: string) {
+  const base = process.env.NEXT_PUBLIC_CAPSULE_API_BASE_URL || "http://localhost:8010";
+  return `${base.replace(/\/$/, "")}${path}`;
+}
+
 export default function ImportPage() {
   const router = useRouter();
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
-  const [files, setFiles] = useState<QueuedFile[]>(EXAMPLE_FILES);
+  const [files, setFiles] = useState<QueuedFile[]>([]);
   const [dragging, setDragging] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   const counts = useMemo(
     () => ({
@@ -90,10 +102,13 @@ export default function ImportPage() {
   );
 
   const addFiles = (incoming: FileList | File[]) => {
-    const normalized = normalizeFiles(incoming);
+    addQueuedFiles(normalizeFiles(incoming));
+  };
+
+  const addQueuedFiles = (incoming: QueuedFile[]) => {
     setFiles((current) => {
       const seen = new Set(current.map((item) => item.path));
-      return [...current, ...normalized.filter((item) => !seen.has(item.path))];
+      return [...current, ...incoming.filter((item) => !seen.has(item.path))];
     });
   };
 
@@ -103,10 +118,87 @@ export default function ImportPage() {
     addFiles(event.dataTransfer.files);
   };
 
-  const startImport = () => {
+  const selectDirectory = async () => {
+    setImportError(null);
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    if (!picker) {
+      folderInput.current?.click();
+      return;
+    }
+    try {
+      addQueuedFiles(await collectDirectoryFiles(await picker()));
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setImportError(error instanceof Error ? error.message : "读取文件夹失败");
+    }
+  };
+
+  const startImport = async () => {
     if (!files.length) return;
     setStarting(true);
-    window.setTimeout(() => router.push("/tasks"), 650);
+    setImportError(null);
+    setUploadProgress(0);
+    try {
+      const workspaceId = "workspace_demo";
+      const created = await fetch(endpoint("/api/v1/import-jobs"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_id: workspaceId }),
+      });
+      if (!created.ok) {
+        const body = await created.json().catch(() => null);
+        throw new Error(body?.detail?.message || "创建导入任务失败");
+      }
+      const { job_id: jobId } = (await created.json()) as { job_id: string };
+
+      for (const [index, item] of files.entries()) {
+        const form = new FormData();
+        form.set("workspace_id", workspaceId);
+        form.set("relative_path", item.path);
+        form.set("file", item.file, item.name);
+        let lastError: Error | null = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const uploaded = await fetch(
+              endpoint(`/api/v1/import-jobs/${encodeURIComponent(jobId)}/files`),
+              { method: "POST", body: form },
+            );
+            if (!uploaded.ok) {
+              const body = await uploaded.json().catch(() => null);
+              throw new Error(body?.detail?.message || `上传 ${item.name} 失败`);
+            }
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error instanceof Error ? error : new Error(`上传 ${item.name} 失败`);
+            if (attempt < 2) {
+              await new Promise((resolve) => window.setTimeout(resolve, 600 * (attempt + 1)));
+            }
+          }
+        }
+        if (lastError) throw lastError;
+        setUploadProgress(index + 1);
+      }
+
+      const started = await fetch(
+        endpoint(`/api/v1/import-jobs/${encodeURIComponent(jobId)}/complete`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workspace_id: workspaceId }),
+        },
+      );
+      if (!started.ok) {
+        const body = await started.json().catch(() => null);
+        throw new Error(body?.detail?.message || "启动资产化任务失败");
+      }
+      router.push(`/tasks?job_id=${encodeURIComponent(jobId)}`);
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : "创建导入任务失败");
+    } finally {
+      setStarting(false);
+      setUploadProgress(null);
+    }
   };
 
   return (
@@ -164,7 +256,7 @@ export default function ImportPage() {
             <button onClick={() => fileInput.current?.click()}>
               选择文件
             </button>
-            <button onClick={() => folderInput.current?.click()}>
+            <button onClick={selectDirectory}>
               选择文件夹
             </button>
           </div>
@@ -172,7 +264,7 @@ export default function ImportPage() {
             ref={fileInput}
             type="file"
             multiple
-            accept=".md,.markdown,.jpg,.jpeg,.png,.webp,.gif,.mp4,.mov,.mkv,.webm"
+            accept=".md,.jpg,.jpeg,.png,.webp,.mp4,.mov"
             onChange={(event) => event.target.files && addFiles(event.target.files)}
             hidden
           />
@@ -193,21 +285,21 @@ export default function ImportPage() {
             <span>MD</span>
             <p>
               <strong>Markdown</strong>
-              <small>.md · .markdown</small>
+              <small>.md</small>
             </p>
           </div>
           <div>
             <span>IMG</span>
             <p>
               <strong>图片</strong>
-              <small>.jpg · .png · .webp · .gif</small>
+              <small>.jpg · .png · .webp</small>
             </p>
           </div>
           <div>
             <span>VID</span>
             <p>
               <strong>视频</strong>
-              <small>.mp4 · .mov · .mkv · .webm</small>
+              <small>.mp4 · .mov</small>
             </p>
           </div>
           <footer>
@@ -224,7 +316,6 @@ export default function ImportPage() {
             <span className="eyebrow">QUEUE / RELATIVE PATH</span>
             <h2>导入清单</h2>
           </div>
-          <button onClick={() => setFiles(EXAMPLE_FILES)}>载入示例批次</button>
         </header>
         <div className="data-table">
           <div className="data-row data-head">
@@ -262,7 +353,12 @@ export default function ImportPage() {
         <div>
           <small>WORKSPACE</small>
           <strong>workspace_demo</strong>
-          <span>{files.length} 个 Source File 将进入处理队列</span>
+          <span>
+            {uploadProgress === null
+              ? `${files.length} 个 Source File 将进入处理队列`
+              : `正在上传 ${uploadProgress}/${files.length}`}
+          </span>
+          {importError && <span className="import-error">{importError}</span>}
         </div>
         <button disabled={!files.length || starting} onClick={startImport}>
           {starting ? "正在创建任务…" : "开始处理"}

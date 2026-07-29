@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -251,6 +252,38 @@ class MilvusVectorStore:
             ],
         )
         return _parse_search_hits(raw)
+
+    async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Fetch exact vectors by embedding primary key for offline clustering."""
+        if not embedding_ids:
+            return {}
+        return await asyncio.to_thread(self._fetch_vectors_sync, list(embedding_ids))
+
+    def _fetch_vectors_sync(self, embedding_ids: list[str]) -> dict[str, list[float]]:
+        vectors: dict[str, list[float]] = {}
+        for start in range(0, len(embedding_ids), self._batch_size):
+            batch = embedding_ids[start : start + self._batch_size]
+            encoded_ids = ", ".join(json.dumps(item) for item in batch)
+            rows = self._client.query(
+                collection_name=self._collection,
+                filter=f"embedding_id in [{encoded_ids}]",
+                output_fields=["embedding_id", "vector"],
+                limit=len(batch),
+            )
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                embedding_id = row.get("embedding_id")
+                vector = row.get("vector")
+                if not isinstance(embedding_id, str) or not isinstance(vector, list):
+                    continue
+                try:
+                    parsed = [float(value) for value in vector]
+                    self.validate_vector(parsed)
+                except (TypeError, ValueError):
+                    continue
+                vectors[embedding_id] = parsed
+        return vectors
 
     @staticmethod
     def build_filter_expression(

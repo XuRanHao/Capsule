@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,10 +28,12 @@ class Settings(BaseSettings):
     object_storage_access_key: SecretStr = SecretStr("minioadmin")
     object_storage_secret_key: SecretStr = SecretStr("minioadmin")
     object_storage_region: str = "us-east-1"
+    import_root: Path = Path("data/imports")
+    import_file_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
-    understanding_model: str = "doubao-seed-2-0-mini-260215"
+    understanding_model: str = "doubao-seed-2-0-lite-260215"
     embedding_model: str = "doubao-embedding-vision-250615"
     embedding_dimension: int = Field(default=1024, ge=1)
     tokenization_batch_size: int = Field(default=64, ge=1, le=256)

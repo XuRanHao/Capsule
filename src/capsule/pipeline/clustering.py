@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import hdbscan
@@ -37,6 +38,27 @@ class ClusterResult:
     @property
     def noise_ratio(self) -> float:
         return self.noise_count / len(self.labels)
+
+
+@dataclass(slots=True, frozen=True)
+class ClusterMemberCandidate:
+    """Metadata for one vector that may become a representative Asset."""
+
+    asset_id: str
+    source_file_id: str
+    membership_probability: float
+
+
+@dataclass(slots=True, frozen=True)
+class RepresentativeSelection:
+    """One ordered Asset selected to explain a cluster rather than the whole cluster."""
+
+    asset_id: str
+    source_file_id: str
+    role: str
+    rank: int
+    distance_to_medoid: float
+    membership_probability: float
 
 
 def dynamic_hdbscan_parameters(sample_count: int) -> HdbscanParameters:
@@ -106,15 +128,146 @@ def representative_indices(
     *,
     limit: int = 10,
 ) -> dict[int, list[int]]:
+    """Return actual-medoid-adjacent members for callers without Asset metadata."""
     representatives: dict[int, list[int]] = {}
     for label in sorted(set(labels.tolist()) - {-1}):
         member_indices = np.flatnonzero(labels == label)
         members = vectors[member_indices]
-        centroid = members.mean(axis=0)
-        distances = np.linalg.norm(members - centroid, axis=1)
-        order = np.argsort(distances)[:limit]
+        medoid_position = _medoid_position(members)
+        medoid = members[medoid_position]
+        distances = np.linalg.norm(members - medoid, axis=1)
+        order = np.lexsort((member_indices, distances))[:limit]
         representatives[label] = member_indices[order].tolist()
     return representatives
+
+
+def select_cluster_representatives(
+    vectors: NDArray[np.float32],
+    labels: NDArray[np.int_],
+    candidates: list[ClusterMemberCandidate],
+    *,
+    limit: int = 10,
+    edge_limit: int = 2,
+    max_per_source_file: int = 2,
+) -> dict[int, list[RepresentativeSelection]]:
+    """Select medoid, core and optional edge Assets from each non-noise cluster.
+
+    The vectors must be the PCA-transformed vectors that HDBSCAN clustered.  This
+    keeps the medoid and its distances in the same space used to form the cluster.
+    No membership threshold is imposed on edge Assets: their lower membership is
+    used only for ordering, so the caller can later tune that policy explicitly.
+    """
+    if vectors.ndim != 2:
+        raise ValueError("vectors must be a two-dimensional matrix")
+    if len(vectors) != len(labels) or len(vectors) != len(candidates):
+        raise ValueError("vectors, labels, and candidates must have the same length")
+    if limit < 1 or edge_limit < 0 or max_per_source_file < 1:
+        raise ValueError("representative selection limits must be positive")
+
+    selections: dict[int, list[RepresentativeSelection]] = {}
+    for label in sorted(set(labels.tolist()) - {-1}):
+        member_indices = np.flatnonzero(labels == label)
+        members = vectors[member_indices]
+        medoid_index = int(member_indices[_medoid_position(members)])
+        medoid_vector = vectors[medoid_index]
+        distances = {
+            int(index): float(np.linalg.norm(vectors[index] - medoid_vector))
+            for index in member_indices
+        }
+        target_count = min(limit, len(member_indices))
+        planned_edge_count = min(edge_limit, max(0, target_count - 5))
+        core_target = target_count - planned_edge_count
+
+        selected_indices = [medoid_index]
+        source_counts = {candidates[medoid_index].source_file_id: 1}
+
+        closest_first = sorted(
+            (int(index) for index in member_indices if int(index) != medoid_index),
+            key=lambda index: (distances[index], candidates[index].asset_id),
+        )
+        _append_with_source_cap(
+            selected_indices,
+            closest_first,
+            candidates,
+            source_counts,
+            max_per_source_file=max_per_source_file,
+            maximum=core_target,
+        )
+
+        edge_indices: list[int] = []
+        edge_candidates = sorted(
+            (index for index in closest_first if index not in selected_indices),
+            key=lambda index: (
+                candidates[index].membership_probability,
+                distances[index],
+                candidates[index].asset_id,
+            ),
+        )
+        _append_with_source_cap(
+            edge_indices,
+            edge_candidates,
+            candidates,
+            source_counts,
+            max_per_source_file=max_per_source_file,
+            maximum=planned_edge_count,
+        )
+
+        # If a source-file cap prevented the planned core/edge balance, fill any
+        # remaining slots with the closest still-eligible members.
+        _append_with_source_cap(
+            selected_indices,
+            (
+                index
+                for index in closest_first
+                if index not in selected_indices and index not in edge_indices
+            ),
+            candidates,
+            source_counts,
+            max_per_source_file=max_per_source_file,
+            maximum=target_count - len(edge_indices),
+        )
+        ordered_indices = [*selected_indices, *edge_indices]
+        selections[label] = [
+            RepresentativeSelection(
+                asset_id=candidates[index].asset_id,
+                source_file_id=candidates[index].source_file_id,
+                role="medoid"
+                if index == medoid_index
+                else "edge"
+                if index in edge_indices
+                else "core",
+                rank=rank,
+                distance_to_medoid=distances[index],
+                membership_probability=candidates[index].membership_probability,
+            )
+            for rank, index in enumerate(ordered_indices)
+        ]
+    return selections
+
+
+def _medoid_position(members: NDArray[np.float32]) -> int:
+    distances = np.linalg.norm(members[:, np.newaxis, :] - members[np.newaxis, :, :], axis=2)
+    total_distances = distances.sum(axis=1)
+    return int(np.argmin(total_distances))
+
+
+def _append_with_source_cap(
+    selected: list[int],
+    candidates_to_add: Iterable[int],
+    candidates: list[ClusterMemberCandidate],
+    source_counts: dict[str, int],
+    *,
+    max_per_source_file: int,
+    maximum: int,
+) -> None:
+    for index in candidates_to_add:
+        if len(selected) >= maximum:
+            return
+        source_file_id = candidates[index].source_file_id
+        if source_counts.get(source_file_id, 0) >= max_per_source_file:
+            continue
+        selected.append(index)
+        source_counts[source_file_id] = source_counts.get(source_file_id, 0) + 1
 
 
 def _l2_normalize(vectors: NDArray[np.float32]) -> NDArray[np.float32]:

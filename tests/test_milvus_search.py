@@ -29,6 +29,10 @@ class FakeMilvusClient:
     def upsert(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
 
+    def query(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.kwargs = kwargs
+        return [{"embedding_id": "emb_1", "vector": [0.0, 1.0, 2.0]}]
+
 
 class FakeBootstrapMilvusClient(FakeMilvusClient):
     def __init__(
@@ -177,6 +181,17 @@ async def test_milvus_async_upsert_uses_embedding_id_as_primary_key() -> None:
             "vector": [0.0, 1.0, 2.0],
         }
     ]
+
+
+async def test_milvus_fetch_vectors_queries_exact_embedding_ids() -> None:
+    client = FakeMilvusClient()
+    store = MilvusVectorStore(Settings(embedding_dimension=3), client=client)
+
+    vectors = await store.fetch_vectors(["emb_1", "emb_missing"])
+
+    assert vectors == {"emb_1": [0.0, 1.0, 2.0]}
+    assert client.kwargs["filter"] == 'embedding_id in ["emb_1", "emb_missing"]'
+    assert client.kwargs["output_fields"] == ["embedding_id", "vector"]
 
 
 async def test_milvus_bootstrap_creates_and_loads_frozen_collection() -> None:

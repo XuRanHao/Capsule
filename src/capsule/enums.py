@@ -91,3 +91,17 @@ class ClusterRunStatus(StrEnum):
     COMPLETED = "completed"
     INSUFFICIENT_DATA = "insufficient_data"
     FAILED = "failed"
+
+
+class ClusterRepresentativeRole(StrEnum):
+    """How an Asset represents a Cluster Capsule."""
+
+    MEDOID = "medoid"
+    CORE = "core"
+    EDGE = "edge"
+
+
+class ClusterInternalVariance(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"

@@ -3,7 +3,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from capsule.config import Settings
 from capsule.model_clients.concurrency import AsyncCallPool
@@ -83,12 +83,32 @@ class DoubaoClient:
         self,
         messages: Sequence[Mapping[str, Any]],
     ) -> ClusterSummary:
-        return await self._chat_json(
-            messages=messages,
-            output_type=ClusterSummary,
-            pool=self.capsule_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-        )
+        try:
+            return await self._responses_json(
+                messages=messages,
+                output_type=ClusterSummary,
+                pool=self.capsule_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+            )
+        except ValidationError as exc:
+            # Responses can be valid JSON but still violate the persisted Capsule
+            # contract (most often a description shorter than 50 Chinese chars).
+            # Retry once with the original representatives intact and explicit errors.
+            correction = {
+                "role": "user",
+                "content": (
+                    "上一份输出未通过结构校验。请仅基于前述代表资产重新输出完整合法 JSON，"
+                    "不要解释或使用 Markdown。description 必须是 50 到 150 个中文字符；"
+                    "keywords 必须为 3 到 8 项；internal_variance 只能为 low、medium 或 high。"
+                    f"校验错误：{json.dumps(exc.errors(include_url=False), ensure_ascii=False)}"
+                ),
+            }
+            return await self._responses_json(
+                messages=[*messages, correction],
+                output_type=ClusterSummary,
+                pool=self.capsule_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+            )
 
     async def parse_search_query(
         self,
@@ -265,6 +285,37 @@ class DoubaoClient:
 
         return await pool.run(request)
 
+    async def _responses_json(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        output_type: type[ModelT],
+        pool: AsyncCallPool,
+        timeout_seconds: float,
+    ) -> ModelT:
+        """Call Ark Responses API for the Lite model with thinking disabled."""
+
+        input_text = _responses_input_text(messages)
+
+        async def request() -> ModelT:
+            response = await self._client.post(
+                "/responses",
+                json={
+                    "model": self._settings.understanding_model,
+                    "input": input_text,
+                    "thinking": {"type": "disabled"},
+                },
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            try:
+                decoded = json.loads(_extract_response_output_text(response.json()))
+            except json.JSONDecodeError as exc:
+                raise DoubaoResponseError("model response is not valid JSON") from exc
+            return output_type.model_validate(decoded)
+
+        return await pool.run(request)
+
 
 def _extract_message_content(payload: Mapping[str, Any]) -> str:
     try:
@@ -274,6 +325,43 @@ def _extract_message_content(payload: Mapping[str, Any]) -> str:
     if not isinstance(content, str):
         raise DoubaoResponseError("chat message content must be a JSON string")
     return content
+
+
+def _responses_input_text(messages: Sequence[Mapping[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = message.get("content", "")
+        if isinstance(content, str):
+            rendered = content
+        elif isinstance(content, (Mapping, list)):
+            rendered = json.dumps(content, ensure_ascii=False)
+        else:
+            raise DoubaoResponseError("Responses input content must be text or JSON data")
+        parts.append(f"{role}:\n{rendered}")
+    return "\n\n".join(parts)
+
+
+def _extract_response_output_text(payload: Mapping[str, Any]) -> str:
+    direct = payload.get("output_text")
+    if isinstance(direct, str):
+        return direct
+    output = payload.get("output")
+    if not isinstance(output, list):
+        raise DoubaoResponseError("Responses payload does not contain output text")
+    for item in output:
+        if not isinstance(item, Mapping) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping) or part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                return text
+    raise DoubaoResponseError("Responses payload does not contain output text")
 
 
 def _extract_embedding(payload: Mapping[str, Any]) -> list[float]:

@@ -6,10 +6,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from capsule.api.capsules import router as capsules_router
+from capsule.api.clusters import router as cluster_runs_router
+from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.config import Settings, get_settings
+from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
 from capsule.db.session import Database
 from capsule.model_clients.doubao import DoubaoClient
+from capsule.pipeline.cluster_service import ClusterService
+from capsule.pipeline.import_service import BrowserImportService
+from capsule.pipeline.runner import PipelineRunner
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.query_parser import QueryParser
@@ -26,14 +32,28 @@ def create_app(
     *,
     settings: Settings | None = None,
     search_service: SearchService | None = None,
+    cluster_service: ClusterService | None = None,
+    cluster_repository: ClusterRepository | None = None,
+    import_service: BrowserImportService | None = None,
+    asset_repository: AssetRepository | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = resolved_settings
-        if search_service is not None:
+        if (
+            search_service is not None
+            or cluster_service is not None
+            or cluster_repository is not None
+            or import_service is not None
+            or asset_repository is not None
+        ):
             app.state.search_service = search_service
+            app.state.cluster_service = cluster_service
+            app.state.cluster_repository = cluster_repository
+            app.state.import_service = import_service
+            app.state.asset_repository = asset_repository
             yield
             return
 
@@ -44,11 +64,19 @@ def create_app(
         query_images = QueryImageService(database, storage)
         app.state.search_history = history
         app.state.query_image_service = query_images
+        app.state.cluster_repository = ClusterRepository(database)
+        app.state.asset_repository = AssetRepository(database)
+        app.state.import_service = BrowserImportService(
+            settings=resolved_settings,
+            repository=app.state.asset_repository,
+            runner=PipelineRunner(settings=resolved_settings, database=database),
+        )
         if resolved_settings.ark_api_key is None:
             logging.getLogger(__name__).warning(
                 "CAPSULE_ARK_API_KEY is not configured; search endpoint will return 503"
             )
             app.state.search_service = None
+            app.state.cluster_service = None
             try:
                 yield
             finally:
@@ -69,6 +97,13 @@ def create_app(
             history=history,
             image_resolver=query_images,
             settings=resolved_settings,
+        )
+        app.state.cluster_service = ClusterService(
+            settings=resolved_settings,
+            embedding_repository=EmbeddingRepository(database),
+            cluster_repository=app.state.cluster_repository,
+            vector_store=vectors,
+            model_client=embedding_client,
         )
         try:
             yield
@@ -94,12 +129,15 @@ def create_app(
     )
     application.include_router(search_router)
     application.include_router(capsules_router)
+    application.include_router(cluster_runs_router)
+    application.include_router(imports_router)
 
     @application.get("/health")
     async def health() -> dict[str, str | bool]:
         return {
             "status": "ok",
             "search_ready": resolved_settings.ark_api_key is not None,
+            "cluster_ready": resolved_settings.ark_api_key is not None,
         }
 
     return application

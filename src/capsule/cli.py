@@ -11,12 +11,13 @@ from alembic.config import Config
 from capsule import __version__
 from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
-from capsule.db.repositories import EmbeddingRepository
+from capsule.db.repositories import ClusterRepository, EmbeddingRepository
 from capsule.db.session import Database
 from capsule.enums import EmbeddingType
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
+from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeClusterResult
 from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.runner import PipelineRunner
 from capsule.search.evaluation import evaluate_search_file
@@ -175,6 +176,34 @@ def embed_command(
         raise typer.Exit(code=2)
 
 
+@app.command(name="cluster")
+def cluster_command(
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+    embedding_type: Annotated[
+        EmbeddingType,
+        typer.Option(
+            "--embedding-type",
+            help="Embedding Type to cluster; each invocation runs exactly one Type.",
+        ),
+    ] = EmbeddingType.NATIVE_MULTIMODAL,
+) -> None:
+    """Cluster one Embedding Type into its own PCA, HDBSCAN, and ClusterRun."""
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    result = asyncio.run(
+        _cluster_assets(
+            workspace_id=workspace,
+            embedding_type=embedding_type,
+        )
+    )
+    typer.echo(result.model_dump_json(indent=2))
+    if result.status.value == "failed":
+        raise typer.Exit(code=2)
+
+
 @app.command(name="evaluate-search")
 def evaluate_search_command(
     dataset: Annotated[Path, typer.Argument(exists=True, readable=True)],
@@ -224,6 +253,30 @@ async def _embed_assets(
                 embedding_type=embedding_type,
                 asset_ids=asset_ids,
                 force=force,
+            )
+    finally:
+        await database.dispose()
+
+
+async def _cluster_assets(
+    *,
+    workspace_id: str,
+    embedding_type: EmbeddingType,
+) -> EmbeddingTypeClusterResult:
+    settings = get_settings()
+    database = Database(settings)
+    try:
+        async with DoubaoClient(settings) as model_client:
+            service = ClusterService(
+                settings=settings,
+                embedding_repository=EmbeddingRepository(database),
+                cluster_repository=ClusterRepository(database),
+                vector_store=MilvusVectorStore(settings),
+                model_client=model_client,
+            )
+            return await service.run(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
             )
     finally:
         await database.dispose()

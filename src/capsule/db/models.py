@@ -308,17 +308,63 @@ class ClusterCapsule(Base, TimestampMixin):
     )
     embedding_type: Mapped[str] = mapped_column(String(64), nullable=False)
     cluster_label: Mapped[int] = mapped_column(Integer, nullable=False)
+    model_generated_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    user_override_name: Mapped[str | None] = mapped_column(String(1024))
     effective_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    model_generated_description: Mapped[str] = mapped_column(Text, nullable=False)
+    user_override_description: Mapped[str | None] = mapped_column(Text)
     effective_description: Mapped[str] = mapped_column(Text, nullable=False)
     keywords: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    common_features: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    internal_variance: Mapped[str | None] = mapped_column(String(16))
     member_count: Mapped[int] = mapped_column(Integer, nullable=False)
     average_membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
+    medoid_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="SET NULL"),
+        index=True,
+    )
     representative_asset_ids: Mapped[list[str]] = mapped_column(
         JSONB,
         default=list,
         nullable=False,
     )
     is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class ClusterRepresentativeAsset(Base):
+    """A durable, ordered Asset reference used to explain one Cluster Capsule."""
+
+    __tablename__ = "cluster_representative_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "cluster_capsule_id",
+            "asset_id",
+            name="uq_cluster_representative_asset",
+        ),
+        UniqueConstraint(
+            "cluster_capsule_id",
+            "rank",
+            name="uq_cluster_representative_rank",
+        ),
+    )
+
+    cluster_representative_asset_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("crep"),
+    )
+    cluster_capsule_id: Mapped[str] = mapped_column(
+        ForeignKey("cluster_capsules.cluster_capsule_id", ondelete="CASCADE"),
+        index=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    distance_to_medoid: Mapped[float] = mapped_column(Float, nullable=False)
+    membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
 
 
 class ClusterMembership(Base):

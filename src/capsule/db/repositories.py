@@ -6,20 +6,41 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.db.base import id_factory
-from capsule.db.models import Asset, EmbeddingRecord, ProcessingJob, SourceFile, Workspace
+from capsule.db.models import (
+    Asset,
+    ClusterCapsule,
+    ClusterMembership,
+    ClusterRepresentativeAsset,
+    ClusterRun,
+    EmbeddingRecord,
+    ProcessingJob,
+    SourceFile,
+    Workspace,
+)
 from capsule.db.session import Database
 from capsule.enums import (
     AssetNameSource,
+    ClusterInternalVariance,
+    ClusterRunStatus,
     EmbeddingStatus,
     JobStatus,
     PipelineStage,
     ProcessingStatus,
 )
-from capsule.schemas import AssetCreate, DiscoveredFile, StoredFileResult
+from capsule.schemas import (
+    AssetCreate,
+    ClusterCapsuleRecord,
+    ClusterCapsuleWrite,
+    ClusterRepresentativeWrite,
+    ClusterRunRecord,
+    DiscoveredFile,
+    ProcessingJobRecord,
+    StoredFileResult,
+)
 
 
 class AssetRepository:
@@ -46,6 +67,43 @@ class AssetRepository:
             session.add(job)
             await session.flush()
             return job.job_id
+
+    async def create_pending_import_job(
+        self,
+        *,
+        workspace_id: str,
+        import_root: Path,
+    ) -> str:
+        """Create the durable upload session before browser files are transferred."""
+        root = _resolve_path(import_root)
+        async with self._database.session() as session, session.begin():
+            await self._ensure_workspace(session, workspace_id)
+            job = ProcessingJob(
+                workspace_id=workspace_id,
+                input_path=str(root),
+                total_count=0,
+                status=JobStatus.QUEUED.value,
+                current_stage=PipelineStage.DISCOVERING.value,
+            )
+            session.add(job)
+            await session.flush()
+            job.input_path = str(root / job.job_id)
+            return job.job_id
+
+    async def start_import_job(self, *, job_id: str, total_count: int) -> None:
+        """Freeze an upload session and make it available to ``PipelineRunner``."""
+        if total_count < 1:
+            raise ValueError("an import job must contain at least one file")
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            if job.status != JobStatus.QUEUED.value:
+                raise ValueError(f"processing job cannot be started from status {job.status}")
+            job.total_count = total_count
+            job.status = JobStatus.RUNNING.value
+            job.current_stage = PipelineStage.PARSING.value
+            job.started_at = datetime.now(UTC)
 
     async def get_or_create_source_file(
         self,
@@ -178,6 +236,43 @@ class AssetRepository:
                 job.status = JobStatus.PARTIAL_FAILED.value
                 job.current_stage = PipelineStage.ASSET_STORED.value
             job.completed_at = datetime.now(UTC)
+
+    async def fail_job(self, *, job_id: str, error: str) -> None:
+        """Fail an import before per-file handling could record an outcome."""
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            job.status = JobStatus.FAILED.value
+            job.current_stage = PipelineStage.FAILED.value
+            job.error_info = [*job.error_info, {"relative_path": "", "error": error[:2000]}]
+            if job.failed_count == 0:
+                job.failed_count = 1
+            job.completed_at = datetime.now(UTC)
+
+    async def get_job(self, *, job_id: str, workspace_id: str) -> ProcessingJobRecord:
+        async with self._database.session() as session:
+            job = await session.scalar(
+                select(ProcessingJob).where(
+                    ProcessingJob.job_id == job_id,
+                    ProcessingJob.workspace_id == workspace_id,
+                )
+            )
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            return ProcessingJobRecord(
+                job_id=job.job_id,
+                workspace_id=job.workspace_id,
+                input_path=job.input_path,
+                total_count=job.total_count,
+                completed_count=job.completed_count,
+                failed_count=job.failed_count,
+                status=job.status,
+                current_stage=job.current_stage,
+                error_info=list(job.error_info),
+                started_at=job.started_at,
+                completed_at=job.completed_at,
+            )
 
     @staticmethod
     async def _ensure_workspace(session: AsyncSession, workspace_id: str) -> None:
@@ -403,3 +498,522 @@ class EmbeddingRepository:
             record = await session.get(EmbeddingRecord, embedding_id, with_for_update=True)
             if record is not None:
                 record.status = EmbeddingStatus.FAILED.value
+
+    async def list_indexed_cluster_embeddings(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        milvus_collection: str,
+    ) -> list["ClusterEmbeddingAsset"]:
+        """Return the latest indexed vector record for each Asset in one channel."""
+        statement = (
+            select(EmbeddingRecord, Asset)
+            .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
+            .where(
+                EmbeddingRecord.workspace_id == workspace_id,
+                EmbeddingRecord.embedding_type == embedding_type,
+                EmbeddingRecord.model_name == model_name,
+                EmbeddingRecord.dimension == dimension,
+                EmbeddingRecord.milvus_collection == milvus_collection,
+                EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+            )
+            .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
+        )
+        async with self._database.session() as session:
+            rows = (await session.execute(statement)).all()
+
+        # A regenerated Asset can have historical indexed records.  Keep its
+        # newest record so one Asset contributes at most one vector per type.
+        selected: dict[str, ClusterEmbeddingAsset] = {}
+        for record, asset in rows:
+            if asset.asset_id in selected:
+                continue
+            selected[asset.asset_id] = ClusterEmbeddingAsset(
+                embedding_id=record.embedding_id,
+                asset_id=asset.asset_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                asset_name=asset.asset_name,
+                asset_description=asset.asset_description,
+                asset_features=dict(asset.asset_features),
+                file_tree_context=list(asset.file_tree_context),
+            )
+        return list(selected.values())
+
+
+#===========================================
+#      Cluster Capsule persistence
+#===========================================
+
+
+class ClusterRepository:
+    """Persist model summaries, representative Asset IDs, and user overrides."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def create_pending_run(self, *, workspace_id: str, embedding_type: str) -> str:
+        """Reserve a ClusterRun ID for an HTTP request before background execution."""
+        async with self._database.session() as session, session.begin():
+            if await session.get(Workspace, workspace_id) is None:
+                raise ValueError(f"workspace does not exist: {workspace_id}")
+            run = ClusterRun(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                input_embedding_ids=[],
+                dataset_hash="0" * 64,
+                sample_count=0,
+                preprocessing={"submission_mode": "async_api"},
+                parameters={},
+                status=ClusterRunStatus.PENDING.value,
+            )
+            session.add(run)
+            await session.flush()
+            return run.cluster_run_id
+
+    async def start_pending_run(
+        self,
+        *,
+        cluster_run_id: str,
+        workspace_id: str,
+        embedding_type: str,
+        embedding_ids: list[str],
+        dataset_hash: str,
+        preprocessing: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> None:
+        """Populate a pending API run once its exact vector inputs are loaded."""
+        async with self._database.session() as session, session.begin():
+            run = await _load_run_for_update(session, cluster_run_id)
+            if run.workspace_id != workspace_id or run.embedding_type != embedding_type:
+                raise ValueError("pending run workspace or embedding type does not match")
+            if run.status != ClusterRunStatus.PENDING.value:
+                raise ValueError(f"cluster run is not pending: {cluster_run_id}")
+            run.input_embedding_ids = embedding_ids
+            run.dataset_hash = dataset_hash
+            run.sample_count = len(embedding_ids)
+            run.preprocessing = preprocessing
+            run.parameters = parameters
+            run.status = ClusterRunStatus.RUNNING.value
+            run.started_at = datetime.now(UTC)
+
+    async def create_run(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        embedding_ids: list[str],
+        dataset_hash: str,
+        preprocessing: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> str:
+        """Create an independently auditable run for exactly one embedding type."""
+        async with self._database.session() as session, session.begin():
+            if await session.get(Workspace, workspace_id) is None:
+                raise ValueError(f"workspace does not exist: {workspace_id}")
+            run = ClusterRun(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                input_embedding_ids=embedding_ids,
+                dataset_hash=dataset_hash,
+                sample_count=len(embedding_ids),
+                preprocessing=preprocessing,
+                parameters=parameters,
+                status=ClusterRunStatus.RUNNING.value,
+                started_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.flush()
+            return run.cluster_run_id
+
+    async def complete_run(
+        self,
+        *,
+        cluster_run_id: str,
+        cluster_count: int,
+        noise_count: int,
+        noise_ratio: float,
+        status: ClusterRunStatus = ClusterRunStatus.COMPLETED,
+        preprocessing: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._database.session() as session, session.begin():
+            run = await _load_run_for_update(session, cluster_run_id)
+            run.cluster_count = cluster_count
+            run.noise_count = noise_count
+            run.noise_ratio = noise_ratio
+            run.status = status.value
+            if preprocessing is not None:
+                run.preprocessing = preprocessing
+            if parameters is not None:
+                run.parameters = parameters
+            run.completed_at = datetime.now(UTC)
+
+    async def fail_run(self, *, cluster_run_id: str, error: str) -> None:
+        """Mark a run failed while retaining its inputs and execution context."""
+        async with self._database.session() as session, session.begin():
+            run = await _load_run_for_update(session, cluster_run_id)
+            run.status = ClusterRunStatus.FAILED.value
+            run.preprocessing = {**run.preprocessing, "error": error[:2000]}
+            run.completed_at = datetime.now(UTC)
+
+    async def store_memberships(
+        self,
+        *,
+        cluster_run_id: str,
+        memberships: list["ClusterMembershipWrite"],
+    ) -> None:
+        """Store all members, including HDBSCAN noise, for one immutable run."""
+        async with self._database.session() as session, session.begin():
+            await _load_run_for_update(session, cluster_run_id)
+            session.add_all(
+                [
+                    ClusterMembership(
+                        cluster_run_id=cluster_run_id,
+                        cluster_capsule_id=item.cluster_capsule_id,
+                        asset_id=item.asset_id,
+                        hdbscan_label=item.hdbscan_label,
+                        membership_probability=item.membership_probability,
+                        is_noise=item.is_noise,
+                        distance_to_representative=item.distance_to_representative,
+                    )
+                    for item in memberships
+                ]
+            )
+
+    async def get_run(
+        self,
+        *,
+        cluster_run_id: str,
+        workspace_id: str,
+    ) -> ClusterRunRecord:
+        async with self._database.session() as session:
+            run = await session.scalar(
+                select(ClusterRun).where(
+                    ClusterRun.cluster_run_id == cluster_run_id,
+                    ClusterRun.workspace_id == workspace_id,
+                )
+            )
+            if run is None:
+                raise ValueError(f"cluster run does not exist: {cluster_run_id}")
+            return _cluster_run_record(run)
+
+    async def list_capsules(
+        self,
+        *,
+        cluster_run_id: str,
+        workspace_id: str,
+    ) -> list[ClusterCapsuleRecord]:
+        async with self._database.session() as session:
+            rows = await session.scalars(
+                select(ClusterCapsule)
+                .where(
+                    ClusterCapsule.cluster_run_id == cluster_run_id,
+                    ClusterCapsule.workspace_id == workspace_id,
+                )
+                .order_by(ClusterCapsule.cluster_label)
+            )
+            return [_cluster_capsule_record(capsule) for capsule in rows]
+
+    async def upsert_capsule(self, values: ClusterCapsuleWrite) -> ClusterCapsuleRecord:
+        """Store a generated summary without replacing existing user overrides."""
+        _validate_representatives(values.representatives)
+        representative_ids = [item.asset_id for item in values.representatives]
+        medoid = next(
+            item for item in values.representatives if item.role.value == "medoid"
+        )
+
+        async with self._database.session() as session, session.begin():
+            run = await session.get(ClusterRun, values.cluster_run_id, with_for_update=True)
+            if run is None:
+                raise ValueError(f"cluster run does not exist: {values.cluster_run_id}")
+            if run.workspace_id != values.workspace_id:
+                raise ValueError("cluster run belongs to another workspace")
+            if run.embedding_type != values.embedding_type:
+                raise ValueError("cluster run embedding type does not match capsule")
+
+            assets = await _load_representative_assets(
+                session,
+                workspace_id=values.workspace_id,
+                representative_ids=representative_ids,
+            )
+            _validate_representative_source_limits(values.representatives, assets)
+
+            capsule = await session.scalar(
+                select(ClusterCapsule)
+                .where(
+                    ClusterCapsule.cluster_run_id == values.cluster_run_id,
+                    ClusterCapsule.cluster_label == values.cluster_label,
+                )
+                .with_for_update()
+            )
+            if capsule is None:
+                capsule = ClusterCapsule(
+                    cluster_run_id=values.cluster_run_id,
+                    workspace_id=values.workspace_id,
+                    embedding_type=values.embedding_type,
+                    cluster_label=values.cluster_label,
+                    model_generated_name=values.summary.name,
+                    effective_name=values.summary.name,
+                    model_generated_description=values.summary.description,
+                    effective_description=values.summary.description,
+                    keywords=values.summary.keywords,
+                    common_features=values.summary.common_features,
+                    internal_variance=values.summary.internal_variance.value,
+                    member_count=values.member_count,
+                    average_membership_probability=values.average_membership_probability,
+                    medoid_asset_id=medoid.asset_id,
+                    representative_asset_ids=representative_ids,
+                )
+                session.add(capsule)
+                await session.flush()
+            else:
+                capsule.embedding_type = values.embedding_type
+                capsule.model_generated_name = values.summary.name
+                capsule.effective_name = capsule.user_override_name or values.summary.name
+                capsule.model_generated_description = values.summary.description
+                capsule.effective_description = (
+                    capsule.user_override_description or values.summary.description
+                )
+                capsule.keywords = values.summary.keywords
+                capsule.common_features = values.summary.common_features
+                capsule.internal_variance = values.summary.internal_variance.value
+                capsule.member_count = values.member_count
+                capsule.average_membership_probability = values.average_membership_probability
+                capsule.medoid_asset_id = medoid.asset_id
+                # Kept as an API-compatible ID-only cache; the relation below is authoritative.
+                capsule.representative_asset_ids = representative_ids
+
+            await session.execute(
+                delete(ClusterRepresentativeAsset).where(
+                    ClusterRepresentativeAsset.cluster_capsule_id == capsule.cluster_capsule_id
+                )
+            )
+            session.add_all(
+                [
+                    ClusterRepresentativeAsset(
+                        cluster_capsule_id=capsule.cluster_capsule_id,
+                        asset_id=item.asset_id,
+                        role=item.role.value,
+                        rank=item.rank,
+                        distance_to_medoid=item.distance_to_medoid,
+                        membership_probability=item.membership_probability,
+                    )
+                    for item in values.representatives
+                ]
+            )
+            await session.flush()
+            return _cluster_capsule_record(capsule)
+
+    async def set_name_override(
+        self,
+        *,
+        cluster_capsule_id: str,
+        workspace_id: str,
+        name: str | None,
+    ) -> ClusterCapsuleRecord:
+        """Set a user name, or clear it with ``None`` to restore the model value."""
+        return await self.update_overrides(
+            cluster_capsule_id=cluster_capsule_id,
+            workspace_id=workspace_id,
+            update_name=True,
+            name=name,
+            update_description=False,
+            description=None,
+        )
+
+    async def set_description_override(
+        self,
+        *,
+        cluster_capsule_id: str,
+        workspace_id: str,
+        description: str | None,
+    ) -> ClusterCapsuleRecord:
+        """Set a user description, or clear it with ``None`` to restore the model value."""
+        return await self.update_overrides(
+            cluster_capsule_id=cluster_capsule_id,
+            workspace_id=workspace_id,
+            update_name=False,
+            name=None,
+            update_description=True,
+            description=description,
+        )
+
+    async def update_overrides(
+        self,
+        *,
+        cluster_capsule_id: str,
+        workspace_id: str,
+        update_name: bool,
+        name: str | None,
+        update_description: bool,
+        description: str | None,
+    ) -> ClusterCapsuleRecord:
+        """Apply one atomic front-end edit; ``None`` clears a supplied override."""
+        if update_name:
+            _validate_user_override(name, field="name")
+        if update_description:
+            _validate_user_override(description, field="description")
+        async with self._database.session() as session, session.begin():
+            capsule = await _load_capsule_for_update(
+                session,
+                cluster_capsule_id=cluster_capsule_id,
+                workspace_id=workspace_id,
+            )
+            if update_name:
+                capsule.user_override_name = name
+                capsule.effective_name = name or capsule.model_generated_name
+            if update_description:
+                capsule.user_override_description = description
+                capsule.effective_description = description or capsule.model_generated_description
+            await session.flush()
+            return _cluster_capsule_record(capsule)
+
+
+def _validate_representatives(representatives: list[ClusterRepresentativeWrite]) -> None:
+    ids = [item.asset_id for item in representatives]
+    if len(ids) != len(set(ids)):
+        raise ValueError("representative Asset IDs must be unique")
+    if [item.rank for item in representatives] != list(range(len(representatives))):
+        raise ValueError("representative ranks must be consecutive and start at zero")
+    medoids = [item for item in representatives if item.role.value == "medoid"]
+    if len(medoids) != 1 or medoids[0].rank != 0:
+        raise ValueError("representatives must have exactly one rank-zero medoid")
+
+
+@dataclass(slots=True, frozen=True)
+class ClusterEmbeddingAsset:
+    """The indexed vector and Asset metadata required for one clustering type."""
+
+    embedding_id: str
+    asset_id: str
+    source_file_id: str
+    asset_type: str
+    asset_name: str | None
+    asset_description: str | None
+    asset_features: dict[str, Any]
+    file_tree_context: list[str]
+
+
+@dataclass(slots=True, frozen=True)
+class ClusterMembershipWrite:
+    asset_id: str
+    cluster_capsule_id: str | None
+    hdbscan_label: int
+    membership_probability: float
+    is_noise: bool
+    distance_to_representative: float | None
+
+
+def _validate_user_override(value: str | None, *, field: str) -> None:
+    if value is not None and not value.strip():
+        raise ValueError(f"user override {field} must not be blank")
+
+
+async def _load_representative_assets(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    representative_ids: list[str],
+) -> dict[str, Asset]:
+    rows = await session.scalars(
+        select(Asset)
+        .where(
+            Asset.workspace_id == workspace_id,
+            Asset.asset_id.in_(representative_ids),
+        )
+        .with_for_update()
+    )
+    assets = {asset.asset_id: asset for asset in rows}
+    missing = sorted(set(representative_ids) - set(assets))
+    if missing:
+        raise ValueError(f"representative Assets do not exist in workspace: {', '.join(missing)}")
+    return assets
+
+
+def _validate_representative_source_limits(
+    representatives: list[ClusterRepresentativeWrite],
+    assets: dict[str, Asset],
+) -> None:
+    counts: dict[str, int] = {}
+    for representative in representatives:
+        source_file_id = assets[representative.asset_id].source_file_id
+        counts[source_file_id] = counts.get(source_file_id, 0) + 1
+    if any(count > 2 for count in counts.values()):
+        raise ValueError("at most two representative Assets may come from one source file")
+
+
+async def _load_capsule_for_update(
+    session: AsyncSession,
+    *,
+    cluster_capsule_id: str,
+    workspace_id: str,
+) -> ClusterCapsule:
+    capsule = await session.scalar(
+        select(ClusterCapsule)
+        .where(
+            ClusterCapsule.cluster_capsule_id == cluster_capsule_id,
+            ClusterCapsule.workspace_id == workspace_id,
+        )
+        .with_for_update()
+    )
+    if capsule is None:
+        raise ValueError(f"cluster capsule does not exist: {cluster_capsule_id}")
+    return capsule
+
+
+async def _load_run_for_update(session: AsyncSession, cluster_run_id: str) -> ClusterRun:
+    run = await session.get(ClusterRun, cluster_run_id, with_for_update=True)
+    if run is None:
+        raise ValueError(f"cluster run does not exist: {cluster_run_id}")
+    return run
+
+
+def _cluster_capsule_record(capsule: ClusterCapsule) -> ClusterCapsuleRecord:
+    return ClusterCapsuleRecord(
+        cluster_capsule_id=capsule.cluster_capsule_id,
+        cluster_run_id=capsule.cluster_run_id,
+        workspace_id=capsule.workspace_id,
+        embedding_type=capsule.embedding_type,
+        cluster_label=capsule.cluster_label,
+        model_generated_name=capsule.model_generated_name,
+        user_override_name=capsule.user_override_name,
+        effective_name=capsule.effective_name,
+        model_generated_description=capsule.model_generated_description,
+        user_override_description=capsule.user_override_description,
+        effective_description=capsule.effective_description,
+        keywords=list(capsule.keywords),
+        common_features=list(capsule.common_features),
+        internal_variance=(
+            ClusterInternalVariance(capsule.internal_variance)
+            if capsule.internal_variance is not None
+            else None
+        ),
+        member_count=capsule.member_count,
+        average_membership_probability=capsule.average_membership_probability,
+        medoid_asset_id=capsule.medoid_asset_id,
+        representative_asset_ids=list(capsule.representative_asset_ids),
+        is_favorite=capsule.is_favorite,
+    )
+
+
+def _cluster_run_record(run: ClusterRun) -> ClusterRunRecord:
+    return ClusterRunRecord(
+        cluster_run_id=run.cluster_run_id,
+        workspace_id=run.workspace_id,
+        embedding_type=run.embedding_type,
+        input_embedding_ids=list(run.input_embedding_ids),
+        dataset_hash=run.dataset_hash,
+        sample_count=run.sample_count,
+        preprocessing=dict(run.preprocessing),
+        parameters=dict(run.parameters),
+        cluster_count=run.cluster_count,
+        noise_count=run.noise_count,
+        noise_ratio=run.noise_ratio,
+        status=run.status,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+    )

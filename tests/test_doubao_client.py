@@ -50,3 +50,111 @@ async def test_embed_multimodal_requests_configured_dimension() -> None:
 
     assert captured["dimensions"] == 3
     assert result.vector == [0.0, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> None:
+    captured: dict[str, object] = {}
+    description = (
+        "这一组素材以夜间城市中的蓝紫色霓虹光影为主，人物和街道在冷色调反射中呈现出"
+        "稳定的赛博朋克电影感，少量镜头的构图变化不影响整体风格判断。"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/responses"
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "name": "蓝紫色霓虹夜景",
+                                        "description": description,
+                                        "keywords": ["霓虹", "夜景", "赛博朋克"],
+                                        "common_features": ["蓝紫色冷光", "城市夜景"],
+                                        "internal_variance": "low",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        summary = await client.summarize_cluster(
+            [
+                {"role": "system", "content": "只输出 JSON"},
+                {"role": "user", "content": "代表资产只有 asset_1"},
+            ]
+        )
+    finally:
+        await client.close()
+
+    assert captured["model"] == "doubao-seed-2-0-lite-260215"
+    assert captured["thinking"] == {"type": "disabled"}
+    assert "asset_1" in str(captured["input"])
+    assert summary.name == "蓝紫色霓虹夜景"
+
+
+@pytest.mark.asyncio
+async def test_summarize_cluster_retries_once_when_response_violates_contract() -> None:
+    calls: list[dict[str, object]] = []
+    valid_description = (
+        "这一组素材围绕蓝紫色霓虹夜景展开，冷色光线、城市建筑和夜间反射共同形成"
+        "稳定的电影化视觉风格，代表资产之间仅在画面主体与构图细节上存在轻微变化。"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        description = "这段描述太短。" if len(calls) == 1 else valid_description
+        return httpx.Response(
+            200,
+            json={
+                "output_text": json.dumps(
+                    {
+                        "name": "蓝紫色霓虹夜景",
+                        "description": description,
+                        "keywords": ["霓虹", "夜景", "冷色"],
+                        "common_features": ["蓝紫色光线"],
+                        "internal_variance": "low",
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        )
+
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        summary = await client.summarize_cluster(
+            [
+                {"role": "system", "content": "只输出 JSON"},
+                {"role": "user", "content": "代表资产只有 asset_1"},
+            ]
+        )
+    finally:
+        await client.close()
+
+    assert summary.description == valid_description
+    assert len(calls) == 2
+    assert "上一份输出未通过结构校验" in str(calls[1]["input"])

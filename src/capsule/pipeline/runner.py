@@ -71,7 +71,13 @@ class PipelineRunner:
             counts_by_extension=dict(sorted(counts.items())),
         )
 
-    async def run(self, input_path: Path, workspace_id: str) -> PipelineRunResult:
+    async def run(
+        self,
+        input_path: Path,
+        workspace_id: str,
+        *,
+        job_id: str | None = None,
+    ) -> PipelineRunResult:
         source_files = discover_files(input_path)
         database = self._database or Database(self._settings)
         owns_database = self._database is None
@@ -88,11 +94,12 @@ class PipelineRunner:
         factory = AssetFactory()
         assetizer = _build_assetizer(counter, self._settings, self._video_embedder)
         object_storage = self._object_storage
-        job_id = await repository.create_job(
-            workspace_id=workspace_id,
-            input_path=input_path,
-            total_count=len(source_files),
-        )
+        if job_id is None:
+            job_id = await repository.create_job(
+                workspace_id=workspace_id,
+                input_path=input_path,
+                total_count=len(source_files),
+            )
         succeeded = 0
         failed = 0
         asset_count = 0
