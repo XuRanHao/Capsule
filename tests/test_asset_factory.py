@@ -32,6 +32,7 @@ def test_factory_builds_complete_markdown_asset(tmp_path: Path) -> None:
     assert len(asset.asset_id.removeprefix("asset_")) == 26
     assert asset.file_name == "notes.md"
     assert asset.file_type == ".md"
+    assert asset.file_tree_context == ["docs"]
     assert asset.raw_content == "# 标题\n\n正文"
     assert len(asset.asset_key) == 64
     assert len(asset.content_hash) == 64
@@ -74,3 +75,4 @@ def test_asset_key_is_stable_but_content_hash_tracks_content(tmp_path: Path) -> 
 
     assert first.asset_key == second.asset_key
     assert first.content_hash != second.content_hash
+    assert first.file_tree_context == []

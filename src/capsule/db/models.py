@@ -120,6 +120,7 @@ class Asset(Base, TimestampMixin):
     asset_name_source: Mapped[str | None] = mapped_column(String(32))
     asset_description: Mapped[str | None] = mapped_column(Text)
     asset_features: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    file_tree_context: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     source_contexts: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB,
         default=list,

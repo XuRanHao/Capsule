@@ -107,6 +107,7 @@ async def test_repository_replaces_assets_and_preserves_user_name(tmp_path: Path
             assert asset is not None
             assert job is not None
             assert asset.raw_content == "# Second"
+            assert asset.file_tree_context == ["docs"]
             assert asset.asset_name == "人工标题"
             assert asset.asset_name_source == AssetNameSource.USER.value
             assert asset.asset_description is None

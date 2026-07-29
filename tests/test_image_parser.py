@@ -12,7 +12,7 @@ def test_extract_image_info_uses_factual_file_values(tmp_path: Path) -> None:
     path = tmp_path / "sample.png"
     Image.new("RGB", (320, 180), (10, 20, 30)).save(path)
 
-    info = extract_image_info(path, "project/images/sample.png")
+    info = extract_image_info(path)
 
     assert info["width"] == 320
     assert info["height"] == 180
@@ -23,7 +23,7 @@ def test_extract_image_info_uses_factual_file_values(tmp_path: Path) -> None:
     assert info["exif"] == {}
     assert info["captured_at"] is None
     assert info["software"] is None
-    assert info["folder_context"] == ["project", "images"]
+    assert "folder_context" not in info
 
 
 @pytest.mark.asyncio

@@ -220,6 +220,7 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
     current.file_name = values.file_name
     current.file_type = values.file_type
     current.content_hash = values.content_hash
+    current.file_tree_context = values.file_tree_context
     current.source_contexts = [context.model_dump() for context in values.source_contexts]
     current.file_info = values.file_info
     current.source_locator = values.source_locator

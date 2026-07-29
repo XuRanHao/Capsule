@@ -16,7 +16,6 @@ class ImageParser:
         file_info = await asyncio.to_thread(
             extract_image_info,
             path,
-            source_file.relative_path,
         )
         return [
             AssetDraft(
@@ -30,7 +29,7 @@ class ImageParser:
         ]
 
 
-def extract_image_info(path: Path, relative_path: str | None = None) -> dict[str, Any]:
+def extract_image_info(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
         image.verify()
     with Image.open(path) as image:
@@ -42,7 +41,6 @@ def extract_image_info(path: Path, relative_path: str | None = None) -> dict[str
         width, height = image.size
         image_format = image.format
         mime_type = Image.MIME.get(image_format or "")
-        folder_context = _folder_context(relative_path)
         return {
             "width": width,
             "height": height,
@@ -59,15 +57,7 @@ def extract_image_info(path: Path, relative_path: str | None = None) -> dict[str
                 "DateTime",
             ),
             "software": _first_exif_value(exif, "Software"),
-            "folder_context": folder_context,
         }
-
-
-def _folder_context(relative_path: str | None) -> list[str]:
-    if not relative_path:
-        return []
-    parent = Path(relative_path).parent
-    return [] if parent == Path(".") else list(parent.parts)
 
 
 def _first_exif_value(exif: dict[str, Any], *keys: str) -> Any | None:

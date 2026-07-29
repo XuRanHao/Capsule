@@ -65,6 +65,7 @@ class AssetFactory:
             file_type=source_file.extension,
             asset_key=asset_key,
             content_hash=content_hash,
+            file_tree_context=_file_tree_context(source_file.relative_path),
             source_contexts=draft.source_contexts,
             file_info=draft.file_info,
             source_locator=draft.source_locator,
@@ -80,3 +81,8 @@ def _canonical_json(value: object) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _file_tree_context(relative_path: str) -> list[str]:
+    parent = Path(relative_path).parent
+    return [] if parent == Path(".") else list(parent.parts)

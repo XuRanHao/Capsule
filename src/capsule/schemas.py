@@ -42,6 +42,7 @@ class AssetCreate(BaseModel):
     asset_name: str | None = None
     asset_description: str | None = None
     asset_features: dict[str, Any] = Field(default_factory=dict)
+    file_tree_context: list[str] = Field(default_factory=list)
     source_contexts: list[SourceContext] = Field(default_factory=list)
     file_info: dict[str, Any] = Field(default_factory=dict)
     source_locator: dict[str, Any] = Field(default_factory=dict)
@@ -63,6 +64,7 @@ class AssetRecord(BaseModel):
     asset_name: str | None = None
     asset_description: str | None = None
     asset_features: dict[str, Any] = Field(default_factory=dict)
+    file_tree_context: list[str] = Field(default_factory=list)
     file_info: dict[str, Any] = Field(default_factory=dict)
     source_locator: dict[str, Any] = Field(default_factory=dict)
     raw_content: str | None = None
