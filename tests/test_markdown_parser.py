@@ -60,7 +60,7 @@ async def test_long_heading_section_recurses_to_child_heading() -> None:
         start = asset.source_locator["char_start"]
         end = asset.source_locator["char_end"]
         assert asset.raw_content == source[start:end]
-        assert asset.file_info["token_count"] <= 1200
+        assert asset.file_info["token_count"] <= 400 or asset.file_info["oversized"]
 
 
 @pytest.mark.asyncio
@@ -82,7 +82,7 @@ async def test_oversized_code_fence_is_not_split() -> None:
 
 @pytest.mark.asyncio
 async def test_long_list_splits_only_between_top_level_items() -> None:
-    items = [f"- {letter * 500}\n" for letter in ("甲", "乙", "丙")]
+    items = [f"- {letter * 150}\n" for letter in ("甲", "乙", "丙")]
     source = "# List\n\n" + "".join(items)
 
     assets = await MarkdownParser().assetize(

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from capsule.config import DOCUMENT_CHUNK_MAX_TOKENS
 from capsule.enums import AssetType
 from capsule.model_clients.tokenization import TokenCounter
 from capsule.schemas import AssetDraft
@@ -52,7 +53,7 @@ class TextParser:
         path: Path,
         token_counter: TokenCounter,
         *,
-        max_tokens: int = 1200,
+        max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
     ) -> list[AssetDraft]:
         source = await asyncio.to_thread(path.read_text, encoding="utf-8")
         return await self.assetize(source, path.name, token_counter, max_tokens=max_tokens)
@@ -63,7 +64,7 @@ class TextParser:
         file_name: str,
         token_counter: TokenCounter,
         *,
-        max_tokens: int = 1200,
+        max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
     ) -> list[AssetDraft]:
         nodes = _layout_nodes(source)
         if not nodes:

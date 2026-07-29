@@ -30,19 +30,19 @@ async def test_hard_wrapped_paragraphs_keep_original_offsets_and_merge_when_shor
 
 @pytest.mark.asyncio
 async def test_long_paragraph_splits_only_at_sentence_boundaries() -> None:
-    sentence = "甲" * 500 + "。"
+    sentence = "甲" * 150 + "。"
     source = sentence * 3
 
     assets = await TextParser().assetize(source, "long.txt", CharacterTokenCounter())
 
     assert [asset.raw_content for asset in assets] == [sentence * 2, sentence]
-    assert all(asset.file_info["token_count"] <= 1200 for asset in assets)
+    assert all(asset.file_info["token_count"] <= 400 for asset in assets)
     assert all(asset.raw_content.endswith("。") for asset in assets)
 
 
 @pytest.mark.asyncio
 async def test_long_list_splits_between_top_level_items() -> None:
-    items = [f"- {letter * 500}\n" for letter in ("甲", "乙", "丙")]
+    items = [f"- {letter * 150}\n" for letter in ("甲", "乙", "丙")]
     source = "".join(items)
 
     assets = await TextParser().assetize(source, "list.txt", CharacterTokenCounter())

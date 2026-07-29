@@ -6,6 +6,7 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
+from capsule.config import DOCUMENT_CHUNK_MAX_TOKENS
 from capsule.enums import AssetType
 from capsule.model_clients.tokenization import TokenCounter
 from capsule.schemas import AssetDraft, SourceContext
@@ -135,7 +136,7 @@ class MarkdownParser:
         path: Path,
         token_counter: TokenCounter,
         *,
-        max_tokens: int = 1200,
+        max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
     ) -> list[AssetDraft]:
         source = await asyncio.to_thread(_read_markdown, path)
         return await self.assetize(source, path.name, token_counter, max_tokens=max_tokens)
@@ -146,7 +147,7 @@ class MarkdownParser:
         file_name: str,
         token_counter: TokenCounter,
         *,
-        max_tokens: int = 1200,
+        max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
     ) -> list[AssetDraft]:
         nodes = self._structured_nodes(source)
         if not _has_content(nodes):

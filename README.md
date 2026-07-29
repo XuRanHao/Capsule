@@ -60,6 +60,8 @@ Then put the real Volcengine Ark key in the ignored local `.env` file:
 
 ```dotenv
 CAPSULE_ARK_API_KEY=your-ark-api-key
+# Markdown 与 TXT 均使用这个上限，默认值也是 400
+CAPSULE_DOCUMENT_CHUNK_MAX_TOKENS=400
 ```
 
 Start the API and frontend together:

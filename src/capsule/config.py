@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DOCUMENT_CHUNK_MAX_TOKENS = 400
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -32,6 +34,7 @@ class Settings(BaseSettings):
     embedding_model: str = "doubao-embedding-vision-250615"
     embedding_dimension: int = Field(default=1024, ge=1)
     tokenization_batch_size: int = Field(default=64, ge=1, le=256)
+    document_chunk_max_tokens: int = Field(default=DOCUMENT_CHUNK_MAX_TOKENS, ge=1)
 
     understanding_concurrency: int = Field(default=32, ge=1)
     embedding_concurrency: int = Field(default=64, ge=1)

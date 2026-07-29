@@ -185,12 +185,20 @@ def _build_assetizer(
     async def markdown_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
             raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
-        return await markdown.assetize_file(Path(source_file.path), counter)
+        return await markdown.assetize_file(
+            Path(source_file.path),
+            counter,
+            max_tokens=settings.document_chunk_max_tokens,
+        )
 
     async def plain_text_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
             raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
-        return await plain_text.assetize_file(Path(source_file.path), counter)
+        return await plain_text.assetize_file(
+            Path(source_file.path),
+            counter,
+            max_tokens=settings.document_chunk_max_tokens,
+        )
 
     return Assetizer(
         {
