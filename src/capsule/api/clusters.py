@@ -8,7 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from capsule.db.repositories import ClusterRepository
 from capsule.enums import ClusterRunStatus, EmbeddingType
 from capsule.pipeline.cluster_service import ClusterService
-from capsule.schemas import ClusterCapsuleRecord, ClusterRunRecord
+from capsule.schemas import (
+    ClusterCapsuleRecord,
+    ClusterMemberRecord,
+    ClusterRunListResponse,
+    ClusterRunRecord,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["cluster-runs"])
 
@@ -27,6 +32,10 @@ class ClusterRunSubmission(BaseModel):
 
 class ClusterCapsuleListResponse(BaseModel):
     items: list[ClusterCapsuleRecord] = Field(default_factory=list)
+
+
+class ClusterMemberListResponse(BaseModel):
+    items: list[ClusterMemberRecord] = Field(default_factory=list)
 
 
 class ClusterCapsuleOverridePatch(BaseModel):
@@ -95,6 +104,20 @@ async def submit_cluster_run(
     return ClusterRunSubmission(cluster_run_id=cluster_run_id)
 
 
+@router.get("/cluster-runs", response_model=ClusterRunListResponse)
+async def list_cluster_runs(
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> ClusterRunListResponse:
+    return ClusterRunListResponse(
+        items=await _cluster_repository(request).list_runs(
+            workspace_id=workspace_id,
+            limit=limit,
+        )
+    )
+
+
 @router.get("/cluster-runs/{cluster_run_id}", response_model=ClusterRunRecord)
 async def get_cluster_run(
     cluster_run_id: str,
@@ -108,6 +131,46 @@ async def get_cluster_run(
         )
     except ValueError as exc:
         raise _run_not_found(cluster_run_id) from exc
+
+
+@router.get(
+    "/cluster-capsules/{cluster_capsule_id}/members",
+    response_model=ClusterMemberListResponse,
+)
+async def list_cluster_members(
+    cluster_capsule_id: str,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> ClusterMemberListResponse:
+    try:
+        members = await _cluster_repository(request).list_members(
+            cluster_capsule_id=cluster_capsule_id,
+            workspace_id=workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "cluster_capsule_not_found",
+                "message": str(exc),
+            },
+        ) from exc
+    base_url = str(request.base_url).rstrip("/")
+    return ClusterMemberListResponse(
+        items=[
+            member.model_copy(
+                update={
+                    "preview_url": (
+                        f"{base_url}/api/v1/assets/{member.asset_id}/preview"
+                        f"?workspace_id={workspace_id}"
+                    )
+                    if member.asset_type.value in {"image", "video_segment"}
+                    else None
+                }
+            )
+            for member in members
+        ]
+    )
 
 
 @router.get(

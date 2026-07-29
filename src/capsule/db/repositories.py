@@ -1,12 +1,12 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.db.base import id_factory
@@ -24,6 +24,7 @@ from capsule.db.models import (
 from capsule.db.session import Database
 from capsule.enums import (
     AssetNameSource,
+    AssetType,
     ClusterInternalVariance,
     ClusterRunStatus,
     EmbeddingStatus,
@@ -33,14 +34,31 @@ from capsule.enums import (
 )
 from capsule.schemas import (
     AssetCreate,
+    AssetEmbeddingState,
+    AssetListResponse,
+    AssetSourceRecord,
+    AssetUnderstanding,
+    AssetViewRecord,
     ClusterCapsuleRecord,
     ClusterCapsuleWrite,
+    ClusterMemberRecord,
     ClusterRepresentativeWrite,
     ClusterRunRecord,
     DiscoveredFile,
     ProcessingJobRecord,
     StoredFileResult,
 )
+
+
+@dataclass(slots=True, frozen=True)
+class AssetMediaTarget:
+    asset_id: str
+    workspace_id: str
+    asset_type: str
+    source_storage_uri: str
+    source_mime_type: str
+    preview_uri: str | None
+    derived_file_uri: str | None
 
 
 class AssetRepository:
@@ -274,6 +292,272 @@ class AssetRepository:
                 completed_at=job.completed_at,
             )
 
+    async def list_jobs(
+        self,
+        *,
+        workspace_id: str,
+        limit: int = 50,
+    ) -> list[ProcessingJobRecord]:
+        async with self._database.session() as session:
+            rows = await session.scalars(
+                select(ProcessingJob)
+                .where(ProcessingJob.workspace_id == workspace_id)
+                .order_by(ProcessingJob.created_at.desc(), ProcessingJob.job_id.desc())
+                .limit(limit)
+            )
+            return [_processing_job_record(job) for job in rows]
+
+    async def list_asset_views(
+        self,
+        *,
+        workspace_id: str,
+        asset_type: str | None = None,
+        processing_status: str | None = None,
+        source_file_id: str | None = None,
+        query: str | None = None,
+        asset_ids: Sequence[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> AssetListResponse:
+        filters = [Asset.workspace_id == workspace_id]
+        if asset_type:
+            filters.append(Asset.asset_type == asset_type)
+        if processing_status:
+            filters.append(Asset.processing_status == processing_status)
+        if source_file_id:
+            filters.append(Asset.source_file_id == source_file_id)
+        if asset_ids:
+            filters.append(Asset.asset_id.in_(asset_ids))
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            pattern = f"%{normalized_query}%"
+            filters.append(
+                or_(
+                    Asset.file_name.ilike(pattern),
+                    Asset.asset_name.ilike(pattern),
+                    Asset.asset_description.ilike(pattern),
+                    SourceFile.relative_path.ilike(pattern),
+                )
+            )
+
+        async with self._database.session() as session:
+            total = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(Asset)
+                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+                    .where(*filters)
+                )
+                or 0
+            )
+            rows = (
+                await session.execute(
+                    select(Asset, SourceFile)
+                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+                    .where(*filters)
+                    .order_by(Asset.created_at.desc(), Asset.asset_id.desc())
+                    .offset(offset)
+                    .limit(limit)
+                )
+            ).all()
+            embeddings = await _latest_embedding_states(
+                session,
+                [asset.asset_id for asset, _ in rows],
+            )
+        return AssetListResponse(
+            items=[
+                _asset_view_record(
+                    asset,
+                    source,
+                    embeddings=embeddings.get(asset.asset_id, []),
+                )
+                for asset, source in rows
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def get_asset_view(
+        self,
+        *,
+        asset_id: str,
+        workspace_id: str,
+    ) -> AssetViewRecord:
+        result = await self.list_asset_views(
+            workspace_id=workspace_id,
+            asset_ids=[asset_id],
+            limit=1,
+        )
+        if not result.items:
+            raise ValueError(f"asset does not exist: {asset_id}")
+        return result.items[0]
+
+    async def get_asset_media(
+        self,
+        *,
+        asset_id: str,
+        workspace_id: str,
+    ) -> AssetMediaTarget:
+        async with self._database.session() as session:
+            row = (
+                await session.execute(
+                    select(Asset, SourceFile)
+                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+                    .where(
+                        Asset.asset_id == asset_id,
+                        Asset.workspace_id == workspace_id,
+                    )
+                )
+            ).one_or_none()
+        if row is None:
+            raise ValueError(f"asset does not exist: {asset_id}")
+        asset, source = row
+        return AssetMediaTarget(
+            asset_id=asset.asset_id,
+            workspace_id=asset.workspace_id,
+            asset_type=asset.asset_type,
+            source_storage_uri=source.storage_uri,
+            source_mime_type=source.mime_type,
+            preview_uri=asset.preview_uri,
+            derived_file_uri=asset.derived_file_uri,
+        )
+
+    async def set_job_stage(
+        self,
+        *,
+        job_id: str,
+        stage: PipelineStage,
+    ) -> None:
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            job.status = JobStatus.RUNNING.value
+            job.current_stage = stage.value
+            job.completed_at = None
+
+    async def begin_asset_enrichment(self, *, asset_ids: Sequence[str]) -> None:
+        if not asset_ids:
+            return
+        async with self._database.session() as session, session.begin():
+            rows = await session.scalars(
+                select(Asset).where(Asset.asset_id.in_(asset_ids)).with_for_update()
+            )
+            for asset in rows:
+                asset.processing_status = ProcessingStatus.PROCESSING.value
+                asset.error_message = None
+
+    async def store_understanding(
+        self,
+        *,
+        asset_id: str,
+        understanding: AssetUnderstanding,
+    ) -> None:
+        async with self._database.session() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            if asset is None:
+                raise ValueError(f"asset does not exist: {asset_id}")
+            features = understanding.features.model_dump(mode="json")
+            semantic_changed = (
+                asset.asset_description not in {None, understanding.asset_description}
+                or (bool(asset.asset_features) and asset.asset_features != features)
+            )
+            if asset.asset_name_source != AssetNameSource.USER.value:
+                asset.asset_name = understanding.asset_name
+                asset.asset_name_source = AssetNameSource.MODEL.value
+            asset.asset_description = understanding.asset_description
+            asset.asset_features = features
+            asset.processing_status = ProcessingStatus.PROCESSING.value
+            asset.error_message = None
+            if semantic_changed:
+                asset.feature_revision += 1
+                asset.embedding_revision += 1
+
+    async def finalize_enrichment(
+        self,
+        *,
+        job_id: str,
+        asset_ids: Sequence[str],
+        errors: Sequence[dict[str, str]],
+    ) -> None:
+        errors_by_asset: dict[str, list[str]] = {}
+        for error in errors:
+            asset_id = error.get("asset_id", "")
+            if asset_id:
+                errors_by_asset.setdefault(asset_id, []).append(error.get("error", "failed"))
+
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            rows = list(
+                await session.scalars(
+                    select(Asset).where(Asset.asset_id.in_(asset_ids)).with_for_update()
+                )
+            )
+            for asset in rows:
+                asset_errors = errors_by_asset.get(asset.asset_id, [])
+                if asset_errors:
+                    asset.processing_status = ProcessingStatus.PARTIAL_FAILED.value
+                    asset.error_message = "; ".join(asset_errors)[:2000]
+                else:
+                    asset.processing_status = ProcessingStatus.COMPLETED.value
+                    asset.error_message = None
+
+            source_ids = {asset.source_file_id for asset in rows}
+            for source_id in source_ids:
+                source = await session.get(SourceFile, source_id, with_for_update=True)
+                if source is None:
+                    continue
+                source_assets = list(
+                    await session.scalars(
+                        select(Asset).where(Asset.source_file_id == source_id)
+                    )
+                )
+                failed_assets = [
+                    asset
+                    for asset in source_assets
+                    if asset.processing_status
+                    in {
+                        ProcessingStatus.FAILED.value,
+                        ProcessingStatus.PARTIAL_FAILED.value,
+                    }
+                ]
+                source.processing_status = (
+                    ProcessingStatus.PARTIAL_FAILED.value
+                    if failed_assets
+                    else ProcessingStatus.COMPLETED.value
+                )
+                source.error_message = (
+                    "; ".join(
+                        asset.error_message or "asset enrichment failed"
+                        for asset in failed_assets
+                    )[:2000]
+                    if failed_assets
+                    else None
+                )
+
+            if errors:
+                job.status = JobStatus.PARTIAL_FAILED.value
+                job.error_info = [
+                    *job.error_info,
+                    *[
+                        {
+                            "asset_id": error.get("asset_id", ""),
+                            "stage": error.get("stage", ""),
+                            "error": error.get("error", "")[:2000],
+                        }
+                        for error in errors
+                    ],
+                ]
+            elif job.failed_count:
+                job.status = JobStatus.PARTIAL_FAILED.value
+            else:
+                job.status = JobStatus.COMPLETED.value
+            job.current_stage = PipelineStage.COMPLETED.value
+            job.completed_at = datetime.now(UTC)
+
     @staticmethod
     async def _ensure_workspace(session: AsyncSession, workspace_id: str) -> None:
         if await session.get(Workspace, workspace_id) is None:
@@ -295,6 +579,96 @@ class AssetRepository:
         if lock:
             statement = statement.with_for_update()
         return cast(SourceFile | None, await session.scalar(statement))
+
+
+def _processing_job_record(job: ProcessingJob) -> ProcessingJobRecord:
+    return ProcessingJobRecord(
+        job_id=job.job_id,
+        workspace_id=job.workspace_id,
+        input_path=job.input_path,
+        total_count=job.total_count,
+        completed_count=job.completed_count,
+        failed_count=job.failed_count,
+        status=job.status,
+        current_stage=job.current_stage,
+        error_info=list(job.error_info),
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+    )
+
+
+async def _latest_embedding_states(
+    session: AsyncSession,
+    asset_ids: list[str],
+) -> dict[str, list[AssetEmbeddingState]]:
+    if not asset_ids:
+        return {}
+    rows = await session.scalars(
+        select(EmbeddingRecord)
+        .where(EmbeddingRecord.asset_id.in_(asset_ids))
+        .order_by(
+            EmbeddingRecord.asset_id,
+            EmbeddingRecord.embedding_type,
+            EmbeddingRecord.created_at.desc(),
+            EmbeddingRecord.embedding_id.desc(),
+        )
+    )
+    selected: dict[tuple[str, str], AssetEmbeddingState] = {}
+    for record in rows:
+        key = (record.asset_id, record.embedding_type)
+        if key in selected:
+            continue
+        selected[key] = AssetEmbeddingState(
+            embedding_type=record.embedding_type,
+            status=record.status,
+            model_name=record.model_name,
+        )
+    grouped: dict[str, list[AssetEmbeddingState]] = {}
+    for (asset_id, _), state in selected.items():
+        grouped.setdefault(asset_id, []).append(state)
+    return grouped
+
+
+def _asset_view_record(
+    asset: Asset,
+    source: SourceFile,
+    *,
+    embeddings: list[AssetEmbeddingState],
+) -> AssetViewRecord:
+    return AssetViewRecord(
+        asset_id=asset.asset_id,
+        workspace_id=asset.workspace_id,
+        project_id=asset.project_id,
+        source_file_id=asset.source_file_id,
+        asset_type=AssetType(asset.asset_type),
+        file_name=asset.file_name,
+        file_type=asset.file_type,
+        asset_name=asset.asset_name,
+        asset_description=asset.asset_description,
+        asset_features=dict(asset.asset_features),
+        file_tree_context=list(asset.file_tree_context),
+        source_contexts=list(asset.source_contexts),
+        file_info=dict(asset.file_info),
+        source_locator=dict(asset.source_locator),
+        raw_content=asset.raw_content,
+        processing_status=asset.processing_status,
+        feature_revision=asset.feature_revision,
+        embedding_revision=asset.embedding_revision,
+        error_message=asset.error_message,
+        source_file=AssetSourceRecord(
+            source_file_id=source.source_file_id,
+            original_file_name=source.original_file_name,
+            relative_path=source.relative_path,
+            file_type=source.file_type,
+            mime_type=source.mime_type,
+            file_size_bytes=source.file_size_bytes,
+            processing_status=source.processing_status,
+            error_message=source.error_message,
+        ),
+        embeddings=embeddings,
+        created_at=asset.created_at,
+        updated_at=asset.updated_at,
+    )
 
 
 def _asset_values(values: AssetCreate) -> dict[str, object]:
@@ -358,6 +732,10 @@ class EmbeddingAsset:
     derived_file_uri: str | None
     source_storage_uri: str
     source_mime_type: str
+    file_name: str = ""
+    file_tree_context: list[str] = field(default_factory=list)
+    source_contexts: list[dict[str, Any]] = field(default_factory=list)
+    file_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -410,6 +788,10 @@ class EmbeddingRepository:
                 derived_file_uri=asset.derived_file_uri,
                 source_storage_uri=source.storage_uri,
                 source_mime_type=source.mime_type,
+                file_name=asset.file_name,
+                file_tree_context=list(asset.file_tree_context),
+                source_contexts=list(asset.source_contexts),
+                file_info=dict(asset.file_info),
             )
             for asset, source in rows
         ]
@@ -701,6 +1083,21 @@ class ClusterRepository:
                 raise ValueError(f"cluster run does not exist: {cluster_run_id}")
             return _cluster_run_record(run)
 
+    async def list_runs(
+        self,
+        *,
+        workspace_id: str,
+        limit: int = 50,
+    ) -> list[ClusterRunRecord]:
+        async with self._database.session() as session:
+            rows = await session.scalars(
+                select(ClusterRun)
+                .where(ClusterRun.workspace_id == workspace_id)
+                .order_by(ClusterRun.started_at.desc(), ClusterRun.cluster_run_id.desc())
+                .limit(limit)
+            )
+            return [_cluster_run_record(run) for run in rows]
+
     async def list_capsules(
         self,
         *,
@@ -717,6 +1114,53 @@ class ClusterRepository:
                 .order_by(ClusterCapsule.cluster_label)
             )
             return [_cluster_capsule_record(capsule) for capsule in rows]
+
+    async def list_members(
+        self,
+        *,
+        cluster_capsule_id: str,
+        workspace_id: str,
+    ) -> list[ClusterMemberRecord]:
+        async with self._database.session() as session:
+            capsule = await session.scalar(
+                select(ClusterCapsule).where(
+                    ClusterCapsule.cluster_capsule_id == cluster_capsule_id,
+                    ClusterCapsule.workspace_id == workspace_id,
+                )
+            )
+            if capsule is None:
+                raise ValueError(f"cluster capsule does not exist: {cluster_capsule_id}")
+            rows = (
+                await session.execute(
+                    select(ClusterMembership, Asset, SourceFile)
+                    .join(Asset, Asset.asset_id == ClusterMembership.asset_id)
+                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+                    .where(
+                        ClusterMembership.cluster_capsule_id == cluster_capsule_id,
+                        Asset.workspace_id == workspace_id,
+                    )
+                    .order_by(
+                        ClusterMembership.membership_probability.desc(),
+                        Asset.asset_id,
+                    )
+                )
+            ).all()
+            return [
+                ClusterMemberRecord(
+                    asset_id=asset.asset_id,
+                    asset_type=asset.asset_type,
+                    file_name=asset.file_name,
+                    asset_name=asset.asset_name,
+                    asset_description=asset.asset_description,
+                    source_file_id=asset.source_file_id,
+                    relative_path=source.relative_path,
+                    hdbscan_label=membership.hdbscan_label,
+                    membership_probability=membership.membership_probability,
+                    is_noise=membership.is_noise,
+                    distance_to_representative=membership.distance_to_representative,
+                )
+                for membership, asset, source in rows
+            ]
 
     async def upsert_capsule(self, values: ClusterCapsuleWrite) -> ClusterCapsuleRecord:
         """Store a generated summary without replacing existing user overrides."""

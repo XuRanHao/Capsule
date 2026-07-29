@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from capsule.enums import (
     AssetType,
@@ -83,6 +83,59 @@ class AssetRecord(BaseModel):
     updated_at: datetime
 
 
+class AssetEmbeddingState(BaseModel):
+    embedding_type: str
+    status: str
+    model_name: str
+    embedding_revision: int | None = None
+
+
+class AssetSourceRecord(BaseModel):
+    source_file_id: str
+    original_file_name: str
+    relative_path: str
+    file_type: str
+    mime_type: str
+    file_size_bytes: int
+    processing_status: str
+    error_message: str | None = None
+
+
+class AssetViewRecord(BaseModel):
+    asset_id: str
+    workspace_id: str
+    project_id: str
+    source_file_id: str
+    asset_type: AssetType
+    file_name: str
+    file_type: str
+    asset_name: str | None = None
+    asset_description: str | None = None
+    asset_features: dict[str, Any] = Field(default_factory=dict)
+    file_tree_context: list[str] = Field(default_factory=list)
+    source_contexts: list[dict[str, Any]] = Field(default_factory=list)
+    file_info: dict[str, Any] = Field(default_factory=dict)
+    source_locator: dict[str, Any] = Field(default_factory=dict)
+    raw_content: str | None = None
+    processing_status: str
+    feature_revision: int
+    embedding_revision: int
+    error_message: str | None = None
+    preview_url: str | None = None
+    content_url: str | None = None
+    source_file: AssetSourceRecord
+    embeddings: list[AssetEmbeddingState] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class AssetListResponse(BaseModel):
+    items: list[AssetViewRecord] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+
+
 class StoredFileResult(BaseModel):
     source_file_id: str
     asset_ids: list[str] = Field(default_factory=list)
@@ -93,6 +146,33 @@ class FeatureValue(BaseModel):
     status: FeatureStatus
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_output(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {
+                "value": value,
+                "status": FeatureStatus.INFERRED.value,
+                "confidence": 0.5,
+                "evidence": [],
+            }
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        evidence = normalized.get("evidence")
+        if isinstance(evidence, str):
+            normalized["evidence"] = [evidence]
+        elif evidence is None:
+            normalized["evidence"] = []
+        valid_statuses = {status.value for status in FeatureStatus}
+        if normalized.get("status") not in valid_statuses:
+            normalized["status"] = (
+                FeatureStatus.INFERRED.value
+                if normalized.get("value")
+                else FeatureStatus.UNKNOWN.value
+            )
+        return normalized
 
 
 class AssetFeatures(BaseModel):
@@ -106,6 +186,38 @@ class AssetFeatures(BaseModel):
     target_audience: FeatureValue
     provenance: FeatureValue
     rights_version_authorship: FeatureValue
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_omitted_model_fields(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            normalized_items: dict[str, Any] = {}
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                field_name = item.get("feature_name") or item.get("name")
+                if not isinstance(field_name, str):
+                    continue
+                normalized_items[field_name] = {
+                    key: item_value
+                    for key, item_value in item.items()
+                    if key not in {"feature_name", "name"}
+                }
+            value = normalized_items
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for field_name in cls.model_fields:
+            normalized.setdefault(
+                field_name,
+                {
+                    "value": None,
+                    "status": FeatureStatus.UNKNOWN.value,
+                    "confidence": 0.0,
+                    "evidence": [],
+                },
+            )
+        return normalized
 
 
 class AssetUnderstanding(BaseModel):
@@ -191,6 +303,25 @@ class ClusterRunRecord(BaseModel):
     completed_at: datetime | None
 
 
+class ClusterMemberRecord(BaseModel):
+    asset_id: str
+    asset_type: AssetType
+    file_name: str
+    asset_name: str | None
+    asset_description: str | None
+    source_file_id: str
+    relative_path: str
+    hdbscan_label: int
+    membership_probability: float
+    is_noise: bool
+    distance_to_representative: float | None
+    preview_url: str | None = None
+
+
+class ClusterRunListResponse(BaseModel):
+    items: list[ClusterRunRecord] = Field(default_factory=list)
+
+
 class ProcessingJobRecord(BaseModel):
     job_id: str
     workspace_id: str
@@ -203,3 +334,7 @@ class ProcessingJobRecord(BaseModel):
     error_info: list[dict[str, Any]] = Field(default_factory=list)
     started_at: datetime | None
     completed_at: datetime | None
+
+
+class ProcessingJobListResponse(BaseModel):
+    items: list[ProcessingJobRecord] = Field(default_factory=list)

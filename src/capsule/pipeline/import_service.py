@@ -8,12 +8,15 @@ from typing import BinaryIO
 from uuid import uuid4
 
 from fastapi import UploadFile
+from pydantic import BaseModel, Field
 
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository
-from capsule.enums import JobStatus
+from capsule.enums import EmbeddingType, JobStatus, PipelineStage
 from capsule.parsers.discovery import SUPPORTED_EXTENSIONS, discover_files
+from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.runner import PipelineRunner, PipelineRunResult
+from capsule.pipeline.understanding import AssetUnderstandingService
 
 
 class ImportSubmissionError(ValueError):
@@ -37,6 +40,85 @@ class ImportCompletion:
     file_count: int
 
 
+class AssetEnrichmentResult(BaseModel):
+    job_id: str
+    workspace_id: str
+    requested_asset_count: int
+    completed_asset_count: int
+    partial_failed_asset_count: int
+    errors: list[dict[str, str]] = Field(default_factory=list)
+
+
+async def enrich_assets(
+    *,
+    job_id: str,
+    workspace_id: str,
+    asset_ids: list[str],
+    repository: AssetRepository,
+    understanding_service: AssetUnderstandingService,
+    embedding_service: AssetEmbeddingService,
+) -> AssetEnrichmentResult:
+    """Run model understanding and every independent embedding channel."""
+    await repository.begin_asset_enrichment(asset_ids=asset_ids)
+    errors: list[dict[str, str]] = []
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.UNDERSTANDING,
+    )
+    understanding = await understanding_service.run(
+        workspace_id=workspace_id,
+        asset_ids=asset_ids,
+    )
+    errors.extend(
+        {
+            "asset_id": error["asset_id"],
+            "stage": PipelineStage.UNDERSTANDING.value,
+            "error": error["error"],
+        }
+        for error in understanding.errors
+    )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.FEATURE_READY,
+    )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.EMBEDDING,
+    )
+    for embedding_type in EmbeddingType:
+        embedding = await embedding_service.run(
+            workspace_id=workspace_id,
+            embedding_type=embedding_type,
+            asset_ids=asset_ids,
+        )
+        errors.extend(
+            {
+                "asset_id": error["asset_id"],
+                "stage": f"{PipelineStage.EMBEDDING.value}:{embedding_type.value}",
+                "error": error["error"],
+            }
+            for error in embedding.errors
+        )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.INDEXING,
+    )
+    await repository.finalize_enrichment(
+        job_id=job_id,
+        asset_ids=asset_ids,
+        errors=errors,
+    )
+    failed_asset_ids = {error["asset_id"] for error in errors}
+    return AssetEnrichmentResult(
+        job_id=job_id,
+        workspace_id=workspace_id,
+        requested_asset_count=len(asset_ids),
+        completed_asset_count=len(asset_ids) - len(failed_asset_ids),
+        partial_failed_asset_count=len(failed_asset_ids),
+        errors=errors,
+    )
+
+
 class BrowserImportService:
     """Own the browser upload lifecycle before delegating to ``PipelineRunner``.
 
@@ -51,10 +133,14 @@ class BrowserImportService:
         settings: Settings,
         repository: AssetRepository,
         runner: PipelineRunner,
+        understanding_service: AssetUnderstandingService | None = None,
+        embedding_service: AssetEmbeddingService | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._runner = runner
+        self._understanding_service = understanding_service
+        self._embedding_service = embedding_service
 
     async def create_job(self, *, workspace_id: str) -> BrowserImportJob:
         root = self._settings.import_root.expanduser().resolve()
@@ -127,11 +213,28 @@ class BrowserImportService:
         workspace_id: str,
     ) -> PipelineRunResult | None:
         try:
-            return await self._runner.run(
+            result = await self._runner.run(
                 completion.staged_path,
                 workspace_id,
                 job_id=completion.job_id,
             )
+            asset_ids = list(getattr(result, "asset_ids", []))
+            if (
+                not asset_ids
+                or self._understanding_service is None
+                or self._embedding_service is None
+            ):
+                return result
+
+            await enrich_assets(
+                job_id=completion.job_id,
+                workspace_id=workspace_id,
+                asset_ids=asset_ids,
+                repository=self._repository,
+                understanding_service=self._understanding_service,
+                embedding_service=self._embedding_service,
+            )
+            return result
         except Exception as exc:
             message = str(exc) or type(exc).__name__
             await self._repository.fail_job(job_id=completion.job_id, error=message)

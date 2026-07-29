@@ -96,3 +96,21 @@ class ObjectStorage:
             unquote(parsed.path.lstrip("/")),
             expires_seconds=expires_seconds,
         )
+
+    async def download_uri(self, uri: str) -> bytes:
+        parsed = urlparse(uri)
+        if parsed.scheme != "s3" or parsed.netloc != self._bucket or not parsed.path.lstrip("/"):
+            raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
+
+        def download() -> bytes:
+            response = self._client.get_object(
+                Bucket=self._bucket,
+                Key=unquote(parsed.path.lstrip("/")),
+            )
+            body = response["Body"]
+            try:
+                return bytes(body.read())
+            finally:
+                body.close()
+
+        return await asyncio.to_thread(download)

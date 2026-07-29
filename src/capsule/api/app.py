@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
 from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
@@ -14,8 +15,10 @@ from capsule.db.repositories import AssetRepository, ClusterRepository, Embeddin
 from capsule.db.session import Database
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.pipeline.cluster_service import ClusterService
+from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.import_service import BrowserImportService
 from capsule.pipeline.runner import PipelineRunner
+from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.query_parser import QueryParser
@@ -64,19 +67,28 @@ def create_app(
         query_images = QueryImageService(database, storage)
         app.state.search_history = history
         app.state.query_image_service = query_images
-        app.state.cluster_repository = ClusterRepository(database)
-        app.state.asset_repository = AssetRepository(database)
-        app.state.import_service = BrowserImportService(
+        app.state.object_storage = storage
+        cluster_repo = ClusterRepository(database)
+        asset_repo = AssetRepository(database)
+        embedding_repository = EmbeddingRepository(database)
+        pipeline_runner = PipelineRunner(
             settings=resolved_settings,
-            repository=app.state.asset_repository,
-            runner=PipelineRunner(settings=resolved_settings, database=database),
+            database=database,
+            object_storage=storage,
         )
+        app.state.cluster_repository = cluster_repo
+        app.state.asset_repository = asset_repo
         if resolved_settings.ark_api_key is None:
             logging.getLogger(__name__).warning(
                 "CAPSULE_ARK_API_KEY is not configured; search endpoint will return 503"
             )
             app.state.search_service = None
             app.state.cluster_service = None
+            app.state.import_service = BrowserImportService(
+                settings=resolved_settings,
+                repository=asset_repo,
+                runner=pipeline_runner,
+            )
             try:
                 yield
             finally:
@@ -85,6 +97,27 @@ def create_app(
 
         embedding_client = DoubaoClient(resolved_settings)
         vectors = MilvusVectorStore(resolved_settings)
+        embedding_service = AssetEmbeddingService(
+            settings=resolved_settings,
+            repository=embedding_repository,
+            model_client=embedding_client,
+            vector_store=vectors,
+            video_url_signer=storage,
+        )
+        understanding_service = AssetUnderstandingService(
+            settings=resolved_settings,
+            embedding_repository=embedding_repository,
+            asset_repository=asset_repo,
+            model_client=embedding_client,
+            artifact_reader=storage,
+        )
+        app.state.import_service = BrowserImportService(
+            settings=resolved_settings,
+            repository=asset_repo,
+            runner=pipeline_runner,
+            understanding_service=understanding_service,
+            embedding_service=embedding_service,
+        )
         app.state.search_service = SearchService(
             query_embedding=QueryEmbeddingService(
                 embedding_client,
@@ -100,8 +133,8 @@ def create_app(
         )
         app.state.cluster_service = ClusterService(
             settings=resolved_settings,
-            embedding_repository=EmbeddingRepository(database),
-            cluster_repository=app.state.cluster_repository,
+            embedding_repository=embedding_repository,
+            cluster_repository=cluster_repo,
             vector_store=vectors,
             model_client=embedding_client,
         )
@@ -128,6 +161,7 @@ def create_app(
         allow_headers=["Content-Type"],
     )
     application.include_router(search_router)
+    application.include_router(assets_router)
     application.include_router(capsules_router)
     application.include_router(cluster_runs_router)
     application.include_router(imports_router)

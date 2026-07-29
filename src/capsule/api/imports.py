@@ -21,7 +21,7 @@ from capsule.pipeline.import_service import (
     ImportFileTooLargeError,
     ImportSubmissionError,
 )
-from capsule.schemas import ProcessingJobRecord
+from capsule.schemas import ProcessingJobListResponse, ProcessingJobRecord
 
 router = APIRouter(prefix="/api/v1", tags=["imports"])
 
@@ -88,6 +88,19 @@ async def create_import_job(
             detail={"code": "import_staging_unavailable", "message": str(exc)},
         ) from exc
     return ImportJobCreated(job_id=job.job_id, status="queued")
+
+
+@router.get("/import-jobs", response_model=ProcessingJobListResponse)
+async def list_import_jobs(
+    request: Request,
+    workspace_id: str,
+    limit: int = 50,
+) -> ProcessingJobListResponse:
+    items = await _asset_repository(request).list_jobs(
+        workspace_id=workspace_id,
+        limit=max(1, min(limit, 200)),
+    )
+    return ProcessingJobListResponse(items=items)
 
 
 @router.post(

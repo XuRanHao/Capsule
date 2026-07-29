@@ -11,7 +11,7 @@ from alembic.config import Config
 from capsule import __version__
 from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
-from capsule.db.repositories import ClusterRepository, EmbeddingRepository
+from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
 from capsule.db.session import Database
 from capsule.enums import EmbeddingType
 from capsule.model_clients.doubao import DoubaoClient
@@ -19,7 +19,9 @@ from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
 from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeClusterResult
 from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
+from capsule.pipeline.import_service import AssetEnrichmentResult, enrich_assets
 from capsule.pipeline.runner import PipelineRunner
+from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.search.evaluation import evaluate_search_file
 from capsule.storage.object_storage import ObjectStorage
 from capsule.vectorstore.milvus import MilvusVectorStore
@@ -204,6 +206,28 @@ def cluster_command(
         raise typer.Exit(code=2)
 
 
+@app.command(name="enrich")
+def enrich_command(
+    job_id: Annotated[str, typer.Option("--job-id", help="Processing Job to update.")],
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+    asset_ids: Annotated[
+        list[str] | None,
+        typer.Option("--asset-id", help="Only enrich this Asset ID; repeat as needed."),
+    ] = None,
+) -> None:
+    """Backfill understanding and all embedding channels for stored Assets."""
+    result = asyncio.run(
+        _enrich_assets(
+            job_id=job_id,
+            workspace_id=workspace,
+            asset_ids=asset_ids,
+        )
+    )
+    typer.echo(result.model_dump_json(indent=2))
+    if result.partial_failed_asset_count:
+        raise typer.Exit(code=2)
+
+
 @app.command(name="evaluate-search")
 def evaluate_search_command(
     dataset: Annotated[Path, typer.Argument(exists=True, readable=True)],
@@ -277,6 +301,50 @@ async def _cluster_assets(
             return await service.run(
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
+            )
+    finally:
+        await database.dispose()
+
+
+async def _enrich_assets(
+    *,
+    job_id: str,
+    workspace_id: str,
+    asset_ids: list[str] | None,
+) -> AssetEnrichmentResult:
+    settings = get_settings()
+    database = Database(settings)
+    storage = ObjectStorage(settings)
+    asset_repository = AssetRepository(database)
+    embedding_repository = EmbeddingRepository(database)
+    try:
+        assets = await embedding_repository.list_assets(
+            workspace_id=workspace_id,
+            asset_ids=asset_ids,
+        )
+        selected_asset_ids = [asset.asset_id for asset in assets]
+        if not selected_asset_ids:
+            raise ValueError("no Assets matched the enrichment request")
+        async with DoubaoClient(settings) as model_client:
+            return await enrich_assets(
+                job_id=job_id,
+                workspace_id=workspace_id,
+                asset_ids=selected_asset_ids,
+                repository=asset_repository,
+                understanding_service=AssetUnderstandingService(
+                    settings=settings,
+                    embedding_repository=embedding_repository,
+                    asset_repository=asset_repository,
+                    model_client=model_client,
+                    artifact_reader=storage,
+                ),
+                embedding_service=AssetEmbeddingService(
+                    settings=settings,
+                    repository=embedding_repository,
+                    model_client=model_client,
+                    vector_store=MilvusVectorStore(settings),
+                    video_url_signer=storage,
+                ),
             )
     finally:
         await database.dispose()

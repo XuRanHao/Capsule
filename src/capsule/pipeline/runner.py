@@ -39,6 +39,7 @@ class PipelineRunResult(BaseModel):
     succeeded_count: int
     failed_count: int
     asset_count: int
+    asset_ids: list[str] = Field(default_factory=list)
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -103,6 +104,7 @@ class PipelineRunner:
         succeeded = 0
         failed = 0
         asset_count = 0
+        asset_ids: list[str] = []
         errors: list[dict[str, str]] = []
         try:
             for source_file in source_files:
@@ -138,6 +140,7 @@ class PipelineRunner:
                     await repository.record_file_success(job_id=job_id)
                     succeeded += 1
                     asset_count += len(stored.asset_ids)
+                    asset_ids.extend(stored.asset_ids)
                 except Exception as exc:
                     message = str(exc) or type(exc).__name__
                     await repository.record_file_failure(
@@ -156,6 +159,7 @@ class PipelineRunner:
                 succeeded_count=succeeded,
                 failed_count=failed,
                 asset_count=asset_count,
+                asset_ids=asset_ids,
                 errors=errors,
             )
         finally:
