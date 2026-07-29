@@ -206,6 +206,10 @@ class MilvusVectorStore:
                 ],
             )
 
+    async def aupsert(self, records: list[VectorRecord]) -> None:
+        """Write vectors without blocking callers that process many Assets."""
+        await asyncio.to_thread(self.upsert, records)
+
     async def search(
         self,
         *,

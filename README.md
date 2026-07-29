@@ -31,11 +31,12 @@ boundary; retrieval starts from persisted Assets and Embedding Records.
   file parsing, and FFmpeg.
 - PostgreSQL stores business metadata; Milvus stores vectors; S3/TOS-compatible
   object storage stores source and derived media.
-- Duplicate files are skipped by `(workspace_id, sha256)`.
+- Re-imports replace a source file by `(workspace_id, relative_path)` and keep
+  stable Asset IDs where the Asset locator is unchanged.
 - Images referenced by Markdown preserve nearby source text separately from
   model-generated descriptions.
-- Video segments initially use description-based embeddings and record
-  `embedding_source_mode=description_fallback`.
+- Native video vectors use the rendered segment MP4 through a temporary signed
+  object-storage URL; they record `embedding_source_mode=original_video`.
 
 ## Local environment
 
@@ -80,9 +81,10 @@ make test         # backend and frontend quality gates
 make down         # stop containers without deleting persisted data
 ```
 
-The assetization CLI persists Markdown and image assets to PostgreSQL. A failed
-file is recorded without aborting the batch. Video files remain explicitly
-unsupported until the MPS visual Worker and its segmentation parameters land.
+The assetization CLI persists Markdown, image and video Assets to PostgreSQL.
+Video segments additionally persist playable MP4/JPEG artifacts in MinIO/S3. A
+failed file is recorded without aborting the batch. Use the `embed` CLI command
+after import to write `EmbeddingRecord` metadata and vectors to Milvus.
 
 To reset persisted PostgreSQL/Milvus/MinIO data, use
 `docker compose down -v` deliberately; `make down` preserves it.
@@ -120,11 +122,21 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    capsule doctor
    capsule scan ./test-data
    capsule pipeline ./test-data --workspace workspace_demo --dry-run
+   capsule pipeline ./test-data --workspace workspace_demo --execute
+   capsule embed --workspace workspace_demo
    ```
 
-The non-dry-run pipeline persists Markdown and image assets to PostgreSQL.
-Video input requires the host MPS worker described below; a video failure is
-recorded without aborting the rest of the batch.
+The non-dry-run pipeline persists Markdown, image and video Assets to
+PostgreSQL. Video input requires the host MPS worker described below; a video
+failure is recorded without aborting the rest of the batch.
+
+`capsule embed` processes one embedding route at a time. Its default is native
+multimodal: Markdown uses the block text, images are sent inline as their
+original bytes, and video uses the derived playable MP4 through a temporary
+signed object-storage URL. Repeat `--asset-id` to limit a batch; already
+indexed logical inputs are skipped unless `--force` is set. For Ark to process
+videos, `CAPSULE_OBJECT_STORAGE_PUBLIC_ENDPOINT` must point to an endpoint Ark
+can reach; the local Docker-only MinIO address cannot be used for this step.
 
 ## Video MPS worker
 

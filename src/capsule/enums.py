@@ -69,6 +69,7 @@ class EmbeddingStatus(StrEnum):
 class EmbeddingSourceMode(StrEnum):
     ORIGINAL_TEXT = "original_text"
     ORIGINAL_IMAGE = "original_image"
+    ORIGINAL_VIDEO = "original_video"
     FEATURE_TEXT = "feature_text"
     DESCRIPTION_TEXT = "description_text"
     DESCRIPTION_FALLBACK = "description_fallback"

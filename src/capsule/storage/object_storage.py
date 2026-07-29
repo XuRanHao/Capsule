@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import boto3
 from botocore.client import BaseClient
@@ -84,4 +85,14 @@ class ObjectStorage:
             "get_object",
             Params={"Bucket": self._bucket, "Key": object_key},
             ExpiresIn=expires_seconds,
+        )
+
+    async def presigned_get_uri(self, uri: str, *, expires_seconds: int = 3600) -> str:
+        """Turn a stored ``s3://`` URI into a temporary model-readable URL."""
+        parsed = urlparse(uri)
+        if parsed.scheme != "s3" or parsed.netloc != self._bucket or not parsed.path.lstrip("/"):
+            raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
+        return await self.presigned_get_url(
+            unquote(parsed.path.lstrip("/")),
+            expires_seconds=expires_seconds,
         )

@@ -11,10 +11,17 @@ from alembic.config import Config
 from capsule import __version__
 from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
+from capsule.db.repositories import EmbeddingRepository
+from capsule.db.session import Database
+from capsule.enums import EmbeddingType
+from capsule.model_clients.doubao import DoubaoClient
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
+from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.runner import PipelineRunner
 from capsule.search.evaluation import evaluate_search_file
+from capsule.storage.object_storage import ObjectStorage
+from capsule.vectorstore.milvus import MilvusVectorStore
 
 app = typer.Typer(no_args_is_help=True, help="Capsule multimodal clustering pipeline")
 
@@ -133,6 +140,41 @@ def mps_video_command(
         raise typer.Exit(code=2)
 
 
+@app.command(name="embed")
+def embed_command(
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+    embedding_type: Annotated[
+        EmbeddingType,
+        typer.Option("--embedding-type", help="Run exactly one independent embedding channel."),
+    ] = EmbeddingType.NATIVE_MULTIMODAL,
+    asset_ids: Annotated[
+        list[str] | None,
+        typer.Option("--asset-id", help="Only embed this Asset ID; repeat the option as needed."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Regenerate and upsert already indexed logical inputs."),
+    ] = False,
+) -> None:
+    """Generate Embeddings for stored Assets and upsert them into Milvus."""
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    result = asyncio.run(
+        _embed_assets(
+            workspace_id=workspace,
+            embedding_type=embedding_type,
+            asset_ids=asset_ids,
+            force=force,
+        )
+    )
+    typer.echo(result.model_dump_json(indent=2))
+    if result.failed_count:
+        raise typer.Exit(code=2)
+
+
 @app.command(name="evaluate-search")
 def evaluate_search_command(
     dataset: Annotated[Path, typer.Argument(exists=True, readable=True)],
@@ -157,3 +199,31 @@ def evaluate_search_command(
     typer.echo(report.model_dump_json(indent=2))
     if strict and not report.passed:
         raise typer.Exit(code=1)
+
+
+async def _embed_assets(
+    *,
+    workspace_id: str,
+    embedding_type: EmbeddingType,
+    asset_ids: list[str] | None,
+    force: bool,
+) -> EmbeddingRunResult:
+    settings = get_settings()
+    database = Database(settings)
+    try:
+        async with DoubaoClient(settings) as model_client:
+            service = AssetEmbeddingService(
+                settings=settings,
+                repository=EmbeddingRepository(database),
+                model_client=model_client,
+                vector_store=MilvusVectorStore(settings),
+                video_url_signer=ObjectStorage(settings),
+            )
+            return await service.run(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                asset_ids=asset_ids,
+                force=force,
+            )
+    finally:
+        await database.dispose()

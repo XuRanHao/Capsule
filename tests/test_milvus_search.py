@@ -2,7 +2,7 @@ from typing import Any
 
 from capsule.config import Settings
 from capsule.search.models import SearchFilters
-from capsule.vectorstore.milvus import MilvusVectorStore
+from capsule.vectorstore.milvus import MilvusVectorStore, VectorRecord
 
 
 class FakeMilvusClient:
@@ -25,6 +25,9 @@ class FakeMilvusClient:
                 }
             ]
         ]
+
+    def upsert(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
 
 
 class FakeBootstrapMilvusClient(FakeMilvusClient):
@@ -110,6 +113,46 @@ async def test_milvus_search_builds_scoped_filter_and_parses_hits() -> None:
     assert hits[0].asset_id == "asset_1"
     assert hits[0].embedding_revision == 2
     assert hits[0].similarity == 0.91
+
+
+async def test_milvus_async_upsert_uses_embedding_id_as_primary_key() -> None:
+    client = FakeMilvusClient()
+    store = MilvusVectorStore(Settings(embedding_dimension=3), client=client)
+
+    await store.aupsert(
+        [
+            VectorRecord(
+                embedding_id="emb_1",
+                workspace_id="workspace_demo",
+                project_id="project_default",
+                asset_id="asset_1",
+                source_file_id="src_1",
+                asset_type="markdown_block",
+                embedding_type="native_multimodal",
+                model_version="doubao-embedding-vision-250615",
+                embedding_revision=2,
+                created_at_ts=1_700_000_000,
+                vector=[0.0, 1.0, 2.0],
+            )
+        ]
+    )
+
+    assert client.kwargs["collection_name"] == "asset_embeddings_seed16_1024"
+    assert client.kwargs["data"] == [
+        {
+            "embedding_id": "emb_1",
+            "workspace_id": "workspace_demo",
+            "project_id": "project_default",
+            "asset_id": "asset_1",
+            "source_file_id": "src_1",
+            "asset_type": "markdown_block",
+            "embedding_type": "native_multimodal",
+            "model_version": "doubao-embedding-vision-250615",
+            "embedding_revision": 2,
+            "created_at_ts": 1_700_000_000,
+            "vector": [0.0, 1.0, 2.0],
+        }
+    ]
 
 
 async def test_milvus_bootstrap_creates_and_loads_frozen_collection() -> None:

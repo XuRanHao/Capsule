@@ -1,15 +1,24 @@
-"""Transactional persistence for source files, assets, and processing jobs."""
+"""Transactional persistence for source files, assets, jobs, and Embeddings."""
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from capsule.db.models import Asset, ProcessingJob, SourceFile, Workspace
+from capsule.db.base import id_factory
+from capsule.db.models import Asset, EmbeddingRecord, ProcessingJob, SourceFile, Workspace
 from capsule.db.session import Database
-from capsule.enums import AssetNameSource, JobStatus, PipelineStage, ProcessingStatus
+from capsule.enums import (
+    AssetNameSource,
+    EmbeddingStatus,
+    JobStatus,
+    PipelineStage,
+    ProcessingStatus,
+)
 from capsule.schemas import AssetCreate, DiscoveredFile, StoredFileResult
 
 
@@ -227,3 +236,167 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
         current.asset_features = {}
         current.feature_revision += 1
         current.embedding_revision += 1
+
+
+#===========================================
+#      Embedding persistence
+#===========================================
+
+
+@dataclass(slots=True, frozen=True)
+class EmbeddingAsset:
+    """The Asset fields needed to construct one model Embedding input."""
+
+    asset_id: str
+    workspace_id: str
+    project_id: str
+    source_file_id: str
+    asset_type: str
+    file_type: str
+    content_hash: str
+    embedding_revision: int
+    raw_content: str | None
+    asset_description: str | None
+    asset_features: dict[str, Any]
+    derived_file_uri: str | None
+    source_storage_uri: str
+    source_mime_type: str
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedEmbedding:
+    """A durable record reserved before calling the model or Milvus."""
+
+    embedding_id: str
+    milvus_primary_key: str
+    already_indexed: bool
+
+
+class EmbeddingRepository:
+    """Own PostgreSQL metadata and state transitions for vector persistence."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+        self._new_embedding_id = id_factory("emb")
+
+    async def list_assets(
+        self,
+        *,
+        workspace_id: str,
+        asset_ids: Sequence[str] | None = None,
+    ) -> list[EmbeddingAsset]:
+        statement = (
+            select(Asset, SourceFile)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+            .where(Asset.workspace_id == workspace_id)
+            .order_by(Asset.created_at, Asset.asset_id)
+        )
+        if asset_ids:
+            statement = statement.where(Asset.asset_id.in_(asset_ids))
+
+        async with self._database.session() as session:
+            rows = (await session.execute(statement)).all()
+        return [
+            EmbeddingAsset(
+                asset_id=asset.asset_id,
+                workspace_id=asset.workspace_id,
+                project_id=asset.project_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                file_type=asset.file_type,
+                content_hash=asset.content_hash,
+                embedding_revision=asset.embedding_revision,
+                raw_content=asset.raw_content,
+                asset_description=asset.asset_description,
+                asset_features=dict(asset.asset_features),
+                derived_file_uri=asset.derived_file_uri,
+                source_storage_uri=source.storage_uri,
+                source_mime_type=source.mime_type,
+            )
+            for asset, source in rows
+        ]
+
+    async def prepare(
+        self,
+        *,
+        asset: EmbeddingAsset,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        source_content_hash: str,
+        source_mode: str,
+        milvus_collection: str,
+        force: bool,
+    ) -> PreparedEmbedding:
+        """Reserve one stable primary key or return an existing indexed record."""
+        async with self._database.session() as session, session.begin():
+            statement = (
+                select(EmbeddingRecord)
+                .where(
+                    EmbeddingRecord.asset_id == asset.asset_id,
+                    EmbeddingRecord.embedding_type == embedding_type,
+                    EmbeddingRecord.model_name == model_name,
+                    EmbeddingRecord.dimension == dimension,
+                    EmbeddingRecord.source_content_hash == source_content_hash,
+                )
+                .with_for_update()
+            )
+            record = await session.scalar(statement)
+            if record is not None:
+                if record.status == EmbeddingStatus.INDEXED.value and not force:
+                    return PreparedEmbedding(
+                        embedding_id=record.embedding_id,
+                        milvus_primary_key=record.milvus_primary_key,
+                        already_indexed=True,
+                    )
+                record.status = EmbeddingStatus.PROCESSING.value
+                record.latency_ms = None
+                record.usage = {}
+                return PreparedEmbedding(
+                    embedding_id=record.embedding_id,
+                    milvus_primary_key=record.milvus_primary_key,
+                    already_indexed=False,
+                )
+
+            embedding_id = self._new_embedding_id()
+            record = EmbeddingRecord(
+                embedding_id=embedding_id,
+                workspace_id=asset.workspace_id,
+                project_id=asset.project_id,
+                asset_id=asset.asset_id,
+                embedding_type=embedding_type,
+                model_name=model_name,
+                dimension=dimension,
+                source_content_hash=source_content_hash,
+                embedding_source_mode=source_mode,
+                milvus_collection=milvus_collection,
+                milvus_primary_key=embedding_id,
+                status=EmbeddingStatus.PROCESSING.value,
+            )
+            session.add(record)
+            return PreparedEmbedding(
+                embedding_id=embedding_id,
+                milvus_primary_key=embedding_id,
+                already_indexed=False,
+            )
+
+    async def mark_indexed(
+        self,
+        *,
+        embedding_id: str,
+        latency_ms: int,
+        usage: dict[str, Any],
+    ) -> None:
+        async with self._database.session() as session, session.begin():
+            record = await session.get(EmbeddingRecord, embedding_id, with_for_update=True)
+            if record is None:
+                raise ValueError(f"embedding record does not exist: {embedding_id}")
+            record.status = EmbeddingStatus.INDEXED.value
+            record.latency_ms = latency_ms
+            record.usage = usage
+
+    async def mark_failed(self, *, embedding_id: str) -> None:
+        async with self._database.session() as session, session.begin():
+            record = await session.get(EmbeddingRecord, embedding_id, with_for_update=True)
+            if record is not None:
+                record.status = EmbeddingStatus.FAILED.value
