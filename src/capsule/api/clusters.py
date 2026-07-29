@@ -23,6 +23,7 @@ class ClusterRunCreate(BaseModel):
 
     workspace_id: str = Field(min_length=1, max_length=64)
     embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL
+    optimize_parameters: bool = False
 
 
 class ClusterRunSubmission(BaseModel):
@@ -100,6 +101,7 @@ async def submit_cluster_run(
         workspace_id=payload.workspace_id,
         embedding_type=payload.embedding_type,
         cluster_run_id=cluster_run_id,
+        optimize_parameters=payload.optimize_parameters,
     )
     return ClusterRunSubmission(cluster_run_id=cluster_run_id)
 
@@ -240,11 +242,13 @@ async def _execute_cluster_run(
     workspace_id: str,
     embedding_type: EmbeddingType,
     cluster_run_id: str,
+    optimize_parameters: bool,
 ) -> None:
     await service.run(
         workspace_id=workspace_id,
         embedding_type=embedding_type,
         cluster_run_id=cluster_run_id,
+        optimize_parameters=optimize_parameters,
     )
 
 

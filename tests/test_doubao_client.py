@@ -22,6 +22,84 @@ def test_extract_embedding_rejects_missing_vector() -> None:
 
 
 @pytest.mark.asyncio
+async def test_understand_asset_constrains_object_schema_and_repairs_invalid_shape() -> None:
+    calls: list[dict[str, object]] = []
+    feature_names = [
+        "subject_content",
+        "scene_theme",
+        "visual_style",
+        "color_composition",
+        "mood_atmosphere",
+        "character_state_or_psychology",
+        "asset_usage",
+        "target_audience",
+        "provenance",
+        "rights_version_authorship",
+    ]
+    valid_features = {
+        name: {
+            "value": "测试值",
+            "status": "observed",
+            "confidence": 0.9,
+            "evidence": ["测试证据"],
+        }
+        for name in feature_names
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        features: object = (
+            [{"key": "subject_content", **valid_features["subject_content"]}]
+            if len(calls) == 1
+            else valid_features
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "asset_name": "测试素材",
+                                    "asset_description": "一条用于验证结构化输出约束的素材描述。",
+                                    "features": features,
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.understand_asset(
+            [{"role": "user", "content": "分析这条测试素材"}]
+        )
+    finally:
+        await client.close()
+
+    assert result.features.subject_content.value == "测试值"
+    assert len(calls) == 2
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    first_messages = calls[0]["messages"]
+    assert isinstance(first_messages, list)
+    assert "features 必须是对象，不能是数组" in str(first_messages[0])
+    assert "JSON 结构示例" in str(first_messages[0])
+    assert "禁止照抄" in str(first_messages[0])
+    assert all(name in str(first_messages[0]) for name in feature_names)
+    assert "上一份输出未通过 AssetUnderstanding 结构校验" in str(calls[1]["messages"])
+
+
+@pytest.mark.asyncio
 async def test_embed_multimodal_requests_configured_dimension() -> None:
     captured: dict[str, object] = {}
 

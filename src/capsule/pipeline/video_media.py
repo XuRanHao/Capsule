@@ -34,8 +34,14 @@ class VideoDerivedMediaWriter:
     playable and can later be supplied unchanged to video embedding calls.
     """
 
-    def __init__(self, storage: VideoArtifactStorage) -> None:
+    def __init__(self, storage: VideoArtifactStorage, *, concurrency: int = 1) -> None:
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
         self._storage = storage
+        self._concurrency = concurrency
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self._bucket_lock = asyncio.Lock()
+        self._bucket_ready = False
 
     async def persist(
         self,
@@ -48,64 +54,130 @@ class VideoDerivedMediaWriter:
             return list(assets)
 
         source = await asyncio.to_thread(_resolve_source, source_file)
-        await self._storage.ensure_bucket()
+        await self._ensure_bucket()
 
-        updated: dict[str, AssetCreate] = {}
         with tempfile.TemporaryDirectory(prefix="capsule-video-") as temporary_directory:
             temporary_root = Path(temporary_directory)
-            for asset in video_assets:
-                artifacts = await asyncio.to_thread(
-                    _render_artifacts,
-                    source,
-                    asset,
-                    temporary_root / asset.asset_key,
+            persisted = await self._persist_many(
+                source=source,
+                assets=video_assets,
+                temporary_root=temporary_root,
+            )
+        updated = {asset.asset_key: asset for asset in persisted}
+        return [updated.get(asset.asset_key, asset) for asset in assets]
+
+    async def _persist_many(
+        self,
+        *,
+        source: Path,
+        assets: list[AssetCreate],
+        temporary_root: Path,
+    ) -> list[AssetCreate]:
+        persisted: list[AssetCreate | None] = [None] * len(assets)
+        next_index = 0
+
+        async def worker() -> None:
+            nonlocal next_index
+            while next_index < len(assets):
+                index = next_index
+                next_index += 1
+                asset = assets[index]
+                persisted[index] = await self._persist_one(
+                    source=source,
+                    asset=asset,
+                    output_directory=temporary_root / asset.asset_key,
                 )
-                prefix = _object_prefix(asset)
-                derived_uri = await self._storage.upload_file(
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(self._concurrency, len(assets)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        if any(asset is None for asset in persisted):
+            raise RuntimeError("video media persistence ended before all assets completed")
+        return [asset for asset in persisted if asset is not None]
+
+    async def _ensure_bucket(self) -> None:
+        if self._bucket_ready:
+            return
+        async with self._bucket_lock:
+            if not self._bucket_ready:
+                await self._storage.ensure_bucket()
+                self._bucket_ready = True
+
+    async def _persist_one(
+        self,
+        *,
+        source: Path,
+        asset: AssetCreate,
+        output_directory: Path,
+    ) -> AssetCreate:
+        async with self._semaphore:
+            artifacts = await asyncio.to_thread(
+                _render_artifacts,
+                source,
+                asset,
+                output_directory,
+            )
+            prefix = _object_prefix(asset)
+            uploads = await asyncio.gather(
+                self._storage.upload_file(
                     artifacts.segment_path,
                     f"{prefix}/segment.mp4",
                     content_type="video/mp4",
-                )
-                preview_uri = await self._storage.upload_file(
+                ),
+                self._storage.upload_file(
                     artifacts.keyframe_paths[0],
                     f"{prefix}/preview.jpg",
                     content_type="image/jpeg",
-                )
-                original_summaries = _representative_summaries(asset)
-                keyframes: list[dict[str, object]] = []
-                for ordinal, frame_path in enumerate(artifacts.keyframe_paths, start=1):
-                    frame_uri = await self._storage.upload_file(
+                ),
+                *(
+                    self._storage.upload_file(
                         frame_path,
                         f"{prefix}/keyframes/{ordinal:02d}.jpg",
                         content_type="image/jpeg",
                     )
-                    summary = original_summaries[ordinal - 1]
-                    keyframes.append(
-                        {
-                            "uri": frame_uri,
-                            "timestamp_ms": summary["timestamp_ms"],
-                            "role": "representative",
-                            "brightness": summary.get("brightness"),
-                            "contrast": summary.get("contrast"),
-                            "sharpness": summary.get("sharpness"),
-                        }
+                    for ordinal, frame_path in enumerate(
+                        artifacts.keyframe_paths,
+                        start=1,
                     )
-                file_info = dict(asset.file_info)
-                file_info["keyframes"] = keyframes
-                file_info["derived_video"] = {
-                    "container": "mp4",
-                    "video_codec": artifacts.video_encoder,
-                    "audio_codec": "aac",
-                }
-                updated[asset.asset_key] = asset.model_copy(
-                    update={
-                        "derived_file_uri": derived_uri,
-                        "preview_uri": preview_uri,
-                        "file_info": file_info,
+                ),
+            )
+            derived_uri, preview_uri, *frame_uris = uploads
+            original_summaries = _representative_summaries(asset)
+            keyframes: list[dict[str, object]] = []
+            for ordinal, frame_uri in enumerate(frame_uris, start=1):
+                summary = original_summaries[ordinal - 1]
+                keyframes.append(
+                    {
+                        "uri": frame_uri,
+                        "timestamp_ms": summary["timestamp_ms"],
+                        "role": "representative",
+                        "brightness": summary.get("brightness"),
+                        "contrast": summary.get("contrast"),
+                        "sharpness": summary.get("sharpness"),
                     }
                 )
-
-        return [updated.get(asset.asset_key, asset) for asset in assets]
+            file_info = dict(asset.file_info)
+            file_info["keyframes"] = keyframes
+            file_info["derived_video"] = {
+                "container": "mp4",
+                "video_codec": artifacts.video_encoder,
+                "audio_codec": "aac",
+            }
+            return asset.model_copy(
+                update={
+                    "derived_file_uri": derived_uri,
+                    "preview_uri": preview_uri,
+                    "file_info": file_info,
+                }
+            )
 
 
 class _RenderedArtifacts:

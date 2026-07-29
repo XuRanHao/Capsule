@@ -61,6 +61,13 @@ class AssetMediaTarget:
     derived_file_uri: str | None
 
 
+@dataclass(slots=True, frozen=True)
+class PreparedSourceFile:
+    source_file_id: str
+    already_processed: bool
+    asset_count: int = 0
+
+
 class AssetRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -163,6 +170,77 @@ class AssetRepository:
             await session.flush()
             return source.source_file_id
 
+    async def prepare_source_file(
+        self,
+        *,
+        workspace_id: str,
+        source_file: DiscoveredFile,
+        sha256: str,
+        mime_type: str,
+        processing_fingerprint: str,
+    ) -> "PreparedSourceFile":
+        """Claim a logical source or reuse its completed, byte-identical assets."""
+        async with self._database.session() as session, session.begin():
+            await self._ensure_workspace(session, workspace_id)
+            source = await self._find_source_file(
+                session,
+                workspace_id=workspace_id,
+                relative_path=source_file.relative_path,
+                lock=True,
+            )
+            source_path = _resolve_path(Path(source_file.path))
+            metadata = {
+                "original_file_name": source_path.name,
+                "file_type": source_file.extension,
+                "mime_type": mime_type,
+                "relative_path": source_file.relative_path,
+                "file_tree_context": list(Path(source_file.relative_path).parent.parts)
+                if Path(source_file.relative_path).parent != Path(".")
+                else [],
+                "storage_uri": source_path.as_uri(),
+                "file_size_bytes": source_file.size_bytes,
+            }
+            if (
+                source is not None
+                and source.sha256 == sha256
+                and source.processing_fingerprint == processing_fingerprint
+                and source.processing_status == ProcessingStatus.COMPLETED.value
+            ):
+                for field, value in metadata.items():
+                    setattr(source, field, value)
+                asset_count = int(
+                    await session.scalar(
+                        select(func.count(Asset.asset_id)).where(
+                            Asset.source_file_id == source.source_file_id
+                        )
+                    )
+                    or 0
+                )
+                return PreparedSourceFile(
+                    source_file_id=source.source_file_id,
+                    already_processed=True,
+                    asset_count=asset_count,
+                )
+
+            values = {
+                **metadata,
+                "sha256": sha256,
+                "processing_fingerprint": processing_fingerprint,
+                "processing_status": ProcessingStatus.PROCESSING.value,
+                "error_message": None,
+            }
+            if source is None:
+                source = SourceFile(workspace_id=workspace_id, **values)
+                session.add(source)
+            else:
+                for field, value in values.items():
+                    setattr(source, field, value)
+            await session.flush()
+            return PreparedSourceFile(
+                source_file_id=source.source_file_id,
+                already_processed=False,
+            )
+
     async def replace_assets(
         self,
         *,
@@ -204,7 +282,7 @@ class AssetRepository:
             for stale in existing.values():
                 await session.delete(stale)
 
-            source.processing_status = ProcessingStatus.PROCESSING.value
+            source.processing_status = ProcessingStatus.COMPLETED.value
             source.error_message = None
             await session.flush()
             return StoredFileResult(source_file_id=source_file_id, asset_ids=stored_ids)

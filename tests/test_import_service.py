@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import UploadFile
+from pydantic import ValidationError
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType, PipelineStage
@@ -187,19 +188,19 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
     assert understanding.features.asset_usage.value == "动画场景参考"
     assert understanding.features.target_audience.status.value == "unknown"
 
-    list_features = AssetUnderstanding.model_validate(
-        {
-            "asset_name": "黄昏街景",
-            "asset_description": "暖色夕阳下的城市街景。",
-            "features": [
-                {
-                    "feature_name": "scene_theme",
-                    "value": "都市黄昏",
-                    "status": "observed",
-                    "confidence": 0.8,
-                    "evidence": ["夕阳与建筑"],
-                }
-            ],
-        }
-    )
-    assert list_features.features.scene_theme.value == "都市黄昏"
+    with pytest.raises(ValidationError, match="features must be an object"):
+        AssetUnderstanding.model_validate(
+            {
+                "asset_name": "黄昏街景",
+                "asset_description": "暖色夕阳下的城市街景。",
+                "features": [
+                    {
+                        "feature_name": "scene_theme",
+                        "value": "都市黄昏",
+                        "status": "observed",
+                        "confidence": 0.8,
+                        "evidence": ["夕阳与建筑"],
+                    }
+                ],
+            }
+        )

@@ -76,6 +76,7 @@ class SourceFile(Base, TimestampMixin):
     file_tree_context: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     storage_uri: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    processing_fingerprint: Mapped[str | None] = mapped_column(String(64))
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     processing_status: Mapped[str] = mapped_column(
         String(32),

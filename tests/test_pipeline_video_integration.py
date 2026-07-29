@@ -99,6 +99,19 @@ async def test_video_file_stores_playable_segment_media(tmp_path: Path) -> None:
         assert any(content[4:8] == b"ftyp" for content in storage.objects.values())
         assert any(content.startswith(b"\xff\xd8") for content in storage.objects.values())
         assert set(storage.content_types.values()) == {"video/mp4", "image/jpeg"}
+        stored_objects = dict(storage.objects)
+
+        repeated = await PipelineRunner(
+            database=database,
+            video_embedder=FakeVideoEmbedder(),
+            object_storage=storage,
+        ).run(tmp_path, workspace_id)
+
+        assert repeated.succeeded_count == 1
+        assert repeated.failed_count == 0
+        assert repeated.skipped_count == 1
+        assert repeated.asset_count == result.asset_count
+        assert storage.objects == stored_objects
     finally:
         async with database.session() as session, session.begin():
             workspace = await session.get(Workspace, workspace_id, with_for_update=True)

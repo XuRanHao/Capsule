@@ -72,12 +72,33 @@ class DoubaoClient:
         self,
         messages: Sequence[Mapping[str, Any]],
     ) -> AssetUnderstanding:
-        return await self._chat_json(
-            messages=messages,
-            output_type=AssetUnderstanding,
-            pool=self.understanding_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-        )
+        constrained_messages = [
+            _asset_understanding_schema_message(),
+            *messages,
+        ]
+        try:
+            return await self._chat_json(
+                messages=constrained_messages,
+                output_type=AssetUnderstanding,
+                pool=self.understanding_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+            )
+        except (DoubaoResponseError, ValidationError) as exc:
+            correction = {
+                "role": "user",
+                "content": (
+                    "上一份输出未通过 AssetUnderstanding 结构校验。请根据原始素材重新输出，"
+                    "不要解释或使用 Markdown。根节点和 features 都必须是 JSON 对象；features "
+                    "必须包含指定的十个命名字段，绝不能使用数组。"
+                    f"校验错误：{_validation_error_text(exc)}"
+                ),
+            }
+            return await self._chat_json(
+                messages=[*constrained_messages, correction],
+                output_type=AssetUnderstanding,
+                pool=self.understanding_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+            )
 
     async def summarize_cluster(
         self,
@@ -94,13 +115,18 @@ class DoubaoClient:
             # Responses can be valid JSON but still violate the persisted Capsule
             # contract (most often a description shorter than 50 Chinese chars).
             # Retry once with the original representatives intact and explicit errors.
+            validation_errors = json.dumps(
+                exc.errors(include_url=False),
+                ensure_ascii=False,
+                default=str,
+            )
             correction = {
                 "role": "user",
                 "content": (
                     "上一份输出未通过结构校验。请仅基于前述代表资产重新输出完整合法 JSON，"
                     "不要解释或使用 Markdown。description 必须是 50 到 150 个中文字符；"
                     "keywords 必须为 3 到 8 项；internal_variance 只能为 low、medium 或 high。"
-                    f"校验错误：{json.dumps(exc.errors(include_url=False), ensure_ascii=False)}"
+                    f"校验错误：{validation_errors}"
                 ),
             }
             return await self._responses_json(
@@ -315,6 +341,67 @@ class DoubaoClient:
             return output_type.model_validate(decoded)
 
         return await pool.run(request)
+
+
+def _asset_understanding_schema_message() -> dict[str, str]:
+    schema = json.dumps(
+        AssetUnderstanding.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    example = json.dumps(
+        _asset_understanding_json_example(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "role": "system",
+        "content": (
+            "以下输出结构约束优先于其他格式描述。只返回一个符合 JSON Schema 的 JSON 对象，"
+            "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
+            "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
+            "的对象，value 无证据时使用 null，不得省略必填字段。下面的手工示例只用于说明 JSON "
+            "结构，示例文字不是素材事实，禁止照抄；所有实际值、状态、置信度和证据必须根据输入素材"
+            f"重新判断。JSON 结构示例：{example}。JSON Schema：{schema}"
+        ),
+    }
+
+
+def _asset_understanding_json_example() -> dict[str, object]:
+    observed: dict[str, object] = {
+        "value": "基于素材证据填写的文字",
+        "status": "observed",
+        "confidence": 0.9,
+        "evidence": ["输入中可核验的简短证据"],
+    }
+    unknown: dict[str, object] = {
+        "value": None,
+        "status": "unknown",
+        "confidence": 0.0,
+        "evidence": [],
+    }
+    return {
+        "asset_name": "基于素材生成的简洁名称",
+        "asset_description": "基于素材生成的客观完整描述",
+        "features": {
+            "subject_content": observed,
+            "scene_theme": observed,
+            "visual_style": observed,
+            "color_composition": observed,
+            "mood_atmosphere": observed,
+            "character_state_or_psychology": unknown,
+            "asset_usage": unknown,
+            "target_audience": unknown,
+            "provenance": unknown,
+            "rights_version_authorship": unknown,
+        },
+    }
+
+
+def _validation_error_text(exc: DoubaoResponseError | ValidationError) -> str:
+    if isinstance(exc, ValidationError):
+        return json.dumps(exc.errors(include_url=False), ensure_ascii=False, default=str)
+    return str(exc)
 
 
 def _extract_message_content(payload: Mapping[str, Any]) -> str:

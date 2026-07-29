@@ -1,9 +1,12 @@
 import numpy as np
 import pytest
+from sklearn.metrics import adjusted_rand_score
 
 from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
+    HdbscanParameters,
     InsufficientDataError,
+    cluster_vectors,
     dataset_hash,
     dynamic_hdbscan_parameters,
     representative_indices,
@@ -36,6 +39,75 @@ def test_representative_indices_excludes_noise() -> None:
 
     assert set(representatives) == {0}
     assert representatives[0][0] in {0, 1}
+
+
+def test_cluster_vectors_adapts_parameters_to_data_density() -> None:
+    rng = np.random.default_rng(3)
+    sample_count = 300
+    cluster_count = 4
+    cluster_sizes = rng.multinomial(sample_count, [1 / cluster_count] * cluster_count)
+    centers = rng.normal(size=(cluster_count, 16))
+    centers *= 2.0 / np.linalg.norm(centers, axis=1, keepdims=True)
+    vectors = np.vstack(
+        [
+            centers[label]
+            + rng.normal(
+                scale=0.3 * (1 + label / (2 * cluster_count)),
+                size=(cluster_sizes[label], 16),
+            )
+            for label in range(cluster_count)
+        ]
+    ).astype(np.float32)
+    vectors = np.hstack(
+        [vectors, np.full((sample_count, 48), 0.15, dtype=np.float32)]
+    )
+    expected_labels = np.concatenate(
+        [np.full(cluster_sizes[label], label) for label in range(cluster_count)]
+    )
+
+    fixed = cluster_vectors(
+        vectors,
+        parameters=HdbscanParameters(min_cluster_size=10, min_samples=5),
+    )
+    adaptive = cluster_vectors(vectors, optimize_parameters=True)
+
+    assert adaptive.parameter_candidates_evaluated > 1
+    assert adaptive.cluster_count == cluster_count
+    assert adjusted_rand_score(expected_labels, adaptive.labels) > (
+        adjusted_rand_score(expected_labels, fixed.labels) + 0.15
+    )
+
+
+def test_cluster_vectors_renormalizes_after_pca() -> None:
+    vectors = np.random.default_rng(7).normal(size=(30, 80)).astype(np.float32)
+
+    result = cluster_vectors(
+        vectors,
+        pca_dimension=12,
+        parameters=HdbscanParameters(min_cluster_size=3, min_samples=2),
+    )
+
+    projected_norms = np.linalg.norm(result.transformed_vectors, axis=1)
+    assert np.allclose(projected_norms, 1.0, atol=1e-6)
+
+
+def test_cluster_vectors_uses_one_parameter_set_by_default() -> None:
+    vectors = np.random.default_rng(9).normal(size=(30, 16)).astype(np.float32)
+
+    result = cluster_vectors(vectors)
+
+    assert result.parameter_candidates_evaluated == 1
+    assert result.parameters == dynamic_hdbscan_parameters(len(vectors))
+
+
+def test_cluster_vectors_rejects_weak_clusters_in_unstructured_data() -> None:
+    vectors = np.random.default_rng(0).normal(size=(300, 64)).astype(np.float32)
+
+    result = cluster_vectors(vectors, optimize_parameters=True)
+
+    assert result.cluster_count == 0
+    assert result.noise_count == len(vectors)
+    assert np.all(result.probabilities == 0.0)
 
 
 def test_select_cluster_representatives_uses_actual_medoid_and_source_cap() -> None:

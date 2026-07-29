@@ -44,7 +44,18 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
         assert result.succeeded_count == 3
         assert result.failed_count == 1
         assert result.asset_count == 3
+        assert result.skipped_count == 0
         assert result.errors[0]["relative_path"] == "broken.png"
+
+        repeated = await PipelineRunner(
+            database=database,
+            token_counter=CharacterTokenCounter(),
+        ).run(tmp_path, workspace_id)
+
+        assert repeated.succeeded_count == 3
+        assert repeated.failed_count == 1
+        assert repeated.skipped_count == 3
+        assert repeated.asset_count == 3
 
         async with database.session() as session:
             job = await session.get(ProcessingJob, result.job_id)
@@ -69,6 +80,15 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
             assert job.failed_count == 1
             assert asset_count == 3
             assert source_count == 4
+            assert all(
+                source.processing_status == "completed"
+                for source in await session.scalars(
+                    select(SourceFile).where(
+                        SourceFile.workspace_id == workspace_id,
+                        SourceFile.relative_path != "broken.png",
+                    )
+                )
+            )
             assert [asset.file_name for asset in assets] == ["notes.md", "notes.txt", "valid.png"]
             assert assets[0].raw_content == "# Capsule\n\n正文"
             assert assets[1].raw_content == "普通文本\n\n第二段"

@@ -136,9 +136,45 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "workspace_id": "workspace_api_test",
             "embedding_type": EmbeddingType.NATIVE_MULTIMODAL,
             "cluster_run_id": "run_api_test",
+            "optimize_parameters": False,
         }
     ]
     assert polled.json()["status"] == "completed"
     assert capsules.json()["items"][0]["medoid_asset_id"] == "asset_medoid"
     assert patched.json()["effective_name"] == "人工名称"
     assert patched.json()["effective_description"] == "人工说明"
+
+
+@pytest.mark.asyncio
+async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
+    repository = FakeClusterRepository()
+    service = FakeClusterService(repository)
+    app = create_app(
+        settings=Settings(),
+        cluster_service=service,  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/cluster-runs",
+                json={
+                    "workspace_id": "workspace_api_test",
+                    "embedding_type": "visual_style",
+                    "optimize_parameters": True,
+                },
+            )
+
+    assert response.status_code == 202
+    assert service.calls == [
+        {
+            "workspace_id": "workspace_api_test",
+            "embedding_type": EmbeddingType.VISUAL_STYLE,
+            "cluster_run_id": "run_api_test",
+            "optimize_parameters": True,
+        }
+    ]

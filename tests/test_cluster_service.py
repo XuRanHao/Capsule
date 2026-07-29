@@ -122,6 +122,7 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     visual_result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=EmbeddingType.VISUAL_STYLE,
+        optimize_parameters=True,
     )
 
     assert native_result.embedding_type == EmbeddingType.NATIVE_MULTIMODAL
@@ -133,6 +134,17 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
         "native_multimodal",
         "visual_style",
     }
+    runs_by_type = {run["embedding_type"]: run for run in repository.runs.values()}
+    assert (
+        runs_by_type["native_multimodal"]["preprocessing"]["parameter_selection"]
+        == "size_based_default"
+    )
+    assert runs_by_type["native_multimodal"]["parameters"]["candidates_evaluated"] == 1
+    assert (
+        runs_by_type["visual_style"]["preprocessing"]["parameter_selection"]
+        == "adaptive_dbcv_silhouette"
+    )
+    assert runs_by_type["visual_style"]["parameters"]["candidates_evaluated"] > 1
     assert all(len(memberships) == 20 for memberships in repository.memberships.values())
     assert {capsule.embedding_type for capsule in repository.capsules} == {
         "native_multimodal",

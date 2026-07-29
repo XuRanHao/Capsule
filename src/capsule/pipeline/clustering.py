@@ -6,6 +6,10 @@ import hdbscan
 import numpy as np
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+
+_MIN_ACCEPTABLE_CLUSTER_QUALITY = 0.05
+_SILHOUETTE_SAMPLE_SIZE = 2_000
 
 
 class InsufficientDataError(ValueError):
@@ -26,6 +30,8 @@ class ClusterResult:
     transformed_vectors: NDArray[np.float32]
     pca_dimension: int
     parameters: HdbscanParameters
+    quality_score: float
+    parameter_candidates_evaluated: int
 
     @property
     def cluster_count(self) -> int:
@@ -83,11 +89,14 @@ def cluster_vectors(
     *,
     pca_dimension: int | None = 64,
     parameters: HdbscanParameters | None = None,
+    optimize_parameters: bool = False,
 ) -> ClusterResult:
     if vectors.ndim != 2:
         raise ValueError("vectors must be a two-dimensional matrix")
+    if parameters is not None and optimize_parameters:
+        raise ValueError("explicit parameters cannot be combined with parameter optimization")
     sample_count, original_dimension = vectors.shape
-    parameters = parameters or dynamic_hdbscan_parameters(sample_count)
+    base_parameters = parameters or dynamic_hdbscan_parameters(sample_count)
 
     normalized = _l2_normalize(vectors)
     target_dimension = min(
@@ -103,23 +112,140 @@ def cluster_vectors(
     else:
         transformed = normalized
 
-    transformed = np.asarray(transformed, dtype=np.float32)
+    # PCA centers the vectors and truncation changes their lengths. Normalize
+    # again so Euclidean distance continues to represent angular similarity.
+    transformed = _l2_normalize_projection(
+        np.asarray(transformed, dtype=np.float32),
+    )
+
+    parameter_candidates = (
+        _hdbscan_parameter_candidates(sample_count, base_parameters)
+        if optimize_parameters
+        else [base_parameters]
+    )
+    best = max(
+        (
+            _fit_candidate(transformed, candidate)
+            for candidate in parameter_candidates
+        ),
+        key=lambda candidate: candidate.quality_score,
+    )
+
+    # Density clustering can always carve a few tiny groups out of unstructured
+    # data. Reject weak adaptive results rather than presenting those groups as
+    # meaningful Capsules. An explicitly supplied configuration remains exact.
+    if optimize_parameters and best.quality_score < _MIN_ACCEPTABLE_CLUSTER_QUALITY:
+        labels = np.full(sample_count, -1, dtype=np.int_)
+        probabilities = np.zeros(sample_count, dtype=np.float64)
+    else:
+        labels = best.labels
+        probabilities = best.probabilities
+
+    return ClusterResult(
+        labels=np.asarray(labels, dtype=np.int_),
+        probabilities=np.asarray(probabilities, dtype=np.float64),
+        transformed_vectors=transformed,
+        pca_dimension=target_dimension,
+        parameters=best.parameters,
+        quality_score=best.quality_score,
+        parameter_candidates_evaluated=len(parameter_candidates),
+    )
+
+
+@dataclass(slots=True)
+class _CandidateResult:
+    labels: NDArray[np.int_]
+    probabilities: NDArray[np.float64]
+    parameters: HdbscanParameters
+    quality_score: float
+
+
+def _hdbscan_parameter_candidates(
+    sample_count: int,
+    base: HdbscanParameters,
+) -> list[HdbscanParameters]:
+    """Return a small deterministic search space around the size-based default."""
+    cluster_sizes = {
+        max(3, base.min_cluster_size // 2),
+        base.min_cluster_size,
+        min(max(3, sample_count // 4), base.min_cluster_size * 2),
+    }
+    candidates = [base]
+    for cluster_size in sorted(cluster_sizes):
+        min_samples_values = {
+            1,
+            min(base.min_samples, cluster_size),
+            max(1, cluster_size // 2),
+        }
+        for min_samples in sorted(min_samples_values):
+            candidate = HdbscanParameters(
+                min_cluster_size=cluster_size,
+                min_samples=min_samples,
+                cluster_selection_method=base.cluster_selection_method,
+            )
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _fit_candidate(
+    vectors: NDArray[np.float32],
+    parameters: HdbscanParameters,
+) -> _CandidateResult:
     model = hdbscan.HDBSCAN(
         min_cluster_size=parameters.min_cluster_size,
         min_samples=parameters.min_samples,
         metric="euclidean",
         cluster_selection_method=parameters.cluster_selection_method,
         allow_single_cluster=False,
-        prediction_data=True,
+        gen_min_span_tree=True,
     )
-    labels = model.fit_predict(transformed)
-    return ClusterResult(
-        labels=np.asarray(labels, dtype=np.int_),
+    labels = np.asarray(model.fit_predict(vectors), dtype=np.int_)
+    return _CandidateResult(
+        labels=labels,
         probabilities=np.asarray(model.probabilities_, dtype=np.float64),
-        transformed_vectors=transformed,
-        pca_dimension=target_dimension,
         parameters=parameters,
+        quality_score=_clustering_quality(vectors, labels, model, parameters),
     )
+
+
+def _clustering_quality(
+    vectors: NDArray[np.float32],
+    labels: NDArray[np.int_],
+    model: hdbscan.HDBSCAN,
+    parameters: HdbscanParameters,
+) -> float:
+    """Score separation, coverage, and resistance to tiny-cluster fragmentation."""
+    cluster_labels = set(labels.tolist()) - {-1}
+    clustered_mask = labels != -1
+    clustered_count = int(np.count_nonzero(clustered_mask))
+    if len(cluster_labels) < 2 or clustered_count <= len(cluster_labels):
+        return -1.0
+
+    try:
+        relative_validity = float(model.relative_validity_)
+        silhouette = float(
+            silhouette_score(
+                vectors[clustered_mask],
+                labels[clustered_mask],
+                sample_size=min(_SILHOUETTE_SAMPLE_SIZE, clustered_count),
+                random_state=0,
+            )
+        )
+    except (AttributeError, ValueError):
+        return -1.0
+    coverage = clustered_count / len(labels)
+    fragmentation = min(
+        1.0,
+        len(cluster_labels) * parameters.min_cluster_size / clustered_count,
+    )
+    quality = (
+        0.65 * relative_validity
+        + 0.35 * silhouette
+        - 0.15 * max(0.0, 0.5 - coverage)
+        - 0.10 * fragmentation
+    )
+    return quality if np.isfinite(quality) else -1.0
 
 
 def representative_indices(
@@ -277,3 +403,12 @@ def _l2_normalize(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
     if np.any(norms == 0):
         raise ValueError("vectors contain an all-zero row")
     return np.asarray(vectors / norms, dtype=np.float32)
+
+
+def _l2_normalize_projection(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Normalize projected rows while allowing a point exactly at the PCA origin."""
+    if not np.isfinite(vectors).all():
+        raise ValueError("PCA projection contains NaN or infinity")
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    safe_norms = np.where(norms > np.finfo(np.float32).eps, norms, 1.0)
+    return np.asarray(vectors / safe_norms, dtype=np.float32)

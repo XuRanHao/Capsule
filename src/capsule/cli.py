@@ -188,6 +188,13 @@ def cluster_command(
             help="Embedding Type to cluster; each invocation runs exactly one Type.",
         ),
     ] = EmbeddingType.NATIVE_MULTIMODAL,
+    optimize_parameters: Annotated[
+        bool,
+        typer.Option(
+            "--optimize-parameters/--no-optimize-parameters",
+            help="Evaluate multiple HDBSCAN parameter candidates; disabled by default.",
+        ),
+    ] = False,
 ) -> None:
     """Cluster one Embedding Type into its own PCA, HDBSCAN, and ClusterRun."""
     settings = get_settings()
@@ -199,6 +206,7 @@ def cluster_command(
         _cluster_assets(
             workspace_id=workspace,
             embedding_type=embedding_type,
+            optimize_parameters=optimize_parameters,
         )
     )
     typer.echo(result.model_dump_json(indent=2))
@@ -286,6 +294,7 @@ async def _cluster_assets(
     *,
     workspace_id: str,
     embedding_type: EmbeddingType,
+    optimize_parameters: bool = False,
 ) -> EmbeddingTypeClusterResult:
     settings = get_settings()
     database = Database(settings)
@@ -301,6 +310,7 @@ async def _cluster_assets(
             return await service.run(
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
+                optimize_parameters=optimize_parameters,
             )
     finally:
         await database.dispose()

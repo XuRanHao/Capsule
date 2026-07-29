@@ -97,12 +97,14 @@ class ClusterService:
         workspace_id: str,
         embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL,
         cluster_run_id: str | None = None,
+        optimize_parameters: bool = False,
     ) -> EmbeddingTypeClusterResult:
         """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
         return await self._run_embedding_type(
             workspace_id=workspace_id,
             embedding_type=embedding_type,
             cluster_run_id=cluster_run_id,
+            optimize_parameters=optimize_parameters,
         )
 
     async def _run_embedding_type(
@@ -111,6 +113,7 @@ class ClusterService:
         workspace_id: str,
         embedding_type: EmbeddingType,
         cluster_run_id: str | None,
+        optimize_parameters: bool,
     ) -> EmbeddingTypeClusterResult:
         assets: list[ClusterEmbeddingAsset] = []
         loaded: list[_LoadedClusterVector] = []
@@ -127,6 +130,12 @@ class ClusterService:
             preprocessing = {
                 "normalization": "l2",
                 "pca_max_dimension": 64,
+                "post_pca_normalization": "l2",
+                "parameter_selection": (
+                    "adaptive_dbcv_silhouette"
+                    if optimize_parameters
+                    else "size_based_default"
+                ),
                 "indexed_asset_count": len(assets),
                 "missing_vector_count": len(assets) - len(loaded),
             }
@@ -173,7 +182,7 @@ class ClusterService:
         assert run_id is not None
 
         try:
-            parameters = dynamic_hdbscan_parameters(len(loaded))
+            dynamic_hdbscan_parameters(len(loaded))
         except InsufficientDataError:
             await self._cluster_repository.complete_run(
                 cluster_run_id=run_id,
@@ -197,7 +206,7 @@ class ClusterService:
             clustered = cluster_vectors(
                 matrix,
                 pca_dimension=64,
-                parameters=parameters,
+                optimize_parameters=optimize_parameters,
             )
             candidates = [
                 ClusterMemberCandidate(
@@ -246,6 +255,8 @@ class ClusterService:
                     "min_cluster_size": clustered.parameters.min_cluster_size,
                     "min_samples": clustered.parameters.min_samples,
                     "cluster_selection_method": clustered.parameters.cluster_selection_method,
+                    "quality_score": clustered.quality_score,
+                    "candidates_evaluated": clustered.parameter_candidates_evaluated,
                 },
             )
             return EmbeddingTypeClusterResult(

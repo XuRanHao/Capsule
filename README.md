@@ -89,6 +89,12 @@ MinIO/S3. A failed file is recorded without aborting the batch. Use the `embed`
 CLI command after import to write `EmbeddingRecord` metadata and vectors to
 Milvus.
 
+Repeated imports reuse a completed source when its workspace-relative path,
+SHA-256 digest, and assetization fingerprint are unchanged. The fingerprint
+includes parser configuration that affects generated Assets. Increment
+`CAPSULE_ASSETIZATION_VERSION` after changing parser behavior or media output
+semantics so unchanged source bytes are processed once with the new logic.
+
 To reset persisted PostgreSQL/Milvus/MinIO data, use
 `docker compose down -v` deliberately; `make down` preserves it.
 

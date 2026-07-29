@@ -1,8 +1,11 @@
 """Top-level file discovery, assetization, and PostgreSQL persistence."""
 
 import asyncio
+import hashlib
+import json
 import mimetypes
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -40,7 +43,17 @@ class PipelineRunResult(BaseModel):
     failed_count: int
     asset_count: int
     asset_ids: list[str] = Field(default_factory=list)
+    skipped_count: int = 0
     errors: list[dict[str, str]] = Field(default_factory=list)
+
+
+@dataclass(slots=True, frozen=True)
+class _FileOutcome:
+    succeeded: bool
+    asset_count: int = 0
+    asset_ids: list[str] = field(default_factory=list)
+    skipped: bool = False
+    error: dict[str, str] | None = None
 
 
 class PipelineRunner:
@@ -95,71 +108,45 @@ class PipelineRunner:
         factory = AssetFactory()
         assetizer = _build_assetizer(counter, self._settings, self._video_embedder)
         object_storage = self._object_storage
+        media_writer: VideoDerivedMediaWriter | None = None
+        if any(item.extension in {".mp4", ".mov"} for item in source_files):
+            object_storage = object_storage or ObjectStorage(self._settings)
+            media_writer = VideoDerivedMediaWriter(
+                object_storage,
+                concurrency=self._settings.ffmpeg_concurrency,
+            )
         if job_id is None:
             job_id = await repository.create_job(
                 workspace_id=workspace_id,
                 input_path=input_path,
                 total_count=len(source_files),
             )
-        succeeded = 0
-        failed = 0
-        asset_count = 0
-        asset_ids: list[str] = []
-        errors: list[dict[str, str]] = []
         try:
-            for source_file in source_files:
-                source_file_id: str | None = None
-                try:
-                    digest = await asyncio.to_thread(sha256_file, Path(source_file.path))
-                    source_file_id = await repository.get_or_create_source_file(
-                        workspace_id=workspace_id,
-                        source_file=source_file,
-                        sha256=digest,
-                        mime_type=_mime_type(source_file),
-                    )
-                    result = await assetizer.assetize(source_file)
-                    if not result.succeeded:
-                        raise ValueError(result.error_message or "assetization failed")
-                    assets = factory.build_many(
-                        workspace_id=workspace_id,
-                        source_file_id=source_file_id,
-                        source_sha256=digest,
-                        source_file=source_file,
-                        drafts=result.assets,
-                    )
-                    if any(asset.asset_type.value == "video_segment" for asset in assets):
-                        object_storage = object_storage or ObjectStorage(self._settings)
-                        assets = await VideoDerivedMediaWriter(object_storage).persist(
-                            source_file=source_file,
-                            assets=assets,
-                        )
-                    stored = await repository.replace_assets(
-                        source_file_id=source_file_id,
-                        assets=assets,
-                    )
-                    await repository.record_file_success(job_id=job_id)
-                    succeeded += 1
-                    asset_count += len(stored.asset_ids)
-                    asset_ids.extend(stored.asset_ids)
-                except Exception as exc:
-                    message = str(exc) or type(exc).__name__
-                    await repository.record_file_failure(
-                        job_id=job_id,
-                        source_file_id=source_file_id,
-                        relative_path=source_file.relative_path,
-                        error=message,
-                    )
-                    errors.append({"relative_path": source_file.relative_path, "error": message})
-                    failed += 1
+            outcomes = await self._process_files(
+                source_files=source_files,
+                workspace_id=workspace_id,
+                job_id=job_id,
+                repository=repository,
+                factory=factory,
+                assetizer=assetizer,
+                media_writer=media_writer,
+            )
             await repository.finalize_job(job_id=job_id)
+            errors = [outcome.error for outcome in outcomes if outcome.error is not None]
+            asset_ids = [
+                asset_id
+                for outcome in outcomes
+                for asset_id in outcome.asset_ids
+            ]
             return PipelineRunResult(
                 job_id=job_id,
                 workspace_id=workspace_id,
                 file_count=len(source_files),
-                succeeded_count=succeeded,
-                failed_count=failed,
-                asset_count=asset_count,
+                succeeded_count=sum(outcome.succeeded for outcome in outcomes),
+                failed_count=sum(not outcome.succeeded for outcome in outcomes),
+                asset_count=sum(outcome.asset_count for outcome in outcomes),
                 asset_ids=asset_ids,
+                skipped_count=sum(outcome.skipped for outcome in outcomes),
                 errors=errors,
             )
         finally:
@@ -167,6 +154,120 @@ class PipelineRunner:
                 await counter.close()
             if owns_database:
                 await database.dispose()
+
+    async def _process_files(
+        self,
+        *,
+        source_files: list[DiscoveredFile],
+        workspace_id: str,
+        job_id: str,
+        repository: AssetRepository,
+        factory: AssetFactory,
+        assetizer: Assetizer,
+        media_writer: VideoDerivedMediaWriter | None,
+    ) -> list[_FileOutcome]:
+        """Process files with a fixed worker count and deterministic result ordering."""
+        if not source_files:
+            return []
+
+        outcomes: list[_FileOutcome | None] = [None] * len(source_files)
+        next_index = 0
+
+        async def worker() -> None:
+            nonlocal next_index
+            while next_index < len(source_files):
+                index = next_index
+                next_index += 1
+                outcomes[index] = await self._process_file(
+                    source_file=source_files[index],
+                    workspace_id=workspace_id,
+                    job_id=job_id,
+                    repository=repository,
+                    factory=factory,
+                    assetizer=assetizer,
+                    media_writer=media_writer,
+                )
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(self._settings.file_parse_concurrency, len(source_files)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        if any(outcome is None for outcome in outcomes):
+            raise RuntimeError("file processing ended before all files completed")
+        return [outcome for outcome in outcomes if outcome is not None]
+
+    async def _process_file(
+        self,
+        *,
+        source_file: DiscoveredFile,
+        workspace_id: str,
+        job_id: str,
+        repository: AssetRepository,
+        factory: AssetFactory,
+        assetizer: Assetizer,
+        media_writer: VideoDerivedMediaWriter | None,
+    ) -> _FileOutcome:
+        source_file_id: str | None = None
+        try:
+            digest = await asyncio.to_thread(sha256_file, Path(source_file.path))
+            prepared = await repository.prepare_source_file(
+                workspace_id=workspace_id,
+                source_file=source_file,
+                sha256=digest,
+                mime_type=_mime_type(source_file),
+                processing_fingerprint=_processing_fingerprint(source_file, self._settings),
+            )
+            source_file_id = prepared.source_file_id
+            if prepared.already_processed:
+                await repository.record_file_success(job_id=job_id)
+                return _FileOutcome(
+                    succeeded=True,
+                    asset_count=prepared.asset_count,
+                    skipped=True,
+                )
+            result = await assetizer.assetize(source_file)
+            if not result.succeeded:
+                raise ValueError(result.error_message or "assetization failed")
+            assets = factory.build_many(
+                workspace_id=workspace_id,
+                source_file_id=source_file_id,
+                source_sha256=digest,
+                source_file=source_file,
+                drafts=result.assets,
+            )
+            if any(asset.asset_type.value == "video_segment" for asset in assets):
+                if media_writer is None:
+                    raise RuntimeError("video media writer is unavailable")
+                assets = await media_writer.persist(source_file=source_file, assets=assets)
+            stored = await repository.replace_assets(
+                source_file_id=source_file_id,
+                assets=assets,
+            )
+            await repository.record_file_success(job_id=job_id)
+            return _FileOutcome(
+                succeeded=True,
+                asset_count=len(stored.asset_ids),
+                asset_ids=stored.asset_ids,
+            )
+        except Exception as exc:
+            message = str(exc) or type(exc).__name__
+            await repository.record_file_failure(
+                job_id=job_id,
+                source_file_id=source_file_id,
+                relative_path=source_file.relative_path,
+                error=message,
+            )
+            return _FileOutcome(
+                succeeded=False,
+                error={"relative_path": source_file.relative_path, "error": message},
+            )
 
 
 def _build_assetizer(
@@ -228,3 +329,25 @@ def _build_assetizer(
 def _mime_type(source_file: DiscoveredFile) -> str:
     guessed, _ = mimetypes.guess_type(source_file.path)
     return guessed or "application/octet-stream"
+
+
+def _processing_fingerprint(source_file: DiscoveredFile, settings: Settings) -> str:
+    payload: dict[str, object] = {
+        "version": settings.assetization_version,
+        "extension": source_file.extension,
+    }
+    if source_file.extension in {".md", ".txt"}:
+        payload["document_chunk_max_tokens"] = settings.document_chunk_max_tokens
+    elif source_file.extension in {".mp4", ".mov"}:
+        payload["video"] = {
+            "scene_threshold": settings.video_scene_threshold,
+            "min_scene_seconds": settings.video_min_scene_seconds,
+            "max_shot_seconds": settings.video_max_shot_seconds,
+            "window_seconds": settings.video_window_seconds,
+            "sample_interval_seconds": settings.video_sample_interval_seconds,
+            "max_candidate_frames": settings.video_max_candidate_frames,
+            "max_representative_frames": settings.video_max_representative_frames,
+            "mobileclip_model_path": settings.mobileclip_model_path,
+        }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

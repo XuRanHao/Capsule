@@ -191,19 +191,7 @@ class AssetFeatures(BaseModel):
     @classmethod
     def fill_omitted_model_fields(cls, value: Any) -> Any:
         if isinstance(value, list):
-            normalized_items: dict[str, Any] = {}
-            for item in value:
-                if not isinstance(item, dict):
-                    continue
-                field_name = item.get("feature_name") or item.get("name")
-                if not isinstance(field_name, str):
-                    continue
-                normalized_items[field_name] = {
-                    key: item_value
-                    for key, item_value in item.items()
-                    if key not in {"feature_name", "name"}
-                }
-            value = normalized_items
+            raise ValueError("features must be an object, not a list")
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
