@@ -3099,6 +3099,87 @@ blockquote p {
   transform: translate(-50%, -50%) scale(1.5);
 }
 
+.cluster-bubble-map {
+  overflow: hidden;
+  min-height: 400px;
+}
+
+.cluster-bubble-group {
+  position: absolute;
+  min-width: 112px;
+  min-height: 112px;
+  overflow: hidden;
+  padding: 18px;
+  border: 2px solid;
+  border-radius: 50%;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  transition:
+    box-shadow 160ms ease,
+    filter 160ms ease,
+    transform 160ms ease;
+}
+
+.cluster-bubble-group:hover,
+.cluster-bubble-group.active {
+  z-index: 3;
+  filter: saturate(1.08);
+  transform: translate(-50%, -50%) scale(1.04);
+}
+
+.cluster-bubble-group.active {
+  box-shadow:
+    0 0 0 4px var(--card),
+    0 0 0 6px currentcolor,
+    0 14px 30px rgb(23 23 21 / 14%);
+}
+
+.cluster-bubble-group strong,
+.cluster-bubble-group small {
+  position: relative;
+  z-index: 2;
+  display: block;
+  pointer-events: none;
+}
+
+.cluster-bubble-group strong {
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cluster-bubble-group small {
+  margin-top: 4px;
+  color: var(--muted-ink);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7px;
+}
+
+.cluster-bubble-group > i {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--card);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgb(23 23 21 / 15%);
+  pointer-events: none;
+}
+
+.cluster-map-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted-ink);
+  font-size: 11px;
+  text-align: center;
+}
+
 .scatter-group-0 {
   background: var(--violet) !important;
 }

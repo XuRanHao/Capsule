@@ -329,9 +329,41 @@ const DEMO_RESPONSE: SearchResponse = {
   results: DEMO_RESULTS,
 };
 
-function getPreviewUrl(uri: string | null) {
-  if (!uri) return null;
-  return /^(https?:|data:image\/)/.test(uri) ? uri : null;
+const EMPTY_RESPONSE: SearchResponse = {
+  ...DEMO_RESPONSE,
+  query: {
+    query_type: "text",
+    query_text: null,
+    query_image_url: null,
+    query_image_upload_id: null,
+    precision_mode: true,
+  },
+  parsed_query: null,
+  fusion_method: "weighted_rrf",
+  rerank_method: "doubao_seed_2_lite",
+  search_engine_version: "search-v1",
+  execution_id: null,
+  capsule_id: null,
+  total: 0,
+  degraded: false,
+  degraded_reasons: [],
+  timings: { total_ms: 0 },
+  results: [],
+};
+
+function getPreviewUrl(
+  result: SearchResult,
+  apiBaseUrl: string,
+  workspaceId: string,
+) {
+  if (result.preview_uri && /^(https?:|data:image\/)/.test(result.preview_uri)) {
+    return result.preview_uri;
+  }
+  if (result.asset_type !== "image") return null;
+  const base = apiBaseUrl.replace(/\/$/, "");
+  return `${base}/api/v1/assets/${encodeURIComponent(
+    result.asset_id,
+  )}/preview?workspace_id=${encodeURIComponent(workspaceId)}`;
 }
 
 function locatorTime(locator: Record<string, unknown>) {
@@ -351,13 +383,17 @@ function SearchResultCard({
   result,
   index,
   fusionMethod,
+  apiBaseUrl,
+  workspaceId,
 }: {
   result: SearchResult;
   index: number;
   fusionMethod: FusionMethod;
+  apiBaseUrl: string;
+  workspaceId: string;
 }) {
   const [imageFailed, setImageFailed] = useState(false);
-  const previewUrl = getPreviewUrl(result.preview_uri);
+  const previewUrl = getPreviewUrl(result, apiBaseUrl, workspaceId);
   const startTime = locatorTime(result.source_locator);
   const context = result.source_contexts.find((item) => item.text)?.text;
   const foldedCount = result.folded_asset_ids?.length ?? 1;
@@ -510,8 +546,8 @@ export default function Home() {
   const [modelName, setModelName] = useState("");
   const [clusterCapsuleId, setClusterCapsuleId] = useState("");
   const [favoriteOnly, setFavoriteOnly] = useState(false);
-  const [response, setResponse] = useState<SearchResponse>(DEMO_RESPONSE);
-  const [viewMode, setViewMode] = useState<"demo" | "live">("demo");
+  const [response, setResponse] = useState<SearchResponse>(EMPTY_RESPONSE);
+  const [viewMode, setViewMode] = useState<"demo" | "live">("live");
   const [capsules, setCapsules] = useState<CapsuleSummary[]>([]);
   const [selectedCapsule, setSelectedCapsule] =
     useState<CapsuleDetail | null>(null);
@@ -947,12 +983,12 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => {
-                      setResponse(DEMO_RESPONSE);
-                      setViewMode("demo");
+                      setResponse(EMPTY_RESPONSE);
+                      setViewMode("live");
                       setError(null);
                     }}
                   >
-                    查看演示结果
+                    清空结果
                   </button>
                 </div>
               )}
@@ -1024,6 +1060,8 @@ export default function Home() {
                     result={result}
                     index={index}
                     fusionMethod={response.fusion_method}
+                    apiBaseUrl={apiBaseUrl}
+                    workspaceId={workspaceId}
                     key={result.asset_id}
                   />
                 ))}
@@ -1124,6 +1162,8 @@ export default function Home() {
                           result={result}
                           index={index}
                           fusionMethod={selectedCapsule.fusion_method}
+                          apiBaseUrl={apiBaseUrl}
+                          workspaceId={workspaceId}
                           key={`${selectedCapsule.capsule_id}-${result.asset_id}`}
                         />
                       ),

@@ -116,10 +116,21 @@ export default function DemoShell({
 
 export function StatusBadge({ status }: { status: string }) {
   const labels: Record<string, string> = {
+    queued: "排队中",
+    running: "运行中",
+    retrying: "重试中",
     completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+    insufficient_data: "数据不足",
     processing: "处理中",
     partial_failed: "部分失败",
     pending: "等待中",
+    asset_stored: "素材已入库",
+    understanding: "内容理解",
+    feature_ready: "特征已生成",
+    embedding: "向量生成",
+    indexing: "向量入库",
     indexed: "已入库",
     observed: "观察值",
     inferred: "模型推断",

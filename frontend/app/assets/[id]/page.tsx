@@ -2,105 +2,133 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import DemoShell, {
   AssetThumb,
   StatusBadge,
 } from "../../components/DemoShell";
-import { DEMO_ASSETS } from "../../lib/demo-data";
+import {
+  type AssetRecord,
+  WORKSPACE_ID,
+  apiFetch,
+} from "../../lib/api";
+
+const FEATURE_LABELS: Record<string, string> = {
+  subject_content: "主体内容",
+  scene_theme: "场景主题",
+  visual_style: "视觉风格",
+  color_composition: "色彩构图",
+  mood_atmosphere: "情绪氛围",
+  character_state_or_psychology: "人物状态",
+  asset_usage: "素材用途",
+  target_audience: "目标受众",
+  provenance: "来源",
+  rights_version_authorship: "版权版本",
+};
 
 export default function AssetDetailPage() {
   const pathname = usePathname();
   const assetId = pathname.split("/").filter(Boolean).at(-1);
-  const asset =
-    DEMO_ASSETS.find((item) => item.id === assetId) ?? DEMO_ASSETS[0];
-  const [editing, setEditing] = useState(false);
-  const [name, setName] = useState(asset.name);
-  const [description, setDescription] = useState(asset.description);
-  const [featureValues, setFeatureValues] = useState(
-    Object.fromEntries(asset.features.map((feature) => [feature.key, feature.value])),
-  );
-  const [reprocessing, setReprocessing] = useState(false);
-  const changed = useMemo(
-    () =>
-      name !== asset.name ||
-      description !== asset.description ||
-      asset.features.some(
-        (feature) => featureValues[feature.key] !== feature.value,
-      ),
-    [asset.description, asset.features, asset.name, description, featureValues, name],
-  );
+  const [asset, setAsset] = useState<AssetRecord | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const reprocess = () => {
-    setReprocessing(true);
-    window.setTimeout(() => setReprocessing(false), 1100);
-  };
+  useEffect(() => {
+    if (!assetId) return;
+    void apiFetch<AssetRecord>(
+      `/api/v1/assets/${encodeURIComponent(assetId)}?workspace_id=${WORKSPACE_ID}`,
+    )
+      .then(setAsset)
+      .catch((requestError: unknown) =>
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "Asset 加载失败",
+        ),
+      );
+  }, [assetId]);
+
+  if (!asset) {
+    return (
+      <DemoShell
+        active="assets"
+        eyebrow="ASSET DETAIL / LIVE"
+        title={error ? "无法打开 Asset" : "正在读取 Asset…"}
+        description={error || assetId || ""}
+        actions={
+          <Link className="secondary-action button-link" href="/assets">
+            ← 返回列表
+          </Link>
+        }
+      >
+        <div className="asset-empty">
+          <strong>{error || "正在读取 PostgreSQL 中的真实记录"}</strong>
+        </div>
+      </DemoShell>
+    );
+  }
+
+  const features = Object.entries(asset.asset_features).map(([key, raw]) => {
+    const feature =
+      typeof raw === "string"
+        ? { value: raw, status: "observed", confidence: 1, evidence: [] }
+        : raw;
+    return {
+      key,
+      label: FEATURE_LABELS[key] || key,
+      value: feature.value || "暂无",
+      status: feature.status || "unknown",
+      confidence: feature.confidence ?? 0,
+      evidence: feature.evidence || [],
+    };
+  });
+  const locator = Object.entries(asset.source_locator)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" · ");
+  const context = asset.source_contexts
+    .map((item) => item.text)
+    .filter(Boolean)
+    .join("\n");
 
   return (
     <DemoShell
       active="assets"
-      eyebrow="ASSET DETAIL / 44.4"
-      title={asset.name}
-      description={`${asset.id} · ${asset.locator}`}
+      eyebrow="ASSET DETAIL / LIVE"
+      title={asset.asset_name || asset.file_name}
+      description={`${asset.asset_id} · ${locator || "whole_file"}`}
       actions={
-        <>
-          <Link className="secondary-action button-link" href="/assets">
-            ← 返回列表
-          </Link>
-          <button
-            className="secondary-action"
-            disabled={reprocessing}
-            onClick={reprocess}
-          >
-            {reprocessing ? "已加入队列…" : "重新处理"}
-          </button>
-          <button
-            className="primary-action"
-            onClick={() => setEditing((current) => !current)}
-          >
-            {editing ? "完成编辑" : "手动修改"}
-          </button>
-        </>
+        <Link className="secondary-action button-link" href="/assets">
+          ← 返回列表
+        </Link>
       }
     >
       <div className="asset-detail-hero">
         <div className="asset-detail-preview">
           <AssetThumb
-            preview={asset.preview}
-            name={asset.name}
-            type={asset.type}
+            preview={asset.preview_url}
+            name={asset.asset_name || asset.file_name}
+            type={asset.asset_type}
           />
           <div className="preview-meta">
-            <StatusBadge status={asset.status} />
-            <span>{asset.locator}</span>
+            <StatusBadge status={asset.processing_status} />
+            <span>{asset.file_info.width ? `${asset.file_info.width} × ${asset.file_info.height}` : asset.file_type}</span>
           </div>
         </div>
         <section className="asset-core-info">
           <span className="eyebrow">SEMANTIC IDENTITY</span>
           <label>
             Asset Name
-            {editing ? (
-              <input value={name} onChange={(event) => setName(event.target.value)} />
-            ) : (
-              <strong>{name}</strong>
-            )}
+            <strong>{asset.asset_name || asset.file_name}</strong>
           </label>
           <label>
             Asset Description
-            {editing ? (
-              <textarea
-                value={description}
-                onChange={(event) => setDescription(event.target.value)}
-                rows={5}
-              />
-            ) : (
-              <p>{description}</p>
-            )}
+            <p>
+              {asset.asset_description ||
+                "语义理解尚未完成；原始文件已经可用并可在列表中预览。"}
+            </p>
           </label>
-          {changed && (
+          {asset.error_message && (
             <div className="unsaved-banner">
-              <span>有未保存的人工修改</span>
-              <button onClick={() => setEditing(false)}>保存并更新向量</button>
+              <span>{asset.error_message}</span>
             </div>
           )}
         </section>
@@ -115,25 +143,27 @@ export default function AssetDetailPage() {
           <dl>
             <div>
               <dt>Source File</dt>
-              <dd>{asset.sourceFile}</dd>
+              <dd>{asset.source_file.original_file_name}</dd>
             </div>
             <div>
               <dt>相对路径</dt>
-              <dd>{asset.sourcePath}</dd>
+              <dd>{asset.source_file.relative_path}</dd>
+            </div>
+            <div>
+              <dt>文件大小</dt>
+              <dd>{(asset.source_file.file_size_bytes / 1024).toFixed(1)} KB</dd>
             </div>
             <div>
               <dt>原始位置</dt>
-              <dd>{asset.locator}</dd>
-            </div>
-            <div>
-              <dt>所属 Cluster</dt>
-              <dd>{asset.cluster ?? "尚未聚类"}</dd>
+              <dd>{locator || "whole_file"}</dd>
             </div>
           </dl>
-          <blockquote>
-            <span>关联段落</span>
-            <p>{asset.sourceContext}</p>
-          </blockquote>
+          {context && (
+            <blockquote>
+              <span>关联段落</span>
+              <p>{context}</p>
+            </blockquote>
+          )}
         </section>
 
         <section className="embedding-inspector">
@@ -142,15 +172,22 @@ export default function AssetDetailPage() {
             <h2>向量状态</h2>
           </header>
           {asset.embeddings.map((embedding) => (
-            <div key={embedding.type}>
+            <div key={embedding.embedding_type}>
               <span>
                 <i className={`embedding-dot ${embedding.status}`} />
-                {embedding.type}
+                {embedding.embedding_type}
               </span>
               <StatusBadge status={embedding.status} />
-              <small>REV {embedding.revision}</small>
+              <small>{embedding.model_name}</small>
             </div>
           ))}
+          {!asset.embeddings.length && (
+            <div>
+              <span>尚无 Embedding</span>
+              <StatusBadge status="pending" />
+              <small>REV {asset.embedding_revision}</small>
+            </div>
+          )}
         </section>
       </div>
 
@@ -160,7 +197,7 @@ export default function AssetDetailPage() {
             <span className="eyebrow">ASSET FEATURES</span>
             <h2>多维语义特征</h2>
           </div>
-          <span>{asset.features.length} / 10 DIMENSIONS</span>
+          <span>{features.length} / 10 DIMENSIONS</span>
         </header>
         <div className="feature-table">
           <div className="feature-row feature-head">
@@ -170,22 +207,10 @@ export default function AssetDetailPage() {
             <span>Confidence</span>
             <span>Evidence</span>
           </div>
-          {asset.features.map((feature) => (
+          {features.map((feature) => (
             <div className="feature-row" key={feature.key}>
               <strong>{feature.label}</strong>
-              {editing ? (
-                <textarea
-                  value={featureValues[feature.key]}
-                  onChange={(event) =>
-                    setFeatureValues((current) => ({
-                      ...current,
-                      [feature.key]: event.target.value,
-                    }))
-                  }
-                />
-              ) : (
-                <span>{featureValues[feature.key]}</span>
-              )}
+              <span>{feature.value}</span>
               <StatusBadge status={feature.status} />
               <span className="confidence-cell">
                 <i style={{ width: `${feature.confidence * 100}%` }} />
@@ -201,6 +226,12 @@ export default function AssetDetailPage() {
               </details>
             </div>
           ))}
+          {!features.length && (
+            <div className="asset-empty">
+              <strong>语义理解正在排队</strong>
+              <span>完成后这里会显示 10 个真实 Feature。</span>
+            </div>
+          )}
         </div>
       </section>
     </DemoShell>

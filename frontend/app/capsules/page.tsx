@@ -1,161 +1,189 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import DemoShell, { AssetThumb } from "../components/DemoShell";
-import { DEMO_ASSETS, DEMO_CLUSTERS } from "../lib/demo-data";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import DemoShell, { AssetThumb, StatusBadge } from "../components/DemoShell";
+import {
+  type AssetRecord,
+  type ClusterCapsule,
+  type ClusterRun,
+  type SearchCapsule,
+  CREATED_BY,
+  WORKSPACE_ID,
+  apiFetch,
+  loadAssets,
+} from "../lib/api";
 
 type CapsuleKind = "cluster" | "search";
-type CapsuleFilter = "all" | "recent" | "favorite";
+type CapsuleFilter = "all" | "favorite";
 
-type CapsuleRecord = {
-  id: string;
-  kind: CapsuleKind;
-  name: string;
-  summary: string;
-  queryType?: string;
-  query?: string;
-  members: number;
-  favorite: boolean;
-  usedAt: string;
-  timestamp: number;
-  assetIds: string[];
-  executions?: number;
-};
-
-const SEARCH_CAPSULES: CapsuleRecord[] = [
-  {
-    id: "search_capsule_twilight",
-    kind: "search",
-    name: "蓝紫色黄昏动画场景",
-    summary: "文本精搜 · 6 路召回 · Weighted RRF · Seed 重排",
-    queryType: "text",
-    query: "蓝紫色黄昏动画场景，安静，有人物但不要文字水印",
-    members: 20,
-    favorite: true,
-    usedAt: "刚刚",
-    timestamp: 100,
-    assetIds: ["asset_twilight_01", "asset_field_02", "asset_city_03"],
-    executions: 4,
-  },
-  {
-    id: "search_capsule_city",
-    kind: "search",
-    name: "城市边缘的小人物",
-    summary: "图文精搜 · 保持构图 · 修改情绪",
-    queryType: "image_text",
-    query: "保持大面积天空和人物比例，更像蓝调时刻，排除高饱和霓虹",
-    members: 16,
-    favorite: false,
-    usedAt: "今天 14:22",
-    timestamp: 94,
-    assetIds: ["asset_city_03", "asset_twilight_01"],
-    executions: 2,
-  },
-  {
-    id: "search_capsule_portrait",
-    kind: "search",
-    name: "金色轮廓光人像",
-    summary: "图片快速模式 · Native Multimodal",
-    queryType: "image",
-    query: "参考图片",
-    members: 12,
-    favorite: false,
-    usedAt: "昨天 21:08",
-    timestamp: 72,
-    assetIds: ["asset_reference_06"],
-    executions: 1,
-  },
-  {
-    id: "search_capsule_seaside",
-    kind: "search",
-    name: "海边奔跑与飞鸟",
-    summary: "文本精搜 · Normalized Similarity",
-    queryType: "text",
-    query: "夕阳海边奔跑的人，飞鸟，柔和速度感",
-    members: 18,
-    favorite: false,
-    usedAt: "7 月 26 日",
-    timestamp: 48,
-    assetIds: ["asset_seaside_05", "asset_field_02"],
-    executions: 3,
-  },
-];
-
-const CLUSTER_CAPSULES: CapsuleRecord[] = DEMO_CLUSTERS.map(
-  (cluster, index) => ({
-    id: cluster.id,
-    kind: "cluster",
-    name: cluster.name,
-    summary: cluster.description,
-    members: cluster.members,
-    favorite: cluster.favorite,
-    usedAt: index < 2 ? "今天" : "昨天",
-    timestamp: 90 - index * 10,
-    assetIds: cluster.assetIds,
-  }),
-);
+type LiveCapsule =
+  | { kind: "search"; id: string; search: SearchCapsule }
+  | { kind: "cluster"; id: string; cluster: ClusterCapsule };
 
 export default function CapsulesPage() {
   const [kind, setKind] = useState<CapsuleKind>("search");
   const [filter, setFilter] = useState<CapsuleFilter>("all");
-  const [records, setRecords] = useState([
-    ...SEARCH_CAPSULES,
-    ...CLUSTER_CAPSULES,
-  ]);
-  const [selectedId, setSelectedId] = useState(SEARCH_CAPSULES[0].id);
-  const [snapshotMode, setSnapshotMode] = useState<"saved" | "latest">(
-    "saved",
-  );
-  const [refreshing, setRefreshing] = useState(false);
+  const [records, setRecords] = useState<LiveCapsule[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [searchPayload, runPayload] = await Promise.all([
+        apiFetch<{ items: SearchCapsule[] }>(
+          `/api/v1/search-capsules?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+        ),
+        apiFetch<{ items: ClusterRun[] }>(
+          `/api/v1/cluster-runs?workspace_id=${WORKSPACE_ID}&limit=100`,
+        ),
+      ]);
+      const completedRuns = runPayload.items.filter(
+        (run) => run.status === "completed",
+      );
+      const clusterPayloads = await Promise.all(
+        completedRuns.map((run) =>
+          apiFetch<{ items: ClusterCapsule[] }>(
+            `/api/v1/cluster-runs/${run.cluster_run_id}/capsules?workspace_id=${WORKSPACE_ID}`,
+          ),
+        ),
+      );
+      const next: LiveCapsule[] = [
+        ...searchPayload.items.map(
+          (search): LiveCapsule => ({
+            kind: "search",
+            id: search.capsule_id,
+            search,
+          }),
+        ),
+        ...clusterPayloads.flatMap((payload) =>
+          payload.items.map(
+            (cluster): LiveCapsule => ({
+              kind: "cluster",
+              id: cluster.cluster_capsule_id,
+              cluster,
+            }),
+          ),
+        ),
+      ];
+      setRecords(next);
+      setSelectedId((current) =>
+        current && next.some((record) => record.id === current)
+          ? current
+          : next.find((record) => record.kind === kind)?.id || "",
+      );
+      setError(null);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Capsule 加载失败",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [kind]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
 
   const visible = useMemo(
     () =>
-      records
-        .filter((record) => record.kind === kind)
-        .filter((record) => filter !== "favorite" || record.favorite)
-        .sort((left, right) => right.timestamp - left.timestamp),
+      records.filter((record) => {
+        if (record.kind !== kind) return false;
+        if (filter !== "favorite") return true;
+        return record.kind === "search"
+          ? record.search.is_favorite
+          : record.cluster.is_favorite;
+      }),
     [filter, kind, records],
   );
   const selected =
     records.find((record) => record.id === selectedId && record.kind === kind) ??
     visible[0];
-  const assets =
-    selected?.assetIds
-      .map((id) => DEMO_ASSETS.find((asset) => asset.id === id))
-      .filter((asset) => asset !== undefined) ?? [];
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      if (!selected) {
+        setAssets([]);
+        return;
+      }
+      const loadSelectedAssets = async () => {
+        let assetIds: string[] = [];
+        if (selected.kind === "cluster") {
+          assetIds = selected.cluster.representative_asset_ids;
+        } else {
+          const detail = await apiFetch<{
+            latest_snapshot: {
+              results: Array<{ asset_id: string }>;
+            };
+          }>(
+            `/api/v1/search-capsules/${selected.search.capsule_id}?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+          );
+          assetIds = detail.latest_snapshot.results.map(
+            (item) => item.asset_id,
+          );
+        }
+        if (!assetIds.length) {
+          setAssets([]);
+          return;
+        }
+        const params = new URLSearchParams({
+          workspace_id: WORKSPACE_ID,
+          limit: "100",
+        });
+        assetIds.forEach((assetId) => params.append("asset_id", assetId));
+        setAssets((await loadAssets(params)).items);
+      };
+      void loadSelectedAssets().catch(() => setAssets([]));
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [selected]);
 
   const switchKind = (nextKind: CapsuleKind) => {
     setKind(nextKind);
-    const first = records.find((record) => record.kind === nextKind);
-    if (first) setSelectedId(first.id);
+    setSelectedId(records.find((record) => record.kind === nextKind)?.id || "");
   };
 
-  const toggleFavorite = (id: string) => {
-    setRecords((current) =>
-      current.map((record) =>
-        record.id === id
-          ? { ...record, favorite: !record.favorite }
-          : record,
-      ),
+  const toggleFavorite = async () => {
+    if (!selected || selected.kind !== "search") return;
+    await apiFetch(
+      `/api/v1/search-capsules/${selected.search.capsule_id}?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          is_favorite: !selected.search.is_favorite,
+        }),
+      },
     );
+    await load();
   };
 
-  const refresh = () => {
-    setRefreshing(true);
-    window.setTimeout(() => {
-      setRefreshing(false);
-      setSnapshotMode("latest");
-    }, 1000);
-  };
+  const name = selected
+    ? selected.kind === "search"
+      ? selected.search.query_summary
+      : selected.cluster.effective_name
+    : "";
+  const summary = selected
+    ? selected.kind === "search"
+      ? selected.search.query_text || selected.search.query_summary
+      : selected.cluster.effective_description
+    : "";
 
   return (
     <DemoShell
       active="capsules"
-      eyebrow="CAPSULE LIBRARY / 44.7"
+      eyebrow="CAPSULE LIBRARY / LIVE"
       title="把一次发现，变成可复用的入口。"
-      description="统一管理 Cluster Capsule 与 Search Capsule，快速回到最近使用和收藏的语义资产。"
+      description="统一读取真实 Cluster Capsule 和 Search Capsule，并展示其关联 Asset。"
       actions={
-        <button className="secondary-action">导出 Capsule 清单</button>
+        <button className="secondary-action" onClick={() => void load()}>
+          刷新
+        </button>
       }
     >
       <section className="capsule-dashboard">
@@ -184,171 +212,108 @@ export default function CapsulesPage() {
               全部
             </button>
             <button
-              className={filter === "recent" ? "active" : ""}
-              onClick={() => setFilter("recent")}
-            >
-              最近使用
-            </button>
-            <button
               className={filter === "favorite" ? "active" : ""}
               onClick={() => setFilter("favorite")}
             >
-              ★ 收藏
+              已收藏
             </button>
           </div>
         </header>
 
-        <div className="capsule-browser">
-          <aside className="unified-capsule-list">
-            <header>
-              <span>{filter === "favorite" ? "FAVORITES" : "RECENTLY USED"}</span>
-              <b>{visible.length}</b>
-            </header>
-            {visible.map((record, index) => (
-              <article
-                className={selected?.id === record.id ? "active" : ""}
-                onClick={() => setSelectedId(record.id)}
-                key={record.id}
-              >
-                <div className={`capsule-glyph capsule-glyph-${record.kind}`}>
-                  {record.kind === "search" ? "⌕" : "◎"}
-                </div>
-                <div>
-                  <small>
-                    {record.kind.toUpperCase()} · {record.usedAt}
-                  </small>
-                  <strong>{record.name}</strong>
-                  <span>{record.summary}</span>
-                  <footer>
-                    <span>{record.members} ASSETS</span>
-                    {record.executions && (
-                      <span>{record.executions} EXECUTIONS</span>
-                    )}
-                  </footer>
-                </div>
-                <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    toggleFavorite(record.id);
-                  }}
-                  aria-label={record.favorite ? "取消收藏" : "收藏"}
-                >
-                  {record.favorite ? "★" : "☆"}
-                </button>
-                <i>{String(index + 1).padStart(2, "0")}</i>
-              </article>
-            ))}
-            {!visible.length && (
-              <div className="capsule-list-empty">这个分类里还没有 Capsule</div>
-            )}
-          </aside>
-
-          <section className="unified-capsule-detail">
-            {selected ? (
-              <>
-                <header>
-                  <div>
-                    <small>
-                      {selected.kind === "search"
-                        ? "SEARCH CAPSULE"
-                        : "CLUSTER CAPSULE"}
-                    </small>
-                    <h2>{selected.name}</h2>
-                    <p>{selected.summary}</p>
-                  </div>
+        {error && (
+          <div className="asset-empty">
+            <strong>无法加载 Capsule</strong>
+            <span>{error}</span>
+          </div>
+        )}
+        {!error && loading && (
+          <div className="asset-empty">
+            <strong>正在读取 Capsule…</strong>
+          </div>
+        )}
+        {!error && !loading && (
+          <div className="capsule-layout">
+            <aside className="capsule-list">
+              {visible.map((record) => {
+                const recordName =
+                  record.kind === "search"
+                    ? record.search.query_summary
+                    : record.cluster.effective_name;
+                const count =
+                  record.kind === "search"
+                    ? record.search.result_count
+                    : record.cluster.member_count;
+                const favorite =
+                  record.kind === "search"
+                    ? record.search.is_favorite
+                    : record.cluster.is_favorite;
+                return (
                   <button
-                    className={selected.favorite ? "favorite-active" : ""}
-                    onClick={() => toggleFavorite(selected.id)}
+                    className={selected?.id === record.id ? "active" : ""}
+                    onClick={() => setSelectedId(record.id)}
+                    key={record.id}
                   >
-                    {selected.favorite ? "★ 已收藏" : "☆ 收藏"}
+                    <span>{record.kind.toUpperCase()}</span>
+                    <strong>{recordName}</strong>
+                    <small>{count} ASSETS</small>
+                    <b>{favorite ? "★" : "☆"}</b>
                   </button>
-                </header>
-
-                {selected.kind === "search" ? (
-                  <>
-                    <div className="saved-query">
-                      <span>QUERY / {selected.queryType}</span>
-                      <strong>{selected.query}</strong>
-                    </div>
-                    <div className="snapshot-switcher">
-                      <button
-                        className={snapshotMode === "saved" ? "active" : ""}
-                        onClick={() => setSnapshotMode("saved")}
-                      >
-                        保存快照
-                        <small>创建时的固定结果</small>
-                      </button>
-                      <button
-                        className={snapshotMode === "latest" ? "active" : ""}
-                        onClick={() => setSnapshotMode("latest")}
-                      >
-                        最新资产
-                        <small>按当前索引重新搜索</small>
-                      </button>
-                      <button
-                        className="snapshot-refresh"
-                        disabled={refreshing}
-                        onClick={refresh}
-                      >
-                        {refreshing ? "刷新中…" : "使用最新资产刷新 ↗"}
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="cluster-capsule-summary">
-                    <span>
-                      <small>MEMBERS</small>
-                      <strong>{selected.members}</strong>
-                    </span>
-                    <span>
-                      <small>EMBEDDING</small>
-                      <strong>native_multimodal</strong>
-                    </span>
-                    <span>
-                      <small>LAST RUN</small>
-                      <strong>{selected.usedAt}</strong>
-                    </span>
-                  </div>
-                )}
-
-                <div className="capsule-asset-grid">
-                  {assets.map((asset, index) => (
-                    <article key={asset.id}>
-                      <AssetThumb
-                        preview={asset.preview}
-                        name={asset.name}
-                        type={asset.type}
-                      />
-                      <div>
-                        <small>
-                          {snapshotMode === "latest" ? "LATEST" : "SNAPSHOT"} /{" "}
-                          {String(index + 1).padStart(2, "0")}
-                        </small>
-                        <strong>{asset.name}</strong>
-                        <span>{asset.sourceFile}</span>
-                      </div>
-                    </article>
-                  ))}
+                );
+              })}
+              {!visible.length && (
+                <div className="asset-empty">
+                  <strong>暂无真实 Capsule</strong>
+                  <span>
+                    {kind === "cluster"
+                      ? "先在 Cluster 页面创建 Run。"
+                      : "在搜索时选择保存 Capsule。"}
+                  </span>
                 </div>
+              )}
+            </aside>
 
-                <footer className="capsule-provenance">
-                  <span>CAPSULE ID</span>
-                  <strong>{selected.id}</strong>
-                  <span>LAST USED</span>
-                  <strong>{selected.usedAt}</strong>
-                  {selected.executions && (
-                    <>
-                      <span>EXECUTIONS</span>
-                      <strong>{selected.executions}</strong>
-                    </>
-                  )}
-                </footer>
-              </>
-            ) : (
-              <div className="capsule-detail-empty">请选择一个 Capsule</div>
-            )}
-          </section>
-        </div>
+            <section className="capsule-detail">
+              {selected ? (
+                <>
+                  <header>
+                    <div>
+                      <span className="eyebrow">
+                        {selected.kind.toUpperCase()} CAPSULE
+                      </span>
+                      <h2>{name}</h2>
+                      <p>{summary}</p>
+                    </div>
+                    <div>
+                      <StatusBadge status="completed" />
+                      {selected.kind === "search" && (
+                        <button onClick={() => void toggleFavorite()}>
+                          {selected.search.is_favorite ? "★ 已收藏" : "☆ 收藏"}
+                        </button>
+                      )}
+                    </div>
+                  </header>
+                  <div className="representative-strip">
+                    {assets.slice(0, 8).map((asset, index) => (
+                      <article key={asset.asset_id}>
+                        <AssetThumb
+                          preview={asset.preview_url}
+                          name={asset.asset_name || asset.file_name}
+                          type={asset.asset_type}
+                        />
+                        <span>ASSET {index + 1}</span>
+                        <strong>{asset.asset_name || asset.file_name}</strong>
+                      </article>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="asset-empty">
+                  <strong>选择一个 Capsule 查看详情</strong>
+                </div>
+              )}
+            </section>
+          </div>
+        )}
       </section>
     </DemoShell>
   );
