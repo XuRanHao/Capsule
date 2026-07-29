@@ -101,8 +101,19 @@ class SearchService:
         assets = await self._assets.get_by_ids(
             workspace_id=request.workspace_id,
             asset_ids=[item.asset_id for item in ranked],
+            embedding_ids=[
+                match.embedding_id
+                for item in ranked
+                for match in item.matched_channels
+            ],
             created_by=request.created_by,
             filters=request.filters,
+        )
+        ranked = self._result_builder.validate_hits(
+            ranked_hits=ranked,
+            assets=assets,
+            workspace_id=request.workspace_id,
+            sort_by_score=True,
         )
         hydration_ms = _elapsed_ms(hydration_started)
 

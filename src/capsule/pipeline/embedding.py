@@ -193,10 +193,11 @@ class AssetEmbeddingService:
                             asset_id=asset.asset_id,
                             source_file_id=asset.source_file_id,
                             asset_type=asset.asset_type,
+                            file_type=asset.file_type,
                             embedding_type=embedding_type.value,
-                            model_version=response.model,
+                            model_name=self._settings.embedding_model,
                             embedding_revision=asset.embedding_revision,
-                            created_at_ts=int(time.time()),
+                            created_at_ts=int(asset.created_at.timestamp()),
                             vector=response.vector,
                         )
                     ]

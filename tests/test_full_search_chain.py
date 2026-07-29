@@ -1,5 +1,6 @@
 import math
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 
 from capsule.enums import EmbeddingType
 from capsule.search.fusion import FusionEngine
@@ -170,6 +171,8 @@ def test_adjacent_video_segments_are_folded_before_same_source_limit() -> None:
     match = ChannelMatch(
         channel="native_multimodal",
         embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=1,
         rank=1,
         similarity=0.9,
         fusion_contribution=0.1,
@@ -217,6 +220,125 @@ def test_adjacent_video_segments_are_folded_before_same_source_limit() -> None:
     assert results[0].source_locator["end_ms"] == 10_000
 
 
+def test_database_state_rejects_stale_milvus_revision() -> None:
+    asset = _asset("image_a", source_id="source_a")
+    stale = ChannelMatch(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=0,
+        rank=1,
+        similarity=0.99,
+        fusion_contribution=0.1,
+    )
+
+    results = SearchResultBuilder().build(
+        ranked_hits=[
+            FusedHit(
+                asset_id=asset.asset_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                score=0.1,
+                matched_channels=[stale],
+            )
+        ],
+        assets={asset.asset_id: asset},
+        workspace_id=asset.workspace_id,
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    assert results == []
+
+
+def test_database_state_uses_current_embedding_when_stale_vector_ranks_first() -> None:
+    query = QueryVector(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        vector=[1],
+        weight=1,
+    )
+    recall = ChannelRecall(
+        query_vector=query,
+        hits=(
+            VectorSearchHit(
+                embedding_id="embedding_stale",
+                asset_id="image_a",
+                source_file_id="source_a",
+                asset_type="image",
+                embedding_revision=0,
+                similarity=0.99,
+            ),
+            VectorSearchHit(
+                embedding_id="embedding_current",
+                asset_id="image_a",
+                source_file_id="source_a",
+                asset_type="image",
+                embedding_revision=1,
+                similarity=0.95,
+            ),
+        ),
+    )
+    ranked = FusionEngine(candidate_cap=10).fuse((recall,), FusionMethod.WEIGHTED_RRF)
+    asset = _asset("image_a", source_id="source_a")
+
+    results = SearchResultBuilder().build(
+        ranked_hits=ranked,
+        assets={asset.asset_id: asset},
+        workspace_id=asset.workspace_id,
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    assert len(results) == 1
+    assert results[0].matched_channels[0].embedding_id == "embedding_current"
+    assert results[0].matched_channels[0].rank == 2
+    assert results[0].file_type == ".png"
+    assert results[0].source_file is not None
+    assert results[0].source_file.sha256 == "f" * 64
+
+
+def test_result_builder_preserves_reranked_order_after_database_validation() -> None:
+    match = ChannelMatch(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=1,
+        rank=1,
+        similarity=0.9,
+        fusion_contribution=0.1,
+    )
+    assets = {
+        asset_id: _asset(asset_id, source_id=f"source_{asset_id}")
+        for asset_id in ("a", "b")
+    }
+
+    results = SearchResultBuilder().build(
+        ranked_hits=[
+            FusedHit(
+                asset_id="b",
+                source_file_id="source_b",
+                asset_type="image",
+                score=0.1,
+                matched_channels=[match],
+            ),
+            FusedHit(
+                asset_id="a",
+                source_file_id="source_a",
+                asset_type="image",
+                score=0.9,
+                matched_channels=[match],
+            ),
+        ],
+        assets=assets,
+        workspace_id="workspace_demo",
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    assert [item.asset_id for item in results] == ["b", "a"]
+
+
 def _asset(
     asset_id: str,
     *,
@@ -224,19 +346,47 @@ def _asset(
     asset_type: str = "image",
     locator: dict[str, object] | None = None,
 ) -> SearchAssetRecord:
+    created_at = datetime(2026, 7, 29, tzinfo=UTC)
     return SearchAssetRecord(
         asset_id=asset_id,
         workspace_id="workspace_demo",
+        project_id="project_default",
         source_file_id=source_id,
         asset_type=asset_type,
+        file_name=f"{asset_id}.png",
+        file_type=".png",
+        asset_key=f"key_{asset_id}",
+        content_hash=asset_id.ljust(64, "0"),
         asset_name=asset_id,
+        asset_name_source="model",
         asset_description="黄昏素材",
         asset_features={},
+        file_tree_context=[],
         source_contexts=[],
+        file_info={},
         source_locator=locator or {},
+        raw_content=None,
+        derived_file_uri=None,
         preview_uri=None,
         processing_status="completed",
+        feature_revision=1,
+        embedding_revision=1,
+        error_message=None,
+        created_at=created_at,
+        updated_at=created_at,
+        source_workspace_id="workspace_demo",
+        source_project_id="project_default",
         source_file_name="source.md",
-        source_file_type="markdown",
+        source_file_type=".md",
+        source_mime_type="text/markdown",
         source_relative_path="source.md",
+        source_file_tree_context=[],
+        source_storage_uri="file:///source.md",
+        source_sha256="f" * 64,
+        source_file_size_bytes=128,
+        source_processing_status="completed",
+        source_error_message=None,
+        source_created_at=created_at,
+        source_updated_at=created_at,
+        indexed_embedding_ids=frozenset({"embedding_current"}),
     )

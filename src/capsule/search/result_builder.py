@@ -22,6 +22,48 @@ class SearchResultBuilder:
             raise ValueError("same_source_limit must be positive")
         self._same_source_limit = same_source_limit
 
+    @staticmethod
+    def validate_hits(
+        *,
+        ranked_hits: list[FusedHit],
+        assets: Mapping[str, SearchAssetRecord],
+        workspace_id: str,
+        sort_by_score: bool = False,
+    ) -> list[FusedHit]:
+        """Keep only vectors whose PostgreSQL state and Asset revision are current."""
+
+        validated: list[FusedHit] = []
+        for hit in ranked_hits:
+            asset = assets.get(hit.asset_id)
+            if asset is None or asset.workspace_id != workspace_id:
+                continue
+            current_by_channel: dict[str, ChannelMatch] = {}
+            for match in sorted(hit.matched_channels, key=lambda item: item.rank):
+                if (
+                    match.embedding_id in asset.indexed_embedding_ids
+                    and match.embedding_revision == asset.embedding_revision
+                ):
+                    current_by_channel.setdefault(match.channel, match)
+            current_channels = list(current_by_channel.values())
+            if not current_channels:
+                logger.info(
+                    "Milvus candidate has no current indexed PostgreSQL embedding",
+                    extra={"asset_id": hit.asset_id, "workspace_id": workspace_id},
+                )
+                continue
+            validated.append(
+                FusedHit(
+                    asset_id=asset.asset_id,
+                    source_file_id=asset.source_file_id,
+                    asset_type=asset.asset_type,
+                    score=sum(item.fusion_contribution for item in current_channels),
+                    matched_channels=current_channels,
+                )
+            )
+        if sort_by_score:
+            return sorted(validated, key=lambda item: (-item.score, item.asset_id))
+        return validated
+
     def build(
         self,
         *,
@@ -34,6 +76,11 @@ class SearchResultBuilder:
     ) -> list[SearchResult]:
         candidates: list[SearchResult] = []
         rerank_items = rerank_items or {}
+        ranked_hits = self.validate_hits(
+            ranked_hits=ranked_hits,
+            assets=assets,
+            workspace_id=workspace_id,
+        )
         for hit in ranked_hits:
             asset = assets.get(hit.asset_id)
             if asset is None:
@@ -71,23 +118,54 @@ class SearchResultBuilder:
                 SearchResult(
                     asset_id=asset.asset_id,
                     asset_type=asset_type,
+                    workspace_id=asset.workspace_id,
+                    project_id=asset.project_id,
+                    source_file_id=asset.source_file_id,
+                    file_name=asset.file_name,
+                    file_type=asset.file_type,
+                    asset_key=asset.asset_key,
+                    content_hash=asset.content_hash,
                     asset_name=asset.asset_name,
+                    asset_name_source=asset.asset_name_source,
                     asset_description=asset.asset_description,
                     asset_features=asset.asset_features,
+                    file_tree_context=asset.file_tree_context,
                     source_contexts=asset.source_contexts,
+                    file_info=asset.file_info,
                     source_locator=dict(asset.source_locator),
+                    raw_content=asset.raw_content,
+                    derived_file_uri=asset.derived_file_uri,
                     preview_uri=asset.preview_uri,
+                    processing_status=asset.processing_status,
+                    feature_revision=asset.feature_revision,
+                    embedding_revision=asset.embedding_revision,
+                    error_message=asset.error_message,
+                    created_at=asset.created_at,
+                    updated_at=asset.updated_at,
                     source_file=SourceFileResult(
                         source_file_id=asset.source_file_id,
+                        workspace_id=asset.source_workspace_id,
+                        project_id=asset.source_project_id,
                         original_file_name=asset.source_file_name,
                         file_type=asset.source_file_type,
+                        mime_type=asset.source_mime_type,
                         relative_path=asset.source_relative_path,
+                        file_tree_context=asset.source_file_tree_context,
+                        storage_uri=asset.source_storage_uri,
+                        sha256=asset.source_sha256,
+                        file_size_bytes=asset.source_file_size_bytes,
+                        processing_status=asset.source_processing_status,
+                        error_message=asset.source_error_message,
+                        created_at=asset.source_created_at,
+                        updated_at=asset.source_updated_at,
                     ),
                     score=hit.score,
                     matched_channels=[
                         MatchedChannel(
                             channel=match.channel,
                             embedding_type=match.embedding_type,
+                            embedding_id=match.embedding_id,
+                            embedding_revision=match.embedding_revision,
                             rank=match.rank,
                             similarity=match.similarity,
                             fusion_contribution=match.fusion_contribution,

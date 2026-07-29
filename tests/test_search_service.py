@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 
 from httpx import ASGITransport, AsyncClient
 
@@ -72,6 +73,7 @@ class FakeAssetRepository:
         *,
         workspace_id: str,
         asset_ids: Sequence[str],
+        embedding_ids: Sequence[str],
         created_by: str = "user_demo",
         filters: SearchFilters | None = None,
     ) -> Mapping[str, SearchAssetRecord]:
@@ -81,27 +83,66 @@ class FakeAssetRepository:
                 asset_id,
                 workspace_id,
                 "source_shared" if int(asset_id.removeprefix("asset_")) <= 4 else "source_other",
+                indexed_embedding_ids=frozenset(
+                    item
+                    for item in embedding_ids
+                    if item.startswith(f"emb_{asset_id.removeprefix('asset_')}_")
+                ),
             )
             for asset_id in asset_ids
         }
 
 
-def asset_record(asset_id: str, workspace_id: str, source_file_id: str) -> SearchAssetRecord:
+def asset_record(
+    asset_id: str,
+    workspace_id: str,
+    source_file_id: str,
+    *,
+    indexed_embedding_ids: frozenset[str],
+) -> SearchAssetRecord:
+    created_at = datetime(2026, 7, 29, tzinfo=UTC)
     return SearchAssetRecord(
         asset_id=asset_id,
         workspace_id=workspace_id,
+        project_id="project_default",
         source_file_id=source_file_id,
         asset_type="image",
+        file_name=f"{asset_id}.png",
+        file_type=".png",
+        asset_key=f"key_{asset_id}",
+        content_hash=asset_id.ljust(64, "0"),
         asset_name=f"Asset {asset_id}",
+        asset_name_source="model",
         asset_description="黄昏动画场景",
         asset_features={"visual_style": {"value": "动画"}},
+        file_tree_context=["references"],
         source_contexts=[{"text": "午后-黄昏", "relation_type": "preceding_text"}],
+        file_info={"width": 1200, "height": 800},
         source_locator={"block_index": 3},
+        raw_content=None,
+        derived_file_uri=None,
         preview_uri=f"s3://previews/{asset_id}.jpg",
         processing_status="completed",
+        feature_revision=1,
+        embedding_revision=1,
+        error_message=None,
+        created_at=created_at,
+        updated_at=created_at,
+        source_workspace_id=workspace_id,
+        source_project_id="project_default",
         source_file_name="moodboard.md",
-        source_file_type="markdown",
+        source_file_type=".md",
+        source_mime_type="text/markdown",
         source_relative_path="references/moodboard.md",
+        source_file_tree_context=["references"],
+        source_storage_uri="file:///references/moodboard.md",
+        source_sha256="f" * 64,
+        source_file_size_bytes=1024,
+        source_processing_status="completed",
+        source_error_message=None,
+        source_created_at=created_at,
+        source_updated_at=created_at,
+        indexed_embedding_ids=indexed_embedding_ids,
     )
 
 

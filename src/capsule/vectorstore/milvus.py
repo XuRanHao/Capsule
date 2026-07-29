@@ -18,8 +18,9 @@ class VectorRecord:
     asset_id: str
     source_file_id: str
     asset_type: str
+    file_type: str
     embedding_type: str
-    model_version: str
+    model_name: str
     embedding_revision: int
     created_at_ts: int
     vector: list[float]
@@ -61,8 +62,9 @@ class MilvusVectorStore:
                 "asset_id",
                 "source_file_id",
                 "asset_type",
+                "file_type",
                 "embedding_type",
-                "model_version",
+                "model_name",
                 "embedding_revision",
                 "created_at_ts",
                 "vector",
@@ -135,12 +137,17 @@ class MilvusVectorStore:
             max_length=32,
         )
         schema.add_field(
+            field_name="file_type",
+            datatype=DataType.VARCHAR,
+            max_length=32,
+        )
+        schema.add_field(
             field_name="embedding_type",
             datatype=DataType.VARCHAR,
             max_length=64,
         )
         schema.add_field(
-            field_name="model_version",
+            field_name="model_name",
             datatype=DataType.VARCHAR,
             max_length=255,
         )
@@ -196,8 +203,9 @@ class MilvusVectorStore:
                         "asset_id": record.asset_id,
                         "source_file_id": record.source_file_id,
                         "asset_type": record.asset_type,
+                        "file_type": record.file_type,
                         "embedding_type": record.embedding_type,
-                        "model_version": record.model_version,
+                        "model_name": record.model_name,
                         "embedding_revision": record.embedding_revision,
                         "created_at_ts": record.created_at_ts,
                         "vector": record.vector,
@@ -261,14 +269,15 @@ class MilvusVectorStore:
         if filters.asset_type:
             encoded_types = ", ".join(json.dumps(item.value) for item in filters.asset_type)
             clauses.append(f"asset_type in [{encoded_types}]")
+        if filters.file_type:
+            encoded_file_types = ", ".join(json.dumps(item) for item in filters.file_type)
+            clauses.append(f"file_type in [{encoded_file_types}]")
         if filters.source_file_id:
             encoded_sources = ", ".join(json.dumps(item) for item in filters.source_file_id)
             clauses.append(f"source_file_id in [{encoded_sources}]")
-        if filters.embedding_model_version:
-            encoded_versions = ", ".join(
-                json.dumps(item) for item in filters.embedding_model_version
-            )
-            clauses.append(f"model_version in [{encoded_versions}]")
+        if filters.model_name:
+            encoded_model_names = ", ".join(json.dumps(item) for item in filters.model_name)
+            clauses.append(f"model_name in [{encoded_model_names}]")
         if filters.created_at_from:
             clauses.append(f"created_at_ts >= {int(filters.created_at_from.timestamp())}")
         if filters.created_at_to:

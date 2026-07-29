@@ -507,7 +507,7 @@ export default function Home() {
   const [projectId, setProjectId] = useState("");
   const [sourceFileId, setSourceFileId] = useState("");
   const [fileTypes, setFileTypes] = useState("");
-  const [modelVersion, setModelVersion] = useState("");
+  const [modelName, setModelName] = useState("");
   const [clusterCapsuleId, setClusterCapsuleId] = useState("");
   const [favoriteOnly, setFavoriteOnly] = useState(false);
   const [response, setResponse] = useState<SearchResponse>(DEMO_RESPONSE);
@@ -604,8 +604,8 @@ export default function Home() {
             source_file_id: sourceFileId.trim()
               ? [sourceFileId.trim()]
               : [],
-            embedding_model_version: modelVersion.trim()
-              ? [modelVersion.trim()]
+            model_name: modelName.trim()
+              ? [modelName.trim()]
               : [],
             favorite: favoriteOnly ? true : null,
             cluster_capsule_id: clusterCapsuleId.trim() || null,
@@ -911,9 +911,9 @@ export default function Home() {
                     placeholder="文件类型，逗号分隔"
                   />
                   <input
-                    value={modelVersion}
-                    onChange={(event) => setModelVersion(event.target.value)}
-                    placeholder="Embedding 模型版本"
+                    value={modelName}
+                    onChange={(event) => setModelName(event.target.value)}
+                    placeholder="Embedding 模型名称"
                   />
                   <input
                     value={clusterCapsuleId}

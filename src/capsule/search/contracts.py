@@ -64,6 +64,7 @@ class AssetSearchRepository(Protocol):
         *,
         workspace_id: str,
         asset_ids: Sequence[str],
+        embedding_ids: Sequence[str],
         created_by: str = "user_demo",
         filters: SearchFilters | None = None,
     ) -> Mapping[str, SearchAssetRecord]: ...

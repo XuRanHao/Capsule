@@ -14,10 +14,11 @@ class WeightedReciprocalRankFusion:
         fused: dict[str, FusedHit] = {}
         for recall in channels:
             seen_assets: set[str] = set()
+            seen_embeddings: set[str] = set()
             for rank, hit in enumerate(recall.hits, start=1):
-                if hit.asset_id in seen_assets:
+                if hit.embedding_id in seen_embeddings:
                     continue
-                seen_assets.add(hit.asset_id)
+                seen_embeddings.add(hit.embedding_id)
                 contribution = recall.query_vector.weight / (self._rrf_k + rank)
                 candidate = fused.setdefault(
                     hit.asset_id,
@@ -27,11 +28,15 @@ class WeightedReciprocalRankFusion:
                         asset_type=hit.asset_type,
                     ),
                 )
-                candidate.score += contribution
+                if hit.asset_id not in seen_assets:
+                    candidate.score += contribution
+                    seen_assets.add(hit.asset_id)
                 candidate.matched_channels.append(
                     ChannelMatch(
                         channel=recall.query_vector.channel,
                         embedding_type=recall.query_vector.embedding_type,
+                        embedding_id=hit.embedding_id,
+                        embedding_revision=hit.embedding_revision,
                         rank=rank,
                         similarity=hit.similarity,
                         fusion_contribution=contribution,
@@ -51,19 +56,18 @@ class NormalizedWeightedSimilarityFusion:
     def fuse(self, channels: tuple[ChannelRecall, ...]) -> list[FusedHit]:
         fused: dict[str, FusedHit] = {}
         for recall in channels:
-            unique_hits = []
-            seen_assets: set[str] = set()
-            for hit in recall.hits:
-                if hit.asset_id not in seen_assets:
-                    unique_hits.append(hit)
-                    seen_assets.add(hit.asset_id)
-            if not unique_hits:
+            if not recall.hits:
                 continue
-            similarities = [item.similarity for item in unique_hits]
+            similarities = [item.similarity for item in recall.hits]
             minimum = min(similarities)
             maximum = max(similarities)
             spread = maximum - minimum
-            for rank, hit in enumerate(unique_hits, start=1):
+            seen_assets: set[str] = set()
+            seen_embeddings: set[str] = set()
+            for rank, hit in enumerate(recall.hits, start=1):
+                if hit.embedding_id in seen_embeddings:
+                    continue
+                seen_embeddings.add(hit.embedding_id)
                 normalized = 1.0 if spread <= 1e-12 else (hit.similarity - minimum) / spread
                 contribution = recall.query_vector.weight * normalized
                 candidate = fused.setdefault(
@@ -74,11 +78,15 @@ class NormalizedWeightedSimilarityFusion:
                         asset_type=hit.asset_type,
                     ),
                 )
-                candidate.score += contribution
+                if hit.asset_id not in seen_assets:
+                    candidate.score += contribution
+                    seen_assets.add(hit.asset_id)
                 candidate.matched_channels.append(
                     ChannelMatch(
                         channel=recall.query_vector.channel,
                         embedding_type=recall.query_vector.embedding_type,
+                        embedding_id=hit.embedding_id,
+                        embedding_revision=hit.embedding_revision,
                         rank=rank,
                         similarity=hit.similarity,
                         fusion_contribution=contribution,

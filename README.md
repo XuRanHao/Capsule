@@ -238,8 +238,9 @@ continues to use its Linux FFmpeg instead.
 query
   -> multimodal Query Parser and explicit weighted dimensions
   -> bounded concurrent query embeddings
-  -> concurrent, workspace-scoped Milvus recall
-  -> PostgreSQL-only favorite / cluster / file filters
+  -> concurrent Milvus recall scoped by workspace and Asset metadata
+  -> PostgreSQL-authoritative hydration, indexed-status and revision validation
+  -> PostgreSQL favorite / cluster filters and exact Asset field recheck
   -> weighted RRF or normalized weighted similarity
   -> optional Seed-2-lite rerank of the top 30
   -> exact dedup, same-source cap and video / Markdown folding
@@ -253,6 +254,11 @@ parses the image into six weighted routes. Image-text search preserves image
 constraints and applies text additions, modifications, and exclusions through
 late fusion and reranking. Any failed route is removed, surviving weights are
 renormalized, and the response reports `degraded=true`.
+
+Search filter names follow PostgreSQL columns. In particular, use
+`filters.model_name` for the Embedding model and `filters.file_type` for the
+Asset extension. The former `embedding_model_version` request key remains
+accepted only as an input compatibility alias.
 
 ## Concurrency defaults
 

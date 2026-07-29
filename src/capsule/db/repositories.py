@@ -256,6 +256,7 @@ class EmbeddingAsset:
     file_type: str
     content_hash: str
     embedding_revision: int
+    created_at: datetime
     raw_content: str | None
     asset_description: str | None
     asset_features: dict[str, Any]
@@ -307,6 +308,7 @@ class EmbeddingRepository:
                 file_type=asset.file_type,
                 content_hash=asset.content_hash,
                 embedding_revision=asset.embedding_revision,
+                created_at=asset.created_at,
                 raw_content=asset.raw_content,
                 asset_description=asset.asset_description,
                 asset_features=dict(asset.asset_features),

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -250,6 +251,7 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
         file_type=".png",
         content_hash="a" * 64,
         embedding_revision=1,
+        created_at=datetime(2026, 7, 29, tzinfo=UTC),
         raw_content=None,
         asset_description=None,
         asset_features={},
@@ -266,6 +268,7 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
         file_type=".mp4",
         content_hash="b" * 64,
         embedding_revision=1,
+        created_at=datetime(2026, 7, 29, tzinfo=UTC),
         raw_content=None,
         asset_description=None,
         asset_features={},

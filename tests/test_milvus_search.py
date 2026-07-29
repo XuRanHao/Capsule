@@ -59,8 +59,9 @@ class FakeBootstrapMilvusClient(FakeMilvusClient):
                     "asset_id",
                     "source_file_id",
                     "asset_type",
+                    "file_type",
                     "embedding_type",
-                    "model_version",
+                    "model_name",
                     "embedding_revision",
                     "created_at_ts",
                 )
@@ -95,8 +96,9 @@ async def test_milvus_search_builds_scoped_filter_and_parses_hits() -> None:
         filters=SearchFilters(
             project_id="project_demo",
             asset_type=["image", "video_segment"],
+            file_type=[".png"],
             source_file_id=["source_1"],
-            embedding_model_version=["seed-1.6"],
+            model_name=["seed-1.6"],
         ),
         limit=60,
     )
@@ -106,13 +108,33 @@ async def test_milvus_search_builds_scoped_filter_and_parses_hits() -> None:
     assert 'embedding_type == "native_multimodal"' in expression
     assert 'project_id == "project_demo"' in expression
     assert 'asset_type in ["image", "video_segment"]' in expression
+    assert 'file_type in [".png"]' in expression
     assert 'source_file_id in ["source_1"]' in expression
-    assert 'model_version in ["seed-1.6"]' in expression
+    assert 'model_name in ["seed-1.6"]' in expression
     assert client.kwargs["search_params"]["params"]["ef"] == 128
     assert client.kwargs["limit"] == 60
     assert hits[0].asset_id == "asset_1"
     assert hits[0].embedding_revision == 2
     assert hits[0].similarity == 0.91
+
+
+def test_search_filter_accepts_legacy_model_field_but_serializes_database_name() -> None:
+    filters = SearchFilters.model_validate(
+        {"embedding_model_version": ["doubao-embedding-vision-250615"]}
+    )
+
+    assert filters.model_name == ["doubao-embedding-vision-250615"]
+    assert filters.model_dump() == {
+        "project_id": None,
+        "asset_type": [],
+        "file_type": [],
+        "source_file_id": [],
+        "created_at_from": None,
+        "created_at_to": None,
+        "model_name": ["doubao-embedding-vision-250615"],
+        "favorite": None,
+        "cluster_capsule_id": None,
+    }
 
 
 async def test_milvus_async_upsert_uses_embedding_id_as_primary_key() -> None:
@@ -128,8 +150,9 @@ async def test_milvus_async_upsert_uses_embedding_id_as_primary_key() -> None:
                 asset_id="asset_1",
                 source_file_id="src_1",
                 asset_type="markdown_block",
+                file_type=".md",
                 embedding_type="native_multimodal",
-                model_version="doubao-embedding-vision-250615",
+                model_name="doubao-embedding-vision-250615",
                 embedding_revision=2,
                 created_at_ts=1_700_000_000,
                 vector=[0.0, 1.0, 2.0],
@@ -146,8 +169,9 @@ async def test_milvus_async_upsert_uses_embedding_id_as_primary_key() -> None:
             "asset_id": "asset_1",
             "source_file_id": "src_1",
             "asset_type": "markdown_block",
+            "file_type": ".md",
             "embedding_type": "native_multimodal",
-            "model_version": "doubao-embedding-vision-250615",
+            "model_name": "doubao-embedding-vision-250615",
             "embedding_revision": 2,
             "created_at_ts": 1_700_000_000,
             "vector": [0.0, 1.0, 2.0],
