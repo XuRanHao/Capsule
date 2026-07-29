@@ -69,6 +69,12 @@ async def enrich_assets(
         workspace_id=workspace_id,
         asset_ids=asset_ids,
     )
+    stage_durations_ms = {
+        PipelineStage.UNDERSTANDING.value: understanding.understanding_duration_ms,
+        PipelineStage.FEATURE_READY.value: understanding.feature_ready_duration_ms,
+        PipelineStage.EMBEDDING.value: 0.0,
+        PipelineStage.INDEXING.value: 0.0,
+    }
     errors.extend(
         {
             "asset_id": error["asset_id"],
@@ -91,6 +97,12 @@ async def enrich_assets(
             embedding_type=embedding_type,
             asset_ids=asset_ids,
         )
+        stage_durations_ms[
+            PipelineStage.EMBEDDING.value
+        ] += embedding.embedding_duration_ms
+        stage_durations_ms[
+            PipelineStage.INDEXING.value
+        ] += embedding.indexing_duration_ms
         errors.extend(
             {
                 "asset_id": error["asset_id"],
@@ -102,6 +114,10 @@ async def enrich_assets(
     await repository.set_job_stage(
         job_id=job_id,
         stage=PipelineStage.INDEXING,
+    )
+    await repository.add_job_stage_durations(
+        job_id=job_id,
+        durations_ms=stage_durations_ms,
     )
     await repository.finalize_enrichment(
         job_id=job_id,

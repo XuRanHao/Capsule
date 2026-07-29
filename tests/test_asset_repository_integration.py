@@ -97,6 +97,10 @@ async def test_repository_replaces_assets_and_preserves_user_name(tmp_path: Path
             source_file_id=source_file_id,
             assets=second,
         )
+        await repository.add_job_stage_durations(
+            job_id=job_id,
+            durations_ms={"parsing": 125.5, "asset_stored": 24.5},
+        )
         await repository.record_file_success(job_id=job_id)
         await repository.finalize_job(job_id=job_id)
 
@@ -117,6 +121,10 @@ async def test_repository_replaces_assets_and_preserves_user_name(tmp_path: Path
             assert job.status == JobStatus.COMPLETED.value
             assert job.completed_count == 1
             assert job.failed_count == 0
+            assert job.stage_durations_ms == {
+                "parsing": 125.5,
+                "asset_stored": 24.5,
+            }
     finally:
         try:
             async with database.session() as session, session.begin():

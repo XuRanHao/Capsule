@@ -76,6 +76,7 @@ export type ProcessingJob = {
     stage?: string;
     error?: string;
   }>;
+  stage_durations_ms: Record<string, number>;
   started_at: string | null;
   completed_at: string | null;
 };

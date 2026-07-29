@@ -57,6 +57,9 @@ async def test_run_processes_files_with_bounded_concurrency_and_stable_errors(
         async def record_file_failure(self, **_values: object) -> None:
             self.failures += 1
 
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
         async def finalize_job(self, **_values: object) -> None:
             self.finalized = True
 
@@ -126,6 +129,9 @@ async def test_run_skips_completed_source_with_same_fingerprint(
             )
 
         async def record_file_success(self, **_values: object) -> None:
+            return None
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
             return None
 
         async def finalize_job(self, **_values: object) -> None:

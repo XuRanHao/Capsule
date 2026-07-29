@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings, get_settings
 from capsule.db.repositories import AssetRepository
 from capsule.db.session import Database
+from capsule.enums import PipelineStage
 from capsule.model_clients.tokenization import ArkTokenCounter, TokenCounter
 from capsule.parsers import discover_files
 from capsule.parsers.assetizer import Assetizer
@@ -54,6 +56,7 @@ class _FileOutcome:
     asset_ids: list[str] = field(default_factory=list)
     skipped: bool = False
     error: dict[str, str] | None = None
+    stage_durations_ms: dict[str, float] = field(default_factory=dict)
 
 
 class PipelineRunner:
@@ -92,7 +95,17 @@ class PipelineRunner:
         *,
         job_id: str | None = None,
     ) -> PipelineRunResult:
+        discovery_started = time.perf_counter()
         source_files = discover_files(input_path)
+        stage_durations_ms = {
+            PipelineStage.DISCOVERING.value: (
+                time.perf_counter() - discovery_started
+            )
+            * 1000,
+            PipelineStage.PARSING.value: 0.0,
+            PipelineStage.SEGMENTING.value: 0.0,
+            PipelineStage.ASSET_STORED.value: 0.0,
+        }
         database = self._database or Database(self._settings)
         owns_database = self._database is None
         counter = self._token_counter
@@ -122,6 +135,7 @@ class PipelineRunner:
                 total_count=len(source_files),
             )
         try:
+            processing_started = time.perf_counter()
             outcomes = await self._process_files(
                 source_files=source_files,
                 workspace_id=workspace_id,
@@ -130,6 +144,30 @@ class PipelineRunner:
                 factory=factory,
                 assetizer=assetizer,
                 media_writer=media_writer,
+            )
+            processing_elapsed_ms = (
+                time.perf_counter() - processing_started
+            ) * 1000
+            raw_durations = {
+                stage: sum(
+                    outcome.stage_durations_ms.get(stage, 0.0)
+                    for outcome in outcomes
+                )
+                for stage in (
+                    PipelineStage.PARSING.value,
+                    PipelineStage.SEGMENTING.value,
+                    PipelineStage.ASSET_STORED.value,
+                )
+            }
+            raw_total_ms = sum(raw_durations.values())
+            if raw_total_ms:
+                for stage, duration_ms in raw_durations.items():
+                    stage_durations_ms[stage] = (
+                        processing_elapsed_ms * duration_ms / raw_total_ms
+                    )
+            await repository.add_job_stage_durations(
+                job_id=job_id,
+                durations_ms=stage_durations_ms,
             )
             await repository.finalize_job(job_id=job_id)
             errors = [outcome.error for outcome in outcomes if outcome.error is not None]
@@ -215,46 +253,84 @@ class PipelineRunner:
         media_writer: VideoDerivedMediaWriter | None,
     ) -> _FileOutcome:
         source_file_id: str | None = None
+        stage_durations_ms = {
+            PipelineStage.PARSING.value: 0.0,
+            PipelineStage.SEGMENTING.value: 0.0,
+            PipelineStage.ASSET_STORED.value: 0.0,
+        }
         try:
-            digest = await asyncio.to_thread(sha256_file, Path(source_file.path))
-            prepared = await repository.prepare_source_file(
-                workspace_id=workspace_id,
-                source_file=source_file,
-                sha256=digest,
-                mime_type=_mime_type(source_file),
-                processing_fingerprint=_processing_fingerprint(source_file, self._settings),
-            )
+            phase_started = time.perf_counter()
+            try:
+                digest = await asyncio.to_thread(
+                    sha256_file,
+                    Path(source_file.path),
+                )
+                prepared = await repository.prepare_source_file(
+                    workspace_id=workspace_id,
+                    source_file=source_file,
+                    sha256=digest,
+                    mime_type=_mime_type(source_file),
+                    processing_fingerprint=_processing_fingerprint(
+                        source_file,
+                        self._settings,
+                    ),
+                )
+            finally:
+                stage_durations_ms[PipelineStage.PARSING.value] += (
+                    time.perf_counter() - phase_started
+                ) * 1000
             source_file_id = prepared.source_file_id
             if prepared.already_processed:
+                phase_started = time.perf_counter()
                 await repository.record_file_success(job_id=job_id)
+                stage_durations_ms[PipelineStage.ASSET_STORED.value] += (
+                    time.perf_counter() - phase_started
+                ) * 1000
                 return _FileOutcome(
                     succeeded=True,
                     asset_count=prepared.asset_count,
                     skipped=True,
+                    stage_durations_ms=stage_durations_ms,
                 )
-            result = await assetizer.assetize(source_file)
+            phase_started = time.perf_counter()
+            try:
+                result = await assetizer.assetize(source_file)
+            finally:
+                stage_durations_ms[PipelineStage.SEGMENTING.value] += (
+                    time.perf_counter() - phase_started
+                ) * 1000
             if not result.succeeded:
                 raise ValueError(result.error_message or "assetization failed")
-            assets = factory.build_many(
-                workspace_id=workspace_id,
-                source_file_id=source_file_id,
-                source_sha256=digest,
-                source_file=source_file,
-                drafts=result.assets,
-            )
-            if any(asset.asset_type.value == "video_segment" for asset in assets):
-                if media_writer is None:
-                    raise RuntimeError("video media writer is unavailable")
-                assets = await media_writer.persist(source_file=source_file, assets=assets)
-            stored = await repository.replace_assets(
-                source_file_id=source_file_id,
-                assets=assets,
-            )
-            await repository.record_file_success(job_id=job_id)
+            phase_started = time.perf_counter()
+            try:
+                assets = factory.build_many(
+                    workspace_id=workspace_id,
+                    source_file_id=source_file_id,
+                    source_sha256=digest,
+                    source_file=source_file,
+                    drafts=result.assets,
+                )
+                if any(asset.asset_type.value == "video_segment" for asset in assets):
+                    if media_writer is None:
+                        raise RuntimeError("video media writer is unavailable")
+                    assets = await media_writer.persist(
+                        source_file=source_file,
+                        assets=assets,
+                    )
+                stored = await repository.replace_assets(
+                    source_file_id=source_file_id,
+                    assets=assets,
+                )
+                await repository.record_file_success(job_id=job_id)
+            finally:
+                stage_durations_ms[PipelineStage.ASSET_STORED.value] += (
+                    time.perf_counter() - phase_started
+                ) * 1000
             return _FileOutcome(
                 succeeded=True,
                 asset_count=len(stored.asset_ids),
                 asset_ids=stored.asset_ids,
+                stage_durations_ms=stage_durations_ms,
             )
         except Exception as exc:
             message = str(exc) or type(exc).__name__
@@ -267,6 +343,7 @@ class PipelineRunner:
             return _FileOutcome(
                 succeeded=False,
                 error={"relative_path": source_file.relative_path, "error": message},
+                stage_durations_ms=stage_durations_ms,
             )
 
 

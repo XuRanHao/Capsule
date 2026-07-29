@@ -52,6 +52,8 @@ class EmbeddingRunResult(BaseModel):
     indexed_count: int = 0
     skipped_count: int = 0
     failed_count: int = 0
+    embedding_duration_ms: float = 0
+    indexing_duration_ms: float = 0
     embedding_ids: list[str] = Field(default_factory=list)
     errors: list[dict[str, str]] = Field(default_factory=list)
 
@@ -69,6 +71,8 @@ class _EmbeddingOutcome:
     asset_id: str
     embedding_id: str | None = None
     error: str | None = None
+    model_duration_ms: float = 0
+    indexing_duration_ms: float = 0
 
 
 class EmbeddingInputUnavailable(ValueError):
@@ -117,6 +121,7 @@ class AssetEmbeddingService:
             workspace_id=workspace_id,
             asset_ids=asset_ids,
         )
+        run_started = time.perf_counter()
         if assets:
             await self._vector_store.ensure_collection()
 
@@ -132,6 +137,11 @@ class AssetEmbeddingService:
                 for asset in assets
             )
         )
+        elapsed_ms = (time.perf_counter() - run_started) * 1000 if assets else 0.0
+        model_ms = sum(outcome.model_duration_ms for outcome in outcomes)
+        indexing_ms = sum(outcome.indexing_duration_ms for outcome in outcomes)
+        measured_ms = model_ms + indexing_ms
+        embedding_ms = elapsed_ms * model_ms / measured_ms if measured_ms else elapsed_ms
         return EmbeddingRunResult(
             workspace_id=workspace_id,
             embedding_type=embedding_type.value,
@@ -139,6 +149,8 @@ class AssetEmbeddingService:
             indexed_count=sum(outcome.kind == "indexed" for outcome in outcomes),
             skipped_count=sum(outcome.kind == "skipped" for outcome in outcomes),
             failed_count=sum(outcome.kind == "failed" for outcome in outcomes),
+            embedding_duration_ms=embedding_ms,
+            indexing_duration_ms=max(0.0, elapsed_ms - embedding_ms),
             embedding_ids=[
                 outcome.embedding_id
                 for outcome in outcomes
@@ -161,6 +173,8 @@ class AssetEmbeddingService:
     ) -> _EmbeddingOutcome:
         async with semaphore:
             prepared_id: str | None = None
+            model_duration_ms = 0.0
+            indexing_duration_ms = 0.0
             try:
                 embedding_input = await self._build_input(asset, embedding_type)
                 prepared = await self._repository.prepare(
@@ -181,36 +195,51 @@ class AssetEmbeddingService:
                         embedding_id=prepared.embedding_id,
                     )
 
-                started_at = time.perf_counter()
-                response = await self._model_client.embed_multimodal(embedding_input.input_items)
-                latency_ms = round((time.perf_counter() - started_at) * 1000)
-                await self._vector_store.aupsert(
-                    [
-                        VectorRecord(
-                            embedding_id=prepared.milvus_primary_key,
-                            workspace_id=asset.workspace_id,
-                            project_id=asset.project_id,
-                            asset_id=asset.asset_id,
-                            source_file_id=asset.source_file_id,
-                            asset_type=asset.asset_type,
-                            file_type=asset.file_type,
-                            embedding_type=embedding_type.value,
-                            model_name=self._settings.embedding_model,
-                            embedding_revision=asset.embedding_revision,
-                            created_at_ts=int(asset.created_at.timestamp()),
-                            vector=response.vector,
-                        )
-                    ]
-                )
-                await self._repository.mark_indexed(
-                    embedding_id=prepared.embedding_id,
-                    latency_ms=latency_ms,
-                    usage=response.usage,
-                )
+                phase_started = time.perf_counter()
+                try:
+                    response = await self._model_client.embed_multimodal(
+                        embedding_input.input_items
+                    )
+                finally:
+                    model_duration_ms = (
+                        time.perf_counter() - phase_started
+                    ) * 1000
+                latency_ms = round(model_duration_ms)
+                phase_started = time.perf_counter()
+                try:
+                    await self._vector_store.aupsert(
+                        [
+                            VectorRecord(
+                                embedding_id=prepared.milvus_primary_key,
+                                workspace_id=asset.workspace_id,
+                                project_id=asset.project_id,
+                                asset_id=asset.asset_id,
+                                source_file_id=asset.source_file_id,
+                                asset_type=asset.asset_type,
+                                file_type=asset.file_type,
+                                embedding_type=embedding_type.value,
+                                model_name=self._settings.embedding_model,
+                                embedding_revision=asset.embedding_revision,
+                                created_at_ts=int(asset.created_at.timestamp()),
+                                vector=response.vector,
+                            )
+                        ]
+                    )
+                    await self._repository.mark_indexed(
+                        embedding_id=prepared.embedding_id,
+                        latency_ms=latency_ms,
+                        usage=response.usage,
+                    )
+                finally:
+                    indexing_duration_ms = (
+                        time.perf_counter() - phase_started
+                    ) * 1000
                 return _EmbeddingOutcome(
                     kind="indexed",
                     asset_id=asset.asset_id,
                     embedding_id=prepared.embedding_id,
+                    model_duration_ms=model_duration_ms,
+                    indexing_duration_ms=indexing_duration_ms,
                 )
             except EmbeddingInputUnavailable:
                 return _EmbeddingOutcome(kind="skipped", asset_id=asset.asset_id)
@@ -230,6 +259,8 @@ class AssetEmbeddingService:
                     asset_id=asset.asset_id,
                     embedding_id=prepared_id,
                     error=error[:2000],
+                    model_duration_ms=model_duration_ms,
+                    indexing_duration_ms=indexing_duration_ms,
                 )
 
     async def _build_input(

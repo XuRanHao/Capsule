@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +34,8 @@ class UnderstandingRunResult(BaseModel):
     requested_asset_count: int
     completed_count: int = 0
     failed_count: int = 0
+    understanding_duration_ms: float = 0
+    feature_ready_duration_ms: float = 0
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -69,20 +72,30 @@ class AssetUnderstandingService:
             for asset in assets
             if not asset.asset_description or not asset.asset_features
         ]
+        run_started = time.perf_counter()
         semaphore = asyncio.Semaphore(self._settings.understanding_concurrency)
         outcomes = await asyncio.gather(
             *(self._understand_one(asset, semaphore=semaphore) for asset in assets)
         )
         errors = [
             {"asset_id": asset_id, "error": error}
-            for asset_id, error in outcomes
+            for asset_id, error, _, _ in outcomes
             if error is not None
         ]
+        elapsed_ms = (time.perf_counter() - run_started) * 1000 if assets else 0.0
+        model_ms = sum(outcome[2] for outcome in outcomes)
+        storage_ms = sum(outcome[3] for outcome in outcomes)
+        measured_ms = model_ms + storage_ms
+        understanding_ms = (
+            elapsed_ms * model_ms / measured_ms if measured_ms else elapsed_ms
+        )
         return UnderstandingRunResult(
             workspace_id=workspace_id,
             requested_asset_count=len(assets),
             completed_count=len(assets) - len(errors),
             failed_count=len(errors),
+            understanding_duration_ms=understanding_ms,
+            feature_ready_duration_ms=max(0.0, elapsed_ms - understanding_ms),
             errors=errors,
         )
 
@@ -91,20 +104,30 @@ class AssetUnderstandingService:
         asset: EmbeddingAsset,
         *,
         semaphore: asyncio.Semaphore,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, float, float]:
         async with semaphore:
+            model_ms = 0.0
+            storage_ms = 0.0
             try:
                 messages = await self._messages(asset)
-                understanding = await self._model_client.understand_asset(messages)
-                await self._asset_repository.store_understanding(
-                    asset_id=asset.asset_id,
-                    understanding=understanding,
-                )
-                return asset.asset_id, None
+                phase_started = time.perf_counter()
+                try:
+                    understanding = await self._model_client.understand_asset(messages)
+                finally:
+                    model_ms = (time.perf_counter() - phase_started) * 1000
+                phase_started = time.perf_counter()
+                try:
+                    await self._asset_repository.store_understanding(
+                        asset_id=asset.asset_id,
+                        understanding=understanding,
+                    )
+                finally:
+                    storage_ms = (time.perf_counter() - phase_started) * 1000
+                return asset.asset_id, None, model_ms, storage_ms
             except Exception as exc:
                 error = str(exc) or type(exc).__name__
                 logger.exception("understanding failed for asset %s", asset.asset_id)
-                return asset.asset_id, error[:2000]
+                return asset.asset_id, error[:2000], model_ms, storage_ms
 
     async def _messages(self, asset: EmbeddingAsset) -> list[dict[str, Any]]:
         system = {

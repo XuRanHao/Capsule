@@ -106,6 +106,7 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         def __init__(self) -> None:
             self.stages: list[PipelineStage] = []
             self.final_errors: list[dict[str, str]] = []
+            self.durations: dict[str, float] = {}
 
         async def begin_asset_enrichment(self, *, asset_ids: list[str]) -> None:
             assert asset_ids == ["asset_a", "asset_b"]
@@ -113,6 +114,15 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         async def set_job_stage(self, *, job_id: str, stage: PipelineStage) -> None:
             assert job_id == "job_test"
             self.stages.append(stage)
+
+        async def add_job_stage_durations(
+            self,
+            *,
+            job_id: str,
+            durations_ms: dict[str, float],
+        ) -> None:
+            assert job_id == "job_test"
+            self.durations = durations_ms
 
         async def finalize_enrichment(
             self,
@@ -128,7 +138,9 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     class Understanding:
         async def run(self, **_: object) -> SimpleNamespace:
             return SimpleNamespace(
-                errors=[{"asset_id": "asset_b", "error": "understanding failed"}]
+                errors=[{"asset_id": "asset_b", "error": "understanding failed"}],
+                understanding_duration_ms=120.0,
+                feature_ready_duration_ms=5.0,
             )
 
     class Embedding:
@@ -142,7 +154,11 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
             **_: object,
         ) -> SimpleNamespace:
             self.types.append(embedding_type)
-            return SimpleNamespace(errors=[])
+            return SimpleNamespace(
+                errors=[],
+                embedding_duration_ms=20.0,
+                indexing_duration_ms=2.0,
+            )
 
     repository = Repository()
     embedding = Embedding()
@@ -165,6 +181,10 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     assert result.completed_asset_count == 1
     assert result.partial_failed_asset_count == 1
     assert repository.final_errors[0]["stage"] == "understanding"
+    assert repository.durations["understanding"] == 120.0
+    assert repository.durations["feature_ready"] == 5.0
+    assert repository.durations["embedding"] == 20.0 * len(EmbeddingType)
+    assert repository.durations["indexing"] == 2.0 * len(EmbeddingType)
 
 
 def test_asset_understanding_normalizes_loose_model_feature_json() -> None:

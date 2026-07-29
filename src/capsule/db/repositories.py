@@ -317,6 +317,27 @@ class AssetRepository:
                 raise ValueError(f"processing job does not exist: {job_id}")
             job.completed_count += 1
 
+    async def add_job_stage_durations(
+        self,
+        *,
+        job_id: str,
+        durations_ms: dict[str, float],
+    ) -> None:
+        """Accumulate measured wall-clock work for independently timed stages."""
+        if not durations_ms:
+            return
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            current = dict(job.stage_durations_ms)
+            for stage, duration_ms in durations_ms.items():
+                current[stage] = round(
+                    current.get(stage, 0.0) + max(0.0, duration_ms),
+                    3,
+                )
+            job.stage_durations_ms = current
+
     async def finalize_job(self, *, job_id: str) -> None:
         async with self._database.session() as session, session.begin():
             job = await session.get(ProcessingJob, job_id, with_for_update=True)
@@ -366,6 +387,7 @@ class AssetRepository:
                 status=job.status,
                 current_stage=job.current_stage,
                 error_info=list(job.error_info),
+                stage_durations_ms=dict(job.stage_durations_ms),
                 started_at=job.started_at,
                 completed_at=job.completed_at,
             )
@@ -670,6 +692,7 @@ def _processing_job_record(job: ProcessingJob) -> ProcessingJobRecord:
         status=job.status,
         current_stage=job.current_stage,
         error_info=list(job.error_info),
+        stage_durations_ms=dict(job.stage_durations_ms),
         started_at=job.started_at,
         completed_at=job.completed_at,
     )

@@ -45,6 +45,23 @@ function progress(job: ProcessingJob) {
   return Math.min(99, Math.round(Math.max(stageProgress, fileProgress)));
 }
 
+function elapsedMilliseconds(job: ProcessingJob) {
+  if (!job.started_at) return null;
+  const end = job.completed_at ? new Date(job.completed_at) : new Date();
+  return Math.max(0, end.getTime() - new Date(job.started_at).getTime());
+}
+
+function formatDuration(durationMs: number | null | undefined) {
+  if (durationMs == null) return "未记录";
+  if (durationMs < 10) return "< 0.01s";
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  const seconds = durationMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 2 : 1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  return `${minutes}m ${String(remaining).padStart(2, "0")}s`;
+}
+
 export default function TasksPage() {
   const [jobs, setJobs] = useState<ProcessingJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -91,14 +108,10 @@ export default function TasksPage() {
     ? PIPELINE_STAGES.indexOf(selected.current_stage)
     : -1;
   const elapsed = useMemo(() => {
-    if (!selected?.started_at) return "—";
-    const end = selected.completed_at
-      ? new Date(selected.completed_at)
-      : new Date();
-    const seconds = Math.max(
-      0,
-      Math.round((end.getTime() - new Date(selected.started_at).getTime()) / 1000),
-    );
+    if (!selected) return "—";
+    const durationMs = elapsedMilliseconds(selected);
+    if (durationMs == null) return "—";
+    const seconds = Math.round(durationMs / 1000);
     return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(
       seconds % 60,
     ).padStart(2, "0")}`;
@@ -182,6 +195,10 @@ export default function TasksPage() {
                 const completed =
                   selected.status === "completed" || index < currentStage;
                 const active = index === currentStage;
+                const duration =
+                  stage === "completed"
+                    ? elapsedMilliseconds(selected)
+                    : selected.stage_durations_ms?.[stage];
                 return (
                   <div
                     className={`${completed ? "completed" : ""} ${
@@ -192,7 +209,11 @@ export default function TasksPage() {
                     <span>{completed ? "✓" : String(index + 1)}</span>
                     <strong>{STAGE_LABELS[stage]}</strong>
                     <small>
-                      {active ? `${progress(selected)}%` : completed ? "完成" : "等待"}
+                      {active && selected.status === "running"
+                        ? "计时中…"
+                        : completed
+                          ? formatDuration(duration)
+                          : "等待"}
                     </small>
                   </div>
                 );
@@ -257,6 +278,18 @@ export default function TasksPage() {
                 <p className="console-active">
                   <span>STAGE</span>
                   {STAGE_LABELS[selected.current_stage] || selected.current_stage}
+                </p>
+                <p>
+                  <span>DURATION</span>
+                  {selected.status === "running"
+                    ? "计时中…"
+                    : formatDuration(
+                        selected.current_stage === "completed"
+                          ? elapsedMilliseconds(selected)
+                          : selected.stage_durations_ms?.[
+                              selected.current_stage
+                            ],
+                      )}
                 </p>
               </div>
             </section>

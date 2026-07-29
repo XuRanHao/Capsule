@@ -168,6 +168,11 @@ class ProcessingJob(Base, TimestampMixin):
     error_info: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, default=list, nullable=False
     )
+    stage_durations_ms: Mapped[dict[str, float]] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

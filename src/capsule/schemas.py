@@ -320,6 +320,7 @@ class ProcessingJobRecord(BaseModel):
     status: str
     current_stage: str
     error_info: list[dict[str, Any]] = Field(default_factory=list)
+    stage_durations_ms: dict[str, float] = Field(default_factory=dict)
     started_at: datetime | None
     completed_at: datetime | None
 
