@@ -131,7 +131,11 @@ recorded without aborting the rest of the batch.
 Video visual features run only on the macOS host because Docker cannot access
 MPS. The first pass uses scene detection, 45-second long-shot splitting into
 20-second windows, end-inclusive 5-second frame sampling (maximum 12), quality
-filtering, and up to three MobileCLIP-S0 representative frames.
+filtering, and up to three MobileCLIP-S0 representative frames. Each final
+Segment is then rendered once as a playable MP4, cover image and representative
+keyframe images. The derived media is written to the configured private
+S3-compatible bucket; the Asset keeps the logical time range plus generic
+`derived_file_uri`, `preview_uri`, and video-specific `file_info.keyframes`.
 
 Run the command from a native Apple-silicon Python environment that has the
 Capsule dependencies plus PyTorch, Apple `ml-mobileclip`, FFmpeg and FFprobe:

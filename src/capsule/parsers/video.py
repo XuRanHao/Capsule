@@ -1,9 +1,9 @@
 """Video visual segmentation and Asset draft generation.
 
-The parser owns deterministic video analysis only.  It keeps segments as time
-ranges on the source file and never creates derived video files.  Visual
-embeddings are supplied by a host-side backend so that the Docker application
-does not need to carry PyTorch or access macOS MPS.
+The parser owns deterministic video analysis and creates logical Segment
+drafts. The pipeline's media writer turns those drafts into persistent clips
+and images. Visual embeddings are supplied by a host-side backend so that the
+Docker application does not need to carry PyTorch or access macOS MPS.
 """
 
 import asyncio
@@ -116,11 +116,11 @@ class VideoParser:
         return [
             executable
             for executable in ("ffmpeg", "ffprobe")
-            if _resolve_video_tool(executable) is None
+            if resolve_video_tool(executable) is None
         ]
 
     async def assetize(self, source_file: DiscoveredFile) -> list[AssetDraft]:
-        """Build video Asset drafts without producing physical clips."""
+        """Build logical video Segment drafts for later media persistence."""
         async with self._semaphore:
             return await asyncio.to_thread(self.assetize_path, Path(source_file.path))
 
@@ -541,13 +541,13 @@ def _require_video_tools() -> None:
 
 
 def _require_video_tool(executable: str) -> Path:
-    resolved = _resolve_video_tool(executable)
+    resolved = resolve_video_tool(executable)
     if resolved is None:
         raise VideoToolingError(f"missing video dependency: {executable}")
     return resolved
 
 
-def _resolve_video_tool(executable: str) -> Path | None:
+def resolve_video_tool(executable: str) -> Path | None:
     if found := shutil.which(executable):
         return Path(found)
     if platform.system() != "Darwin":

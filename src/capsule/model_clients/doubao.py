@@ -187,6 +187,7 @@ class DoubaoClient:
                 json={
                     "model": self._settings.embedding_model,
                     "encoding_format": "float",
+                    "dimensions": self._settings.embedding_dimension,
                     "input": list(input_items),
                 },
                 timeout=self._settings.embedding_timeout_seconds,
@@ -277,7 +278,13 @@ def _extract_message_content(payload: Mapping[str, Any]) -> str:
 
 def _extract_embedding(payload: Mapping[str, Any]) -> list[float]:
     try:
-        raw = payload["data"][0]["embedding"]
+        data = payload["data"]
+        if isinstance(data, list):
+            raw = data[0]["embedding"]
+        elif isinstance(data, Mapping):
+            raw = data["embedding"]
+        else:
+            raise TypeError("embedding data must be a list or object")
     except (KeyError, IndexError, TypeError) as exc:
         raise DoubaoResponseError("embedding response does not contain a vector") from exc
 

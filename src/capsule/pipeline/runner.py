@@ -18,7 +18,9 @@ from capsule.parsers.image import ImageParser
 from capsule.parsers.markdown import MarkdownParser
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
+from capsule.pipeline.video_media import VideoArtifactStorage, VideoDerivedMediaWriter
 from capsule.schemas import AssetDraft, DiscoveredFile
+from capsule.storage.object_storage import ObjectStorage
 
 
 class PipelinePlan(BaseModel):
@@ -49,11 +51,13 @@ class PipelineRunner:
         database: Database | None = None,
         token_counter: TokenCounter | None = None,
         video_embedder: VisualEmbedder | None = None,
+        object_storage: VideoArtifactStorage | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._database = database
         self._token_counter = token_counter
         self._video_embedder = video_embedder
+        self._object_storage = object_storage
 
     def build_plan(self, input_path: Path, workspace_id: str) -> PipelinePlan:
         files = discover_files(input_path)
@@ -82,6 +86,7 @@ class PipelineRunner:
         repository = AssetRepository(database)
         factory = AssetFactory()
         assetizer = _build_assetizer(counter, self._settings, self._video_embedder)
+        object_storage = self._object_storage
         job_id = await repository.create_job(
             workspace_id=workspace_id,
             input_path=input_path,
@@ -112,6 +117,12 @@ class PipelineRunner:
                         source_file=source_file,
                         drafts=result.assets,
                     )
+                    if any(asset.asset_type.value == "video_segment" for asset in assets):
+                        object_storage = object_storage or ObjectStorage(self._settings)
+                        assets = await VideoDerivedMediaWriter(object_storage).persist(
+                            source_file=source_file,
+                            assets=assets,
+                        )
                     stored = await repository.replace_assets(
                         source_file_id=source_file_id,
                         assets=assets,

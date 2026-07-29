@@ -41,13 +41,25 @@ class ObjectStorage:
 
         await asyncio.to_thread(create_if_missing)
 
-    async def upload_file(self, source: Path, object_key: str) -> str:
-        await asyncio.to_thread(
-            self._client.upload_file,
-            str(source),
-            self._bucket,
-            object_key,
-        )
+    async def upload_file(
+        self,
+        source: Path,
+        object_key: str,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        extra_args = {"ContentType": content_type} if content_type else None
+
+        def upload() -> None:
+            kwargs = {"ExtraArgs": extra_args} if extra_args else {}
+            self._client.upload_file(
+                str(source),
+                self._bucket,
+                object_key,
+                **kwargs,
+            )
+
+        await asyncio.to_thread(upload)
         return f"s3://{self._bucket}/{object_key}"
 
     async def upload_bytes(
