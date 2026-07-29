@@ -16,6 +16,7 @@ from capsule.parsers.assetizer import Assetizer
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.image import ImageParser
 from capsule.parsers.markdown import MarkdownParser
+from capsule.parsers.text import TextParser
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
 from capsule.pipeline.video_media import VideoArtifactStorage, VideoDerivedMediaWriter
@@ -76,7 +77,7 @@ class PipelineRunner:
         owns_database = self._database is None
         counter = self._token_counter
         owns_counter = False
-        if counter is None and any(item.extension == ".md" for item in source_files):
+        if counter is None and any(item.extension in {".md", ".txt"} for item in source_files):
             try:
                 counter = ArkTokenCounter(self._settings)
                 owns_counter = True
@@ -163,6 +164,7 @@ def _build_assetizer(
     video_embedder: VisualEmbedder | None,
 ) -> Assetizer:
     markdown = MarkdownParser()
+    plain_text = TextParser()
     image = ImageParser()
     video = VideoParser(
         concurrency=settings.ffmpeg_concurrency,
@@ -182,12 +184,18 @@ def _build_assetizer(
 
     async def markdown_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
-            raise ValueError("CAPSULE_ARK_API_KEY is required to split Markdown")
+            raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
         return await markdown.assetize_file(Path(source_file.path), counter)
+
+    async def plain_text_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
+        if counter is None:
+            raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
+        return await plain_text.assetize_file(Path(source_file.path), counter)
 
     return Assetizer(
         {
             ".md": markdown_handler,
+            ".txt": plain_text_handler,
             ".jpg": image.assetize,
             ".jpeg": image.assetize,
             ".png": image.assetize,

@@ -4,7 +4,9 @@ from pathlib import Path
 
 from capsule.schemas import DiscoveredFile
 
-SUPPORTED_EXTENSIONS = frozenset({".md", ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"})
+SUPPORTED_EXTENSIONS = frozenset(
+    {".md", ".txt", ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+)
 
 
 def discover_files(root: Path) -> list[DiscoveredFile]:

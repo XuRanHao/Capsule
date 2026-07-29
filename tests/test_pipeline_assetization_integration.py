@@ -31,6 +31,7 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
             pytest.skip("PostgreSQL integration database is unavailable")
 
         (tmp_path / "notes.md").write_text("# Capsule\n\n正文", encoding="utf-8")
+        (tmp_path / "notes.txt").write_text("普通文本\n\n第二段", encoding="utf-8")
         Image.new("RGB", (64, 32), (1, 2, 3)).save(tmp_path / "valid.png")
         (tmp_path / "broken.png").write_bytes(b"not-an-image")
 
@@ -39,10 +40,10 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
             token_counter=CharacterTokenCounter(),
         ).run(tmp_path, workspace_id)
 
-        assert result.file_count == 3
-        assert result.succeeded_count == 2
+        assert result.file_count == 4
+        assert result.succeeded_count == 3
         assert result.failed_count == 1
-        assert result.asset_count == 2
+        assert result.asset_count == 3
         assert result.errors[0]["relative_path"] == "broken.png"
 
         async with database.session() as session:
@@ -64,13 +65,14 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
             )
             assert job is not None
             assert job.status == JobStatus.PARTIAL_FAILED.value
-            assert job.completed_count == 2
+            assert job.completed_count == 3
             assert job.failed_count == 1
-            assert asset_count == 2
-            assert source_count == 3
-            assert [asset.file_name for asset in assets] == ["notes.md", "valid.png"]
+            assert asset_count == 3
+            assert source_count == 4
+            assert [asset.file_name for asset in assets] == ["notes.md", "notes.txt", "valid.png"]
             assert assets[0].raw_content == "# Capsule\n\n正文"
-            assert assets[1].raw_content is None
+            assert assets[1].raw_content == "普通文本\n\n第二段"
+            assert assets[2].raw_content is None
     finally:
         try:
             async with database.session() as session, session.begin():

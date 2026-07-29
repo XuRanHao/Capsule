@@ -1,8 +1,8 @@
 # Capsule
 
-Capsule is a proof-of-concept system for turning local Markdown, image, and
-video files into multimodal assets, embeddings, explainable HDBSCAN clusters,
-and searchable results.
+Capsule is a proof-of-concept system for turning local Markdown, plain-text,
+image, and video files into multimodal assets, embeddings, explainable HDBSCAN
+clusters, and searchable results.
 
 The repository is split at the Asset/Embedding handoff. The role B retrieval
 path is implemented end to end:
@@ -81,10 +81,11 @@ make test         # backend and frontend quality gates
 make down         # stop containers without deleting persisted data
 ```
 
-The assetization CLI persists Markdown, image and video Assets to PostgreSQL.
-Video segments additionally persist playable MP4/JPEG artifacts in MinIO/S3. A
-failed file is recorded without aborting the batch. Use the `embed` CLI command
-after import to write `EmbeddingRecord` metadata and vectors to Milvus.
+The assetization CLI persists Markdown, plain-text, image and video Assets to
+PostgreSQL. Video segments additionally persist playable MP4/JPEG artifacts in
+MinIO/S3. A failed file is recorded without aborting the batch. Use the `embed`
+CLI command after import to write `EmbeddingRecord` metadata and vectors to
+Milvus.
 
 To reset persisted PostgreSQL/Milvus/MinIO data, use
 `docker compose down -v` deliberately; `make down` preserves it.
@@ -126,9 +127,9 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    capsule embed --workspace workspace_demo
    ```
 
-The non-dry-run pipeline persists Markdown, image and video Assets to
-PostgreSQL. Video input requires the host MPS worker described below; a video
-failure is recorded without aborting the rest of the batch.
+The non-dry-run pipeline persists Markdown, plain-text, image and video Assets
+to PostgreSQL. Video input requires the host MPS worker described below; a
+video failure is recorded without aborting the rest of the batch.
 
 `capsule embed` processes one embedding route at a time. Its default is native
 multimodal: Markdown uses the block text, images are sent inline as their

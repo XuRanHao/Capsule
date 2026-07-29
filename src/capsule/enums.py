@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class AssetType(StrEnum):
     MARKDOWN_BLOCK = "markdown_block"
+    TEXT_BLOCK = "text_block"
     IMAGE = "image"
     VIDEO_SEGMENT = "video_segment"
 

@@ -251,7 +251,7 @@ class AssetEmbeddingService:
         )
 
     async def _native_input(self, asset: EmbeddingAsset) -> _EmbeddingInput:
-        if asset.asset_type == AssetType.MARKDOWN_BLOCK.value:
+        if asset.asset_type in {AssetType.MARKDOWN_BLOCK.value, AssetType.TEXT_BLOCK.value}:
             return _text_input(
                 asset.raw_content,
                 embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
