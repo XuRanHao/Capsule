@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType, EmbeddingSourceMode, EmbeddingType
-from capsule.media.model_image import prepare_model_image
+from capsule.media.model_image import ModelImageCache
 from capsule.schemas import EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
 
@@ -102,12 +102,22 @@ class AssetEmbeddingService:
         model_client: AssetEmbeddingClient,
         vector_store: EmbeddingVectorStore,
         video_url_signer: VideoUrlSigner | None = None,
+        image_cache: ModelImageCache | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._model_client = model_client
         self._vector_store = vector_store
         self._video_url_signer = video_url_signer
+        self._image_cache = image_cache or ModelImageCache(
+            target_bytes=settings.model_image_target_bytes,
+            max_edge=settings.model_image_max_edge,
+            max_entries=settings.model_image_cache_entries,
+        )
+        self._native_semaphore = asyncio.Semaphore(
+            settings.native_embedding_concurrency
+        )
+        self._text_semaphore = asyncio.Semaphore(settings.embedding_concurrency)
 
     async def run(
         self,
@@ -122,18 +132,62 @@ class AssetEmbeddingService:
             workspace_id=workspace_id,
             asset_ids=asset_ids,
         )
-        run_started = time.perf_counter()
         if assets:
             await self._vector_store.ensure_collection()
+        return await self._run_assets(
+            workspace_id=workspace_id,
+            embedding_type=embedding_type,
+            assets=assets,
+            force=force,
+        )
 
-        semaphore = asyncio.Semaphore(self._settings.embedding_concurrency)
+    async def run_many(
+        self,
+        *,
+        workspace_id: str,
+        embedding_types: Sequence[EmbeddingType],
+        asset_ids: Sequence[str] | None = None,
+        force: bool = False,
+    ) -> list[EmbeddingRunResult]:
+        """Run independent channels concurrently behind shared workload pools."""
+        selected_types = list(dict.fromkeys(embedding_types))
+        if not selected_types:
+            return []
+        assets = await self._repository.list_assets(
+            workspace_id=workspace_id,
+            asset_ids=asset_ids,
+        )
+        if assets:
+            await self._vector_store.ensure_collection()
+        return list(
+            await asyncio.gather(
+                *(
+                    self._run_assets(
+                        workspace_id=workspace_id,
+                        embedding_type=embedding_type,
+                        assets=assets,
+                        force=force,
+                    )
+                    for embedding_type in selected_types
+                )
+            )
+        )
+
+    async def _run_assets(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: EmbeddingType,
+        assets: Sequence[EmbeddingAsset],
+        force: bool,
+    ) -> EmbeddingRunResult:
+        run_started = time.perf_counter()
         outcomes = await asyncio.gather(
             *(
                 self._embed_one(
                     asset=asset,
                     embedding_type=embedding_type,
                     force=force,
-                    semaphore=semaphore,
                 )
                 for asset in assets
             )
@@ -170,8 +224,12 @@ class AssetEmbeddingService:
         asset: EmbeddingAsset,
         embedding_type: EmbeddingType,
         force: bool,
-        semaphore: asyncio.Semaphore,
     ) -> _EmbeddingOutcome:
+        semaphore = (
+            self._native_semaphore
+            if embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+            else self._text_semaphore
+        )
         async with semaphore:
             prepared_id: str | None = None
             model_duration_ms = 0.0
@@ -291,11 +349,10 @@ class AssetEmbeddingService:
                 source_mode=EmbeddingSourceMode.ORIGINAL_TEXT,
             )
         if asset.asset_type == AssetType.IMAGE.value:
-            image_bytes = await asyncio.to_thread(_read_local_source, asset.source_storage_uri)
-            prepared_image = await asyncio.to_thread(
-                prepare_model_image,
-                image_bytes,
-                asset.source_mime_type,
+            prepared_image = await self._image_cache.prepare(
+                cache_key=asset.content_hash,
+                mime_type=asset.source_mime_type,
+                loader=lambda: _read_local_source(asset.source_storage_uri),
             )
             image_url = _data_uri(
                 mime_type=prepared_image.mime_type,

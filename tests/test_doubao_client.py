@@ -47,6 +47,7 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/responses"
         payload = json.loads(request.content)
         calls.append(payload)
         features: object = (
@@ -57,20 +58,14 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
         return httpx.Response(
             200,
             json={
-                "choices": [
+                "output_text": json.dumps(
                     {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "asset_name": "测试素材",
-                                    "asset_description": "一条用于验证结构化输出约束的素材描述。",
-                                    "features": features,
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
+                        "asset_name": "测试素材",
+                        "asset_description": "一条用于验证结构化输出约束的素材描述。",
+                        "features": features,
+                    },
+                    ensure_ascii=False,
+                )
             },
         )
 
@@ -82,21 +77,35 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
     )
     try:
         result = await client.understand_asset(
-            [{"role": "user", "content": "分析这条测试素材"}]
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "分析这条测试素材"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,ZmFrZQ=="},
+                        },
+                    ],
+                }
+            ]
         )
     finally:
         await client.close()
 
     assert result.features.subject_content.value == "测试值"
     assert len(calls) == 2
-    assert calls[0]["response_format"] == {"type": "json_object"}
-    first_messages = calls[0]["messages"]
-    assert isinstance(first_messages, list)
-    assert "features 必须是对象，不能是数组" in str(first_messages[0])
-    assert "JSON 结构示例" in str(first_messages[0])
-    assert "禁止照抄" in str(first_messages[0])
-    assert all(name in str(first_messages[0]) for name in feature_names)
-    assert "上一份输出未通过 AssetUnderstanding 结构校验" in str(calls[1]["messages"])
+    assert calls[0]["thinking"] == {"type": "disabled"}
+    assert calls[0]["max_output_tokens"] == 2048
+    assert calls[0]["text"] == {"format": {"type": "json_object"}}
+    first_input = calls[0]["input"]
+    assert isinstance(first_input, list)
+    assert "features 必须是对象，不能是数组" in str(first_input[0])
+    assert "JSON 结构示例" in str(first_input[0])
+    assert "禁止照抄" in str(first_input[0])
+    assert all(name in str(first_input[0]) for name in feature_names)
+    assert "input_image" in str(first_input)
+    assert "上一份输出未通过 AssetUnderstanding 结构校验" in str(calls[1]["input"])
 
 
 @pytest.mark.asyncio
@@ -185,6 +194,7 @@ async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> 
 
     assert captured["model"] == "doubao-seed-2-0-lite-260215"
     assert captured["thinking"] == {"type": "disabled"}
+    assert captured["text"] == {"format": {"type": "json_object"}}
     assert "asset_1" in str(captured["input"])
     assert summary.name == "蓝紫色霓虹夜景"
 

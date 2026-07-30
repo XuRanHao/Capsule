@@ -36,11 +36,11 @@ class DoubaoClient:
                 "Content-Type": "application/json",
             },
             limits=httpx.Limits(
-                max_connections=max(
-                    32,
-                    settings.understanding_concurrency + settings.embedding_concurrency,
+                max_connections=settings.http_max_connections,
+                max_keepalive_connections=min(
+                    settings.http_max_keepalive_connections,
+                    settings.http_max_connections,
                 ),
-                max_keepalive_connections=24,
             ),
         )
         self.understanding_pool = AsyncCallPool(
@@ -48,8 +48,13 @@ class DoubaoClient:
             concurrency=settings.understanding_concurrency,
             max_attempts=settings.model_max_retries,
         )
+        self.native_embedding_pool = AsyncCallPool(
+            name="native_embedding",
+            concurrency=settings.native_embedding_concurrency,
+            max_attempts=settings.model_max_retries,
+        )
         self.embedding_pool = AsyncCallPool(
-            name="embedding",
+            name="text_embedding",
             concurrency=settings.embedding_concurrency,
             max_attempts=settings.model_max_retries,
         )
@@ -77,7 +82,7 @@ class DoubaoClient:
             *messages,
         ]
         try:
-            return await self._chat_json(
+            return await self._responses_json(
                 messages=constrained_messages,
                 output_type=AssetUnderstanding,
                 pool=self.understanding_pool,
@@ -93,7 +98,7 @@ class DoubaoClient:
                     f"校验错误：{_validation_error_text(exc)}"
                 ),
             }
-            return await self._chat_json(
+            return await self._responses_json(
                 messages=[*constrained_messages, correction],
                 output_type=AssetUnderstanding,
                 pool=self.understanding_pool,
@@ -253,7 +258,12 @@ class DoubaoClient:
                 request_id=response.headers.get("x-request-id") or payload.get("id"),
             )
 
-        return await self.embedding_pool.run(request)
+        pool = (
+            self.native_embedding_pool
+            if _contains_visual_embedding_input(input_items)
+            else self.embedding_pool
+        )
+        return await pool.run(request)
 
     async def embed_text(self, text: str) -> EmbeddingResult:
         """Embed text in the same multimodal space used by indexed assets."""
@@ -321,15 +331,17 @@ class DoubaoClient:
     ) -> ModelT:
         """Call Ark Responses API for the Lite model with thinking disabled."""
 
-        input_text = _responses_input_text(messages)
+        response_input = _responses_input(messages)
 
         async def request() -> ModelT:
             response = await self._client.post(
                 "/responses",
                 json={
                     "model": self._settings.understanding_model,
-                    "input": input_text,
+                    "input": response_input,
                     "thinking": {"type": "disabled"},
+                    "max_output_tokens": self._settings.understanding_max_output_tokens,
+                    "text": {"format": {"type": "json_object"}},
                 },
                 timeout=timeout_seconds,
             )
@@ -344,11 +356,6 @@ class DoubaoClient:
 
 
 def _asset_understanding_schema_message() -> dict[str, str]:
-    schema = json.dumps(
-        AssetUnderstanding.model_json_schema(),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
     example = json.dumps(
         _asset_understanding_json_example(),
         ensure_ascii=False,
@@ -360,10 +367,9 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "以下输出结构约束优先于其他格式描述。只返回一个符合 JSON Schema 的 JSON 对象，"
             "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
             "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
-            "的对象；value 使用中文分号连接该维度内最多五个关键词，无证据时使用 null，不得省略"
-            "必填字段。下面的手工示例只用于说明 JSON 结构，示例文字不是素材事实，禁止照抄；所有"
-            "实际值、状态、置信度和证据必须根据输入素材"
-            f"重新判断。JSON 结构示例：{example}。JSON Schema：{schema}"
+            "的对象；value 最多五个关键词，evidence 最多一条，无证据时使用 null 和空数组。"
+            "下面的手工示例只说明结构，禁止照抄；实际值必须根据输入素材重新判断。"
+            f"JSON 结构示例：{example}"
         ),
     }
 
@@ -415,19 +421,61 @@ def _extract_message_content(payload: Mapping[str, Any]) -> str:
     return content
 
 
-def _responses_input_text(messages: Sequence[Mapping[str, Any]]) -> str:
-    parts: list[str] = []
+def _responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    response_input: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role", "user"))
         content = message.get("content", "")
         if isinstance(content, str):
-            rendered = content
-        elif isinstance(content, (Mapping, list)):
-            rendered = json.dumps(content, ensure_ascii=False)
+            rendered_content = [{"type": "input_text", "text": content}]
+        elif isinstance(content, Mapping):
+            rendered_content = _responses_content([content])
+        elif isinstance(content, list):
+            rendered_content = _responses_content(content)
         else:
             raise DoubaoResponseError("Responses input content must be text or JSON data")
-        parts.append(f"{role}:\n{rendered}")
-    return "\n\n".join(parts)
+        response_input.append({"role": role, "content": rendered_content})
+    return response_input
+
+
+def _responses_content(items: Sequence[object]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise DoubaoResponseError("Responses content items must be JSON objects")
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise DoubaoResponseError("Responses text content must contain text")
+            converted.append({"type": "input_text", "text": text})
+            continue
+        if item_type == "image_url":
+            image = item.get("image_url")
+            if isinstance(image, Mapping):
+                image_url = image.get("url")
+                detail = image.get("detail")
+            else:
+                image_url = image
+                detail = None
+            if not isinstance(image_url, str):
+                raise DoubaoResponseError("Responses image content must contain a URL")
+            converted_image: dict[str, Any] = {
+                "type": "input_image",
+                "image_url": image_url,
+            }
+            if isinstance(detail, str):
+                converted_image["detail"] = detail
+            converted.append(converted_image)
+            continue
+        raise DoubaoResponseError(f"unsupported Responses content type: {item_type}")
+    return converted
+
+
+def _contains_visual_embedding_input(
+    input_items: Sequence[Mapping[str, Any]],
+) -> bool:
+    return any(item.get("type") in {"image_url", "video_url"} for item in input_items)
 
 
 def _extract_response_output_text(payload: Mapping[str, Any]) -> str:

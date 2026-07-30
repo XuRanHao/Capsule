@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository, EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType
-from capsule.media.model_image import prepare_model_image
+from capsule.media.model_image import ModelImageCache
 from capsule.schemas import AssetUnderstanding
 
 logger = logging.getLogger(__name__)
@@ -51,12 +51,18 @@ class AssetUnderstandingService:
         asset_repository: AssetRepository,
         model_client: UnderstandingClient,
         artifact_reader: ArtifactReader | None = None,
+        image_cache: ModelImageCache | None = None,
     ) -> None:
         self._settings = settings
         self._embedding_repository = embedding_repository
         self._asset_repository = asset_repository
         self._model_client = model_client
         self._artifact_reader = artifact_reader
+        self._image_cache = image_cache or ModelImageCache(
+            target_bytes=settings.model_image_target_bytes,
+            max_edge=settings.model_image_max_edge,
+            max_entries=settings.model_image_cache_entries,
+        )
 
     async def run(
         self,
@@ -134,29 +140,16 @@ class AssetUnderstandingService:
         system = {
             "role": "system",
             "content": (
-                "你是多模态 Asset 特征提取器。请结合 Asset 本体与上下文信息理解当前 Asset。"
-                "上下文用于补充名称、含义、主题、人物关系、场景背景和来源，但最终结果始终"
-                "描述当前 Asset，而不是概括整篇文档。十个 Feature 是相互独立的特征空间："
-                "每条信息只归入定义最准确的一个维度；每个维度只回答自己的问题，彼此不补充、"
-                "不推导、不重复。"
-                "只能输出合法 JSON，不要 Markdown。JSON 必须包含 "
-                "asset_name、asset_description、features。features 必须完整包含 "
-                "subject_content、scene_theme、visual_style、color_composition、"
-                "mood_atmosphere、character_state_or_psychology、asset_usage、"
-                "target_audience、provenance、rights_version_authorship。每个 Feature 都必须包含 "
-                "value、status、confidence、evidence；status 只能是 observed、inferred、"
-                "metadata、user_supplied、unknown、not_applicable，confidence 为 0 到 1；"
-                "evidence 必须是 JSON 字符串数组，即使只有一条也必须写成 [\"证据\"]。"
-                "每个 value 只输出该维度内部的 0 到 5 个关键词，使用中文分号连接；关键词应为"
-                "2 到 8 个汉字的名词、形容词或短语，不写完整句子；无法确定或不适用时 value "
-                "使用 null。各维度分别回答：subject_content 当前有什么；scene_theme 是什么"
-                "题材或概念；visual_style 采用什么视觉表现；color_composition 如何组织颜色"
-                "和画面；mood_atmosphere 形成什么情绪氛围；"
-                "character_state_or_psychology 角色处于什么动作、姿态、表情或互动状态；"
-                "asset_usage 可用于什么场景；target_audience 面向什么人群；provenance 有什么"
-                "客观来源和载体；rights_version_authorship 有什么明确的权利、版本和作者信息。"
-                "asset_name 简洁可辨识，asset_description 描述可检索的主体、场景、风格、"
-                "色彩、构图和氛围。不得虚构无法从素材、目录和关联段落中得到的事实。"
+                "你是多模态 Asset 特征提取器，只描述当前 Asset；上下文仅用于消歧。"
+                "十个 Feature 彼此独立，不跨维度重复或推导。asset_name 不超过 20 字；"
+                "asset_description 用 40 到 120 字客观描述可检索内容。每个 Feature 的 value "
+                "只含该维度 0 到 5 个中文关键词，以分号连接；evidence 最多一条且不超过 40 字。"
+                "维度边界：subject_content=主体与动作；scene_theme=场景题材；"
+                "visual_style=表现技法；color_composition=色彩构图；"
+                "mood_atmosphere=情绪氛围；character_state_or_psychology=人物可观察状态；"
+                "asset_usage=用途；target_audience=受众；provenance=客观来源；"
+                "rights_version_authorship=有证据的权利版本作者。无证据使用 null/unknown，"
+                "不得虚构。只输出约定 JSON，不要 Markdown。"
             ),
         }
         metadata = _asset_context_payload(asset)
@@ -180,11 +173,10 @@ class AssetUnderstandingService:
                 }
             )
         elif asset.asset_type == AssetType.IMAGE.value:
-            image_bytes = await asyncio.to_thread(_read_local_source, asset.source_storage_uri)
-            prepared_image = await asyncio.to_thread(
-                prepare_model_image,
-                image_bytes,
-                asset.source_mime_type,
+            prepared_image = await self._image_cache.prepare(
+                cache_key=asset.content_hash,
+                mime_type=asset.source_mime_type,
+                loader=lambda: _read_local_source(asset.source_storage_uri),
             )
             content.append(
                 {
@@ -258,13 +250,13 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
     ]
     associated_text = list(
         dict.fromkeys(
-            text.strip()
+            text.strip()[:2_000]
             for context in source_contexts
             if context.get("relation_type") in {"caption", "preceding_text"}
             and isinstance((text := context.get("text")), str)
             and text.strip()
         )
-    )
+    )[:4]
     heading_path = asset.source_locator.get("heading_path")
     if not isinstance(heading_path, list):
         heading_path = next(
@@ -275,6 +267,11 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
             ),
             [],
         )
+    normalized_heading_path = (
+        [item for item in heading_path if isinstance(item, str)]
+        if isinstance(heading_path, list)
+        else []
+    )
     document_title = next(
         (
             context.get("document_title")
@@ -285,18 +282,40 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
     )
     return {
         "asset": {
-            "asset_id": asset.asset_id,
             "asset_type": asset.asset_type,
             "file_name": asset.file_name,
-            "file_info": asset.file_info,
+            "file_info": _compact_file_info(asset.file_info),
         },
         "context": {
-            "source_file_id": asset.source_file_id,
             "source_path": asset.source_relative_path,
             "document_title": document_title,
-            "heading_path": heading_path,
+            "heading_path": normalized_heading_path[:8],
             "associated_text": associated_text,
-            "source_contexts": source_contexts,
-            "file_tree_context": asset.file_tree_context,
+            "relations": [
+                {
+                    key: context[key]
+                    for key in ("relation_type", "source_path", "paragraph_id")
+                    if key in context
+                }
+                for context in source_contexts[:4]
+            ],
+            "file_tree_context": asset.file_tree_context[-12:],
         },
+    }
+
+
+def _compact_file_info(file_info: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in file_info.items()
+        if key
+        in {
+            "width",
+            "height",
+            "duration_seconds",
+            "frame_count",
+            "format",
+            "mime_type",
+        }
+        and isinstance(value, (str, int, float, bool))
     }

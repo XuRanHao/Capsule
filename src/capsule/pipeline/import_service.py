@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
@@ -58,17 +59,29 @@ async def enrich_assets(
     understanding_service: AssetUnderstandingService,
     embedding_service: AssetEmbeddingService,
 ) -> AssetEnrichmentResult:
-    """Run model understanding and every independent embedding channel."""
+    """Overlap native embedding with understanding, then fan out text channels."""
     await repository.begin_asset_enrichment(asset_ids=asset_ids)
     errors: list[dict[str, str]] = []
     await repository.set_job_stage(
         job_id=job_id,
         stage=PipelineStage.UNDERSTANDING,
     )
-    understanding = await understanding_service.run(
-        workspace_id=workspace_id,
-        asset_ids=asset_ids,
+    native_embedding_task = asyncio.create_task(
+        embedding_service.run(
+            workspace_id=workspace_id,
+            embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+            asset_ids=asset_ids,
+        )
     )
+    try:
+        understanding = await understanding_service.run(
+            workspace_id=workspace_id,
+            asset_ids=asset_ids,
+        )
+    except BaseException:
+        native_embedding_task.cancel()
+        await asyncio.gather(native_embedding_task, return_exceptions=True)
+        raise
     stage_durations_ms = {
         PipelineStage.UNDERSTANDING.value: understanding.understanding_duration_ms,
         PipelineStage.FEATURE_READY.value: understanding.feature_ready_duration_ms,
@@ -91,22 +104,43 @@ async def enrich_assets(
         job_id=job_id,
         stage=PipelineStage.EMBEDDING,
     )
-    for embedding_type in EmbeddingType:
-        embedding = await embedding_service.run(
+    text_embedding_types = [
+        embedding_type
+        for embedding_type in EmbeddingType
+        if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+    ]
+    embedding_wait_started = time.perf_counter()
+    native_embedding, text_embeddings = await asyncio.gather(
+        native_embedding_task,
+        embedding_service.run_many(
             workspace_id=workspace_id,
-            embedding_type=embedding_type,
+            embedding_types=text_embedding_types,
             asset_ids=asset_ids,
+        ),
+    )
+    embedding_elapsed_ms = (time.perf_counter() - embedding_wait_started) * 1000
+    embeddings = [native_embedding, *text_embeddings]
+    model_weight = sum(embedding.embedding_duration_ms for embedding in embeddings)
+    indexing_weight = sum(embedding.indexing_duration_ms for embedding in embeddings)
+    measured_weight = model_weight + indexing_weight
+    if measured_weight:
+        stage_durations_ms[PipelineStage.EMBEDDING.value] = (
+            embedding_elapsed_ms * model_weight / measured_weight
         )
-        stage_durations_ms[
-            PipelineStage.EMBEDDING.value
-        ] += embedding.embedding_duration_ms
-        stage_durations_ms[
-            PipelineStage.INDEXING.value
-        ] += embedding.indexing_duration_ms
+        stage_durations_ms[PipelineStage.INDEXING.value] = max(
+            0.0,
+            embedding_elapsed_ms - stage_durations_ms[PipelineStage.EMBEDDING.value],
+        )
+    else:
+        stage_durations_ms[PipelineStage.EMBEDDING.value] = embedding_elapsed_ms
+
+    for embedding in embeddings:
         errors.extend(
             {
                 "asset_id": error["asset_id"],
-                "stage": f"{PipelineStage.EMBEDDING.value}:{embedding_type.value}",
+                "stage": (
+                    f"{PipelineStage.EMBEDDING.value}:{embedding.embedding_type}"
+                ),
                 "error": error["error"],
             }
             for error in embedding.errors

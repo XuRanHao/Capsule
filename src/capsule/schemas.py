@@ -172,14 +172,27 @@ class FeatureValue(BaseModel):
         raw_value = normalized.get("value")
         if isinstance(raw_value, list):
             terms = [
-                item.strip()
+                item.strip()[:32]
                 for item in raw_value
                 if isinstance(item, str) and item.strip()
             ]
             normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
+        elif isinstance(raw_value, str):
+            terms = [
+                item.strip()[:32]
+                for item in raw_value.replace(";", "；").split("；")
+                if item.strip()
+            ]
+            normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
         evidence = normalized.get("evidence")
         if isinstance(evidence, str):
-            normalized["evidence"] = [evidence]
+            normalized["evidence"] = [evidence.strip()[:80]] if evidence.strip() else []
+        elif isinstance(evidence, list):
+            normalized["evidence"] = [
+                item.strip()[:80]
+                for item in evidence
+                if isinstance(item, str) and item.strip()
+            ][:1]
         elif evidence is None:
             normalized["evidence"] = []
         valid_statuses = {status.value for status in FeatureStatus}
@@ -229,6 +242,20 @@ class AssetUnderstanding(BaseModel):
     asset_name: str
     asset_description: str
     features: AssetFeatures
+
+    @model_validator(mode="before")
+    @classmethod
+    def bound_generated_text(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        asset_name = normalized.get("asset_name")
+        if isinstance(asset_name, str):
+            normalized["asset_name"] = asset_name.strip()[:40]
+        asset_description = normalized.get("asset_description")
+        if isinstance(asset_description, str):
+            normalized["asset_description"] = asset_description.strip()[:500]
+        return normalized
 
 
 class EmbeddingResult(BaseModel):

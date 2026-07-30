@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,8 +136,11 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
             assert asset_ids == ["asset_a", "asset_b"]
             self.final_errors = errors
 
+    native_started = asyncio.Event()
+
     class Understanding:
         async def run(self, **_: object) -> SimpleNamespace:
+            await asyncio.wait_for(native_started.wait(), timeout=1)
             return SimpleNamespace(
                 errors=[{"asset_id": "asset_b", "error": "understanding failed"}],
                 understanding_duration_ms=120.0,
@@ -154,11 +158,30 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
             **_: object,
         ) -> SimpleNamespace:
             self.types.append(embedding_type)
+            native_started.set()
             return SimpleNamespace(
+                embedding_type=embedding_type.value,
                 errors=[],
                 embedding_duration_ms=20.0,
                 indexing_duration_ms=2.0,
             )
+
+        async def run_many(
+            self,
+            *,
+            embedding_types: list[EmbeddingType],
+            **_: object,
+        ) -> list[SimpleNamespace]:
+            self.types.extend(embedding_types)
+            return [
+                SimpleNamespace(
+                    embedding_type=embedding_type.value,
+                    errors=[],
+                    embedding_duration_ms=20.0,
+                    indexing_duration_ms=2.0,
+                )
+                for embedding_type in embedding_types
+            ]
 
     repository = Repository()
     embedding = Embedding()
@@ -183,8 +206,12 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     assert repository.final_errors[0]["stage"] == "understanding"
     assert repository.durations["understanding"] == 120.0
     assert repository.durations["feature_ready"] == 5.0
-    assert repository.durations["embedding"] == 20.0 * len(EmbeddingType)
-    assert repository.durations["indexing"] == 2.0 * len(EmbeddingType)
+    assert repository.durations["embedding"] > 0
+    assert repository.durations["indexing"] > 0
+    assert (
+        repository.durations["embedding"] / repository.durations["indexing"]
+        == pytest.approx(10)
+    )
 
 
 def test_asset_understanding_normalizes_loose_model_feature_json() -> None:

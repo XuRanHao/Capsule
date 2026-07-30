@@ -13,6 +13,7 @@ from capsule.api.search import router as search_router
 from capsule.config import Settings, get_settings
 from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
 from capsule.db.session import Database
+from capsule.media.model_image import ModelImageCache
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.embedding import AssetEmbeddingService
@@ -97,12 +98,18 @@ def create_app(
 
         embedding_client = DoubaoClient(resolved_settings)
         vectors = MilvusVectorStore(resolved_settings)
+        model_image_cache = ModelImageCache(
+            target_bytes=resolved_settings.model_image_target_bytes,
+            max_edge=resolved_settings.model_image_max_edge,
+            max_entries=resolved_settings.model_image_cache_entries,
+        )
         embedding_service = AssetEmbeddingService(
             settings=resolved_settings,
             repository=embedding_repository,
             model_client=embedding_client,
             vector_store=vectors,
             video_url_signer=storage,
+            image_cache=model_image_cache,
         )
         understanding_service = AssetUnderstandingService(
             settings=resolved_settings,
@@ -110,6 +117,7 @@ def create_app(
             asset_repository=asset_repo,
             model_client=embedding_client,
             artifact_reader=storage,
+            image_cache=model_image_cache,
         )
         app.state.import_service = BrowserImportService(
             settings=resolved_settings,

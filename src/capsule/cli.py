@@ -14,6 +14,7 @@ from capsule.config import get_settings
 from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
 from capsule.db.session import Database
 from capsule.enums import EmbeddingType
+from capsule.media.model_image import ModelImageCache
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
@@ -336,6 +337,11 @@ async def _enrich_assets(
         if not selected_asset_ids:
             raise ValueError("no Assets matched the enrichment request")
         async with DoubaoClient(settings) as model_client:
+            model_image_cache = ModelImageCache(
+                target_bytes=settings.model_image_target_bytes,
+                max_edge=settings.model_image_max_edge,
+                max_entries=settings.model_image_cache_entries,
+            )
             return await enrich_assets(
                 job_id=job_id,
                 workspace_id=workspace_id,
@@ -347,6 +353,7 @@ async def _enrich_assets(
                     asset_repository=asset_repository,
                     model_client=model_client,
                     artifact_reader=storage,
+                    image_cache=model_image_cache,
                 ),
                 embedding_service=AssetEmbeddingService(
                     settings=settings,
@@ -354,6 +361,7 @@ async def _enrich_assets(
                     model_client=model_client,
                     vector_store=MilvusVectorStore(settings),
                     video_url_signer=storage,
+                    image_cache=model_image_cache,
                 ),
             )
     finally:
