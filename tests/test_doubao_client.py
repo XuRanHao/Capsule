@@ -6,6 +6,7 @@ from pydantic import SecretStr
 
 from capsule.config import Settings
 from capsule.model_clients.doubao import DoubaoClient, DoubaoResponseError, _extract_embedding
+from capsule.search.models import QueryType, SearchRequest
 
 
 def test_extract_embedding_accepts_openai_list_shape() -> None:
@@ -19,6 +20,85 @@ def test_extract_embedding_accepts_ark_object_shape() -> None:
 def test_extract_embedding_rejects_missing_vector() -> None:
     with pytest.raises(DoubaoResponseError, match="does not contain a vector"):
         _extract_embedding({"data": {}})
+
+
+@pytest.mark.asyncio
+async def test_asset_and_search_understanding_use_independent_pools() -> None:
+    feature_names = [
+        "subject_content",
+        "scene_theme",
+        "visual_style",
+        "color_composition",
+        "mood_atmosphere",
+        "character_state_or_psychology",
+        "asset_usage",
+        "target_audience",
+        "provenance",
+        "rights_version_authorship",
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/responses":
+            content = {
+                "asset_name": "测试素材",
+                "asset_description": "一条用于验证独立并发池的素材描述。",
+                "features": {
+                    name: {
+                        "value": "测试值",
+                        "status": "observed",
+                        "confidence": 0.9,
+                        "evidence": ["测试证据"],
+                    }
+                    for name in feature_names
+                },
+            }
+            return httpx.Response(200, json={"output_text": json.dumps(content)})
+        content = {
+            "query_summary": "蓝色湖泊",
+            "dimension_queries": [
+                {
+                    "embedding_type": "native_multimodal",
+                    "query": "蓝色湖泊",
+                    "weight": 1.0,
+                    "source": "text",
+                    "constraint": "match",
+                }
+            ],
+            "negative_terms": [],
+            "parser_mode": "model",
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(content)}}]},
+        )
+
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            understanding_concurrency=1,
+            search_understanding_concurrency=1,
+        )
+    )
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.understand_asset([{"role": "user", "content": "分析测试素材"}])
+        await client.parse_search_query(
+            SearchRequest(
+                workspace_id="workspace_test",
+                query_type=QueryType.TEXT,
+                query_text="蓝色湖泊",
+            ),
+            image_url=None,
+        )
+    finally:
+        await client.close()
+
+    assert client.asset_understanding_pool.max_observed == 1
+    assert client.search_understanding_pool.max_observed == 1
 
 
 @pytest.mark.asyncio

@@ -43,9 +43,14 @@ class DoubaoClient:
                 ),
             ),
         )
-        self.understanding_pool = AsyncCallPool(
-            name="understanding",
+        self.asset_understanding_pool = AsyncCallPool(
+            name="asset_understanding",
             concurrency=settings.understanding_concurrency,
+            max_attempts=settings.model_max_retries,
+        )
+        self.search_understanding_pool = AsyncCallPool(
+            name="search_understanding",
+            concurrency=settings.search_understanding_concurrency,
             max_attempts=settings.model_max_retries,
         )
         self.native_embedding_pool = AsyncCallPool(
@@ -85,7 +90,7 @@ class DoubaoClient:
             return await self._responses_json(
                 messages=constrained_messages,
                 output_type=AssetUnderstanding,
-                pool=self.understanding_pool,
+                pool=self.asset_understanding_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
             )
         except (DoubaoResponseError, ValidationError) as exc:
@@ -101,7 +106,7 @@ class DoubaoClient:
             return await self._responses_json(
                 messages=[*constrained_messages, correction],
                 output_type=AssetUnderstanding,
-                pool=self.understanding_pool,
+                pool=self.asset_understanding_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
             )
 
@@ -180,7 +185,7 @@ class DoubaoClient:
         return await self._chat_json(
             messages=[system, {"role": "user", "content": content}],
             output_type=ParsedQuery,
-            pool=self.understanding_pool,
+            pool=self.search_understanding_pool,
             timeout_seconds=self._settings.understanding_timeout_seconds,
         )
 

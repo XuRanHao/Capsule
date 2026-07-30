@@ -27,8 +27,10 @@ boundary; retrieval starts from persisted Assets and Embedding Records.
 ## Core decisions
 
 - Python 3.11+ and a single-process asynchronous runner.
-- Separate concurrency limits for understanding, embedding, capsule naming,
-  file parsing, and FFmpeg.
+- Separate concurrency pools for Asset understanding, search Query Parser,
+  native embedding, text embedding, capsule naming, file parsing, and FFmpeg.
+- Enrichment overlaps native embedding with Asset understanding, then runs the
+  independent description and Feature embedding channels concurrently.
 - PostgreSQL stores business metadata; Milvus stores vectors; S3/TOS-compatible
   object storage stores source and derived media.
 - Re-imports replace a source file by `(workspace_id, relative_path)` and keep
@@ -270,15 +272,28 @@ accepted only as an input compatibility alias.
 
 | Stage | Default |
 | --- | ---: |
-| Asset understanding | 6 |
-| Embedding generation | 16 |
+| Asset understanding | 32 |
+| Search query understanding | 4 |
+| Native embedding generation | 24 |
+| Text embedding generation | 96 |
 | Search query embedding | 16 |
-| Cluster naming | 4 |
+| Cluster naming | 8 |
 | File parsing | 4 |
 | FFmpeg | 2 |
 
 All values are environment-driven. HTTP 429, transient 5xx errors, and network
 timeouts are retried with exponential backoff and jitter.
+
+The 2026-07-29 local Ark benchmark measured Asset Understanding throughput at
+20.80, 29.10, 36.03, 40.32, and 45.64 Assets/minute for concurrency 16, 24,
+32, 36, and 40 respectively. The recommended shared-host configuration is
+Asset Understanding 32, Search Understanding 4, Native Embedding 16, and Text
+Embedding 16. Concurrency 40 remains a dedicated-worker load-test ceiling
+until full video keyframe, object-storage, and PostgreSQL pressure is
+validated. On nine real images, the earlier bounded Understanding-to-Embedding
+pipeline reduced full enrichment time from 45.60 seconds to 43.28 seconds
+(5.1%) with no recorded failures; the current upstream pipeline additionally
+overlaps native embedding and fans out all text channels concurrently.
 
 ## Development
 
