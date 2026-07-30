@@ -149,22 +149,27 @@ only after both file processing and the enrichment queue have drained.
 
 `capsule embed` processes one embedding route at a time. Its default is native
 multimodal: Markdown uses the block text, images are sent inline as their
-original bytes, and video uses the derived playable MP4 through a temporary
-signed object-storage URL. Repeat `--asset-id` to limit a batch; already
-indexed logical inputs are skipped unless `--force` is set. For Ark to process
-videos, `CAPSULE_OBJECT_STORAGE_PUBLIC_ENDPOINT` must point to an endpoint Ark
-can reach; the local Docker-only MinIO address cannot be used for this step.
+original bytes, and video uses the derived playable MP4 inline as a Base64 Data
+URI. Repeat `--asset-id` to limit a batch; already indexed logical inputs are
+skipped unless `--force` is set.
 
 ## Video MPS worker
 
 Video visual features run only on the macOS host because Docker cannot access
-MPS. The first pass uses scene detection, 45-second long-shot splitting into
-20-second windows, end-inclusive 5-second frame sampling (maximum 12), quality
-filtering, and up to three MobileCLIP-S0 representative frames. Each final
+MPS. The first pass uses scene detection at threshold 38, keeps natural shots
+up to 10 seconds intact, splits longer shots into two-second windows, samples
+internal candidate frames every 0.5 seconds (maximum 20), applies quality
+filtering, bounds temporary analysis frames to a 512-pixel longest edge, and
+selects up to three MobileCLIP-S0 representative frames. Each final
 Segment is then rendered once as a playable MP4, cover image and representative
 keyframe images. The derived media is written to the configured private
 S3-compatible bucket; the Asset keeps the logical time range plus generic
 `derived_file_uri`, `preview_uri`, and video-specific `file_info.keyframes`.
+Both downstream video model paths read their durable private `s3://` objects
+from MinIO and send them inline to Ark as Base64 Data URIs: Understanding
+receives up to three representative JPEG keyframes, while native multimodal
+Embedding receives the rendered Segment MP4. Ark therefore does not need
+network access to the MinIO endpoint.
 
 Run the command from a native Apple-silicon Python environment that has the
 Capsule dependencies plus PyTorch, Apple `ml-mobileclip`, FFmpeg and FFprobe:
@@ -179,6 +184,23 @@ The MobileCLIP-S0 checkpoint defaults to
 `CAPSULE_MOBILECLIP_MODEL_PATH`. The command fails clearly when MPS, FFmpeg,
 FFprobe, MobileCLIP or the checkpoint is unavailable; it never silently uses
 Docker CPU.
+
+A long-running `PipelineRunner` owns one lazy, process-resident MobileCLIP
+worker. The model is loaded by the first video and reused by later import jobs;
+concurrent video analysis cannot initialize duplicate MPS model copies. Runs
+that contain only images or documents do not load the model. A one-shot CLI
+process still releases the model when that process exits.
+
+Video rendering and object-storage upload use separate bounded pools. FFmpeg
+writes one Segment bundle (MP4, preview source, and representative keyframes)
+to `CAPSULE_VIDEO_SPOOL_ROOT`, publishes its manifest to Redis Streams, and
+releases the FFmpeg slot immediately. Upload workers retry deterministic object
+keys and reclaim abandoned pending messages with `XAUTOCLAIM`. A source-level
+generation guard makes repeated delivery idempotent and rejects stale work.
+Each successfully uploaded Segment is committed and submitted to Understanding
+immediately; generation finalization removes obsolete Segments only after the
+whole source succeeds. Set `CAPSULE_VIDEO_UPLOAD_QUEUE_BACKEND=memory` to run
+the bounded in-process transport for local comparison tests.
 
 Without Homebrew, this checkout can use the ignored project-local binaries at
 `tmp/tools/ffmpeg/bin/`; the macOS parser discovers them automatically. Docker

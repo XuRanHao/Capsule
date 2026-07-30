@@ -22,9 +22,10 @@ async def test_hard_wrapped_paragraphs_keep_original_offsets_and_merge_when_shor
     assert asset.asset_type is AssetType.TEXT_BLOCK
     assert asset.raw_content == source
     assert "heading_path" not in asset.source_locator
-    assert asset.raw_content == source[
-        asset.source_locator["char_start"] : asset.source_locator["char_end"]
-    ]
+    assert (
+        asset.raw_content
+        == source[asset.source_locator["char_start"] : asset.source_locator["char_end"]]
+    )
     assert asset.file_info["node_kinds"] == ["paragraph"]
 
 

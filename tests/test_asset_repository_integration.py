@@ -5,10 +5,14 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from capsule.config import get_settings
-from capsule.db.models import Asset, ProcessingJob, Workspace
-from capsule.db.repositories import AssetRepository
+from capsule.db.models import Asset, ProcessingJob, SourceFile, Workspace
+from capsule.db.repositories import (
+    AssetRepository,
+    LibraryClearBusyError,
+    StaleAssetGenerationError,
+)
 from capsule.db.session import Database
-from capsule.enums import AssetNameSource, AssetType, JobStatus
+from capsule.enums import AssetNameSource, AssetType, JobStatus, ProcessingStatus
 from capsule.parsers.discovery import sha256_file
 from capsule.pipeline.asset_factory import AssetFactory
 from capsule.schemas import AssetDraft, DiscoveredFile
@@ -132,6 +136,178 @@ async def test_repository_replaces_assets_and_preserves_user_name(tmp_path: Path
                     delete(Workspace).where(
                         Workspace.workspace_id == "workspace_repository_integration"
                     )
+                )
+        finally:
+            await database.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_incremental_generation_is_idempotent_and_rejects_stale_delivery(
+    tmp_path: Path,
+) -> None:
+    database = Database(get_settings())
+    workspace_id = "workspace_generation_integration"
+    try:
+        try:
+            async with database.session() as session:
+                await session.execute(text("select 1"))
+        except SQLAlchemyError:
+            pytest.skip("PostgreSQL integration database is unavailable")
+
+        repository = AssetRepository(database)
+        path = tmp_path / "video.mp4"
+        path.write_bytes(b"generation-one")
+        discovered = DiscoveredFile(
+            path=str(path),
+            relative_path=path.name,
+            extension=".mp4",
+            size_bytes=path.stat().st_size,
+        )
+        first = await repository.prepare_source_file(
+            workspace_id=workspace_id,
+            source_file=discovered,
+            sha256="1" * 64,
+            mime_type="video/mp4",
+            processing_fingerprint="a" * 64,
+        )
+        factory = AssetFactory()
+        drafts = [
+            AssetDraft(
+                asset_type=AssetType.VIDEO_SEGMENT,
+                file_name=path.name,
+                source_locator={"start_ms": index * 1_000, "end_ms": (index + 1) * 1_000},
+                file_info={"fps": 30.0},
+            )
+            for index in range(2)
+        ]
+        first_assets = factory.build_many(
+            workspace_id=workspace_id,
+            source_file_id=first.source_file_id,
+            source_sha256="1" * 64,
+            source_file=discovered,
+            drafts=drafts,
+            generation=first.generation,
+        )
+        first_id = await repository.upsert_generated_asset(
+            source_file_id=first.source_file_id,
+            generation=first.generation,
+            asset=first_assets[0],
+        )
+        duplicate_id = await repository.upsert_generated_asset(
+            source_file_id=first.source_file_id,
+            generation=first.generation,
+            asset=first_assets[0],
+        )
+        await repository.upsert_generated_asset(
+            source_file_id=first.source_file_id,
+            generation=first.generation,
+            asset=first_assets[1],
+        )
+        assert duplicate_id == first_id
+
+        second = await repository.prepare_source_file(
+            workspace_id=workspace_id,
+            source_file=discovered,
+            sha256="2" * 64,
+            mime_type="video/mp4",
+            processing_fingerprint="b" * 64,
+        )
+        with pytest.raises(StaleAssetGenerationError):
+            await repository.upsert_generated_asset(
+                source_file_id=first.source_file_id,
+                generation=first.generation,
+                asset=first_assets[0],
+            )
+
+        second_asset = factory.build_many(
+            workspace_id=workspace_id,
+            source_file_id=second.source_file_id,
+            source_sha256="2" * 64,
+            source_file=discovered,
+            drafts=drafts[:1],
+            generation=second.generation,
+        )[0]
+        await repository.upsert_generated_asset(
+            source_file_id=second.source_file_id,
+            generation=second.generation,
+            asset=second_asset,
+        )
+        visible = await repository.list_asset_views(workspace_id=workspace_id)
+        assert visible.total == 1
+        assert await repository.finalize_asset_generation_if_complete(
+            source_file_id=second.source_file_id,
+            generation=second.generation,
+            expected_asset_count=1,
+        )
+
+        async with database.session() as session:
+            rows = list(
+                await session.scalars(
+                    select(Asset).where(Asset.source_file_id == second.source_file_id)
+                )
+            )
+            source_row = await session.get(SourceFile, second.source_file_id)
+        assert len(rows) == 1
+        assert rows[0].generation == second.generation
+        assert source_row is not None
+        assert source_row.processing_status == ProcessingStatus.COMPLETED.value
+    finally:
+        try:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(Workspace).where(Workspace.workspace_id == workspace_id)
+                )
+        finally:
+            await database.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_repository_clear_library_rejects_active_jobs(
+    tmp_path: Path,
+) -> None:
+    database = Database(get_settings())
+    workspace_id = "workspace_clear_repository_integration"
+    try:
+        try:
+            async with database.session() as session:
+                await session.execute(text("select 1"))
+        except SQLAlchemyError:
+            pytest.skip("PostgreSQL integration database is unavailable")
+
+        repository = AssetRepository(database)
+        job_id = await repository.create_job(
+            workspace_id=workspace_id,
+            input_path=tmp_path,
+            total_count=1,
+        )
+        path = tmp_path / "clear.md"
+        path.write_text("# clear", encoding="utf-8")
+        source_file_id = await repository.get_or_create_source_file(
+            workspace_id=workspace_id,
+            source_file=DiscoveredFile(
+                path=str(path),
+                relative_path=path.name,
+                extension=".md",
+                size_bytes=path.stat().st_size,
+            ),
+            sha256=sha256_file(path),
+            mime_type="text/markdown",
+        )
+
+        with pytest.raises(LibraryClearBusyError):
+            await repository.clear_all_records()
+
+        async with database.session() as session:
+            assert await session.get(Workspace, workspace_id) is not None
+            assert await session.get(SourceFile, source_file_id) is not None
+            assert await session.get(ProcessingJob, job_id) is not None
+    finally:
+        try:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(Workspace).where(Workspace.workspace_id == workspace_id)
                 )
         finally:
             await database.dispose()

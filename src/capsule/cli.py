@@ -287,7 +287,7 @@ async def _embed_assets(
                 repository=EmbeddingRepository(database),
                 model_client=model_client,
                 vector_store=MilvusVectorStore(settings),
-                video_url_signer=ObjectStorage(settings),
+                artifact_reader=ObjectStorage(settings),
             )
             return await service.run(
                 workspace_id=workspace_id,
@@ -369,7 +369,7 @@ async def _enrich_assets(
                     repository=embedding_repository,
                     model_client=model_client,
                     vector_store=MilvusVectorStore(settings),
-                    video_url_signer=storage,
+                    artifact_reader=storage,
                     image_cache=model_image_cache,
                 ),
                 force_understanding=force_understanding,

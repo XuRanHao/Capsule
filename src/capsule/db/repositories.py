@@ -17,6 +17,7 @@ from capsule.db.models import (
     ClusterRepresentativeAsset,
     ClusterRun,
     EmbeddingRecord,
+    ModelCallLog,
     ProcessingJob,
     SourceFile,
     Workspace,
@@ -67,6 +68,26 @@ class PreparedSourceFile:
     source_file_id: str
     already_processed: bool
     asset_count: int = 0
+    generation: int = 0
+
+
+class StaleAssetGenerationError(ValueError):
+    """A delayed queue delivery belongs to an older source processing run."""
+
+
+class LibraryClearBusyError(ValueError):
+    """The asset library cannot be cleared while an import is still active."""
+
+
+@dataclass(slots=True, frozen=True)
+class LibraryClearSnapshot:
+    """Durable records collected before every workspace is deleted."""
+
+    workspace_count: int
+    asset_count: int
+    source_file_count: int
+    embedding_count: int
+    job_count: int
 
 
 class AssetRepository:
@@ -115,6 +136,62 @@ class AssetRepository:
             await session.flush()
             job.input_path = str(root / job.job_id)
             return job.job_id
+
+    async def clear_all_records(self) -> LibraryClearSnapshot:
+        """Clear every workspace and its owned records from PostgreSQL.
+
+        PostgreSQL cascades remove all workspace-owned assets, jobs, Embeddings,
+        Cluster runs, search history, and query-image metadata. Orphaned model
+        call logs are deleted explicitly. External cleanup targets are returned
+        for the caller to remove after this transaction.
+        """
+        active_statuses = (
+            JobStatus.QUEUED.value,
+            JobStatus.RUNNING.value,
+            JobStatus.RETRYING.value,
+        )
+        async with self._database.session() as session, session.begin():
+            workspaces = list(
+                await session.scalars(select(Workspace).with_for_update())
+            )
+
+            active_job_count = int(
+                await session.scalar(
+                    select(func.count(ProcessingJob.job_id)).where(
+                        ProcessingJob.status.in_(active_statuses)
+                    )
+                )
+                or 0
+            )
+            if active_job_count:
+                raise LibraryClearBusyError(
+                    f"asset library has {active_job_count} active import job(s)"
+                )
+
+            asset_count = int(
+                await session.scalar(select(func.count(Asset.asset_id))) or 0
+            )
+            source_file_count = int(
+                await session.scalar(select(func.count(SourceFile.source_file_id))) or 0
+            )
+            job_count = int(
+                await session.scalar(select(func.count(ProcessingJob.job_id))) or 0
+            )
+            embedding_count = int(
+                await session.scalar(select(func.count(EmbeddingRecord.embedding_id)))
+                or 0
+            )
+            await session.execute(delete(ModelCallLog))
+            for workspace in workspaces:
+                await session.delete(workspace)
+
+            return LibraryClearSnapshot(
+                workspace_count=len(workspaces),
+                asset_count=asset_count,
+                source_file_count=source_file_count,
+                embedding_count=embedding_count,
+                job_count=job_count,
+            )
 
     async def start_import_job(self, *, job_id: str, total_count: int) -> None:
         """Freeze an upload session and make it available to ``PipelineRunner``."""
@@ -221,6 +298,7 @@ class AssetRepository:
                     source_file_id=source.source_file_id,
                     already_processed=True,
                     asset_count=asset_count,
+                    generation=source.processing_generation,
                 )
 
             values = {
@@ -231,15 +309,21 @@ class AssetRepository:
                 "error_message": None,
             }
             if source is None:
-                source = SourceFile(workspace_id=workspace_id, **values)
+                source = SourceFile(
+                    workspace_id=workspace_id,
+                    processing_generation=1,
+                    **values,
+                )
                 session.add(source)
             else:
                 for field, value in values.items():
                     setattr(source, field, value)
+                source.processing_generation += 1
             await session.flush()
             return PreparedSourceFile(
                 source_file_id=source.source_file_id,
                 already_processed=False,
+                generation=source.processing_generation,
             )
 
     async def replace_assets(
@@ -255,6 +339,9 @@ class AssetRepository:
             source = await session.get(SourceFile, source_file_id, with_for_update=True)
             if source is None:
                 raise ValueError(f"source file does not exist: {source_file_id}")
+            generation = source.processing_generation
+            if any(asset.generation != generation for asset in assets):
+                raise ValueError("asset generation does not match the source generation")
 
             rows = await session.scalars(
                 select(Asset).where(Asset.source_file_id == source_file_id).with_for_update()
@@ -288,6 +375,148 @@ class AssetRepository:
             await session.flush()
             return StoredFileResult(source_file_id=source_file_id, asset_ids=stored_ids)
 
+    async def upsert_generated_asset(
+        self,
+        *,
+        source_file_id: str,
+        generation: int,
+        asset: AssetCreate,
+    ) -> str:
+        """Store one completed Segment, rejecting deliveries from an obsolete run."""
+        if asset.source_file_id != source_file_id or asset.generation != generation:
+            raise ValueError("asset does not belong to the supplied source generation")
+        async with self._database.session() as session, session.begin():
+            source = await session.get(SourceFile, source_file_id, with_for_update=True)
+            if source is None:
+                raise ValueError(f"source file does not exist: {source_file_id}")
+            if source.processing_generation != generation:
+                raise StaleAssetGenerationError(
+                    f"source generation advanced from {generation} "
+                    f"to {source.processing_generation}"
+                )
+            current = await session.scalar(
+                select(Asset)
+                .where(
+                    Asset.source_file_id == source_file_id,
+                    Asset.asset_key == asset.asset_key,
+                )
+                .with_for_update()
+            )
+            if current is None:
+                current = Asset(**_asset_values(asset))
+                session.add(current)
+            else:
+                content_changed = current.content_hash != asset.content_hash
+                user_name = (
+                    current.asset_name
+                    if current.asset_name_source == AssetNameSource.USER.value
+                    else None
+                )
+                _update_asset(current, asset, content_changed=content_changed)
+                if user_name is not None:
+                    current.asset_name = user_name
+                    current.asset_name_source = AssetNameSource.USER.value
+            await session.flush()
+            return current.asset_id
+
+    async def assert_current_generation(
+        self,
+        *,
+        source_file_id: str,
+        generation: int,
+    ) -> None:
+        """Reject stale queue work before it can overwrite a stable object key."""
+        async with self._database.session() as session:
+            current_generation = await session.scalar(
+                select(SourceFile.processing_generation).where(
+                    SourceFile.source_file_id == source_file_id
+                )
+            )
+        if current_generation is None:
+            raise ValueError(f"source file does not exist: {source_file_id}")
+        if current_generation != generation:
+            raise StaleAssetGenerationError(
+                f"source generation advanced from {generation} to {current_generation}"
+            )
+
+    async def finalize_asset_generation(
+        self,
+        *,
+        source_file_id: str,
+        generation: int,
+    ) -> StoredFileResult:
+        """Publish one complete generation and remove stale Asset rows atomically."""
+        async with self._database.session() as session, session.begin():
+            source = await session.get(SourceFile, source_file_id, with_for_update=True)
+            if source is None:
+                raise ValueError(f"source file does not exist: {source_file_id}")
+            if source.processing_generation != generation:
+                raise StaleAssetGenerationError(
+                    f"source generation advanced from {generation} "
+                    f"to {source.processing_generation}"
+                )
+            await session.execute(
+                delete(Asset).where(
+                    Asset.source_file_id == source_file_id,
+                    Asset.generation != generation,
+                )
+            )
+            asset_ids = list(
+                await session.scalars(
+                    select(Asset.asset_id)
+                    .where(
+                        Asset.source_file_id == source_file_id,
+                        Asset.generation == generation,
+                    )
+                    .order_by(Asset.asset_key)
+                )
+            )
+            source.processing_status = ProcessingStatus.COMPLETED.value
+            source.error_message = None
+            return StoredFileResult(source_file_id=source_file_id, asset_ids=asset_ids)
+
+    async def finalize_asset_generation_if_complete(
+        self,
+        *,
+        source_file_id: str,
+        generation: int,
+        expected_asset_count: int,
+    ) -> bool:
+        """Finalize a recovered stream generation once every Segment is durable."""
+        if expected_asset_count < 1:
+            raise ValueError("expected_asset_count must be positive")
+        async with self._database.session() as session, session.begin():
+            source = await session.get(SourceFile, source_file_id, with_for_update=True)
+            if source is None:
+                raise ValueError(f"source file does not exist: {source_file_id}")
+            if source.processing_generation != generation:
+                raise StaleAssetGenerationError(
+                    f"source generation advanced from {generation} "
+                    f"to {source.processing_generation}"
+                )
+            stored_count = int(
+                await session.scalar(
+                    select(func.count(Asset.asset_id)).where(
+                        Asset.source_file_id == source_file_id,
+                        Asset.generation == generation,
+                    )
+                )
+                or 0
+            )
+            if stored_count < expected_asset_count:
+                return False
+            if stored_count > expected_asset_count:
+                raise ValueError("source generation contains more Assets than its upload manifest")
+            await session.execute(
+                delete(Asset).where(
+                    Asset.source_file_id == source_file_id,
+                    Asset.generation != generation,
+                )
+            )
+            source.processing_status = ProcessingStatus.COMPLETED.value
+            source.error_message = None
+            return True
+
     async def record_file_failure(
         self,
         *,
@@ -295,6 +524,7 @@ class AssetRepository:
         source_file_id: str | None,
         relative_path: str,
         error: str,
+        generation: int | None = None,
     ) -> None:
         async with self._database.session() as session, session.begin():
             job = await session.get(ProcessingJob, job_id, with_for_update=True)
@@ -307,7 +537,9 @@ class AssetRepository:
             ]
             if source_file_id is not None:
                 source = await session.get(SourceFile, source_file_id, with_for_update=True)
-                if source is not None:
+                if source is not None and (
+                    generation is None or source.processing_generation == generation
+                ):
                     source.processing_status = ProcessingStatus.FAILED.value
                     source.error_message = error[:2000]
 
@@ -420,7 +652,10 @@ class AssetRepository:
         limit: int = 100,
         offset: int = 0,
     ) -> AssetListResponse:
-        filters = [Asset.workspace_id == workspace_id]
+        filters = [
+            Asset.workspace_id == workspace_id,
+            Asset.generation == SourceFile.processing_generation,
+        ]
         if asset_type:
             filters.append(Asset.asset_type == asset_type)
         if processing_status:
@@ -508,6 +743,7 @@ class AssetRepository:
                     .where(
                         Asset.asset_id == asset_id,
                         Asset.workspace_id == workspace_id,
+                        Asset.generation == SourceFile.processing_generation,
                     )
                 )
             ).one_or_none()
@@ -611,8 +847,18 @@ class AssetRepository:
                 source = await session.get(SourceFile, source_id, with_for_update=True)
                 if source is None:
                     continue
+                # Incremental video Assets can finish Understanding while later
+                # Segments are still rendering/uploading. Only generation
+                # finalization may publish the SourceFile in that window.
+                if source.processing_status == ProcessingStatus.PROCESSING.value:
+                    continue
                 source_assets = list(
-                    await session.scalars(select(Asset).where(Asset.source_file_id == source_id))
+                    await session.scalars(
+                        select(Asset).where(
+                            Asset.source_file_id == source_id,
+                            Asset.generation == source.processing_generation,
+                        )
+                    )
                 )
                 failed_assets = [
                     asset
@@ -788,6 +1034,7 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
     current.file_name = values.file_name
     current.file_type = values.file_type
     current.content_hash = values.content_hash
+    current.generation = values.generation
     current.file_tree_context = values.file_tree_context
     current.source_contexts = [context.model_dump() for context in values.source_contexts]
     current.file_info = values.file_info
@@ -864,7 +1111,10 @@ class EmbeddingRepository:
         statement = (
             select(Asset, SourceFile)
             .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
-            .where(Asset.workspace_id == workspace_id)
+            .where(
+                Asset.workspace_id == workspace_id,
+                Asset.generation == SourceFile.processing_generation,
+            )
             .order_by(Asset.created_at, Asset.asset_id)
         )
         if asset_ids:
@@ -1005,6 +1255,7 @@ class EmbeddingRepository:
                 EmbeddingRecord.dimension == dimension,
                 EmbeddingRecord.milvus_collection == milvus_collection,
                 EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+                Asset.generation == SourceFile.processing_generation,
             )
             .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
         )
@@ -1249,6 +1500,7 @@ class ClusterRepository:
                     .where(
                         ClusterMembership.cluster_capsule_id == cluster_capsule_id,
                         Asset.workspace_id == workspace_id,
+                        Asset.generation == SourceFile.processing_generation,
                     )
                     .order_by(
                         ClusterMembership.membership_probability.desc(),

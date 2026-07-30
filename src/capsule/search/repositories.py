@@ -37,6 +37,7 @@ class PostgresAssetSearchRepository:
                 Asset.workspace_id == workspace_id,
                 SourceFile.workspace_id == workspace_id,
                 Asset.asset_id.in_(asset_ids),
+                Asset.generation == SourceFile.processing_generation,
             )
         )
         if filters.project_id:
@@ -132,9 +133,7 @@ class PostgresAssetSearchRepository:
                 source_error_message=source_file.error_message,
                 source_created_at=source_file.created_at,
                 source_updated_at=source_file.updated_at,
-                indexed_embedding_ids=frozenset(
-                    indexed_embedding_ids.get(asset.asset_id, set())
-                ),
+                indexed_embedding_ids=frozenset(indexed_embedding_ids.get(asset.asset_id, set())),
             )
             for asset, source_file in rows
         }

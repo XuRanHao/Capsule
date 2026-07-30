@@ -7,8 +7,10 @@ from capsule.parsers.video import (
     CandidateFrame,
     VideoParser,
     VideoSegmentationConfig,
+    _candidate_frame,
     candidate_timestamps,
     filter_invalid_frames,
+    merge_short_ranges,
     select_representative_frames,
     split_shot_windows,
 )
@@ -44,25 +46,72 @@ def _candidate(
     )
 
 
-def test_long_shot_uses_twenty_second_windows() -> None:
+def test_long_shot_uses_two_second_windows_after_ten_seconds() -> None:
     config = VideoSegmentationConfig()
 
-    assert split_shot_windows(0, 45_000, config) == [(0, 45_000)]
-    assert split_shot_windows(0, 70_000, config) == [
-        (0, 20_000),
-        (20_000, 40_000),
-        (40_000, 60_000),
-        (60_000, 70_000),
+    assert split_shot_windows(0, 10_000, config) == [(0, 10_000)]
+    assert split_shot_windows(0, 11_000, config) == [
+        (0, 2_000),
+        (2_000, 4_000),
+        (4_000, 6_000),
+        (6_000, 8_000),
+        (8_000, 10_000),
+        (10_000, 11_000),
     ]
 
 
-def test_candidate_sampling_preserves_both_endpoints_and_cap() -> None:
-    assert candidate_timestamps(0, 3_000, 5.0, 12) == [0, 3_000]
-    assert candidate_timestamps(0, 20_000, 5.0, 12) == [0, 5_000, 10_000, 15_000, 20_000]
-    sampled = candidate_timestamps(0, 100_000, 5.0, 12)
-    assert len(sampled) == 12
-    assert sampled[0] == 0
-    assert sampled[-1] == 100_000
+def test_sub_second_window_tail_merges_into_previous_window() -> None:
+    config = VideoSegmentationConfig()
+
+    assert split_shot_windows(0, 10_167, config) == [
+        (0, 2_000),
+        (2_000, 4_000),
+        (4_000, 6_000),
+        (6_000, 8_000),
+        (8_000, 10_167),
+    ]
+
+
+def test_sub_second_scene_ranges_merge_with_temporal_neighbors() -> None:
+    assert merge_short_ranges(
+        [(0, 400), (400, 2_000), (2_000, 2_700), (2_700, 4_000)],
+        minimum_ms=1_000,
+    ) == [(0, 2_700), (2_700, 4_000)]
+
+    assert merge_short_ranges([(0, 700)], minimum_ms=1_000) == [(0, 700)]
+
+
+def test_candidate_sampling_uses_half_second_internal_points() -> None:
+    assert candidate_timestamps(0, 3_000, 0.5, 20) == [
+        500,
+        1_000,
+        1_500,
+        2_000,
+        2_500,
+    ]
+    assert candidate_timestamps(1_000, 3_000, 0.5, 20) == [1_500, 2_000, 2_500]
+    assert candidate_timestamps(0, 400, 0.5, 20) == [200]
+    sampled = candidate_timestamps(0, 10_000, 0.5, 20)
+    assert len(sampled) == 19
+    assert sampled[0] == 500
+    assert sampled[-1] == 9_500
+
+
+def test_candidate_frame_bounds_analysis_memory_after_full_resolution_metrics() -> None:
+    original = np.full((216, 384, 3), 100, dtype=np.uint8)
+
+    candidate = _candidate_frame(
+        500,
+        500,
+        original,
+        analysis_frame_max_edge=128,
+    )
+
+    assert original.shape == (216, 384, 3)
+    assert candidate.frame.shape == (72, 128, 3)
+    assert candidate.frame.flags.c_contiguous
+    assert candidate.frame.nbytes < original.nbytes
+    assert candidate.brightness == pytest.approx(100.0)
 
 
 def test_invalid_frame_filter_rejects_blank_and_duplicate_frames() -> None:
@@ -113,5 +162,5 @@ async def test_video_fixture_becomes_logical_segment_assets() -> None:
         assert asset.source_locator["segment_index"] == index
         assert asset.source_locator["type"] == "time_range"
         assert asset.source_locator["start_ms"] < asset.source_locator["end_ms"]
-        assert asset.file_info["candidate_frame_count"] >= 2
+        assert asset.file_info["candidate_frame_count"] >= 1
         assert 1 <= len(asset.file_info["representative_frames"]) <= 3

@@ -35,8 +35,7 @@ def extract_image_info(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
         raw_exif = image.getexif()
         exif = {
-            ExifTags.TAGS.get(tag, str(tag)): _json_safe(value)
-            for tag, value in raw_exif.items()
+            ExifTags.TAGS.get(tag, str(tag)): _json_safe(value) for tag, value in raw_exif.items()
         }
         width, height = image.size
         image_format = image.format

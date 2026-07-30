@@ -109,8 +109,7 @@ async def test_cluster_capsule_persists_asset_references_and_user_overrides() ->
                 await session.scalars(
                     select(ClusterRepresentativeAsset)
                     .where(
-                        ClusterRepresentativeAsset.cluster_capsule_id
-                        == stored.cluster_capsule_id
+                        ClusterRepresentativeAsset.cluster_capsule_id == stored.cluster_capsule_id
                     )
                     .order_by(ClusterRepresentativeAsset.rank)
                 )

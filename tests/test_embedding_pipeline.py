@@ -52,13 +52,13 @@ class FakeVectorStore:
         self.records.extend(records)
 
 
-class FakeVideoUrlSigner:
+class FakeArtifactReader:
     def __init__(self) -> None:
         self.uris: list[str] = []
 
-    async def presigned_get_uri(self, uri: str, *, expires_seconds: int = 3600) -> str:
+    async def download_uri(self, uri: str) -> bytes:
         self.uris.append(uri)
-        return "https://objects.example.test/segment.mp4?signature=temporary"
+        return b"fake-mp4"
 
 
 def _settings(database_url: str) -> Settings:
@@ -231,7 +231,7 @@ async def test_embedding_service_records_failure_without_stopping_other_assets(
 
 
 @pytest.mark.asyncio
-async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
+async def test_embedding_inputs_use_image_and_video_data_uris(
     tmp_path: Path,
 ) -> None:
     image_path = tmp_path / "still.png"
@@ -241,7 +241,7 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
         repository=cast(EmbeddingRepository, object()),
         model_client=FakeEmbeddingClient(),
         vector_store=FakeVectorStore(),
-        video_url_signer=FakeVideoUrlSigner(),
+        artifact_reader=FakeArtifactReader(),
     )
     image = EmbeddingAsset(
         asset_id="asset_image",
@@ -286,7 +286,7 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
     assert video_input.input_items == [
         {
             "type": "video_url",
-            "video_url": {"url": "https://objects.example.test/segment.mp4?signature=temporary"},
+            "video_url": {"url": "data:video/mp4;base64,ZmFrZS1tcDQ="},
         }
     ]
 

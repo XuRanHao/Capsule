@@ -121,6 +121,8 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(tasksPage, /失败记录/);
   assert.match(assetsPage, /source_file/);
   assert.match(detailPage, /source_contexts/);
+  assert.match(detailPage, /asset-video-player/);
+  assert.match(detailPage, /asset\.content_url/);
   assert.match(clustersPage, /embedding/);
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);

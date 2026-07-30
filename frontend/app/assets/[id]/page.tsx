@@ -90,6 +90,8 @@ export default function AssetDetailPage() {
     .map((item) => item.text)
     .filter(Boolean)
     .join("\n");
+  const playableVideo =
+    asset.asset_type === "video_segment" && Boolean(asset.content_url);
 
   return (
     <DemoShell
@@ -105,11 +107,23 @@ export default function AssetDetailPage() {
     >
       <div className="asset-detail-hero">
         <div className="asset-detail-preview">
-          <AssetThumb
-            preview={asset.preview_url}
-            name={asset.asset_name || asset.file_name}
-            type={asset.asset_type}
-          />
+          {playableVideo ? (
+            <video
+              className="asset-video-player"
+              controls
+              preload="metadata"
+              poster={asset.preview_url ?? undefined}
+            >
+              <source src={asset.content_url ?? undefined} type="video/mp4" />
+              当前浏览器不支持播放此视频片段。
+            </video>
+          ) : (
+            <AssetThumb
+              preview={asset.preview_url}
+              name={asset.asset_name || asset.file_name}
+              type={asset.asset_type}
+            />
+          )}
           <div className="preview-meta">
             <StatusBadge status={asset.processing_status} />
             <span>{asset.file_info.width ? `${asset.file_info.width} × ${asset.file_info.height}` : asset.file_type}</span>

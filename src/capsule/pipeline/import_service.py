@@ -235,9 +235,7 @@ class AssetEnrichmentPipeline:
         if self._started:
             raise RuntimeError("asset enrichment pipeline has already started")
         self._started = True
-        self._workers = [
-            asyncio.create_task(self._worker()) for _ in range(self._worker_count)
-        ]
+        self._workers = [asyncio.create_task(self._worker()) for _ in range(self._worker_count)]
 
     async def submit(self, asset_ids: list[str]) -> None:
         """Queue newly committed Assets, applying backpressure at the configured bound."""
@@ -363,15 +361,12 @@ class AssetEnrichmentPipeline:
     def _mark_active_end(self) -> None:
         self._active_count -= 1
         if self._active_count == 0:
-            self._active_elapsed_ms += (
-                time.perf_counter() - self._active_started_at
-            ) * 1000
+            self._active_elapsed_ms += (time.perf_counter() - self._active_started_at) * 1000
 
     def _normalized_stage_durations(self) -> dict[str, float]:
         raw = {
             stage.value: sum(
-                outcome.stage_durations_ms.get(stage.value, 0.0)
-                for outcome in self._outcomes
+                outcome.stage_durations_ms.get(stage.value, 0.0) for outcome in self._outcomes
             )
             for stage in (
                 PipelineStage.UNDERSTANDING,
@@ -484,10 +479,7 @@ class BrowserImportService:
     ) -> PipelineRunResult | None:
         enrichment_pipeline: AssetEnrichmentPipeline | None = None
         try:
-            if (
-                self._understanding_service is not None
-                and self._embedding_service is not None
-            ):
+            if self._understanding_service is not None and self._embedding_service is not None:
                 enrichment_pipeline = AssetEnrichmentPipeline(
                     settings=self._settings,
                     job_id=completion.job_id,

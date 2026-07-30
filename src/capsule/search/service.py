@@ -102,9 +102,7 @@ class SearchService:
             workspace_id=request.workspace_id,
             asset_ids=[item.asset_id for item in ranked],
             embedding_ids=[
-                match.embedding_id
-                for item in ranked
-                for match in item.matched_channels
+                match.embedding_id for item in ranked for match in item.matched_channels
             ],
             created_by=request.created_by,
             filters=request.filters,

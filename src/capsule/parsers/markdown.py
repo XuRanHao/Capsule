@@ -447,8 +447,7 @@ def _common_heading_path(nodes: list[MarkdownNode]) -> list[str]:
 
 def _has_content(nodes: list[MarkdownNode]) -> bool:
     return any(
-        node.kind not in {"heading", "horizontal_rule"} and node.raw.strip()
-        for node in nodes
+        node.kind not in {"heading", "horizontal_rule"} and node.raw.strip() for node in nodes
     )
 
 

@@ -1,6 +1,7 @@
 """Optional Apple MobileCLIP image encoder for the macOS MPS video Worker."""
 
 import importlib
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +49,35 @@ class MobileClipMpsEmbedder:
         with self._torch.inference_mode():
             for start in range(0, len(frames), self._batch_size):
                 batch = [
-                    self._transform(
-                        Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
-                    ).to("mps")
+                    self._transform(Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))).to(
+                        "mps"
+                    )
                     for frame in frames[start : start + self._batch_size]
                 ]
                 tensor = self._torch.stack(batch)
                 vector = self._model.encode_image(tensor, normalize=True)
                 vectors.append(vector.float().cpu().numpy())
         return np.concatenate(vectors, axis=0).astype(np.float32, copy=False)
+
+
+class ResidentMobileClipWorker:
+    """Keep one lazily loaded MobileCLIP model resident for the process lifetime.
+
+    Video files are analyzed on worker threads.  The lock prevents concurrent
+    first-use model construction and serializes access to the shared MPS model.
+    """
+
+    def __init__(self, *, model_path: Path | None, batch_size: int) -> None:
+        self._model_path = model_path
+        self._batch_size = batch_size
+        self._embedder: MobileClipMpsEmbedder | None = None
+        self._lock = threading.Lock()
+
+    def embed(self, frames: list[np.ndarray]) -> np.ndarray:
+        with self._lock:
+            if self._embedder is None:
+                self._embedder = MobileClipMpsEmbedder(
+                    model_path=self._model_path,
+                    batch_size=self._batch_size,
+                )
+            return self._embedder.embed(frames)

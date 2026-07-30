@@ -34,9 +34,9 @@ class TextAssetBlock:
     oversized_reason: str | None = None
 
 
-#===========================================
+# ===========================================
 #      TXT layout-aware splitting
-#===========================================
+# ===========================================
 
 
 class TextParser:
@@ -315,9 +315,7 @@ def _sentence_spans(text: str) -> list[tuple[int, int]]:
     starts = [0, *boundaries]
     ends = [*boundaries, len(text)]
     return [
-        (start, end)
-        for start, end in zip(starts, ends, strict=True)
-        if text[start:end].strip()
+        (start, end) for start, end in zip(starts, ends, strict=True) if text[start:end].strip()
     ]
 
 

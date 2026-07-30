@@ -22,6 +22,7 @@ class AssetFactory:
         source_sha256: str,
         source_file: DiscoveredFile,
         drafts: list[AssetDraft],
+        generation: int = 0,
     ) -> list[AssetCreate]:
         return [
             self.build(
@@ -30,6 +31,7 @@ class AssetFactory:
                 source_sha256=source_sha256,
                 source_file=source_file,
                 draft=draft,
+                generation=generation,
             )
             for draft in drafts
         ]
@@ -42,6 +44,7 @@ class AssetFactory:
         source_sha256: str,
         source_file: DiscoveredFile,
         draft: AssetDraft,
+        generation: int = 0,
     ) -> AssetCreate:
         locator_json = _canonical_json(draft.source_locator)
         asset_key = _sha256_text(f"{draft.asset_type.value}\n{locator_json}")
@@ -67,6 +70,7 @@ class AssetFactory:
             file_name=Path(source_file.path).name,
             file_type=source_file.extension,
             asset_key=asset_key,
+            generation=generation,
             content_hash=content_hash,
             file_tree_context=_file_tree_context(source_file.relative_path),
             source_contexts=draft.source_contexts,

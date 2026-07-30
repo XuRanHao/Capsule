@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,7 +31,7 @@ class Settings(BaseSettings):
     object_storage_region: str = "us-east-1"
     import_root: Path = Path("data/imports")
     import_file_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
-    assetization_version: str = Field(default="assetization-v3", min_length=1, max_length=64)
+    assetization_version: str = Field(default="assetization-v4", min_length=1, max_length=64)
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
@@ -54,13 +55,25 @@ class Settings(BaseSettings):
     model_image_cache_entries: int = Field(default=128, ge=1)
     file_parse_concurrency: int = Field(default=4, ge=1)
     ffmpeg_concurrency: int = Field(default=2, ge=1)
-    video_scene_threshold: float = Field(default=27.0, gt=0)
+    video_upload_concurrency: int = Field(default=4, ge=1)
+    video_spool_root: Path = Path("data/video-spool")
+    video_spool_max_items: int = Field(default=32, ge=1)
+    video_spool_max_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    video_upload_queue_backend: Literal["memory", "redis"] = "redis"
+    redis_url: str = "redis://localhost:6379/0"
+    video_upload_stream: str = "capsule:video-uploads"
+    video_upload_group: str = "capsule-video-uploaders"
+    video_upload_claim_idle_ms: int = Field(default=30_000, ge=100)
+    video_upload_max_attempts: int = Field(default=4, ge=1, le=20)
+    video_upload_retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
+    video_scene_threshold: float = Field(default=38.0, gt=0)
     video_min_scene_seconds: float = Field(default=1.0, gt=0)
-    video_max_shot_seconds: float = Field(default=45.0, gt=0)
-    video_window_seconds: float = Field(default=20.0, gt=0)
-    video_sample_interval_seconds: float = Field(default=5.0, gt=0)
-    video_max_candidate_frames: int = Field(default=12, ge=2)
+    video_max_shot_seconds: float = Field(default=10.0, gt=0)
+    video_window_seconds: float = Field(default=2.0, gt=0)
+    video_sample_interval_seconds: float = Field(default=0.5, gt=0)
+    video_max_candidate_frames: int = Field(default=20, ge=2)
     video_max_representative_frames: int = Field(default=3, ge=1, le=3)
+    video_analysis_frame_max_edge: int = Field(default=512, ge=256)
     mobileclip_model_path: str = "data/models/mobileclip-s0/mobileclip_s0.pt"
     mobileclip_batch_size: int = Field(default=12, ge=1)
     model_max_retries: int = Field(default=4, ge=1, le=10)

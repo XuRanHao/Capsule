@@ -15,9 +15,10 @@ from urllib.parse import unquote, urlparse
 from pydantic import BaseModel, Field
 
 from capsule.config import Settings, get_settings
-from capsule.db.repositories import AssetRepository
+from capsule.db.repositories import AssetRepository, StaleAssetGenerationError
 from capsule.db.session import Database
 from capsule.enums import PipelineStage
+from capsule.model_clients.mobileclip import ResidentMobileClipWorker
 from capsule.model_clients.tokenization import ArkTokenCounter, TokenCounter
 from capsule.parsers import discover_files
 from capsule.parsers.assetizer import Assetizer
@@ -27,8 +28,12 @@ from capsule.parsers.markdown import MarkdownParser
 from capsule.parsers.text import TextParser
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
-from capsule.pipeline.video_media import VideoArtifactStorage, VideoDerivedMediaWriter
-from capsule.schemas import AssetDraft, DiscoveredFile, SourceContext
+from capsule.pipeline.video_media import (
+    ObsoleteVideoUploadError,
+    VideoArtifactStorage,
+    VideoDerivedMediaWriter,
+)
+from capsule.schemas import AssetCreate, AssetDraft, DiscoveredFile, SourceContext
 from capsule.storage.object_storage import ObjectStorage
 
 AssetStoredCallback = Callable[[list[str]], Awaitable[None]]
@@ -80,6 +85,11 @@ class PipelineRunner:
         self._database = database
         self._token_counter = token_counter
         self._video_embedder = video_embedder
+        if self._video_embedder is None:
+            self._video_embedder = ResidentMobileClipWorker(
+                model_path=Path(self._settings.mobileclip_model_path),
+                batch_size=self._settings.mobileclip_batch_size,
+            )
         self._object_storage = object_storage
 
     def build_plan(self, input_path: Path, workspace_id: str) -> PipelinePlan:
@@ -105,10 +115,7 @@ class PipelineRunner:
         discovery_started = time.perf_counter()
         source_files = discover_files(input_path)
         stage_durations_ms = {
-            PipelineStage.DISCOVERING.value: (
-                time.perf_counter() - discovery_started
-            )
-            * 1000,
+            PipelineStage.DISCOVERING.value: (time.perf_counter() - discovery_started) * 1000,
             PipelineStage.PARSING.value: 0.0,
             PipelineStage.SEGMENTING.value: 0.0,
             PipelineStage.ASSET_STORED.value: 0.0,
@@ -135,9 +142,48 @@ class PipelineRunner:
         media_writer: VideoDerivedMediaWriter | None = None
         if any(item.extension in {".mp4", ".mov"} for item in source_files):
             object_storage = object_storage or ObjectStorage(self._settings)
+
+            async def persist_video_asset(
+                asset: AssetCreate,
+                generation_asset_count: int,
+            ) -> str:
+                asset_id = await repository.upsert_generated_asset(
+                    source_file_id=asset.source_file_id,
+                    generation=asset.generation,
+                    asset=asset,
+                )
+                await repository.finalize_asset_generation_if_complete(
+                    source_file_id=asset.source_file_id,
+                    generation=asset.generation,
+                    expected_asset_count=generation_asset_count,
+                )
+                return asset_id
+
+            async def validate_video_generation(asset: AssetCreate) -> None:
+                try:
+                    await repository.assert_current_generation(
+                        source_file_id=asset.source_file_id,
+                        generation=asset.generation,
+                    )
+                except StaleAssetGenerationError as exc:
+                    raise ObsoleteVideoUploadError(str(exc)) from exc
+
             media_writer = VideoDerivedMediaWriter(
                 object_storage,
                 concurrency=self._settings.ffmpeg_concurrency,
+                upload_concurrency=self._settings.video_upload_concurrency,
+                spool_root=self._settings.video_spool_root,
+                spool_max_items=self._settings.video_spool_max_items,
+                spool_max_bytes=self._settings.video_spool_max_bytes,
+                queue_backend=self._settings.video_upload_queue_backend,
+                redis_url=self._settings.redis_url,
+                redis_stream=self._settings.video_upload_stream,
+                redis_group=self._settings.video_upload_group,
+                redis_claim_idle_ms=self._settings.video_upload_claim_idle_ms,
+                max_upload_attempts=self._settings.video_upload_max_attempts,
+                retry_base_seconds=self._settings.video_upload_retry_base_seconds,
+                on_asset_persisted=persist_video_asset,
+                validate_asset_generation=validate_video_generation,
             )
         if job_id is None:
             job_id = await repository.create_job(
@@ -147,25 +193,34 @@ class PipelineRunner:
             )
         try:
             processing_started = time.perf_counter()
-            outcomes = await self._process_files(
-                source_files=source_files,
-                workspace_id=workspace_id,
-                job_id=job_id,
-                repository=repository,
-                factory=factory,
-                assetizer=assetizer,
-                media_writer=media_writer,
-                image_source_contexts=image_source_contexts,
-                on_assets_stored=on_assets_stored,
-            )
-            processing_elapsed_ms = (
-                time.perf_counter() - processing_started
-            ) * 1000
-            raw_durations = {
-                stage: sum(
-                    outcome.stage_durations_ms.get(stage, 0.0)
-                    for outcome in outcomes
+            try:
+                if media_writer is not None:
+                    recovered_assets = await media_writer.start()
+                    if on_assets_stored is not None:
+                        recovered_ids = [
+                            asset_id
+                            for recovered_workspace_id, asset_id in recovered_assets
+                            if recovered_workspace_id == workspace_id
+                        ]
+                        if recovered_ids:
+                            await on_assets_stored(recovered_ids)
+                outcomes = await self._process_files(
+                    source_files=source_files,
+                    workspace_id=workspace_id,
+                    job_id=job_id,
+                    repository=repository,
+                    factory=factory,
+                    assetizer=assetizer,
+                    media_writer=media_writer,
+                    image_source_contexts=image_source_contexts,
+                    on_assets_stored=on_assets_stored,
                 )
+            finally:
+                if media_writer is not None:
+                    await media_writer.close()
+            processing_elapsed_ms = (time.perf_counter() - processing_started) * 1000
+            raw_durations = {
+                stage: sum(outcome.stage_durations_ms.get(stage, 0.0) for outcome in outcomes)
                 for stage in (
                     PipelineStage.PARSING.value,
                     PipelineStage.SEGMENTING.value,
@@ -175,9 +230,7 @@ class PipelineRunner:
             raw_total_ms = sum(raw_durations.values())
             if raw_total_ms:
                 for stage, duration_ms in raw_durations.items():
-                    stage_durations_ms[stage] = (
-                        processing_elapsed_ms * duration_ms / raw_total_ms
-                    )
+                    stage_durations_ms[stage] = processing_elapsed_ms * duration_ms / raw_total_ms
             await repository.add_job_stage_durations(
                 job_id=job_id,
                 durations_ms=stage_durations_ms,
@@ -185,11 +238,7 @@ class PipelineRunner:
             if finalize_job:
                 await repository.finalize_job(job_id=job_id)
             errors = [outcome.error for outcome in outcomes if outcome.error is not None]
-            asset_ids = [
-                asset_id
-                for outcome in outcomes
-                for asset_id in outcome.asset_ids
-            ]
+            asset_ids = [asset_id for outcome in outcomes for asset_id in outcome.asset_ids]
             return PipelineRunResult(
                 job_id=job_id,
                 workspace_id=workspace_id,
@@ -276,6 +325,7 @@ class PipelineRunner:
         on_assets_stored: AssetStoredCallback | None,
     ) -> _FileOutcome:
         source_file_id: str | None = None
+        generation: int | None = None
         stage_durations_ms = {
             PipelineStage.PARSING.value: 0.0,
             PipelineStage.SEGMENTING.value: 0.0,
@@ -304,6 +354,7 @@ class PipelineRunner:
                     time.perf_counter() - phase_started
                 ) * 1000
             source_file_id = prepared.source_file_id
+            generation = getattr(prepared, "generation", 0)
             if prepared.already_processed:
                 phase_started = time.perf_counter()
                 await repository.record_file_success(job_id=job_id)
@@ -345,20 +396,32 @@ class PipelineRunner:
                     source_sha256=digest,
                     source_file=source_file,
                     drafts=result.assets,
+                    generation=generation,
                 )
                 if any(asset.asset_type.value == "video_segment" for asset in assets):
                     if media_writer is None:
                         raise RuntimeError("video media writer is unavailable")
+
+                    async def emit_segment(asset_id: str) -> None:
+                        if on_assets_stored is not None:
+                            await on_assets_stored([asset_id])
+
                     assets = await media_writer.persist(
                         source_file=source_file,
                         assets=assets,
+                        on_asset_committed=(emit_segment if on_assets_stored is not None else None),
                     )
-                stored = await repository.replace_assets(
-                    source_file_id=source_file_id,
-                    assets=assets,
-                )
-                if on_assets_stored is not None and stored.asset_ids:
-                    await on_assets_stored(stored.asset_ids)
+                    stored = await repository.finalize_asset_generation(
+                        source_file_id=source_file_id,
+                        generation=generation,
+                    )
+                else:
+                    stored = await repository.replace_assets(
+                        source_file_id=source_file_id,
+                        assets=assets,
+                    )
+                    if on_assets_stored is not None and stored.asset_ids:
+                        await on_assets_stored(stored.asset_ids)
                 await repository.record_file_success(job_id=job_id)
             finally:
                 stage_durations_ms[PipelineStage.ASSET_STORED.value] += (
@@ -377,6 +440,7 @@ class PipelineRunner:
                 source_file_id=source_file_id,
                 relative_path=source_file.relative_path,
                 error=message,
+                generation=generation,
             )
             return _FileOutcome(
                 succeeded=False,
@@ -403,6 +467,7 @@ def _build_assetizer(
             sample_interval_seconds=settings.video_sample_interval_seconds,
             max_candidate_frames=settings.video_max_candidate_frames,
             max_representative_frames=settings.video_max_representative_frames,
+            analysis_frame_max_edge=settings.video_analysis_frame_max_edge,
         ),
         embedder=video_embedder,
         mobileclip_model_path=Path(settings.mobileclip_model_path),
@@ -467,6 +532,7 @@ def _processing_fingerprint(
             "sample_interval_seconds": settings.video_sample_interval_seconds,
             "max_candidate_frames": settings.video_max_candidate_frames,
             "max_representative_frames": settings.video_max_representative_frames,
+            "analysis_frame_max_edge": settings.video_analysis_frame_max_edge,
             "mobileclip_model_path": settings.mobileclip_model_path,
         }
     if source_contexts:
@@ -542,9 +608,7 @@ def _resolve_markdown_image_path(
     decoded = unquote(parsed.path).replace("\\", "/")
     if decoded.startswith("/"):
         return None
-    resolved = posixpath.normpath(
-        posixpath.join(posixpath.dirname(document_path), decoded)
-    )
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(document_path), decoded))
     if resolved == ".." or resolved.startswith("../"):
         return None
     return resolved

@@ -26,8 +26,7 @@ class Assetizer:
 
     def __init__(self, handlers: Mapping[str, AssetHandler]) -> None:
         self._handlers = {
-            _normalize_extension(extension): handler
-            for extension, handler in handlers.items()
+            _normalize_extension(extension): handler for extension, handler in handlers.items()
         }
 
     async def assetize(self, source_file: DiscoveredFile) -> AssetizationResult:

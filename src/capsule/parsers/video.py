@@ -39,13 +39,14 @@ class VisualEmbedder(Protocol):
 class VideoSegmentationConfig:
     """First-pass parameters, all measured in source-video time."""
 
-    scene_threshold: float = 27.0
+    scene_threshold: float = 38.0
     min_scene_seconds: float = 1.0
-    max_shot_seconds: float = 45.0
-    window_seconds: float = 20.0
-    sample_interval_seconds: float = 5.0
-    max_candidate_frames: int = 12
+    max_shot_seconds: float = 10.0
+    window_seconds: float = 2.0
+    sample_interval_seconds: float = 0.5
+    max_candidate_frames: int = 20
     max_representative_frames: int = 3
+    analysis_frame_max_edge: int = 512
     dark_luma_max: float = 12.0
     bright_luma_min: float = 243.0
     min_luma_stddev: float = 8.0
@@ -60,6 +61,8 @@ class VideoSegmentationConfig:
             raise ValueError("window and sample interval must be positive")
         if self.max_candidate_frames < 2 or self.max_representative_frames < 1:
             raise ValueError("at least two candidates and one representative are required")
+        if self.analysis_frame_max_edge < 1:
+            raise ValueError("analysis frame maximum edge must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +144,11 @@ class VideoParser:
                 )
             }
         )
-        candidates_by_request = _extract_candidate_frames(source, requested_times)
+        candidates_by_request = _extract_candidate_frames(
+            source,
+            requested_times,
+            analysis_frame_max_edge=self._config.analysis_frame_max_edge,
+        )
         embedder = self._get_embedder()
 
         drafts: list[AssetDraft] = []
@@ -213,24 +220,20 @@ def candidate_timestamps(
     interval_seconds: float,
     maximum: int,
 ) -> list[int]:
-    """Uniformly sample a range while always preserving its beginning and end."""
+    """Sample inside a range without forcing either boundary into the result."""
     if end_ms < start_ms:
         raise ValueError("end_ms must be greater than or equal to start_ms")
     if end_ms == start_ms:
         return [start_ms]
 
     interval_ms = max(1, round(interval_seconds * 1000))
-    timestamps = list(range(start_ms, end_ms, interval_ms))
-    if not timestamps or timestamps[0] != start_ms:
-        timestamps.insert(0, start_ms)
-    if timestamps[-1] != end_ms:
-        timestamps.append(end_ms)
+    timestamps = list(range(start_ms + interval_ms, end_ms, interval_ms))
+    if not timestamps:
+        timestamps = [start_ms + (end_ms - start_ms) // 2]
     if len(timestamps) <= maximum:
         return timestamps
 
-    selected = {
-        round(index * (len(timestamps) - 1) / (maximum - 1)) for index in range(maximum)
-    }
+    selected = {round(index * (len(timestamps) - 1) / (maximum - 1)) for index in range(maximum)}
     return [timestamp for index, timestamp in enumerate(timestamps) if index in selected]
 
 
@@ -315,7 +318,11 @@ def _build_video_ranges(
     metadata: VideoMetadata,
     config: VideoSegmentationConfig,
 ) -> list[VideoRange]:
-    scene_ranges = _detect_scenes(source, metadata, config)
+    minimum_ms = max(1, round(config.min_scene_seconds * 1000))
+    scene_ranges = merge_short_ranges(
+        _detect_scenes(source, metadata, config),
+        minimum_ms=minimum_ms,
+    )
     ranges: list[VideoRange] = []
     for scene_index, (start_ms, end_ms) in enumerate(scene_ranges):
         ranges.extend(
@@ -332,16 +339,54 @@ def split_shot_windows(
     end_ms: int,
     config: VideoSegmentationConfig,
 ) -> list[tuple[int, int]]:
-    """Keep short natural shots intact and use 20-second windows for long shots."""
+    """Keep short natural shots intact and use two-second windows for long shots."""
     if end_ms <= start_ms:
         return []
     if end_ms - start_ms <= round(config.max_shot_seconds * 1000):
         return [(start_ms, end_ms)]
     window_ms = round(config.window_seconds * 1000)
-    return [
+    windows = [
         (window_start, min(window_start + window_ms, end_ms))
         for window_start in range(start_ms, end_ms, window_ms)
     ]
+    return merge_short_ranges(
+        windows,
+        minimum_ms=max(1, round(config.min_scene_seconds * 1000)),
+    )
+
+
+def merge_short_ranges(
+    ranges: list[tuple[int, int]],
+    *,
+    minimum_ms: int,
+) -> list[tuple[int, int]]:
+    """Merge sub-minimum ranges into a temporal neighbor.
+
+    Interior and trailing short ranges join the preceding range. A short first
+    range joins the following range. A source that is itself shorter than the
+    minimum remains as the only possible Segment.
+    """
+    if minimum_ms < 1:
+        raise ValueError("minimum range duration must be positive")
+    merged: list[tuple[int, int]] = []
+    for start_ms, end_ms in ranges:
+        if end_ms <= start_ms:
+            continue
+        if end_ms - start_ms < minimum_ms and merged:
+            previous_start, previous_end = merged[-1]
+            if start_ms < previous_end:
+                raise ValueError("video ranges must be ordered and non-overlapping")
+            merged[-1] = (previous_start, end_ms)
+            continue
+        merged.append((start_ms, end_ms))
+
+    if len(merged) > 1 and merged[0][1] - merged[0][0] < minimum_ms:
+        first_start, first_end = merged[0]
+        next_start, next_end = merged[1]
+        if next_start < first_end:
+            raise ValueError("video ranges must be ordered and non-overlapping")
+        merged[:2] = [(first_start, next_end)]
+    return merged
 
 
 def _detect_scenes(
@@ -409,6 +454,8 @@ def _probe_metadata(source: Path) -> VideoMetadata:
 def _extract_candidate_frames(
     source: Path,
     requested_times: list[int],
+    *,
+    analysis_frame_max_edge: int,
 ) -> dict[int, CandidateFrame]:
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
@@ -436,7 +483,12 @@ def _extract_candidate_frames(
                     (timestamp_ms, frame),
                     target,
                 )
-                candidates[target] = _candidate_frame(target, selected_time, selected_frame)
+                candidates[target] = _candidate_frame(
+                    target,
+                    selected_time,
+                    selected_frame,
+                    analysis_frame_max_edge=analysis_frame_max_edge,
+                )
                 next_index += 1
             previous = current
             frame_index += 1
@@ -445,23 +497,49 @@ def _extract_candidate_frames(
             raise VideoToolingError(f"video has no decodable frames: {source}")
         while next_index < len(requested_times):
             target = requested_times[next_index]
-            candidates[target] = _candidate_frame(target, previous[0], previous[1])
+            candidates[target] = _candidate_frame(
+                target,
+                previous[0],
+                previous[1],
+                analysis_frame_max_edge=analysis_frame_max_edge,
+            )
             next_index += 1
     finally:
         capture.release()
     return candidates
 
 
-def _candidate_frame(requested_ms: int, timestamp_ms: int, frame: np.ndarray) -> CandidateFrame:
+def _candidate_frame(
+    requested_ms: int,
+    timestamp_ms: int,
+    frame: np.ndarray,
+    *,
+    analysis_frame_max_edge: int,
+) -> CandidateFrame:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return CandidateFrame(
         requested_ms=requested_ms,
         timestamp_ms=timestamp_ms,
-        frame=frame.copy(),
+        frame=_resize_analysis_frame(frame, max_edge=analysis_frame_max_edge),
         brightness=float(np.mean(gray)),
         contrast=float(np.std(gray)),
         sharpness=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
     )
+
+
+def _resize_analysis_frame(frame: np.ndarray, *, max_edge: int) -> np.ndarray:
+    """Bound temporary candidate memory before duplicate detection and MobileCLIP."""
+    height, width = frame.shape[:2]
+    largest = max(height, width)
+    if largest <= max_edge:
+        return frame.copy()
+    scale = max_edge / largest
+    resized = cv2.resize(
+        frame,
+        (max(1, round(width * scale)), max(1, round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    return np.ascontiguousarray(resized)
 
 
 def _nearest_frame(

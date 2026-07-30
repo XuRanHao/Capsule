@@ -30,6 +30,7 @@ dependencies = [
   "scenedetect>=0.7,<1",
   "python-dotenv>=1.0,<2",
   "python-ulid>=3.2,<4",
+  "redis>=5.2,<7",
   "scikit-learn>=1.6,<2",
   "sqlalchemy>=2.0,<3",
   "typer>=0.15,<1",

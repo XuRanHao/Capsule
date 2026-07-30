@@ -244,13 +244,13 @@ class AssetUnderstandingService:
                 }
             )
         elif asset.asset_type == AssetType.VIDEO_SEGMENT.value:
-            keyframes = await self._video_keyframes(asset)
+            keyframes = await self._video_keyframe_data_uris(asset)
             content.extend(
                 {
                     "type": "image_url",
-                    "image_url": {"url": _data_uri("image/jpeg", frame)},
+                    "image_url": {"url": keyframe_data_uri},
                 }
-                for frame in keyframes
+                for keyframe_data_uri in keyframes
             )
             if not keyframes:
                 content.append(
@@ -261,24 +261,29 @@ class AssetUnderstandingService:
                 )
         return [system, {"role": "user", "content": content}]
 
-    async def _video_keyframes(self, asset: EmbeddingAsset) -> list[bytes]:
-        if self._artifact_reader is None:
-            return []
+    async def _video_keyframe_data_uris(self, asset: EmbeddingAsset) -> list[str]:
         raw_keyframes = asset.file_info.get("keyframes")
         if not isinstance(raw_keyframes, list):
             return []
-        frames: list[bytes] = []
+        data_uris: list[str] = []
         for item in raw_keyframes[:3]:
             if not isinstance(item, Mapping):
                 continue
             uri = item.get("uri")
             if not isinstance(uri, str):
                 continue
+            parsed = urlparse(uri)
+            if parsed.scheme == "data":
+                data_uris.append(uri)
+                continue
+            if parsed.scheme != "s3" or self._artifact_reader is None:
+                continue
             try:
-                frames.append(await self._artifact_reader.download_uri(uri))
+                content = await self._artifact_reader.download_uri(uri)
+                data_uris.append(_data_uri("image/jpeg", content))
             except Exception:
                 logger.warning("could not load video keyframe %s", uri, exc_info=True)
-        return frames
+        return data_uris
 
 
 def _read_local_source(storage_uri: str) -> bytes:
@@ -392,8 +397,7 @@ def _attach_asset_usage_path_context(
         )
     else:
         usage.description = (
-            f"该素材对应相对文件路径「{source_path}」，"
-            "当前路径和素材内容尚未提供可确认的具体用途。"
+            f"该素材对应相对文件路径「{source_path}」，当前路径和素材内容尚未提供可确认的具体用途。"
         )
     usage.evidence = [f"相对文件路径：{source_path}"]
 
@@ -420,9 +424,7 @@ def _usage_hint_from_path(
 ) -> str | None:
     directory = _source_directory(source_path)
     context_parts = [
-        item.strip()
-        for item in file_tree_context
-        if isinstance(item, str) and item.strip()
+        item.strip() for item in file_tree_context if isinstance(item, str) and item.strip()
     ]
     combined = "/".join([directory, *context_parts])
     for token, usage in _USAGE_PATH_HINTS:

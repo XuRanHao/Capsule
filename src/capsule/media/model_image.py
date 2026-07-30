@@ -48,10 +48,7 @@ class ModelImageCache:
         mime_type: str,
         loader: Callable[[], bytes],
     ) -> PreparedModelImage:
-        key = (
-            f"{cache_key}:{mime_type.lower()}:{self._target_bytes}:"
-            f"{self._max_edge}"
-        )
+        key = f"{cache_key}:{mime_type.lower()}:{self._target_bytes}:{self._max_edge}"
         async with self._lock:
             cached = self._entries.pop(key, None)
             if cached is not None:
@@ -113,9 +110,7 @@ def prepare_model_image(
             )
 
         byte_scale = (
-            sqrt(target_bytes / len(content)) * 0.92
-            if len(content) > target_bytes
-            else 1.0
+            sqrt(target_bytes / len(content)) * 0.92 if len(content) > target_bytes else 1.0
         )
         scale = min(
             max_edge / max(width, height),
@@ -133,8 +128,7 @@ def prepare_model_image(
             )
             encoded, encoded_mime_type = _encode_image(resized)
             if (
-                len(encoded) <= target_bytes
-                and max(resized_width, resized_height) <= max_edge
+                len(encoded) <= target_bytes and max(resized_width, resized_height) <= max_edge
             ) or (resized_width == 1 and resized_height == 1):
                 return PreparedModelImage(
                     content=encoded,

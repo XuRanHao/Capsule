@@ -77,6 +77,7 @@ class SourceFile(Base, TimestampMixin):
     storage_uri: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     processing_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    processing_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     processing_status: Mapped[str] = mapped_column(
         String(32),
@@ -89,9 +90,7 @@ class SourceFile(Base, TimestampMixin):
 
 class Asset(Base, TimestampMixin):
     __tablename__ = "assets"
-    __table_args__ = (
-        UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),
-    )
+    __table_args__ = (UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),)
 
     asset_id: Mapped[str] = mapped_column(
         String(64),
@@ -116,6 +115,7 @@ class Asset(Base, TimestampMixin):
     file_name: Mapped[str] = mapped_column(String(1024), nullable=False)
     file_type: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     asset_name: Mapped[str | None] = mapped_column(String(1024))
     asset_name_source: Mapped[str | None] = mapped_column(String(32))
@@ -165,9 +165,7 @@ class ProcessingJob(Base, TimestampMixin):
     completed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    error_info: Mapped[list[dict[str, Any]]] = mapped_column(
-        JSONB, default=list, nullable=False
-    )
+    error_info: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, nullable=False)
     stage_durations_ms: Mapped[dict[str, float]] = mapped_column(
         JSONB,
         default=dict,

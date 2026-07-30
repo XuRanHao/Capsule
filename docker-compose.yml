@@ -15,6 +15,7 @@ services:
       CAPSULE_DATABASE_URL: postgresql+asyncpg://capsule:capsule@postgres:5432/capsule
       CAPSULE_MILVUS_URI: http://milvus:19530
       CAPSULE_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+      CAPSULE_REDIS_URL: redis://redis:6379/0
     volumes:
       - .:/workspace
     depends_on:
@@ -24,6 +25,21 @@ services:
         condition: service_healthy
       milvus:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${CAPSULE_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis-data:/data
 
   postgres:
     image: postgres:17-alpine
@@ -107,3 +123,4 @@ volumes:
   etcd-data:
   minio-data:
   milvus-data:
+  redis-data:

@@ -48,6 +48,7 @@ class AssetCreate(BaseModel):
     file_name: str
     file_type: str
     asset_key: str
+    generation: int = Field(default=0, ge=0)
     content_hash: str
     asset_name: str | None = None
     asset_description: str | None = None
@@ -138,6 +139,18 @@ class AssetListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class LibraryClearResult(BaseModel):
+    workspaces_deleted: int
+    assets_deleted: int
+    source_files_deleted: int
+    embeddings_deleted: int
+    jobs_deleted: int
+    vectors_deleted: int
+    objects_deleted: int
+    staging_paths_deleted: int
+    cleanup_warnings: list[str] = Field(default_factory=list)
 
 
 class StoredFileResult(BaseModel):

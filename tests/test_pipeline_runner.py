@@ -3,10 +3,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from capsule.config import Settings
+from capsule.enums import AssetType
+from capsule.model_clients.mobileclip import ResidentMobileClipWorker
 from capsule.parsers.assetizer import AssetizationResult
 from capsule.parsers.discovery import discover_files
 from capsule.pipeline import runner as runner_module
 from capsule.pipeline.runner import PipelineRunner, _collect_image_source_contexts
+from capsule.schemas import AssetDraft
 
 
 def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
@@ -20,6 +23,44 @@ def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
     assert plan.file_count == 3
     assert plan.counts_by_extension == {".md": 1, ".png": 1, ".txt": 1}
     assert plan.workspace_id == "workspace_demo"
+
+
+async def test_runner_reuses_resident_video_worker_across_runs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class FakeDatabase:
+        pass
+
+    class FakeRepository:
+        async def create_job(self, **_values: object) -> str:
+            return "job_empty"
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
+        async def finalize_job(self, **_values: object) -> None:
+            return None
+
+    captured_embedders: list[object] = []
+
+    def capture_assetizer(_counter, _settings, video_embedder):
+        captured_embedders.append(video_embedder)
+        return object()
+
+    monkeypatch.setattr(runner_module, "AssetRepository", lambda _database: FakeRepository())
+    monkeypatch.setattr(runner_module, "_build_assetizer", capture_assetizer)
+    runner = PipelineRunner(
+        settings=Settings(),
+        database=FakeDatabase(),  # type: ignore[arg-type]
+    )
+
+    await runner.run(tmp_path, "workspace_first")
+    await runner.run(tmp_path, "workspace_second")
+
+    assert len(captured_embedders) == 2
+    assert captured_embedders[0] is captured_embedders[1]
+    assert isinstance(captured_embedders[0], ResidentMobileClipWorker)
 
 
 def test_markdown_paragraph_is_attached_to_referenced_image(tmp_path: Path) -> None:
@@ -250,3 +291,126 @@ async def test_run_emits_committed_assets_and_defers_job_finalization(
     assert result.asset_ids == ["asset_stream"]
     assert committed == ["asset_stream"]
     assert not repository.finalized
+
+
+async def test_video_segments_are_committed_and_emitted_one_by_one(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    events: list[str] = []
+
+    class FakeDatabase:
+        pass
+
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.asset_ids: list[str] = []
+
+        async def create_job(self, **_values: object) -> str:
+            return "job_video"
+
+        async def prepare_source_file(self, **_values: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_file_id="source_video",
+                already_processed=False,
+                asset_count=0,
+                generation=7,
+            )
+
+        async def assert_current_generation(self, **_values: object) -> None:
+            return None
+
+        async def upsert_generated_asset(self, *, asset, **_values: object) -> str:
+            events.append(f"upsert:{asset.source_locator['start_ms']}")
+            self.asset_ids.append(asset.asset_id)
+            return asset.asset_id
+
+        async def finalize_asset_generation_if_complete(self, **_values: object) -> bool:
+            events.append("generation-check")
+            return len(self.asset_ids) == 2
+
+        async def finalize_asset_generation(self, **_values: object) -> SimpleNamespace:
+            events.append("source-finalize")
+            return SimpleNamespace(asset_ids=list(self.asset_ids))
+
+        async def replace_assets(self, **_values: object) -> SimpleNamespace:
+            raise AssertionError("video Assets must not use whole-file replace")
+
+        async def record_file_success(self, **_values: object) -> None:
+            return None
+
+        async def record_file_failure(self, **_values: object) -> None:
+            raise AssertionError("the video source should succeed")
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
+        async def finalize_job(self, **_values: object) -> None:
+            return None
+
+    class VideoAssetizer:
+        async def assetize(self, source_file) -> AssetizationResult:
+            return AssetizationResult(
+                source_file=source_file,
+                succeeded=True,
+                assets=[
+                    AssetDraft(
+                        asset_type=AssetType.VIDEO_SEGMENT,
+                        file_name=source.name,
+                        source_locator={"start_ms": index * 1_000, "end_ms": (index + 1) * 1_000},
+                        file_info={
+                            "fps": 30.0,
+                            "representative_frames": [{"timestamp_ms": index * 1_000 + 500}],
+                        },
+                    )
+                    for index in range(2)
+                ],
+            )
+
+    class FakeMediaWriter:
+        def __init__(self, _storage, **values: object) -> None:
+            self._callback = values["on_asset_persisted"]
+
+        async def persist(self, *, source_file, assets, on_asset_committed=None):
+            del source_file
+            persisted = []
+            for asset in assets:
+                updated = asset.model_copy(
+                    update={"derived_file_uri": f"s3://bucket/{asset.asset_key}.mp4"}
+                )
+                asset_id = await self._callback(updated, len(assets))
+                if on_asset_committed is not None:
+                    await on_asset_committed(asset_id)
+                persisted.append(updated)
+            return persisted
+
+        async def start(self) -> list[tuple[str, str]]:
+            return []
+
+        async def close(self) -> None:
+            return None
+
+    repository = FakeRepository()
+    monkeypatch.setattr(runner_module, "AssetRepository", lambda _database: repository)
+    monkeypatch.setattr(runner_module, "_build_assetizer", lambda *_args: VideoAssetizer())
+    monkeypatch.setattr(runner_module, "VideoDerivedMediaWriter", FakeMediaWriter)
+
+    async def on_assets_stored(asset_ids: list[str]) -> None:
+        events.append(f"understanding:{asset_ids[0]}")
+
+    result = await PipelineRunner(
+        settings=Settings(file_parse_concurrency=1),
+        database=FakeDatabase(),  # type: ignore[arg-type]
+        object_storage=object(),  # type: ignore[arg-type]
+    ).run(tmp_path, "workspace_video", on_assets_stored=on_assets_stored)
+
+    assert result.asset_count == 2
+    assert events[-1] == "source-finalize"
+    assert [event for event in events if event.startswith("upsert:")] == [
+        "upsert:0",
+        "upsert:1000",
+    ]
+    assert len([event for event in events if event.startswith("understanding:")]) == 2
+    assert all(event.startswith("understanding:") for event in (events[2], events[5]))

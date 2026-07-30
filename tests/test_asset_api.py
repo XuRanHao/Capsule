@@ -7,7 +7,12 @@ from capsule.api.app import create_app
 from capsule.config import Settings
 from capsule.db.repositories import AssetMediaTarget
 from capsule.enums import AssetType
-from capsule.schemas import AssetListResponse, AssetSourceRecord, AssetViewRecord
+from capsule.schemas import (
+    AssetListResponse,
+    AssetSourceRecord,
+    AssetViewRecord,
+    LibraryClearResult,
+)
 
 
 class FakeAssetRepository:
@@ -63,6 +68,23 @@ class FakeAssetRepository:
         )
 
 
+class FakeLibraryClearService:
+    def __init__(self) -> None:
+        self.clear_calls = 0
+
+    async def clear_all(self) -> LibraryClearResult:
+        self.clear_calls += 1
+        return LibraryClearResult(
+            workspaces_deleted=2,
+            assets_deleted=3,
+            source_files_deleted=1,
+            embeddings_deleted=2,
+            jobs_deleted=1,
+            vectors_deleted=2,
+            objects_deleted=4,
+            staging_paths_deleted=1,
+        )
+
 def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
     import_root = tmp_path / "imports"
     import_root.mkdir()
@@ -93,3 +115,33 @@ def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
         )
         assert preview.status_code == 200
         assert preview.content == image_path.read_bytes()
+
+
+def test_library_clear_requires_explicit_confirmation(tmp_path: Path) -> None:
+    import_root = tmp_path / "imports"
+    import_root.mkdir()
+    image_path = import_root / "image.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    clear_service = FakeLibraryClearService()
+    app = create_app(
+        settings=Settings(import_root=import_root),
+        asset_repository=FakeAssetRepository(image_path),  # type: ignore[arg-type]
+        library_clear_service=clear_service,  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/v1/assets/clear-all",
+            json={"confirmation": "clear"},
+        )
+        assert rejected.status_code == 422
+
+        cleared = client.post(
+            "/api/v1/assets/clear-all",
+            json={
+                "confirmation": "CLEAR ALL DATA",
+            },
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["assets_deleted"] == 3
+        assert clear_service.clear_calls == 1

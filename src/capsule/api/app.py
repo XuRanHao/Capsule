@@ -20,6 +20,7 @@ from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.import_service import BrowserImportService
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
+from capsule.pipeline.workspace_clear import LibraryClearService
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.query_parser import QueryParser
@@ -40,6 +41,7 @@ def create_app(
     cluster_repository: ClusterRepository | None = None,
     import_service: BrowserImportService | None = None,
     asset_repository: AssetRepository | None = None,
+    library_clear_service: LibraryClearService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -52,12 +54,14 @@ def create_app(
             or cluster_repository is not None
             or import_service is not None
             or asset_repository is not None
+            or library_clear_service is not None
         ):
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
             app.state.cluster_repository = cluster_repository
             app.state.import_service = import_service
             app.state.asset_repository = asset_repository
+            app.state.library_clear_service = library_clear_service
             yield
             return
 
@@ -72,6 +76,7 @@ def create_app(
         cluster_repo = ClusterRepository(database)
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
+        vectors = MilvusVectorStore(resolved_settings)
         pipeline_runner = PipelineRunner(
             settings=resolved_settings,
             database=database,
@@ -79,6 +84,12 @@ def create_app(
         )
         app.state.cluster_repository = cluster_repo
         app.state.asset_repository = asset_repo
+        app.state.library_clear_service = LibraryClearService(
+            settings=resolved_settings,
+            repository=asset_repo,
+            vector_store=vectors,
+            object_storage=storage,
+        )
         if resolved_settings.ark_api_key is None:
             logging.getLogger(__name__).warning(
                 "CAPSULE_ARK_API_KEY is not configured; search endpoint will return 503"
@@ -97,7 +108,6 @@ def create_app(
             return
 
         embedding_client = DoubaoClient(resolved_settings)
-        vectors = MilvusVectorStore(resolved_settings)
         model_image_cache = ModelImageCache(
             target_bytes=resolved_settings.model_image_target_bytes,
             max_edge=resolved_settings.model_image_max_edge,
@@ -108,7 +118,7 @@ def create_app(
             repository=embedding_repository,
             model_client=embedding_client,
             vector_store=vectors,
-            video_url_signer=storage,
+            artifact_reader=storage,
             image_cache=model_image_cache,
         )
         understanding_service = AssetUnderstandingService(

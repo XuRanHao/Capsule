@@ -308,10 +308,7 @@ def test_result_builder_preserves_reranked_order_after_database_validation() -> 
         similarity=0.9,
         fusion_contribution=0.1,
     )
-    assets = {
-        asset_id: _asset(asset_id, source_id=f"source_{asset_id}")
-        for asset_id in ("a", "b")
-    }
+    assets = {asset_id: _asset(asset_id, source_id=f"source_{asset_id}") for asset_id in ("a", "b")}
 
     results = SearchResultBuilder().build(
         ranked_hits=[

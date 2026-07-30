@@ -259,6 +259,44 @@ class MilvusVectorStore:
             return {}
         return await asyncio.to_thread(self._fetch_vectors_sync, list(embedding_ids))
 
+    async def delete_workspace(self, workspace_id: str) -> int:
+        """Remove every vector belonging to one cleared workspace."""
+        return await asyncio.to_thread(self._delete_workspace_sync, workspace_id)
+
+    def _delete_workspace_sync(self, workspace_id: str) -> int:
+        response = self._client.delete(
+            collection_name=self._collection,
+            filter=f"workspace_id == {json.dumps(workspace_id)}",
+        )
+        if not isinstance(response, dict):
+            return 0
+        value = response.get("delete_count", response.get("delete_cnt", 0))
+        if not isinstance(value, (int, float, str)):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    async def delete_all(self) -> int:
+        """Remove all Capsule vectors from the configured collection."""
+        return await asyncio.to_thread(self._delete_all_sync)
+
+    def _delete_all_sync(self) -> int:
+        response = self._client.delete(
+            collection_name=self._collection,
+            filter='embedding_id != ""',
+        )
+        if not isinstance(response, dict):
+            return 0
+        value = response.get("delete_count", response.get("delete_cnt", 0))
+        if not isinstance(value, (int, float, str)):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     def _fetch_vectors_sync(self, embedding_ids: list[str]) -> dict[str, list[float]]:
         vectors: dict[str, list[float]] = {}
         for start in range(0, len(embedding_ids), self._batch_size):

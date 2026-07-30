@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
 
+from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset
 from capsule.enums import AssetType, FeatureStatus
 from capsule.pipeline.understanding import (
     _DESCRIPTION_CONTEXT_RULES,
+    AssetUnderstandingService,
     _asset_context_payload,
     _attach_asset_usage_path_context,
 )
@@ -117,3 +119,58 @@ def test_asset_usage_path_is_persisted_as_metadata_evidence() -> None:
     assert usage.description is not None
     assert "海报/素材/20251216-143446.png" in usage.description
     assert usage.evidence == ["相对文件路径：海报/素材/20251216-143446.png"]
+
+
+async def test_video_understanding_uses_keyframe_data_uris() -> None:
+    class Reader:
+        def __init__(self) -> None:
+            self.uris: list[str] = []
+
+        async def download_uri(self, uri: str) -> bytes:
+            self.uris.append(uri)
+            return uri.rsplit("/", 1)[-1].encode()
+
+    asset = EmbeddingAsset(
+        asset_id="asset_video",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="source_video",
+        asset_type=AssetType.VIDEO_SEGMENT.value,
+        file_type=".mp4",
+        content_hash="c" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 7, 30, tzinfo=UTC),
+        raw_content=None,
+        asset_description=None,
+        asset_features={},
+        derived_file_uri="s3://capsule/video/segment.mp4",
+        source_storage_uri="file:///source.mp4",
+        source_mime_type="video/mp4",
+        file_info={
+            "keyframes": [
+                {"uri": "s3://capsule/video/keyframes/01.jpg"},
+                {"uri": "s3://capsule/video/keyframes/02.jpg"},
+            ]
+        },
+    )
+    reader = Reader()
+    service = AssetUnderstandingService(
+        settings=Settings(),
+        embedding_repository=None,  # type: ignore[arg-type]
+        asset_repository=None,  # type: ignore[arg-type]
+        model_client=None,  # type: ignore[arg-type]
+        artifact_reader=reader,
+    )
+
+    messages = await service._messages(asset)
+    content = messages[1]["content"]
+    image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+
+    assert reader.uris == [
+        "s3://capsule/video/keyframes/01.jpg",
+        "s3://capsule/video/keyframes/02.jpg",
+    ]
+    assert image_urls == [
+        "data:image/jpeg;base64,MDEuanBn",
+        "data:image/jpeg;base64,MDIuanBn",
+    ]

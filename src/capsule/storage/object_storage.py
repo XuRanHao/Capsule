@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -114,3 +115,71 @@ class ObjectStorage:
                 body.close()
 
         return await asyncio.to_thread(download)
+
+    async def delete_uris(self, uris: Iterable[str]) -> int:
+        """Delete known objects in this bucket and return the number requested."""
+        keys: list[str] = []
+        for uri in uris:
+            parsed = urlparse(uri)
+            if (
+                parsed.scheme != "s3"
+                or parsed.netloc != self._bucket
+                or not parsed.path.lstrip("/")
+            ):
+                raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
+            keys.append(unquote(parsed.path.lstrip("/")))
+        if not keys:
+            return 0
+
+        def delete() -> int:
+            for start in range(0, len(keys), 1_000):
+                batch = keys[start : start + 1_000]
+                response = self._client.delete_objects(
+                    Bucket=self._bucket,
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+                )
+                errors = response.get("Errors") or []
+                if errors:
+                    messages = [
+                        str(item.get("Message") or item.get("Code") or "unknown")
+                        for item in errors
+                    ]
+                    raise RuntimeError(
+                        f"could not delete object storage records: {', '.join(messages)}"
+                    )
+            return len(keys)
+
+        return await asyncio.to_thread(delete)
+
+    async def delete_all_objects(self) -> int:
+        """Delete every object in Capsule's configured, dedicated bucket."""
+
+        def delete_all() -> int:
+            deleted = 0
+            while True:
+                response = self._client.list_objects_v2(Bucket=self._bucket)
+                keys = [
+                    {"Key": str(item["Key"])}
+                    for item in response.get("Contents") or []
+                    if item.get("Key")
+                ]
+                if keys:
+                    deletion = self._client.delete_objects(
+                        Bucket=self._bucket,
+                        Delete={"Objects": keys, "Quiet": True},
+                    )
+                    errors = deletion.get("Errors") or []
+                    if errors:
+                        messages = [
+                            str(item.get("Message") or item.get("Code") or "unknown")
+                            for item in errors
+                        ]
+                        raise RuntimeError(
+                            "could not delete object storage records: "
+                            + ", ".join(messages)
+                        )
+                    deleted += len(keys)
+                if not keys:
+                    return deleted
+
+        return await asyncio.to_thread(delete_all)

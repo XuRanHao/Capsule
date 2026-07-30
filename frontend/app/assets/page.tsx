@@ -6,6 +6,7 @@ import DemoShell, { AssetThumb, StatusBadge } from "../components/DemoShell";
 import {
   type AssetRecord,
   WORKSPACE_ID,
+  apiFetch,
   loadAssets,
 } from "../lib/api";
 
@@ -37,6 +38,8 @@ export default function AssetsPage() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [clearNotice, setClearNotice] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -77,6 +80,42 @@ export default function AssetsPage() {
     [assets],
   );
 
+  const clearLibrary = async () => {
+    const confirmed = window.confirm(
+      "确定清空全部数据吗？\n\n将永久删除所有工作区的 Asset、来源文件、处理任务、向量、媒体文件和导入暂存文件。此操作不可恢复。",
+    );
+    if (!confirmed) return;
+
+    setClearing(true);
+    setError(null);
+    setClearNotice(null);
+    try {
+      const result = await apiFetch<{
+        assets_deleted: number;
+        source_files_deleted: number;
+        vectors_deleted: number;
+        objects_deleted: number;
+        cleanup_warnings: string[];
+      }>("/api/v1/assets/clear-all", {
+        method: "POST",
+        body: JSON.stringify({
+          confirmation: "CLEAR ALL DATA",
+        }),
+      });
+      setAssets([]);
+      setTotal(0);
+      setClearNotice(
+        `已清空全部数据：${result.assets_deleted} 个 Asset、${result.source_files_deleted} 个来源文件、${result.vectors_deleted} 条向量与 ${result.objects_deleted} 个媒体文件。${result.cleanup_warnings.length ? ` ${result.cleanup_warnings.join("；")}` : ""}`,
+      );
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "清空资产库失败",
+      );
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <DemoShell
       active="assets"
@@ -84,9 +123,14 @@ export default function AssetsPage() {
       title="所有素材，都有语义。"
       description="这里直接读取 PostgreSQL 中的真实 Asset，并通过后端安全地加载本地图片和视频预览。"
       actions={
-        <Link className="primary-action button-link" href="/import">
-          ＋ 导入素材
-        </Link>
+        <>
+          <Link className="primary-action button-link" href="/import">
+            ＋ 导入素材
+          </Link>
+          <button className="danger-action" disabled={clearing} onClick={clearLibrary}>
+            {clearing ? "正在清空…" : "清空全部数据"}
+          </button>
+        </>
       }
     >
       <section className="asset-toolbar">
@@ -165,6 +209,12 @@ export default function AssetsPage() {
           <button className="secondary-action" onClick={() => void load()}>
             重新加载
           </button>
+        </div>
+      )}
+      {clearNotice && (
+        <div className="asset-cleared-notice">
+          <strong>工作区已清空</strong>
+          <span>{clearNotice}</span>
         </div>
       )}
       {!error && loading && (

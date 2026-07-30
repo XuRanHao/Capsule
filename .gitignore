@@ -10,6 +10,8 @@
 htmlcov/
 dist/
 build/
+!frontend/build/
+!frontend/build/sites-vite-plugin.ts
 *.egg-info/
 __pycache__/
 *.py[cod]

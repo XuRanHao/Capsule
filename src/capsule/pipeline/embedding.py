@@ -43,8 +43,8 @@ class EmbeddingVectorStore(Protocol):
     async def aupsert(self, records: list[VectorRecord]) -> None: ...
 
 
-class VideoUrlSigner(Protocol):
-    async def presigned_get_uri(self, uri: str, *, expires_seconds: int = 3600) -> str: ...
+class ArtifactReader(Protocol):
+    async def download_uri(self, uri: str) -> bytes: ...
 
 
 class EmbeddingRunResult(BaseModel):
@@ -102,14 +102,14 @@ class AssetEmbeddingService:
         repository: EmbeddingRepository,
         model_client: AssetEmbeddingClient,
         vector_store: EmbeddingVectorStore,
-        video_url_signer: VideoUrlSigner | None = None,
+        artifact_reader: ArtifactReader | None = None,
         image_cache: ModelImageCache | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._model_client = model_client
         self._vector_store = vector_store
-        self._video_url_signer = video_url_signer
+        self._artifact_reader = artifact_reader
         self._image_cache = image_cache or ModelImageCache(
             target_bytes=settings.model_image_target_bytes,
             max_edge=settings.model_image_max_edge,
@@ -384,9 +384,9 @@ class AssetEmbeddingService:
                 source_mode=EmbeddingSourceMode.ORIGINAL_IMAGE,
             )
         if asset.asset_type == AssetType.VIDEO_SEGMENT.value:
-            video_url = await self._video_url(asset)
+            video_data_uri = await self._video_data_uri(asset)
             return _EmbeddingInput(
-                input_items=[{"type": "video_url", "video_url": {"url": video_url}}],
+                input_items=[{"type": "video_url", "video_url": {"url": video_data_uri}}],
                 source_content_hash=_hash_text(
                     EmbeddingType.NATIVE_MULTIMODAL.value,
                     EmbeddingSourceMode.ORIGINAL_VIDEO.value,
@@ -396,20 +396,18 @@ class AssetEmbeddingService:
             )
         raise EmbeddingInputUnavailable(f"unsupported native Asset type: {asset.asset_type}")
 
-    async def _video_url(self, asset: EmbeddingAsset) -> str:
+    async def _video_data_uri(self, asset: EmbeddingAsset) -> str:
         if not asset.derived_file_uri:
             raise EmbeddingInputUnavailable("video Asset has no derived MP4")
         parsed = urlparse(asset.derived_file_uri)
-        if parsed.scheme in {"http", "https"}:
+        if parsed.scheme == "data":
             return asset.derived_file_uri
-        if parsed.scheme != "s3" or self._video_url_signer is None:
+        if parsed.scheme != "s3" or self._artifact_reader is None:
             raise EmbeddingInputUnavailable(
-                "video Asset needs an http(s) derived_file_uri or configured object storage signer"
+                "video Asset needs a data URI or configured object storage reader"
             )
-        signed_url = await self._video_url_signer.presigned_get_uri(asset.derived_file_uri)
-        if urlparse(signed_url).scheme not in {"http", "https"}:
-            raise ValueError("object storage signer did not return an http(s) URL")
-        return signed_url
+        content = await self._artifact_reader.download_uri(asset.derived_file_uri)
+        return _data_uri(mime_type="video/mp4", content=content)
 
 
 def _text_input(
@@ -441,7 +439,7 @@ def _read_local_source(storage_uri: str) -> bytes:
 
 def _data_uri(*, mime_type: str, content: bytes) -> str:
     if not content:
-        raise EmbeddingInputUnavailable("image source file is empty")
+        raise EmbeddingInputUnavailable("model media is empty")
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
 
