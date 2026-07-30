@@ -50,6 +50,12 @@ class AssetEnrichmentResult(BaseModel):
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _EnrichmentBatchResult:
+    errors: list[dict[str, str]]
+    stage_durations_ms: dict[str, float]
+
+
 async def enrich_assets(
     *,
     job_id: str,
@@ -61,11 +67,57 @@ async def enrich_assets(
 ) -> AssetEnrichmentResult:
     """Overlap native embedding with understanding, then fan out text channels."""
     await repository.begin_asset_enrichment(asset_ids=asset_ids)
-    errors: list[dict[str, str]] = []
     await repository.set_job_stage(
         job_id=job_id,
         stage=PipelineStage.UNDERSTANDING,
     )
+    batch = await _run_enrichment_batch(
+        workspace_id=workspace_id,
+        asset_ids=asset_ids,
+        understanding_service=understanding_service,
+        embedding_service=embedding_service,
+    )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.FEATURE_READY,
+    )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.EMBEDDING,
+    )
+    await repository.set_job_stage(
+        job_id=job_id,
+        stage=PipelineStage.INDEXING,
+    )
+    await repository.add_job_stage_durations(
+        job_id=job_id,
+        durations_ms=batch.stage_durations_ms,
+    )
+    await repository.finalize_enrichment(
+        job_id=job_id,
+        asset_ids=asset_ids,
+        errors=batch.errors,
+    )
+    failed_asset_ids = {error["asset_id"] for error in batch.errors}
+    return AssetEnrichmentResult(
+        job_id=job_id,
+        workspace_id=workspace_id,
+        requested_asset_count=len(asset_ids),
+        completed_asset_count=len(asset_ids) - len(failed_asset_ids),
+        partial_failed_asset_count=len(failed_asset_ids),
+        errors=batch.errors,
+    )
+
+
+async def _run_enrichment_batch(
+    *,
+    workspace_id: str,
+    asset_ids: list[str],
+    understanding_service: AssetUnderstandingService,
+    embedding_service: AssetEmbeddingService,
+) -> _EnrichmentBatchResult:
+    """Enrich a committed Asset batch without mutating aggregate Job state."""
+    errors: list[dict[str, str]] = []
     native_embedding_task = asyncio.create_task(
         embedding_service.run(
             workspace_id=workspace_id,
@@ -95,14 +147,6 @@ async def enrich_assets(
             "error": error["error"],
         }
         for error in understanding.errors
-    )
-    await repository.set_job_stage(
-        job_id=job_id,
-        stage=PipelineStage.FEATURE_READY,
-    )
-    await repository.set_job_stage(
-        job_id=job_id,
-        stage=PipelineStage.EMBEDDING,
     )
     text_embedding_types = [
         embedding_type
@@ -145,28 +189,202 @@ async def enrich_assets(
             }
             for error in embedding.errors
         )
-    await repository.set_job_stage(
-        job_id=job_id,
-        stage=PipelineStage.INDEXING,
-    )
-    await repository.add_job_stage_durations(
-        job_id=job_id,
-        durations_ms=stage_durations_ms,
-    )
-    await repository.finalize_enrichment(
-        job_id=job_id,
-        asset_ids=asset_ids,
+    return _EnrichmentBatchResult(
         errors=errors,
+        stage_durations_ms=stage_durations_ms,
     )
-    failed_asset_ids = {error["asset_id"] for error in errors}
-    return AssetEnrichmentResult(
-        job_id=job_id,
-        workspace_id=workspace_id,
-        requested_asset_count=len(asset_ids),
-        completed_asset_count=len(asset_ids) - len(failed_asset_ids),
-        partial_failed_asset_count=len(failed_asset_ids),
-        errors=errors,
-    )
+
+
+class AssetEnrichmentPipeline:
+    """Consume committed Assets immediately through a bounded worker queue."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        job_id: str,
+        workspace_id: str,
+        repository: AssetRepository,
+        understanding_service: AssetUnderstandingService,
+        embedding_service: AssetEmbeddingService,
+    ) -> None:
+        self._job_id = job_id
+        self._workspace_id = workspace_id
+        self._repository = repository
+        self._understanding_service = understanding_service
+        self._embedding_service = embedding_service
+        self._worker_count = settings.understanding_concurrency
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue(
+            maxsize=settings.asset_enrichment_queue_size
+        )
+        self._workers: list[asyncio.Task[None]] = []
+        self._submission_lock = asyncio.Lock()
+        self._seen_asset_ids: set[str] = set()
+        self._asset_ids: list[str] = []
+        self._outcomes: list[_EnrichmentBatchResult] = []
+        self._stage_started = False
+        self._started = False
+        self._closed = False
+        self._active_count = 0
+        self._active_started_at = 0.0
+        self._active_elapsed_ms = 0.0
+
+    async def start(self) -> None:
+        if self._started:
+            raise RuntimeError("asset enrichment pipeline has already started")
+        self._started = True
+        self._workers = [
+            asyncio.create_task(self._worker()) for _ in range(self._worker_count)
+        ]
+
+    async def submit(self, asset_ids: list[str]) -> None:
+        """Queue newly committed Assets, applying backpressure at the configured bound."""
+        if not self._started or self._closed:
+            raise RuntimeError("asset enrichment pipeline is not accepting Assets")
+        async with self._submission_lock:
+            pending = [
+                asset_id
+                for asset_id in dict.fromkeys(asset_ids)
+                if asset_id not in self._seen_asset_ids
+            ]
+            if not pending:
+                return
+            if not self._stage_started:
+                await self._repository.set_job_stage(
+                    job_id=self._job_id,
+                    stage=PipelineStage.UNDERSTANDING,
+                )
+                self._stage_started = True
+            for asset_id in pending:
+                self._seen_asset_ids.add(asset_id)
+                self._asset_ids.append(asset_id)
+                await self._queue.put(asset_id)
+
+    async def finish(self) -> AssetEnrichmentResult:
+        if not self._started or self._closed:
+            raise RuntimeError("asset enrichment pipeline cannot be finished")
+        await self._queue.join()
+        for _ in self._workers:
+            await self._queue.put(None)
+        await asyncio.gather(*self._workers)
+        self._closed = True
+
+        if not self._asset_ids:
+            await self._repository.finalize_job(job_id=self._job_id)
+            return AssetEnrichmentResult(
+                job_id=self._job_id,
+                workspace_id=self._workspace_id,
+                requested_asset_count=0,
+                completed_asset_count=0,
+                partial_failed_asset_count=0,
+            )
+
+        errors = [error for outcome in self._outcomes for error in outcome.errors]
+        stage_durations_ms = self._normalized_stage_durations()
+        for stage in (
+            PipelineStage.FEATURE_READY,
+            PipelineStage.EMBEDDING,
+            PipelineStage.INDEXING,
+        ):
+            await self._repository.set_job_stage(job_id=self._job_id, stage=stage)
+        await self._repository.add_job_stage_durations(
+            job_id=self._job_id,
+            durations_ms=stage_durations_ms,
+        )
+        await self._repository.finalize_enrichment(
+            job_id=self._job_id,
+            asset_ids=self._asset_ids,
+            errors=errors,
+        )
+        failed_asset_ids = {error["asset_id"] for error in errors}
+        return AssetEnrichmentResult(
+            job_id=self._job_id,
+            workspace_id=self._workspace_id,
+            requested_asset_count=len(self._asset_ids),
+            completed_asset_count=len(self._asset_ids) - len(failed_asset_ids),
+            partial_failed_asset_count=len(failed_asset_ids),
+            errors=errors,
+        )
+
+    async def abort(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for worker in self._workers:
+            worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+
+    async def _worker(self) -> None:
+        while True:
+            asset_id = await self._queue.get()
+            try:
+                if asset_id is None:
+                    return
+                self._mark_active_start()
+                started = time.perf_counter()
+                try:
+                    await self._repository.begin_asset_enrichment(asset_ids=[asset_id])
+                    outcome = await _run_enrichment_batch(
+                        workspace_id=self._workspace_id,
+                        asset_ids=[asset_id],
+                        understanding_service=self._understanding_service,
+                        embedding_service=self._embedding_service,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - started) * 1000
+                    outcome = _EnrichmentBatchResult(
+                        errors=[
+                            {
+                                "asset_id": asset_id,
+                                "stage": "enrichment",
+                                "error": (str(exc) or type(exc).__name__)[:2000],
+                            }
+                        ],
+                        stage_durations_ms={
+                            PipelineStage.UNDERSTANDING.value: elapsed_ms,
+                            PipelineStage.FEATURE_READY.value: 0.0,
+                            PipelineStage.EMBEDDING.value: 0.0,
+                            PipelineStage.INDEXING.value: 0.0,
+                        },
+                    )
+                finally:
+                    self._mark_active_end()
+                self._outcomes.append(outcome)
+            finally:
+                self._queue.task_done()
+
+    def _mark_active_start(self) -> None:
+        if self._active_count == 0:
+            self._active_started_at = time.perf_counter()
+        self._active_count += 1
+
+    def _mark_active_end(self) -> None:
+        self._active_count -= 1
+        if self._active_count == 0:
+            self._active_elapsed_ms += (
+                time.perf_counter() - self._active_started_at
+            ) * 1000
+
+    def _normalized_stage_durations(self) -> dict[str, float]:
+        raw = {
+            stage.value: sum(
+                outcome.stage_durations_ms.get(stage.value, 0.0)
+                for outcome in self._outcomes
+            )
+            for stage in (
+                PipelineStage.UNDERSTANDING,
+                PipelineStage.FEATURE_READY,
+                PipelineStage.EMBEDDING,
+                PipelineStage.INDEXING,
+            )
+        }
+        raw_total = sum(raw.values())
+        if not raw_total:
+            return raw
+        return {
+            stage: self._active_elapsed_ms * duration_ms / raw_total
+            for stage, duration_ms in raw.items()
+        }
 
 
 class BrowserImportService:
@@ -262,30 +480,41 @@ class BrowserImportService:
         completion: ImportCompletion,
         workspace_id: str,
     ) -> PipelineRunResult | None:
+        enrichment_pipeline: AssetEnrichmentPipeline | None = None
         try:
+            if (
+                self._understanding_service is not None
+                and self._embedding_service is not None
+            ):
+                enrichment_pipeline = AssetEnrichmentPipeline(
+                    settings=self._settings,
+                    job_id=completion.job_id,
+                    workspace_id=workspace_id,
+                    repository=self._repository,
+                    understanding_service=self._understanding_service,
+                    embedding_service=self._embedding_service,
+                )
+                await enrichment_pipeline.start()
+            if enrichment_pipeline is None:
+                result = await self._runner.run(
+                    completion.staged_path,
+                    workspace_id,
+                    job_id=completion.job_id,
+                )
+                return result
             result = await self._runner.run(
                 completion.staged_path,
                 workspace_id,
                 job_id=completion.job_id,
+                on_assets_stored=enrichment_pipeline.submit,
+                finalize_job=False,
             )
-            asset_ids = list(getattr(result, "asset_ids", []))
-            if (
-                not asset_ids
-                or self._understanding_service is None
-                or self._embedding_service is None
-            ):
-                return result
-
-            await enrich_assets(
-                job_id=completion.job_id,
-                workspace_id=workspace_id,
-                asset_ids=asset_ids,
-                repository=self._repository,
-                understanding_service=self._understanding_service,
-                embedding_service=self._embedding_service,
-            )
+            await enrichment_pipeline.submit(list(getattr(result, "asset_ids", [])))
+            await enrichment_pipeline.finish()
             return result
         except Exception as exc:
+            if enrichment_pipeline is not None:
+                await enrichment_pipeline.abort()
             message = str(exc) or type(exc).__name__
             await self._repository.fail_job(job_id=completion.job_id, error=message)
             return None

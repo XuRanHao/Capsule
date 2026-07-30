@@ -7,7 +7,7 @@ import mimetypes
 import posixpath
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -30,6 +30,8 @@ from capsule.pipeline.asset_factory import AssetFactory
 from capsule.pipeline.video_media import VideoArtifactStorage, VideoDerivedMediaWriter
 from capsule.schemas import AssetDraft, DiscoveredFile, SourceContext
 from capsule.storage.object_storage import ObjectStorage
+
+AssetStoredCallback = Callable[[list[str]], Awaitable[None]]
 
 
 class PipelinePlan(BaseModel):
@@ -97,6 +99,8 @@ class PipelineRunner:
         workspace_id: str,
         *,
         job_id: str | None = None,
+        on_assets_stored: AssetStoredCallback | None = None,
+        finalize_job: bool = True,
     ) -> PipelineRunResult:
         discovery_started = time.perf_counter()
         source_files = discover_files(input_path)
@@ -152,6 +156,7 @@ class PipelineRunner:
                 assetizer=assetizer,
                 media_writer=media_writer,
                 image_source_contexts=image_source_contexts,
+                on_assets_stored=on_assets_stored,
             )
             processing_elapsed_ms = (
                 time.perf_counter() - processing_started
@@ -177,7 +182,8 @@ class PipelineRunner:
                 job_id=job_id,
                 durations_ms=stage_durations_ms,
             )
-            await repository.finalize_job(job_id=job_id)
+            if finalize_job:
+                await repository.finalize_job(job_id=job_id)
             errors = [outcome.error for outcome in outcomes if outcome.error is not None]
             asset_ids = [
                 asset_id
@@ -212,6 +218,7 @@ class PipelineRunner:
         assetizer: Assetizer,
         media_writer: VideoDerivedMediaWriter | None,
         image_source_contexts: Mapping[str, list[SourceContext]],
+        on_assets_stored: AssetStoredCallback | None,
     ) -> list[_FileOutcome]:
         """Process files with a fixed worker count and deterministic result ordering."""
         if not source_files:
@@ -237,6 +244,7 @@ class PipelineRunner:
                         source_files[index].relative_path,
                         [],
                     ),
+                    on_assets_stored=on_assets_stored,
                 )
 
         workers = [
@@ -265,6 +273,7 @@ class PipelineRunner:
         assetizer: Assetizer,
         media_writer: VideoDerivedMediaWriter | None,
         source_contexts: list[SourceContext],
+        on_assets_stored: AssetStoredCallback | None,
     ) -> _FileOutcome:
         source_file_id: str | None = None
         stage_durations_ms = {
@@ -348,6 +357,8 @@ class PipelineRunner:
                     source_file_id=source_file_id,
                     assets=assets,
                 )
+                if on_assets_stored is not None and stored.asset_ids:
+                    await on_assets_stored(stored.asset_ids)
                 await repository.record_file_success(job_id=job_id)
             finally:
                 stage_durations_ms[PipelineStage.ASSET_STORED.value] += (

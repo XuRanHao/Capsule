@@ -118,6 +118,8 @@ class AssetEmbeddingService:
             settings.native_embedding_concurrency
         )
         self._text_semaphore = asyncio.Semaphore(settings.embedding_concurrency)
+        self._collection_ready = False
+        self._collection_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -133,7 +135,7 @@ class AssetEmbeddingService:
             asset_ids=asset_ids,
         )
         if assets:
-            await self._vector_store.ensure_collection()
+            await self._ensure_collection()
         return await self._run_assets(
             workspace_id=workspace_id,
             embedding_type=embedding_type,
@@ -158,7 +160,7 @@ class AssetEmbeddingService:
             asset_ids=asset_ids,
         )
         if assets:
-            await self._vector_store.ensure_collection()
+            await self._ensure_collection()
         return list(
             await asyncio.gather(
                 *(
@@ -172,6 +174,16 @@ class AssetEmbeddingService:
                 )
             )
         )
+
+    async def _ensure_collection(self) -> None:
+        """Initialize Milvus once even when streaming Assets arrive concurrently."""
+        if self._collection_ready:
+            return
+        async with self._collection_lock:
+            if self._collection_ready:
+                return
+            await self._vector_store.ensure_collection()
+            self._collection_ready = True
 
     async def _run_assets(
         self,

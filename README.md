@@ -141,6 +141,12 @@ The non-dry-run pipeline persists Markdown, plain-text, image and video Assets
 to PostgreSQL. Video input requires the host MPS worker described below; a
 video failure is recorded without aborting the rest of the batch.
 
+Browser imports stream each committed Asset into a bounded enrichment queue
+instead of waiting for the complete folder. Native embedding starts alongside
+Understanding; that Asset's text embedding channels start only after its
+description and Feature fields have been committed. The import Job is finalized
+only after both file processing and the enrichment queue have drained.
+
 `capsule embed` processes one embedding route at a time. Its default is native
 multimodal: Markdown uses the block text, images are sent inline as their
 original bytes, and video uses the derived playable MP4 through a temporary
@@ -273,6 +279,7 @@ accepted only as an input compatibility alias.
 | Stage | Default |
 | --- | ---: |
 | Asset understanding | 32 |
+| Pending asset enrichment queue | 64 |
 | Search query understanding | 4 |
 | Native embedding generation | 24 |
 | Text embedding generation | 96 |
@@ -294,6 +301,10 @@ validated. On nine real images, the earlier bounded Understanding-to-Embedding
 pipeline reduced full enrichment time from 45.60 seconds to 43.28 seconds
 (5.1%) with no recorded failures; the current upstream pipeline additionally
 overlaps native embedding and fans out all text channels concurrently.
+The committed Asset-stored streaming pipeline was then measured in two
+cross-ordered live Ark runs over three images and three Markdown files. Average
+end-to-end time fell from 13.008 seconds to 10.911 seconds (16.12%); both runs
+produced all six descriptions and Feature objects without processing errors.
 
 ## Development
 

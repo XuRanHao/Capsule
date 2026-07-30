@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     document_chunk_max_tokens: int = Field(default=DOCUMENT_CHUNK_MAX_TOKENS, ge=1)
 
     understanding_concurrency: int = Field(default=32, ge=1)
+    asset_enrichment_queue_size: int = Field(default=64, ge=1)
     search_understanding_concurrency: int = Field(default=4, ge=1)
     native_embedding_concurrency: int = Field(default=24, ge=1)
     embedding_concurrency: int = Field(default=96, ge=1)

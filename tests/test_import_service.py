@@ -9,7 +9,11 @@ from pydantic import ValidationError
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType, PipelineStage
-from capsule.pipeline.import_service import BrowserImportService, enrich_assets
+from capsule.pipeline.import_service import (
+    BrowserImportService,
+    ImportCompletion,
+    enrich_assets,
+)
 from capsule.schemas import AssetUnderstanding, ProcessingJobRecord
 
 
@@ -212,6 +216,137 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         repository.durations["embedding"] / repository.durations["indexing"]
         == pytest.approx(10)
     )
+
+
+@pytest.mark.asyncio
+async def test_browser_import_enriches_asset_before_runner_finishes(tmp_path: Path) -> None:
+    events: list[str] = []
+    understanding_started = asyncio.Event()
+
+    class Repository:
+        def __init__(self) -> None:
+            self.final_asset_ids: list[str] = []
+            self.failures: list[str] = []
+
+        async def set_job_stage(self, *, job_id: str, stage: PipelineStage) -> None:
+            assert job_id == "job_stream"
+            events.append(f"stage:{stage.value}")
+
+        async def begin_asset_enrichment(self, *, asset_ids: list[str]) -> None:
+            assert asset_ids == ["asset_a"]
+
+        async def add_job_stage_durations(self, **_: object) -> None:
+            return None
+
+        async def finalize_enrichment(
+            self,
+            *,
+            job_id: str,
+            asset_ids: list[str],
+            errors: list[dict[str, str]],
+        ) -> None:
+            assert job_id == "job_stream"
+            assert errors == []
+            self.final_asset_ids = asset_ids
+            events.append("job_finalized")
+
+        async def finalize_job(self, **_: object) -> None:
+            raise AssertionError("an Asset Job must be finalized after enrichment")
+
+        async def fail_job(self, *, error: str, **_: object) -> None:
+            self.failures.append(error)
+
+    class Runner:
+        async def run(
+            self,
+            _input_path: Path,
+            _workspace_id: str,
+            *,
+            job_id: str,
+            on_assets_stored,
+            finalize_job: bool,
+        ) -> SimpleNamespace:
+            assert job_id == "job_stream"
+            assert not finalize_job
+            events.append("asset_committed")
+            await on_assets_stored(["asset_a"])
+            await asyncio.wait_for(understanding_started.wait(), timeout=1)
+            events.append("runner_finished")
+            return SimpleNamespace(asset_ids=["asset_a"])
+
+    class Understanding:
+        async def run(self, *, asset_ids: list[str], **_: object) -> SimpleNamespace:
+            assert asset_ids == ["asset_a"]
+            events.append("understanding_started")
+            understanding_started.set()
+            await asyncio.sleep(0)
+            return SimpleNamespace(
+                errors=[],
+                understanding_duration_ms=10.0,
+                feature_ready_duration_ms=1.0,
+            )
+
+    class Embedding:
+        async def run(
+            self,
+            *,
+            embedding_type: EmbeddingType,
+            **_: object,
+        ) -> SimpleNamespace:
+            assert embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+            events.append("native_embedding_started")
+            return SimpleNamespace(
+                embedding_type=embedding_type.value,
+                errors=[],
+                embedding_duration_ms=2.0,
+                indexing_duration_ms=1.0,
+            )
+
+        async def run_many(
+            self,
+            *,
+            embedding_types: list[EmbeddingType],
+            **_: object,
+        ) -> list[SimpleNamespace]:
+            assert understanding_started.is_set()
+            events.append("text_embedding_started")
+            return [
+                SimpleNamespace(
+                    embedding_type=embedding_type.value,
+                    errors=[],
+                    embedding_duration_ms=2.0,
+                    indexing_duration_ms=1.0,
+                )
+                for embedding_type in embedding_types
+            ]
+
+    repository = Repository()
+    service = BrowserImportService(
+        settings=Settings(
+            import_root=tmp_path,
+            understanding_concurrency=1,
+            asset_enrichment_queue_size=1,
+        ),
+        repository=repository,  # type: ignore[arg-type]
+        runner=Runner(),  # type: ignore[arg-type]
+        understanding_service=Understanding(),  # type: ignore[arg-type]
+        embedding_service=Embedding(),  # type: ignore[arg-type]
+    )
+
+    result = await service.execute(
+        completion=ImportCompletion(
+            job_id="job_stream",
+            staged_path=tmp_path,
+            file_count=1,
+        ),
+        workspace_id="workspace_stream",
+    )
+
+    assert result is not None
+    assert events.index("understanding_started") < events.index("runner_finished")
+    assert events.index("text_embedding_started") < events.index("job_finalized")
+    assert repository.final_asset_ids == ["asset_a"]
+    assert repository.failures == []
 
 
 def test_asset_understanding_normalizes_loose_model_feature_json() -> None:

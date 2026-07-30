@@ -180,3 +180,73 @@ async def test_run_skips_completed_source_with_same_fingerprint(
     assert result.failed_count == 0
     assert result.skipped_count == 1
     assert result.asset_count == 3
+
+
+async def test_run_emits_committed_assets_and_defers_job_finalization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "asset.png").write_bytes(b"image")
+
+    class FakeDatabase:
+        pass
+
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.finalized = False
+
+        async def create_job(self, **_values: object) -> str:
+            return "job_stream"
+
+        async def prepare_source_file(self, **_values: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_file_id="source_stream",
+                already_processed=False,
+                asset_count=0,
+            )
+
+        async def replace_assets(self, **_values: object) -> SimpleNamespace:
+            return SimpleNamespace(asset_ids=["asset_stream"])
+
+        async def record_file_success(self, **_values: object) -> None:
+            return None
+
+        async def record_file_failure(self, **_values: object) -> None:
+            raise AssertionError("the source file should succeed")
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
+        async def finalize_job(self, **_values: object) -> None:
+            self.finalized = True
+
+    class SuccessfulAssetizer:
+        async def assetize(self, source_file) -> AssetizationResult:
+            return AssetizationResult(source_file=source_file, succeeded=True)
+
+    repository = FakeRepository()
+    monkeypatch.setattr(runner_module, "AssetRepository", lambda _database: repository)
+    monkeypatch.setattr(
+        runner_module,
+        "_build_assetizer",
+        lambda *_args: SuccessfulAssetizer(),
+    )
+    committed: list[str] = []
+
+    async def on_assets_stored(asset_ids: list[str]) -> None:
+        committed.extend(asset_ids)
+
+    runner = PipelineRunner(
+        settings=Settings(file_parse_concurrency=1),
+        database=FakeDatabase(),  # type: ignore[arg-type]
+    )
+    result = await runner.run(
+        tmp_path,
+        "workspace_stream",
+        on_assets_stored=on_assets_stored,
+        finalize_job=False,
+    )
+
+    assert result.asset_ids == ["asset_stream"]
+    assert committed == ["asset_stream"]
+    assert not repository.finalized

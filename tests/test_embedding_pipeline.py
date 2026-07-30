@@ -158,7 +158,7 @@ async def test_embedding_service_persists_and_reuses_native_vectors(tmp_path: Pa
         assert len(vectors.records) == 4
         assert {record.asset_id for record in vectors.records} == set(asset_ids)
         assert len({record.embedding_id for record in vectors.records}) == 2
-        assert vectors.ensure_calls == 3
+        assert vectors.ensure_calls == 1
 
         async with database.session() as session:
             records = list(
