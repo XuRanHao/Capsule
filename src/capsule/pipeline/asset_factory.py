@@ -53,6 +53,9 @@ class AssetFactory:
                     locator_json,
                     draft.raw_content or "",
                     _canonical_json(draft.file_info),
+                    _canonical_json(
+                        [context.model_dump(mode="json") for context in draft.source_contexts]
+                    ),
                 )
             )
         )

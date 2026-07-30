@@ -834,9 +834,11 @@ class EmbeddingAsset:
     source_storage_uri: str
     source_mime_type: str
     file_name: str = ""
+    source_relative_path: str = ""
     file_tree_context: list[str] = field(default_factory=list)
     source_contexts: list[dict[str, Any]] = field(default_factory=list)
     file_info: dict[str, Any] = field(default_factory=dict)
+    source_locator: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -890,9 +892,11 @@ class EmbeddingRepository:
                 source_storage_uri=source.storage_uri,
                 source_mime_type=source.mime_type,
                 file_name=asset.file_name,
+                source_relative_path=source.relative_path,
                 file_tree_context=list(asset.file_tree_context),
                 source_contexts=list(asset.source_contexts),
                 file_info=dict(asset.file_info),
+                source_locator=dict(asset.source_locator),
             )
             for asset, source in rows
         ]

@@ -38,9 +38,9 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /CAPSULE/);
   assert.match(html, /搜到你记得的/);
   assert.match(html, /个人多模态素材库/);
-  assert.match(html, /演示数据/);
-  assert.match(html, /关联段落/);
-  assert.match(html, /QUERY PLAN/);
+  assert.match(html, /实时服务/);
+  assert.match(html, /12 路召回/);
+  assert.match(html, /开始检索/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -71,6 +71,28 @@ test("server-renders every POC workspace page", async () => {
   }
 });
 
+test("cluster selector renders exactly the ten Feature dimensions", async () => {
+  const response = await render("/clusters");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const optionValues = [...html.matchAll(/<option[^>]*\bvalue="([^"]+)"/g)]
+    .map((match) => match[1])
+    .filter(Boolean);
+
+  assert.deepEqual(optionValues, [
+    "subject_content",
+    "scene_theme",
+    "visual_style",
+    "color_composition",
+    "mood_atmosphere",
+    "character_state_or_psychology",
+    "asset_usage",
+    "target_audience",
+    "provenance",
+    "rights_version_authorship",
+  ]);
+});
+
 test("removes all disposable starter-preview references", async () => {
   const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -96,9 +118,9 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(shell, /product-nav-compact/);
   assert.doesNotMatch(shell, /demo-sidebar/);
   assert.match(importPage, /选择文件夹/);
-  assert.match(tasksPage, /失败与重试/);
-  assert.match(assetsPage, /sourceFile/);
-  assert.match(detailPage, /sourceContext/);
+  assert.match(tasksPage, /失败记录/);
+  assert.match(assetsPage, /source_file/);
+  assert.match(detailPage, /source_contexts/);
   assert.match(clustersPage, /embedding/);
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);

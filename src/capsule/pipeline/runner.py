@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import posixpath
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, Field
 
@@ -25,7 +28,7 @@ from capsule.parsers.text import TextParser
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
 from capsule.pipeline.video_media import VideoArtifactStorage, VideoDerivedMediaWriter
-from capsule.schemas import AssetDraft, DiscoveredFile
+from capsule.schemas import AssetDraft, DiscoveredFile, SourceContext
 from capsule.storage.object_storage import ObjectStorage
 
 
@@ -120,6 +123,10 @@ class PipelineRunner:
         repository = AssetRepository(database)
         factory = AssetFactory()
         assetizer = _build_assetizer(counter, self._settings, self._video_embedder)
+        image_source_contexts = await asyncio.to_thread(
+            _collect_image_source_contexts,
+            source_files,
+        )
         object_storage = self._object_storage
         media_writer: VideoDerivedMediaWriter | None = None
         if any(item.extension in {".mp4", ".mov"} for item in source_files):
@@ -144,6 +151,7 @@ class PipelineRunner:
                 factory=factory,
                 assetizer=assetizer,
                 media_writer=media_writer,
+                image_source_contexts=image_source_contexts,
             )
             processing_elapsed_ms = (
                 time.perf_counter() - processing_started
@@ -203,6 +211,7 @@ class PipelineRunner:
         factory: AssetFactory,
         assetizer: Assetizer,
         media_writer: VideoDerivedMediaWriter | None,
+        image_source_contexts: Mapping[str, list[SourceContext]],
     ) -> list[_FileOutcome]:
         """Process files with a fixed worker count and deterministic result ordering."""
         if not source_files:
@@ -224,6 +233,10 @@ class PipelineRunner:
                     factory=factory,
                     assetizer=assetizer,
                     media_writer=media_writer,
+                    source_contexts=image_source_contexts.get(
+                        source_files[index].relative_path,
+                        [],
+                    ),
                 )
 
         workers = [
@@ -251,6 +264,7 @@ class PipelineRunner:
         factory: AssetFactory,
         assetizer: Assetizer,
         media_writer: VideoDerivedMediaWriter | None,
+        source_contexts: list[SourceContext],
     ) -> _FileOutcome:
         source_file_id: str | None = None
         stage_durations_ms = {
@@ -273,6 +287,7 @@ class PipelineRunner:
                     processing_fingerprint=_processing_fingerprint(
                         source_file,
                         self._settings,
+                        source_contexts=source_contexts,
                     ),
                 )
             finally:
@@ -301,6 +316,18 @@ class PipelineRunner:
                 ) * 1000
             if not result.succeeded:
                 raise ValueError(result.error_message or "assetization failed")
+            if source_contexts:
+                result.assets = [
+                    draft.model_copy(
+                        update={
+                            "source_contexts": [
+                                *draft.source_contexts,
+                                *source_contexts,
+                            ]
+                        }
+                    )
+                    for draft in result.assets
+                ]
             phase_started = time.perf_counter()
             try:
                 assets = factory.build_many(
@@ -408,7 +435,12 @@ def _mime_type(source_file: DiscoveredFile) -> str:
     return guessed or "application/octet-stream"
 
 
-def _processing_fingerprint(source_file: DiscoveredFile, settings: Settings) -> str:
+def _processing_fingerprint(
+    source_file: DiscoveredFile,
+    settings: Settings,
+    *,
+    source_contexts: list[SourceContext] | None = None,
+) -> str:
     payload: dict[str, object] = {
         "version": settings.assetization_version,
         "extension": source_file.extension,
@@ -426,5 +458,82 @@ def _processing_fingerprint(source_file: DiscoveredFile, settings: Settings) -> 
             "max_representative_frames": settings.video_max_representative_frames,
             "mobileclip_model_path": settings.mobileclip_model_path,
         }
+    if source_contexts:
+        payload["source_contexts"] = [
+            context.model_dump(mode="json") for context in source_contexts
+        ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _collect_image_source_contexts(
+    source_files: list[DiscoveredFile],
+) -> dict[str, list[SourceContext]]:
+    """Map local Markdown image references to their associated text paragraphs."""
+    available_paths = {source.relative_path for source in source_files}
+    contexts_by_image: dict[str, list[SourceContext]] = {}
+    parser = MarkdownParser()
+    for source_file in source_files:
+        if source_file.extension != ".md":
+            continue
+        try:
+            parsed = parser.parse_file(Path(source_file.path))
+        except (OSError, UnicodeError):
+            continue
+        document_title = (
+            next(
+                (
+                    reference.heading_path[0]
+                    for reference in parsed.image_references
+                    if reference.heading_path
+                ),
+                None,
+            )
+            or Path(source_file.relative_path).stem
+        )
+        for reference in parsed.image_references:
+            image_path = _resolve_markdown_image_path(
+                document_path=source_file.relative_path,
+                image_reference=reference.image_path,
+            )
+            if image_path is None or image_path not in available_paths:
+                continue
+            enriched = [
+                context.model_copy(
+                    update={
+                        "paragraph_id": (
+                            f"{source_file.relative_path}#block-{context.text_block_index}"
+                            if context.text_block_index is not None
+                            else None
+                        ),
+                        "source_path": source_file.relative_path,
+                        "document_title": document_title,
+                        "heading_path": list(reference.heading_path),
+                    }
+                )
+                for context in reference.contexts
+            ]
+            existing = contexts_by_image.setdefault(image_path, [])
+            for context in enriched:
+                if context not in existing:
+                    existing.append(context)
+    return contexts_by_image
+
+
+def _resolve_markdown_image_path(
+    *,
+    document_path: str,
+    image_reference: str,
+) -> str | None:
+    parsed = urlparse(image_reference)
+    if parsed.scheme or parsed.netloc or not parsed.path:
+        return None
+    decoded = unquote(parsed.path).replace("\\", "/")
+    if decoded.startswith("/"):
+        return None
+    resolved = posixpath.normpath(
+        posixpath.join(posixpath.dirname(document_path), decoded)
+    )
+    if resolved == ".." or resolved.startswith("../"):
+        return None
+    return resolved

@@ -360,8 +360,9 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "以下输出结构约束优先于其他格式描述。只返回一个符合 JSON Schema 的 JSON 对象，"
             "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
             "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
-            "的对象，value 无证据时使用 null，不得省略必填字段。下面的手工示例只用于说明 JSON "
-            "结构，示例文字不是素材事实，禁止照抄；所有实际值、状态、置信度和证据必须根据输入素材"
+            "的对象；value 使用中文分号连接该维度内最多五个关键词，无证据时使用 null，不得省略"
+            "必填字段。下面的手工示例只用于说明 JSON 结构，示例文字不是素材事实，禁止照抄；所有"
+            "实际值、状态、置信度和证据必须根据输入素材"
             f"重新判断。JSON 结构示例：{example}。JSON Schema：{schema}"
         ),
     }
@@ -369,7 +370,7 @@ def _asset_understanding_schema_message() -> dict[str, str]:
 
 def _asset_understanding_json_example() -> dict[str, object]:
     observed: dict[str, object] = {
-        "value": "基于素材证据填写的文字",
+        "value": "关键词一；关键词二",
         "status": "observed",
         "confidence": 0.9,
         "evidence": ["输入中可核验的简短证据"],

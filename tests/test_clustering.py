@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-from sklearn.metrics import adjusted_rand_score
 
 from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
@@ -16,12 +15,40 @@ from capsule.pipeline.clustering import (
 
 def test_dynamic_hdbscan_parameters() -> None:
     with pytest.raises(InsufficientDataError):
-        dynamic_hdbscan_parameters(14)
+        dynamic_hdbscan_parameters(0)
 
-    assert dynamic_hdbscan_parameters(15).min_cluster_size == 3
-    assert dynamic_hdbscan_parameters(50).min_cluster_size == 5
-    assert dynamic_hdbscan_parameters(200).min_cluster_size == 10
-    assert dynamic_hdbscan_parameters(1000).min_cluster_size == 20
+    assert dynamic_hdbscan_parameters(1).min_cluster_size == 3
+    assert dynamic_hdbscan_parameters(1).min_samples == 1
+    for sample_count in (2, 14, 15, 50, 200, 1000):
+        parameters = dynamic_hdbscan_parameters(sample_count)
+        assert parameters.min_cluster_size == 3
+        assert parameters.min_samples == 1
+
+
+def test_cluster_vectors_accepts_a_single_vector() -> None:
+    vectors = np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+    result = cluster_vectors(vectors)
+
+    assert result.labels.tolist() == [-1]
+    assert result.noise_count == 1
+    assert result.parameter_candidates_evaluated == 1
+
+
+def test_cluster_vectors_clusters_fewer_than_fifteen_vectors() -> None:
+    vectors = np.asarray(
+        [
+            *[[1.0 + index * 0.001, 0.1 + (index % 2) * 0.001] for index in range(6)],
+            *[[0.1 + (index % 2) * 0.001, 1.0 + index * 0.001] for index in range(6)],
+        ],
+        dtype=np.float32,
+    )
+
+    result = cluster_vectors(vectors)
+
+    assert result.parameters == HdbscanParameters(min_cluster_size=3, min_samples=1)
+    assert result.cluster_count > 0
+    assert result.noise_count == 0
 
 
 def test_dataset_hash_is_order_independent() -> None:
@@ -41,7 +68,7 @@ def test_representative_indices_excludes_noise() -> None:
     assert representatives[0][0] in {0, 1}
 
 
-def test_cluster_vectors_adapts_parameters_to_data_density() -> None:
+def test_cluster_vectors_optimization_keeps_fixed_density_parameters() -> None:
     rng = np.random.default_rng(3)
     sample_count = 300
     cluster_count = 4
@@ -61,21 +88,11 @@ def test_cluster_vectors_adapts_parameters_to_data_density() -> None:
     vectors = np.hstack(
         [vectors, np.full((sample_count, 48), 0.15, dtype=np.float32)]
     )
-    expected_labels = np.concatenate(
-        [np.full(cluster_sizes[label], label) for label in range(cluster_count)]
-    )
-
-    fixed = cluster_vectors(
-        vectors,
-        parameters=HdbscanParameters(min_cluster_size=10, min_samples=5),
-    )
     adaptive = cluster_vectors(vectors, optimize_parameters=True)
 
     assert adaptive.parameter_candidates_evaluated > 1
-    assert adaptive.cluster_count == cluster_count
-    assert adjusted_rand_score(expected_labels, adaptive.labels) > (
-        adjusted_rand_score(expected_labels, fixed.labels) + 0.15
-    )
+    assert adaptive.parameters.min_cluster_size == 3
+    assert adaptive.parameters.min_samples == 1
 
 
 def test_cluster_vectors_renormalizes_after_pca() -> None:

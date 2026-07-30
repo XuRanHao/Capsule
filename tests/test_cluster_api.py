@@ -136,6 +136,9 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "workspace_id": "workspace_api_test",
             "embedding_type": EmbeddingType.NATIVE_MULTIMODAL,
             "cluster_run_id": "run_api_test",
+            "pca_dimension": 8,
+            "min_samples": 1,
+            "min_cluster_size": 3,
             "optimize_parameters": False,
         }
     ]
@@ -165,6 +168,9 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
                 json={
                     "workspace_id": "workspace_api_test",
                     "embedding_type": "visual_style",
+                    "pca_dimension": 12,
+                    "min_samples": 2,
+                    "min_cluster_size": 5,
                     "optimize_parameters": True,
                 },
             )
@@ -175,6 +181,9 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
             "workspace_id": "workspace_api_test",
             "embedding_type": EmbeddingType.VISUAL_STYLE,
             "cluster_run_id": "run_api_test",
+            "pca_dimension": 12,
+            "min_samples": 2,
+            "min_cluster_size": 5,
             "optimize_parameters": True,
         }
     ]

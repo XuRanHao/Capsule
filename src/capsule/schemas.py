@@ -16,6 +16,10 @@ class SourceContext(BaseModel):
     text: str
     relation_type: str
     text_block_index: int | None = None
+    paragraph_id: str | None = None
+    source_path: str | None = None
+    document_title: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
 
 
 class DiscoveredFile(BaseModel):
@@ -142,7 +146,12 @@ class StoredFileResult(BaseModel):
 
 
 class FeatureValue(BaseModel):
-    value: str | None
+    value: str | None = Field(
+        description=(
+            "该维度内最多五个互不重复的名词、形容词或短语，使用中文分号连接；"
+            "无法确定时为 null"
+        )
+    )
     status: FeatureStatus
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence: list[str] = Field(default_factory=list)
@@ -160,6 +169,14 @@ class FeatureValue(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
+        raw_value = normalized.get("value")
+        if isinstance(raw_value, list):
+            terms = [
+                item.strip()
+                for item in raw_value
+                if isinstance(item, str) and item.strip()
+            ]
+            normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
         evidence = normalized.get("evidence")
         if isinstance(evidence, str):
             normalized["evidence"] = [evidence]

@@ -4,6 +4,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from PIL import Image
 from pydantic import SecretStr
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -234,7 +235,7 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
     tmp_path: Path,
 ) -> None:
     image_path = tmp_path / "still.png"
-    image_path.write_bytes(b"png-content")
+    Image.new("RGB", (16, 12), "orange").save(image_path)
     service = AssetEmbeddingService(
         settings=Settings(ark_api_key=SecretStr("test-key"), embedding_dimension=3),
         repository=cast(EmbeddingRepository, object()),

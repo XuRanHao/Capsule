@@ -23,6 +23,7 @@ class MarkdownTextBlock:
 class MarkdownImageReference:
     image_path: str
     contexts: list[SourceContext] = field(default_factory=list)
+    heading_path: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -125,6 +126,7 @@ class MarkdownParser:
                         MarkdownImageReference(
                             image_path=str(image.attrGet("src") or ""),
                             contexts=contexts,
+                            heading_path=list(heading_path),
                         )
                     )
             index += 1

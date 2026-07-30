@@ -122,6 +122,9 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     visual_result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=EmbeddingType.VISUAL_STYLE,
+        pca_dimension=2,
+        min_cluster_size=4,
+        min_samples=2,
         optimize_parameters=True,
     )
 
@@ -137,14 +140,17 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     runs_by_type = {run["embedding_type"]: run for run in repository.runs.values()}
     assert (
         runs_by_type["native_multimodal"]["preprocessing"]["parameter_selection"]
-        == "size_based_default"
+        == "user_defined"
     )
     assert runs_by_type["native_multimodal"]["parameters"]["candidates_evaluated"] == 1
     assert (
         runs_by_type["visual_style"]["preprocessing"]["parameter_selection"]
-        == "adaptive_dbcv_silhouette"
+        == "user_defined_selection_optimized"
     )
     assert runs_by_type["visual_style"]["parameters"]["candidates_evaluated"] > 1
+    assert runs_by_type["visual_style"]["preprocessing"]["pca_dimension"] == 2
+    assert runs_by_type["visual_style"]["parameters"]["min_cluster_size"] == 4
+    assert runs_by_type["visual_style"]["parameters"]["min_samples"] == 2
     assert all(len(memberships) == 20 for memberships in repository.memberships.values())
     assert {capsule.embedding_type for capsule in repository.capsules} == {
         "native_multimodal",
@@ -184,7 +190,52 @@ async def test_cluster_service_records_insufficient_type_without_model_call() ->
     assert next(iter(repository.runs.values()))["status"] == ClusterRunStatus.INSUFFICIENT_DATA
 
 
-def _assets(embedding_type: EmbeddingType) -> list[ClusterEmbeddingAsset]:
+@pytest.mark.asyncio
+async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
+    embedding_type = EmbeddingType.NATIVE_MULTIMODAL
+    assets = _assets(embedding_type, count=12)
+    vectors = {
+        asset.embedding_id: (
+            [1.0 + index * 0.001, 0.1 + (index % 2) * 0.001]
+            if index < 6
+            else [0.1 + (index % 2) * 0.001, 1.0 + (index - 6) * 0.001]
+        )
+        for index, asset in enumerate(assets)
+    }
+    repository = FakeClusterRepository()
+    summary_client = FakeSummaryClient()
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(vectors),
+        model_client=summary_client,
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=embedding_type,
+    )
+
+    assert result.status == ClusterRunStatus.COMPLETED
+    assert result.vector_count == 12
+    assert result.cluster_count > 0
+    run = next(iter(repository.runs.values()))
+    assert run["parameters"]["min_cluster_size"] == 3
+    assert run["parameters"]["min_samples"] == 1
+    assert len(next(iter(repository.memberships.values()))) == 12
+
+
+def _assets(
+    embedding_type: EmbeddingType,
+    *,
+    count: int = 20,
+) -> list[ClusterEmbeddingAsset]:
     return [
         ClusterEmbeddingAsset(
             embedding_id=f"emb_{embedding_type.value}_{index}",
@@ -196,7 +247,7 @@ def _assets(embedding_type: EmbeddingType) -> list[ClusterEmbeddingAsset]:
             asset_features={"visual_style": {"value": "测试风格"}},
             file_tree_context=["test"],
         )
-        for index in range(20)
+        for index in range(count)
     ]
 
 

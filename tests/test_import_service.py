@@ -208,6 +208,22 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
     assert understanding.features.asset_usage.value == "动画场景参考"
     assert understanding.features.target_audience.status.value == "unknown"
 
+    normalized_terms = AssetUnderstanding.model_validate(
+        {
+            "asset_name": "黄昏街景",
+            "asset_description": "暖色夕阳下的城市街景。",
+            "features": {
+                "visual_style": {
+                    "value": ["数字插画", "赛博艺术", "数字插画"],
+                    "status": "observed",
+                    "confidence": 0.9,
+                    "evidence": [],
+                }
+            },
+        }
+    )
+    assert normalized_terms.features.visual_style.value == "数字插画；赛博艺术"
+
     with pytest.raises(ValidationError, match="features must be an object"):
         AssetUnderstanding.model_validate(
             {

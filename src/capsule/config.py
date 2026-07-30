@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     object_storage_region: str = "us-east-1"
     import_root: Path = Path("data/imports")
     import_file_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
-    assetization_version: str = Field(default="assetization-v1", min_length=1, max_length=64)
+    assetization_version: str = Field(default="assetization-v3", min_length=1, max_length=64)
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"

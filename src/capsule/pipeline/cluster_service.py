@@ -27,6 +27,7 @@ from capsule.pipeline.cluster_summary import (
 )
 from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
+    HdbscanParameters,
     InsufficientDataError,
     RepresentativeSelection,
     cluster_vectors,
@@ -97,6 +98,9 @@ class ClusterService:
         workspace_id: str,
         embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL,
         cluster_run_id: str | None = None,
+        pca_dimension: int = 8,
+        min_samples: int = 1,
+        min_cluster_size: int = 3,
         optimize_parameters: bool = False,
     ) -> EmbeddingTypeClusterResult:
         """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
@@ -104,6 +108,9 @@ class ClusterService:
             workspace_id=workspace_id,
             embedding_type=embedding_type,
             cluster_run_id=cluster_run_id,
+            pca_dimension=pca_dimension,
+            min_samples=min_samples,
+            min_cluster_size=min_cluster_size,
             optimize_parameters=optimize_parameters,
         )
 
@@ -113,6 +120,9 @@ class ClusterService:
         workspace_id: str,
         embedding_type: EmbeddingType,
         cluster_run_id: str | None,
+        pca_dimension: int,
+        min_samples: int,
+        min_cluster_size: int,
         optimize_parameters: bool,
     ) -> EmbeddingTypeClusterResult:
         assets: list[ClusterEmbeddingAsset] = []
@@ -129,12 +139,12 @@ class ClusterService:
             loaded = await self._load_vectors(assets)
             preprocessing = {
                 "normalization": "l2",
-                "pca_max_dimension": 64,
                 "post_pca_normalization": "l2",
+                "requested_pca_dimension": pca_dimension,
                 "parameter_selection": (
-                    "adaptive_dbcv_silhouette"
+                    "user_defined_selection_optimized"
                     if optimize_parameters
-                    else "size_based_default"
+                    else "user_defined"
                 ),
                 "indexed_asset_count": len(assets),
                 "missing_vector_count": len(assets) - len(loaded),
@@ -147,7 +157,10 @@ class ClusterService:
                     embedding_ids=embedding_ids,
                     dataset_hash=dataset_hash(embedding_ids),
                     preprocessing=preprocessing,
-                    parameters={},
+                    parameters={
+                        "min_cluster_size": min_cluster_size,
+                        "min_samples": min_samples,
+                    },
                 )
             else:
                 await self._cluster_repository.start_pending_run(
@@ -157,7 +170,10 @@ class ClusterService:
                     embedding_ids=embedding_ids,
                     dataset_hash=dataset_hash(embedding_ids),
                     preprocessing=preprocessing,
-                    parameters={},
+                    parameters={
+                        "min_cluster_size": min_cluster_size,
+                        "min_samples": min_samples,
+                    },
                 )
         except Exception as exc:
             error = str(exc) or type(exc).__name__
@@ -205,7 +221,11 @@ class ClusterService:
             matrix = np.asarray([item.vector for item in loaded], dtype=np.float32)
             clustered = cluster_vectors(
                 matrix,
-                pca_dimension=64,
+                pca_dimension=pca_dimension,
+                parameters=HdbscanParameters(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                ),
                 optimize_parameters=optimize_parameters,
             )
             candidates = [

@@ -4,8 +4,9 @@ from types import SimpleNamespace
 
 from capsule.config import Settings
 from capsule.parsers.assetizer import AssetizationResult
+from capsule.parsers.discovery import discover_files
 from capsule.pipeline import runner as runner_module
-from capsule.pipeline.runner import PipelineRunner
+from capsule.pipeline.runner import PipelineRunner, _collect_image_source_contexts
 
 
 def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
@@ -19,6 +20,26 @@ def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
     assert plan.file_count == 3
     assert plan.counts_by_extension == {".md": 1, ".png": 1, ".txt": 1}
     assert plan.workspace_id == "workspace_demo"
+
+
+def test_markdown_paragraph_is_attached_to_referenced_image(tmp_path: Path) -> None:
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "sunset.png").write_bytes(b"image")
+    (tmp_path / "board.md").write_text(
+        "# 光线参考\n\n午后黄昏呈现金黄色调。\n\n![](images/sunset.png)\n",
+        encoding="utf-8",
+    )
+
+    contexts = _collect_image_source_contexts(discover_files(tmp_path))
+
+    linked = contexts["images/sunset.png"]
+    assert linked[0].text == "午后黄昏呈现金黄色调。"
+    assert linked[0].relation_type == "preceding_text"
+    assert linked[0].paragraph_id == "board.md#block-1"
+    assert linked[0].source_path == "board.md"
+    assert linked[0].document_title == "光线参考"
+    assert linked[0].heading_path == ["光线参考"]
 
 
 async def test_run_processes_files_with_bounded_concurrency_and_stable_errors(

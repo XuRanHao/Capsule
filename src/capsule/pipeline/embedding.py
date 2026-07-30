@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType, EmbeddingSourceMode, EmbeddingType
+from capsule.media.model_image import prepare_model_image
 from capsule.schemas import EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
 
@@ -291,13 +292,21 @@ class AssetEmbeddingService:
             )
         if asset.asset_type == AssetType.IMAGE.value:
             image_bytes = await asyncio.to_thread(_read_local_source, asset.source_storage_uri)
-            image_url = _data_uri(mime_type=asset.source_mime_type, content=image_bytes)
+            prepared_image = await asyncio.to_thread(
+                prepare_model_image,
+                image_bytes,
+                asset.source_mime_type,
+            )
+            image_url = _data_uri(
+                mime_type=prepared_image.mime_type,
+                content=prepared_image.content,
+            )
             return _EmbeddingInput(
                 input_items=[{"type": "image_url", "image_url": {"url": image_url}}],
                 source_content_hash=_hash_bytes(
                     EmbeddingType.NATIVE_MULTIMODAL.value.encode("utf-8"),
                     EmbeddingSourceMode.ORIGINAL_IMAGE.value.encode("utf-8"),
-                    image_bytes,
+                    prepared_image.content,
                 ),
                 source_mode=EmbeddingSourceMode.ORIGINAL_IMAGE,
             )

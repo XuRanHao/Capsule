@@ -122,7 +122,18 @@ async def test_video_file_stores_playable_segment_media(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_missing_mps_records_only_the_video_as_failed(tmp_path: Path) -> None:
+async def test_missing_mps_records_only_the_video_as_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingMobileClip:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("MobileCLIP is unavailable for this fallback test")
+
+    monkeypatch.setattr(
+        "capsule.model_clients.mobileclip.MobileClipMpsEmbedder",
+        MissingMobileClip,
+    )
     database = Database(get_settings())
     workspace_id = f"workspace_video_mps_{uuid4().hex[:12]}"
     try:

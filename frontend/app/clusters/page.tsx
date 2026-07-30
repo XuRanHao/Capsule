@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import DemoShell, {
   AssetThumb,
   StatusBadge,
@@ -13,15 +22,24 @@ import {
   apiFetch,
 } from "../lib/api";
 
-const EMBEDDING_TYPES = [
-  "native_multimodal",
-  "asset_description",
-  "subject_content",
-  "scene_theme",
-  "visual_style",
-  "color_composition",
-  "mood_atmosphere",
-];
+const FEATURE_TYPES = [
+  { value: "subject_content", label: "主体与内容" },
+  { value: "scene_theme", label: "场景与题材" },
+  { value: "visual_style", label: "视觉风格" },
+  { value: "color_composition", label: "色彩与构图" },
+  { value: "mood_atmosphere", label: "画面情绪氛围" },
+  {
+    value: "character_state_or_psychology",
+    label: "人物状态或心理",
+  },
+  { value: "asset_usage", label: "资产用途" },
+  { value: "target_audience", label: "目标受众" },
+  { value: "provenance", label: "来源与创作关系" },
+  {
+    value: "rights_version_authorship",
+    label: "权利、版本与作者",
+  },
+] as const;
 
 const GROUP_COLORS = [
   "#6557ef",
@@ -34,10 +52,331 @@ const GROUP_COLORS = [
   "#70a53e",
 ];
 
+const GRAPH_MIN_SCALE = 0.35;
+const GRAPH_MAX_SCALE = 2.4;
+const GRAPH_MEMBER_LIMIT = 32;
+
+type GraphMemberNode = {
+  member: ClusterMember;
+  x: number;
+  y: number;
+};
+
+type GraphGroup = {
+  capsule: ClusterCapsule;
+  color: string;
+  diameter: number;
+  left: number;
+  top: number;
+  members: ClusterMember[];
+  memberNodes: GraphMemberNode[];
+};
+
+type GraphLayout = {
+  width: number;
+  height: number;
+  groups: GraphGroup[];
+};
+
+type GraphViewport = {
+  scale: number;
+  x: number;
+  y: number;
+};
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function parseIntegerParameter(
+  label: string,
+  value: string,
+  minimum: number,
+  maximum: number,
+) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${label} 必须是 ${minimum} 到 ${maximum} 之间的整数`);
+  }
+  return parsed;
+}
+
+function runParameter(value: unknown) {
+  return typeof value === "number" ? value : "—";
+}
+
+function placeMemberNodes(
+  members: ClusterMember[],
+  radius: number,
+): GraphMemberNode[] {
+  const visibleMembers = members.slice(0, GRAPH_MEMBER_LIMIT);
+  return visibleMembers.map((member, index) => {
+    const progress = Math.sqrt((index + 1) / (visibleMembers.length + 1));
+    const distance = radius * (0.48 + progress * 0.32);
+    const angle = index * 2.3999632297 - Math.PI / 2;
+    return {
+      member,
+      x: radius + Math.cos(angle) * distance,
+      y: radius + Math.sin(angle) * distance,
+    };
+  });
+}
+
+function ClusterKnowledgeGraph({
+  layout,
+  selectedCapsuleId,
+  emptyMessage,
+  onSelect,
+}: {
+  layout: GraphLayout;
+  selectedCapsuleId: string;
+  emptyMessage: string;
+  onSelect: (capsuleId: string) => void;
+}) {
+  const viewportElement = useRef<HTMLDivElement>(null);
+  const dragState = useRef<{
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+  const [viewport, setViewport] = useState<GraphViewport>({
+    scale: 1,
+    x: 0,
+    y: 0,
+  });
+  const [dragging, setDragging] = useState(false);
+
+  const fitGraph = useCallback(() => {
+    const element = viewportElement.current;
+    if (!element) return;
+    const bounds = element.getBoundingClientRect();
+    const scale = clamp(
+      Math.min(
+        (bounds.width - 56) / layout.width,
+        (bounds.height - 56) / layout.height,
+      ),
+      GRAPH_MIN_SCALE,
+      1.08,
+    );
+    setViewport({
+      scale,
+      x: (bounds.width - layout.width * scale) / 2,
+      y: (bounds.height - layout.height * scale) / 2,
+    });
+  }, [layout.height, layout.width]);
+
+  useEffect(() => {
+    const animationFrame = window.requestAnimationFrame(fitGraph);
+    window.addEventListener("resize", fitGraph);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("resize", fitGraph);
+    };
+  }, [fitGraph]);
+
+  const zoomAt = useCallback(
+    (nextScale: number, originX?: number, originY?: number) => {
+      const element = viewportElement.current;
+      if (!element) return;
+      const bounds = element.getBoundingClientRect();
+      const x = originX ?? bounds.width / 2;
+      const y = originY ?? bounds.height / 2;
+      setViewport((current) => {
+        const scale = clamp(nextScale, GRAPH_MIN_SCALE, GRAPH_MAX_SCALE);
+        const ratio = scale / current.scale;
+        return {
+          scale,
+          x: x - (x - current.x) * ratio,
+          y: y - (y - current.y) * ratio,
+        };
+      });
+    },
+    [],
+  );
+
+  const handleWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const scale = viewport.scale * Math.exp(-event.deltaY * 0.0012);
+    zoomAt(scale, event.clientX - bounds.left, event.clientY - bounds.top);
+  };
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (
+      event.button !== 0 ||
+      (event.target as HTMLElement).closest(".cluster-graph-node")
+    ) {
+      return;
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragState.current = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+    setDragging(true);
+  };
+
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragState.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.clientX;
+    const deltaY = event.clientY - drag.clientY;
+    drag.clientX = event.clientX;
+    drag.clientY = event.clientY;
+    setViewport((current) => ({
+      ...current,
+      x: current.x + deltaX,
+      y: current.y + deltaY,
+    }));
+  };
+
+  const endDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (dragState.current?.pointerId !== event.pointerId) return;
+    dragState.current = null;
+    setDragging(false);
+  };
+
+  return (
+    <div className="cluster-graph-shell">
+      <div className="cluster-graph-toolbar">
+        <span>滚轮缩放 · 拖拽画布 · 双击适应</span>
+        <div role="group" aria-label="知识图谱缩放控制">
+          <button
+            type="button"
+            aria-label="缩小知识图谱"
+            disabled={viewport.scale <= GRAPH_MIN_SCALE}
+            onClick={() => zoomAt(viewport.scale / 1.2)}
+          >
+            −
+          </button>
+          <output aria-label="当前缩放比例">
+            {Math.round(viewport.scale * 100)}%
+          </output>
+          <button
+            type="button"
+            aria-label="放大知识图谱"
+            disabled={viewport.scale >= GRAPH_MAX_SCALE}
+            onClick={() => zoomAt(viewport.scale * 1.2)}
+          >
+            ＋
+          </button>
+          <button type="button" className="fit" onClick={fitGraph}>
+            适应
+          </button>
+        </div>
+      </div>
+      <div
+        ref={viewportElement}
+        className={`cluster-graph-viewport ${dragging ? "dragging" : ""}`}
+        aria-label="可缩放、可拖拽的聚类知识图谱"
+        onDoubleClick={fitGraph}
+        onPointerCancel={endDrag}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDrag}
+        onWheel={handleWheel}
+      >
+        <div
+          className="cluster-graph-world"
+          style={{
+            width: layout.width,
+            height: layout.height,
+            transform: `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.scale})`,
+          }}
+        >
+          {layout.groups.map((group, index) => {
+            const selected =
+              selectedCapsuleId === group.capsule.cluster_capsule_id;
+            const hiddenMemberCount = Math.max(
+              0,
+              group.capsule.member_count - group.memberNodes.length,
+            );
+            return (
+              <button
+                type="button"
+                className={`cluster-graph-node ${selected ? "active" : ""}`}
+                aria-label={`${group.capsule.effective_name}，${group.capsule.member_count} 个资产`}
+                aria-pressed={selected}
+                style={
+                  {
+                    "--cluster-color": group.color,
+                    left: group.left,
+                    top: group.top,
+                    width: group.diameter,
+                    height: group.diameter,
+                  } as CSSProperties
+                }
+                onClick={() =>
+                  onSelect(group.capsule.cluster_capsule_id)
+                }
+                key={group.capsule.cluster_capsule_id}
+              >
+                <svg
+                  className="cluster-node-network"
+                  viewBox={`0 0 ${group.diameter} ${group.diameter}`}
+                  aria-hidden="true"
+                >
+                  {group.memberNodes.map(({ member, x, y }) => (
+                    <g key={member.asset_id}>
+                      <line
+                        x1={group.diameter / 2}
+                        y1={group.diameter / 2}
+                        x2={x}
+                        y2={y}
+                      />
+                      <circle
+                        className={
+                          member.asset_id === group.capsule.medoid_asset_id
+                            ? "medoid"
+                            : ""
+                        }
+                        cx={x}
+                        cy={y}
+                        r={
+                          member.asset_id === group.capsule.medoid_asset_id
+                            ? 7
+                            : 5
+                        }
+                      >
+                        <title>{member.asset_name || member.file_name}</title>
+                      </circle>
+                    </g>
+                  ))}
+                </svg>
+                <span className="cluster-node-index">
+                  {String(index + 1).padStart(2, "0")}
+                </span>
+                <span className="cluster-node-label">
+                  <strong>{group.capsule.effective_name}</strong>
+                  <small>{group.capsule.member_count} ASSETS</small>
+                </span>
+                {hiddenMemberCount > 0 && (
+                  <span className="cluster-node-overflow">
+                    +{hiddenMemberCount}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {!layout.groups.length && (
+          <div className="cluster-map-empty">{emptyMessage}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ClustersPage() {
   const [runs, setRuns] = useState<ClusterRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
-  const [embeddingType, setEmbeddingType] = useState("native_multimodal");
+  const [embeddingType, setEmbeddingType] = useState<string>(
+    FEATURE_TYPES[0].value,
+  );
+  const [pcaDimension, setPcaDimension] = useState("8");
+  const [minSamples, setMinSamples] = useState("1");
+  const [minClusterSize, setMinClusterSize] = useState("3");
   const [capsules, setCapsules] = useState<ClusterCapsule[]>([]);
   const [selectedCapsuleId, setSelectedCapsuleId] = useState("");
   const [membersByCapsule, setMembersByCapsule] = useState<
@@ -133,6 +472,24 @@ export default function ClustersPage() {
     setRunning(true);
     setError(null);
     try {
+      const parsedPcaDimension = parseIntegerParameter(
+        "PCA Dimension",
+        pcaDimension,
+        2,
+        1024,
+      );
+      const parsedMinSamples = parseIntegerParameter(
+        "Min Samples",
+        minSamples,
+        1,
+        10_000,
+      );
+      const parsedMinClusterSize = parseIntegerParameter(
+        "Min Cluster Size",
+        minClusterSize,
+        2,
+        10_000,
+      );
       const submitted = await apiFetch<{ cluster_run_id: string }>(
         "/api/v1/cluster-runs",
         {
@@ -140,6 +497,9 @@ export default function ClustersPage() {
           body: JSON.stringify({
             workspace_id: WORKSPACE_ID,
             embedding_type: embeddingType,
+            pca_dimension: parsedPcaDimension,
+            min_samples: parsedMinSamples,
+            min_cluster_size: parsedMinClusterSize,
           }),
         },
       );
@@ -172,21 +532,45 @@ export default function ClustersPage() {
     );
   };
 
-  const groupLayout = useMemo(
-    () =>
-      capsules.map((capsule, index) => {
-        const column = index % 3;
-        const row = Math.floor(index / 3);
-        return {
-          capsule,
-          left: 7 + column * 31,
-          top: 7 + row * 43,
-          width: 25,
-          height: 34,
-          color: GROUP_COLORS[index % GROUP_COLORS.length],
-          members: membersByCapsule[capsule.cluster_capsule_id] || [],
-        };
-      }),
+  const graphLayout = useMemo(() => {
+    const columnCount = Math.max(
+      1,
+      Math.ceil(Math.sqrt(Math.max(capsules.length, 1) * 1.25)),
+    );
+    const rowCount = Math.max(1, Math.ceil(capsules.length / columnCount));
+    const cellWidth = 340;
+    const cellHeight = 320;
+    const width = Math.max(760, columnCount * cellWidth + 180);
+    const height = Math.max(520, rowCount * cellHeight + 160);
+    const offsetX = (width - columnCount * cellWidth) / 2;
+    const offsetY = (height - rowCount * cellHeight) / 2;
+    const groups = capsules.map((capsule, index) => {
+      const radius = clamp(
+        106 + Math.sqrt(Math.max(capsule.member_count, 1)) * 7,
+        112,
+        148,
+      );
+      const members = membersByCapsule[capsule.cluster_capsule_id] || [];
+      return {
+        capsule,
+        color: GROUP_COLORS[index % GROUP_COLORS.length],
+        diameter: radius * 2,
+        left:
+          offsetX +
+          (index % columnCount) * cellWidth +
+          cellWidth / 2 -
+          radius,
+        top:
+          offsetY +
+          Math.floor(index / columnCount) * cellHeight +
+          cellHeight / 2 -
+          radius,
+        members,
+        memberNodes: placeMemberNodes(members, radius),
+      };
+    });
+    return { width, height, groups };
+  },
     [capsules, membersByCapsule],
   );
 
@@ -205,14 +589,14 @@ export default function ClustersPage() {
       <section className="run-selector">
         <div>
           <label>
-            Embedding Type
+            Feature Type
             <select
               value={embeddingType}
               onChange={(event) => setEmbeddingType(event.target.value)}
             >
-              {EMBEDDING_TYPES.map((item) => (
-                <option value={item} key={item}>
-                  {item}
+              {FEATURE_TYPES.map((item) => (
+                <option value={item.value} key={item.value}>
+                  {item.label}（{item.value}）
                 </option>
               ))}
             </select>
@@ -231,8 +615,59 @@ export default function ClustersPage() {
               ))}
             </select>
           </label>
+          <label>
+            PCA Dimension
+            <input
+              type="number"
+              min="2"
+              max="1024"
+              step="1"
+              value={pcaDimension}
+              onChange={(event) => setPcaDimension(event.target.value)}
+            />
+          </label>
+          <label>
+            Min Samples
+            <input
+              type="number"
+              min="1"
+              max="10000"
+              step="1"
+              value={minSamples}
+              onChange={(event) => setMinSamples(event.target.value)}
+            />
+          </label>
+          <label>
+            Min Cluster Size
+            <input
+              type="number"
+              min="2"
+              max="10000"
+              step="1"
+              value={minClusterSize}
+              onChange={(event) => setMinClusterSize(event.target.value)}
+            />
+          </label>
         </div>
         <div className="run-parameters">
+          <span>
+            <small>PCA</small>
+            <strong>
+              {runParameter(selectedRun?.preprocessing.pca_dimension)}
+            </strong>
+          </span>
+          <span>
+            <small>MIN SAMPLES</small>
+            <strong>
+              {runParameter(selectedRun?.parameters.min_samples)}
+            </strong>
+          </span>
+          <span>
+            <small>MIN CLUSTER</small>
+            <strong>
+              {runParameter(selectedRun?.parameters.min_cluster_size)}
+            </strong>
+          </span>
           <span>
             <small>SAMPLES</small>
             <strong>{selectedRun?.sample_count ?? 0}</strong>
@@ -272,53 +707,18 @@ export default function ClustersPage() {
             </div>
             <small>每种颜色代表一个真实 Cluster Capsule</small>
           </header>
-          <div className="scatter-plot cluster-bubble-map" aria-label="聚类知识图谱">
-            {groupLayout.map((group) => (
-              <button
-                className={`cluster-bubble-group ${
-                  selectedCapsule?.cluster_capsule_id ===
-                  group.capsule.cluster_capsule_id
-                    ? "active"
-                    : ""
-                }`}
-                style={{
-                  left: `${group.left}%`,
-                  top: `${group.top}%`,
-                  width: `${group.width}%`,
-                  height: `${group.height}%`,
-                  borderColor: group.color,
-                  backgroundColor: `${group.color}18`,
-                }}
-                onClick={() =>
-                  setSelectedCapsuleId(group.capsule.cluster_capsule_id)
-                }
-                key={group.capsule.cluster_capsule_id}
-              >
-                <strong>{group.capsule.effective_name}</strong>
-                <small>{group.capsule.member_count} Assets</small>
-                {group.members.slice(0, 12).map((member, index) => (
-                  <i
-                    style={{
-                      left: `${12 + ((index * 29) % 76)}%`,
-                      top: `${34 + ((index * 37) % 54)}%`,
-                      backgroundColor: group.color,
-                    }}
-                    title={member.asset_name || member.file_name}
-                    key={member.asset_id}
-                  />
-                ))}
-              </button>
-            ))}
-            {!groupLayout.length && (
-              <div className="cluster-map-empty">
-                {selectedRun?.status === "running"
-                  ? "正在计算聚类…"
-                  : "选择 Embedding Type 并创建第一个 Run"}
-              </div>
-            )}
-          </div>
+          <ClusterKnowledgeGraph
+            layout={graphLayout}
+            selectedCapsuleId={selectedCapsule?.cluster_capsule_id || ""}
+            emptyMessage={
+              selectedRun?.status === "running"
+                ? "正在计算聚类…"
+                : "选择 Embedding Type 并创建第一个 Run"
+            }
+            onSelect={setSelectedCapsuleId}
+          />
           <footer>
-            {groupLayout.map((group) => (
+            {graphLayout.groups.map((group) => (
               <span key={group.capsule.cluster_capsule_id}>
                 <i style={{ background: group.color }} />
                 {group.capsule.effective_name}

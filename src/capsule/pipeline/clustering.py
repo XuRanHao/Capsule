@@ -68,15 +68,9 @@ class RepresentativeSelection:
 
 
 def dynamic_hdbscan_parameters(sample_count: int) -> HdbscanParameters:
-    if sample_count < 15:
-        raise InsufficientDataError("at least 15 vectors are required")
-    if sample_count < 50:
-        return HdbscanParameters(min_cluster_size=3, min_samples=2)
-    if sample_count < 200:
-        return HdbscanParameters(min_cluster_size=5, min_samples=3)
-    if sample_count < 1000:
-        return HdbscanParameters(min_cluster_size=10, min_samples=5)
-    return HdbscanParameters(min_cluster_size=20, min_samples=10)
+    if sample_count < 1:
+        raise InsufficientDataError("at least one vector is required")
+    return HdbscanParameters(min_cluster_size=3, min_samples=1)
 
 
 def dataset_hash(embedding_ids: list[str]) -> str:
@@ -93,12 +87,21 @@ def cluster_vectors(
 ) -> ClusterResult:
     if vectors.ndim != 2:
         raise ValueError("vectors must be a two-dimensional matrix")
-    if parameters is not None and optimize_parameters:
-        raise ValueError("explicit parameters cannot be combined with parameter optimization")
     sample_count, original_dimension = vectors.shape
     base_parameters = parameters or dynamic_hdbscan_parameters(sample_count)
 
     normalized = _l2_normalize(vectors)
+    if sample_count == 1:
+        return ClusterResult(
+            labels=np.asarray([-1], dtype=np.int_),
+            probabilities=np.asarray([0.0], dtype=np.float64),
+            transformed_vectors=normalized,
+            pca_dimension=original_dimension,
+            parameters=base_parameters,
+            quality_score=-1.0,
+            parameter_candidates_evaluated=1,
+        )
+
     target_dimension = min(
         pca_dimension or original_dimension,
         sample_count - 1,
@@ -164,28 +167,19 @@ def _hdbscan_parameter_candidates(
     sample_count: int,
     base: HdbscanParameters,
 ) -> list[HdbscanParameters]:
-    """Return a small deterministic search space around the size-based default."""
-    cluster_sizes = {
-        max(3, base.min_cluster_size // 2),
-        base.min_cluster_size,
-        min(max(3, sample_count // 4), base.min_cluster_size * 2),
-    }
-    candidates = [base]
-    for cluster_size in sorted(cluster_sizes):
-        min_samples_values = {
-            1,
-            min(base.min_samples, cluster_size),
-            max(1, cluster_size // 2),
-        }
-        for min_samples in sorted(min_samples_values):
-            candidate = HdbscanParameters(
-                min_cluster_size=cluster_size,
-                min_samples=min_samples,
-                cluster_selection_method=base.cluster_selection_method,
-            )
-            if candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
+    """Keep density thresholds fixed while comparing cluster selection methods."""
+    del sample_count
+    alternate_method = (
+        "leaf" if base.cluster_selection_method == "eom" else "eom"
+    )
+    return [
+        base,
+        HdbscanParameters(
+            min_cluster_size=base.min_cluster_size,
+            min_samples=base.min_samples,
+            cluster_selection_method=alternate_method,
+        ),
+    ]
 
 
 def _fit_candidate(

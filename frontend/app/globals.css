@@ -2984,9 +2984,8 @@ blockquote p {
 /* Clusters */
 
 .run-selector {
-  display: flex;
+  display: grid;
   align-items: flex-end;
-  justify-content: space-between;
   margin-bottom: 18px;
   padding: 17px;
   border: 1px solid var(--line);
@@ -2996,17 +2995,27 @@ blockquote p {
 }
 
 .run-selector > div:first-child {
-  display: flex;
+  display: grid;
+  width: 100%;
   gap: 9px;
+  grid-template-columns:
+    minmax(180px, 1fr)
+    minmax(220px, 1.2fr)
+    repeat(3, minmax(104px, 0.55fr));
 }
 
-.run-selector select {
+.run-selector select,
+.run-selector input[type="number"] {
   min-width: 205px;
 }
 
 .run-parameters {
   display: flex;
   align-items: stretch;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+  justify-content: flex-start;
 }
 
 .run-parameters > span {
@@ -3015,6 +3024,22 @@ blockquote p {
   padding: 0 12px;
   border-left: 1px solid var(--line);
   gap: 2px;
+}
+
+.run-selector input[type="number"] {
+  width: 104px;
+  min-width: 104px;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  font-size: 8px;
+}
+
+.run-selector input[type="number"]:hover,
+.run-selector input[type="number"]:focus {
+  border-color: var(--ink);
 }
 
 .run-parameters small {
@@ -3034,11 +3059,12 @@ blockquote p {
   align-items: start;
   margin-bottom: 18px;
   gap: 18px;
-  grid-template-columns: minmax(400px, 1.1fr) minmax(340px, 0.9fr);
+  grid-template-columns: minmax(560px, 1.55fr) minmax(300px, 0.65fr);
 }
 
 .cluster-map,
 .cluster-cards {
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--card);
@@ -3065,109 +3091,242 @@ blockquote p {
 }
 
 .cluster-map > header small {
+  max-width: 260px;
   color: var(--muted-ink);
+  font-size: 7px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.cluster-graph-shell {
+  position: relative;
+  overflow: hidden;
+  background: #f7f4ed;
+}
+
+.cluster-graph-toolbar {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted-ink);
+  gap: 10px;
+  font-family: var(--font-geist-mono), monospace;
   font-size: 7px;
 }
 
-.scatter-plot {
-  position: relative;
-  height: 400px;
-  margin: 14px;
-  border-bottom: 1px solid #bdb8ad;
-  border-left: 1px solid #bdb8ad;
-  background:
-    linear-gradient(#e5e1d8 1px, transparent 1px) 0 0 / 100% 20%,
-    linear-gradient(90deg, #e5e1d8 1px, transparent 1px) 0 0 / 20% 100%;
+.cluster-graph-toolbar > div {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
 }
 
-.scatter-dot {
-  position: absolute;
-  width: 11px;
-  height: 11px;
-  padding: 0;
-  border: 2px solid var(--card);
-  border-radius: 50%;
-  background: var(--violet);
-  box-shadow: 0 0 0 1px rgb(23 23 21 / 16%);
+.cluster-graph-toolbar button,
+.cluster-graph-toolbar output {
+  display: grid;
+  min-width: 34px;
+  height: 28px;
+  place-items: center;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+}
+
+.cluster-graph-toolbar button {
   cursor: pointer;
-  transform: translate(-50%, -50%);
-  transition: transform 130ms ease;
+  font-size: 11px;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
 }
 
-.scatter-dot:hover {
-  z-index: 2;
-  transform: translate(-50%, -50%) scale(1.5);
+.cluster-graph-toolbar button:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--card);
 }
 
-.cluster-bubble-map {
+.cluster-graph-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.cluster-graph-toolbar output {
+  min-width: 48px;
+  color: var(--muted-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.cluster-graph-toolbar .fit {
+  min-width: 48px;
+  border-right: 0;
+  font-size: 7px;
+}
+
+.cluster-graph-viewport {
+  position: relative;
+  height: 590px;
   overflow: hidden;
-  min-height: 400px;
+  background:
+    radial-gradient(circle at 50% 45%, rgb(255 255 255 / 82%), transparent 52%),
+    #f4f1e9;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
 
-.cluster-bubble-group {
+.cluster-graph-viewport.dragging {
+  cursor: grabbing;
+}
+
+.cluster-graph-world {
   position: absolute;
-  min-width: 112px;
-  min-height: 112px;
+  top: 0;
+  left: 0;
+  background:
+    linear-gradient(rgb(207 201 190 / 52%) 1px, transparent 1px) 0 0 / 80px 80px,
+    linear-gradient(90deg, rgb(207 201 190 / 52%) 1px, transparent 1px) 0 0 / 80px 80px;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.cluster-graph-node {
+  --cluster-color: var(--violet);
+
+  position: absolute;
   overflow: hidden;
-  padding: 18px;
-  border: 2px solid;
+  padding: 0;
+  border: 1.5px solid var(--cluster-color);
   border-radius: 50%;
+  background: color-mix(in srgb, var(--cluster-color) 8%, var(--card));
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 66%),
+    0 16px 40px rgb(23 23 21 / 7%);
   color: var(--ink);
   cursor: pointer;
-  font: inherit;
   text-align: center;
-  transform: translate(-50%, -50%);
   transition:
+    border-color 160ms ease,
     box-shadow 160ms ease,
     filter 160ms ease,
     transform 160ms ease;
 }
 
-.cluster-bubble-group:hover,
-.cluster-bubble-group.active {
-  z-index: 3;
-  filter: saturate(1.08);
-  transform: translate(-50%, -50%) scale(1.04);
-}
-
-.cluster-bubble-group.active {
-  box-shadow:
-    0 0 0 4px var(--card),
-    0 0 0 6px currentcolor,
-    0 14px 30px rgb(23 23 21 / 14%);
-}
-
-.cluster-bubble-group strong,
-.cluster-bubble-group small {
-  position: relative;
+.cluster-graph-node:hover {
   z-index: 2;
-  display: block;
+  filter: saturate(1.08);
+  transform: scale(1.025);
+}
+
+.cluster-graph-node.active {
+  z-index: 3;
+  box-shadow:
+    0 0 0 5px #f4f1e9,
+    0 0 0 8px var(--cluster-color),
+    0 20px 50px rgb(23 23 21 / 16%);
+}
+
+.cluster-node-network {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
 }
 
-.cluster-bubble-group strong {
-  overflow: hidden;
-  font-size: 11px;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.cluster-node-network line {
+  stroke: var(--cluster-color);
+  stroke-opacity: 0.2;
+  stroke-width: 1;
 }
 
-.cluster-bubble-group small {
-  margin-top: 4px;
-  color: var(--muted-ink);
+.cluster-node-network circle {
+  fill: var(--cluster-color);
+  stroke: var(--card);
+  stroke-width: 3;
+}
+
+.cluster-node-network circle.medoid {
+  fill: var(--acid);
+  stroke: var(--ink);
+  stroke-width: 2;
+}
+
+.cluster-node-index,
+.cluster-node-overflow {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--cluster-color) 32%, var(--line));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--cluster-color) 10%, var(--card));
   font-family: var(--font-geist-mono), monospace;
   font-size: 7px;
 }
 
-.cluster-bubble-group > i {
+.cluster-node-index {
+  top: 18px;
+  left: 50%;
+  min-width: 31px;
+  height: 22px;
+  padding: 0 7px;
+  transform: translateX(-50%);
+}
+
+.cluster-node-overflow {
+  right: 22px;
+  bottom: 24px;
+  min-width: 34px;
+  height: 24px;
+  padding: 0 7px;
+  color: var(--cluster-color);
+}
+
+.cluster-node-label {
   position: absolute;
-  width: 8px;
-  height: 8px;
-  border: 2px solid var(--card);
-  border-radius: 50%;
-  box-shadow: 0 0 0 1px rgb(23 23 21 / 15%);
+  z-index: 2;
+  top: 50%;
+  right: 12%;
+  left: 12%;
+  display: block;
+  padding: 12px 14px;
+  border: 1px solid rgb(207 201 190 / 76%);
+  border-radius: 13px;
+  background: rgb(255 253 249 / 91%);
+  box-shadow: 0 8px 24px rgb(23 23 21 / 8%);
   pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.cluster-node-label strong,
+.cluster-node-label small {
+  display: block;
+}
+
+.cluster-node-label strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.cluster-node-label small {
+  margin-top: 5px;
+  color: var(--muted-ink);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7px;
+  letter-spacing: 0.08em;
 }
 
 .cluster-map-empty {
@@ -3176,6 +3335,7 @@ blockquote p {
   display: grid;
   place-items: center;
   color: var(--muted-ink);
+  pointer-events: none;
   font-size: 11px;
   text-align: center;
 }
@@ -3220,19 +3380,30 @@ blockquote p {
 .cluster-map > footer {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 12px;
-  padding: 0 14px 15px;
+  gap: 6px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
 }
 
 .cluster-map > footer span {
   display: flex;
+  min-width: 0;
+  max-width: 210px;
   align-items: center;
+  overflow: hidden;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f7f4ed;
   color: var(--muted-ink);
   gap: 5px;
   font-size: 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cluster-map > footer i {
+  flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -3821,7 +3992,10 @@ blockquote p {
 
   .run-selector {
     align-items: stretch;
-    flex-direction: column;
+  }
+
+  .run-selector > div:first-child {
+    grid-template-columns: repeat(2, minmax(150px, 1fr));
   }
 
   .run-parameters > span:first-child {
@@ -3833,8 +4007,8 @@ blockquote p {
     grid-template-columns: 1fr;
   }
 
-  .scatter-plot {
-    height: 340px;
+  .cluster-graph-viewport {
+    height: 540px;
   }
 }
 
@@ -4101,7 +4275,9 @@ blockquote p {
     flex-wrap: wrap;
   }
 
-  .run-selector select {
+  .run-selector select,
+  .run-selector input[type="number"] {
+    width: 100%;
     min-width: 150px;
   }
 
@@ -4111,8 +4287,14 @@ blockquote p {
     border: 0;
   }
 
-  .scatter-plot {
-    height: 280px;
+  .cluster-graph-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 9px 12px;
+  }
+
+  .cluster-graph-viewport {
+    height: 420px;
   }
 
   .representative-strip,
