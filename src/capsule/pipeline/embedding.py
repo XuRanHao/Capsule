@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType, EmbeddingSourceMode, EmbeddingType
+from capsule.features import asset_usage_embedding_text, effective_feature_text
 from capsule.media.model_image import ModelImageCache
 from capsule.schemas import EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
@@ -80,9 +81,9 @@ class EmbeddingInputUnavailable(ValueError):
     """An Asset has no material for the requested Embedding channel yet."""
 
 
-#===========================================
+# ===========================================
 #      Asset → EmbeddingRecord → Milvus
-#===========================================
+# ===========================================
 
 
 class AssetEmbeddingService:
@@ -114,9 +115,7 @@ class AssetEmbeddingService:
             max_edge=settings.model_image_max_edge,
             max_entries=settings.model_image_cache_entries,
         )
-        self._native_semaphore = asyncio.Semaphore(
-            settings.native_embedding_concurrency
-        )
+        self._native_semaphore = asyncio.Semaphore(settings.native_embedding_concurrency)
         self._text_semaphore = asyncio.Semaphore(settings.embedding_concurrency)
         self._collection_ready = False
         self._collection_lock = asyncio.Lock()
@@ -272,9 +271,7 @@ class AssetEmbeddingService:
                         embedding_input.input_items
                     )
                 finally:
-                    model_duration_ms = (
-                        time.perf_counter() - phase_started
-                    ) * 1000
+                    model_duration_ms = (time.perf_counter() - phase_started) * 1000
                 latency_ms = round(model_duration_ms)
                 phase_started = time.perf_counter()
                 try:
@@ -302,9 +299,7 @@ class AssetEmbeddingService:
                         usage=response.usage,
                     )
                 finally:
-                    indexing_duration_ms = (
-                        time.perf_counter() - phase_started
-                    ) * 1000
+                    indexing_duration_ms = (time.perf_counter() - phase_started) * 1000
                 return _EmbeddingOutcome(
                     kind="indexed",
                     asset_id=asset.asset_id,
@@ -347,8 +342,17 @@ class AssetEmbeddingService:
                 embedding_type=embedding_type,
                 source_mode=EmbeddingSourceMode.DESCRIPTION_TEXT,
             )
+        if embedding_type is EmbeddingType.ASSET_USAGE:
+            return _text_input(
+                asset_usage_embedding_text(
+                    asset.asset_features,
+                    asset.source_relative_path,
+                ),
+                embedding_type=embedding_type,
+                source_mode=EmbeddingSourceMode.FEATURE_TEXT,
+            )
         return _text_input(
-            _feature_text(asset.asset_features, embedding_type),
+            effective_feature_text(asset.asset_features, embedding_type),
             embedding_type=embedding_type,
             source_mode=EmbeddingSourceMode.FEATURE_TEXT,
         )
@@ -421,16 +425,6 @@ def _text_input(
         source_content_hash=_hash_text(embedding_type.value, source_mode.value, text),
         source_mode=source_mode,
     )
-
-
-def _feature_text(features: Mapping[str, Any], embedding_type: EmbeddingType) -> str | None:
-    raw = features.get(embedding_type.value)
-    if isinstance(raw, str):
-        return raw
-    if isinstance(raw, Mapping):
-        value = raw.get("value")
-        return value if isinstance(value, str) else None
-    return None
 
 
 def _read_local_source(storage_uri: str) -> bytes:

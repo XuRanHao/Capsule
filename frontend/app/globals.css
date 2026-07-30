@@ -2940,6 +2940,32 @@ blockquote p {
   font-size: 9px;
 }
 
+.feature-value-cell {
+  display: grid;
+  gap: 5px;
+}
+
+.feature-value-cell b {
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.feature-value-cell small {
+  color: var(--muted-ink);
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.feature-value-cell code {
+  overflow: hidden;
+  color: #5147c5;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .confidence-cell {
   position: relative;
   display: flex;

@@ -148,8 +148,7 @@ class StoredFileResult(BaseModel):
 class FeatureValue(BaseModel):
     value: str | None = Field(
         description=(
-            "该维度内最多五个互不重复的名词、形容词或短语，使用中文分号连接；"
-            "无法确定时为 null"
+            "该维度内最多五个互不重复的名词、形容词或短语，使用中文分号连接；无法确定时为 null"
         )
     )
     status: FeatureStatus
@@ -172,9 +171,7 @@ class FeatureValue(BaseModel):
         raw_value = normalized.get("value")
         if isinstance(raw_value, list):
             terms = [
-                item.strip()[:32]
-                for item in raw_value
-                if isinstance(item, str) and item.strip()
+                item.strip()[:32] for item in raw_value if isinstance(item, str) and item.strip()
             ]
             normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
         elif isinstance(raw_value, str):
@@ -189,9 +186,7 @@ class FeatureValue(BaseModel):
             normalized["evidence"] = [evidence.strip()[:80]] if evidence.strip() else []
         elif isinstance(evidence, list):
             normalized["evidence"] = [
-                item.strip()[:80]
-                for item in evidence
-                if isinstance(item, str) and item.strip()
+                item.strip()[:80] for item in evidence if isinstance(item, str) and item.strip()
             ][:1]
         elif evidence is None:
             normalized["evidence"] = []
@@ -202,7 +197,27 @@ class FeatureValue(BaseModel):
                 if normalized.get("value")
                 else FeatureStatus.UNKNOWN.value
             )
+        if normalized.get("status") in {
+            FeatureStatus.UNKNOWN.value,
+            FeatureStatus.NOT_APPLICABLE.value,
+        }:
+            normalized["value"] = None
         return normalized
+
+
+class AssetUsageFeatureValue(FeatureValue):
+    """Usage semantics plus the deterministic relative-path evidence behind them."""
+
+    description: str | None = Field(
+        default=None,
+        max_length=500,
+        description="明确包含相对文件路径的素材用途说明",
+    )
+    source_path: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="用于判断素材用途的 Workspace 相对路径",
+    )
 
 
 class AssetFeatures(BaseModel):
@@ -212,7 +227,7 @@ class AssetFeatures(BaseModel):
     color_composition: FeatureValue
     mood_atmosphere: FeatureValue
     character_state_or_psychology: FeatureValue
-    asset_usage: FeatureValue
+    asset_usage: AssetUsageFeatureValue
     target_audience: FeatureValue
     provenance: FeatureValue
     rights_version_authorship: FeatureValue

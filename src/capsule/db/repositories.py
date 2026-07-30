@@ -32,6 +32,7 @@ from capsule.enums import (
     PipelineStage,
     ProcessingStatus,
 )
+from capsule.features import embedding_channel_is_eligible
 from capsule.schemas import (
     AssetCreate,
     AssetEmbeddingState,
@@ -559,10 +560,10 @@ class AssetRepository:
             if asset is None:
                 raise ValueError(f"asset does not exist: {asset_id}")
             features = understanding.features.model_dump(mode="json")
-            semantic_changed = (
-                asset.asset_description not in {None, understanding.asset_description}
-                or (bool(asset.asset_features) and asset.asset_features != features)
-            )
+            semantic_changed = asset.asset_description not in {
+                None,
+                understanding.asset_description,
+            } or (bool(asset.asset_features) and asset.asset_features != features)
             if asset.asset_name_source != AssetNameSource.USER.value:
                 asset.asset_name = understanding.asset_name
                 asset.asset_name_source = AssetNameSource.MODEL.value
@@ -611,9 +612,7 @@ class AssetRepository:
                 if source is None:
                     continue
                 source_assets = list(
-                    await session.scalars(
-                        select(Asset).where(Asset.source_file_id == source_id)
-                    )
+                    await session.scalars(select(Asset).where(Asset.source_file_id == source_id))
                 )
                 failed_assets = [
                     asset
@@ -631,8 +630,7 @@ class AssetRepository:
                 )
                 source.error_message = (
                     "; ".join(
-                        asset.error_message or "asset enrichment failed"
-                        for asset in failed_assets
+                        asset.error_message or "asset enrichment failed" for asset in failed_assets
                     )[:2000]
                     if failed_assets
                     else None
@@ -809,9 +807,9 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
         current.embedding_revision += 1
 
 
-#===========================================
+# ===========================================
 #      Embedding persistence
-#===========================================
+# ===========================================
 
 
 @dataclass(slots=True, frozen=True)
@@ -997,8 +995,9 @@ class EmbeddingRepository:
     ) -> list["ClusterEmbeddingAsset"]:
         """Return the latest indexed vector record for each Asset in one channel."""
         statement = (
-            select(EmbeddingRecord, Asset)
+            select(EmbeddingRecord, Asset, SourceFile.relative_path)
             .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
             .where(
                 EmbeddingRecord.workspace_id == workspace_id,
                 EmbeddingRecord.embedding_type == embedding_type,
@@ -1015,8 +1014,14 @@ class EmbeddingRepository:
         # A regenerated Asset can have historical indexed records.  Keep its
         # newest record so one Asset contributes at most one vector per type.
         selected: dict[str, ClusterEmbeddingAsset] = {}
-        for record, asset in rows:
+        for record, asset, source_relative_path in rows:
             if asset.asset_id in selected:
+                continue
+            if not embedding_channel_is_eligible(
+                embedding_type=embedding_type,
+                asset_features=asset.asset_features,
+                asset_description=asset.asset_description,
+            ):
                 continue
             selected[asset.asset_id] = ClusterEmbeddingAsset(
                 embedding_id=record.embedding_id,
@@ -1027,13 +1032,14 @@ class EmbeddingRepository:
                 asset_description=asset.asset_description,
                 asset_features=dict(asset.asset_features),
                 file_tree_context=list(asset.file_tree_context),
+                source_relative_path=source_relative_path,
             )
         return list(selected.values())
 
 
-#===========================================
+# ===========================================
 #      Cluster Capsule persistence
-#===========================================
+# ===========================================
 
 
 class ClusterRepository:
@@ -1271,9 +1277,7 @@ class ClusterRepository:
         """Store a generated summary without replacing existing user overrides."""
         _validate_representatives(values.representatives)
         representative_ids = [item.asset_id for item in values.representatives]
-        medoid = next(
-            item for item in values.representatives if item.role.value == "medoid"
-        )
+        medoid = next(item for item in values.representatives if item.role.value == "medoid")
 
         async with self._database.session() as session, session.begin():
             run = await session.get(ClusterRun, values.cluster_run_id, with_for_update=True)
@@ -1445,6 +1449,7 @@ class ClusterEmbeddingAsset:
     asset_description: str | None
     asset_features: dict[str, Any]
     file_tree_context: list[str]
+    source_relative_path: str = ""
 
 
 @dataclass(slots=True, frozen=True)

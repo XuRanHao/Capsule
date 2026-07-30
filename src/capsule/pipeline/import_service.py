@@ -64,6 +64,7 @@ async def enrich_assets(
     repository: AssetRepository,
     understanding_service: AssetUnderstandingService,
     embedding_service: AssetEmbeddingService,
+    force_understanding: bool = False,
 ) -> AssetEnrichmentResult:
     """Overlap native embedding with understanding, then fan out text channels."""
     await repository.begin_asset_enrichment(asset_ids=asset_ids)
@@ -76,6 +77,7 @@ async def enrich_assets(
         asset_ids=asset_ids,
         understanding_service=understanding_service,
         embedding_service=embedding_service,
+        force_understanding=force_understanding,
     )
     await repository.set_job_stage(
         job_id=job_id,
@@ -115,6 +117,7 @@ async def _run_enrichment_batch(
     asset_ids: list[str],
     understanding_service: AssetUnderstandingService,
     embedding_service: AssetEmbeddingService,
+    force_understanding: bool = False,
 ) -> _EnrichmentBatchResult:
     """Enrich a committed Asset batch without mutating aggregate Job state."""
     errors: list[dict[str, str]] = []
@@ -129,6 +132,7 @@ async def _run_enrichment_batch(
         understanding = await understanding_service.run(
             workspace_id=workspace_id,
             asset_ids=asset_ids,
+            force=force_understanding,
         )
     except BaseException:
         native_embedding_task.cancel()
@@ -182,9 +186,7 @@ async def _run_enrichment_batch(
         errors.extend(
             {
                 "asset_id": error["asset_id"],
-                "stage": (
-                    f"{PipelineStage.EMBEDDING.value}:{embedding.embedding_type}"
-                ),
+                "stage": (f"{PipelineStage.EMBEDDING.value}:{embedding.embedding_type}"),
                 "error": error["error"],
             }
             for error in embedding.errors

@@ -1,12 +1,16 @@
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from httpx import ASGITransport, AsyncClient
 
 from capsule.api.app import create_app
 from capsule.config import Settings
+from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
+    ChannelMatch,
+    FusedHit,
     SearchAssetRecord,
     SearchFilters,
     SearchRequest,
@@ -14,6 +18,7 @@ from capsule.search.models import (
 )
 from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.recall import MultiChannelRecall
+from capsule.search.result_builder import SearchResultBuilder
 from capsule.search.service import SearchService
 
 
@@ -163,6 +168,62 @@ def build_service() -> tuple[SearchService, FakeVectorRepository, FakeAssetRepos
         settings=settings,
     )
     return service, vectors, assets
+
+
+def test_search_rejects_stale_not_applicable_feature_channel() -> None:
+    asset = replace(
+        asset_record(
+            "asset_1",
+            "workspace_demo",
+            "source_1",
+            indexed_embedding_ids=frozenset({"emb_character", "emb_native"}),
+        ),
+        asset_features={
+            "character_state_or_psychology": {
+                "value": "错误遗留状态",
+                "status": "not_applicable",
+            }
+        },
+    )
+    ranked = [
+        FusedHit(
+            asset_id=asset.asset_id,
+            source_file_id=asset.source_file_id,
+            asset_type=asset.asset_type,
+            matched_channels=[
+                ChannelMatch(
+                    channel="character_state_or_psychology",
+                    embedding_type=EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY,
+                    embedding_id="emb_character",
+                    embedding_revision=1,
+                    rank=1,
+                    similarity=0.99,
+                    fusion_contribution=0.4,
+                ),
+                ChannelMatch(
+                    channel="native_multimodal",
+                    embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+                    embedding_id="emb_native",
+                    embedding_revision=1,
+                    rank=2,
+                    similarity=0.8,
+                    fusion_contribution=0.2,
+                ),
+            ],
+        )
+    ]
+
+    validated = SearchResultBuilder.validate_hits(
+        ranked_hits=ranked,
+        assets={asset.asset_id: asset},
+        workspace_id="workspace_demo",
+    )
+
+    assert len(validated) == 1
+    assert [match.embedding_type for match in validated[0].matched_channels] == [
+        EmbeddingType.NATIVE_MULTIMODAL
+    ]
+    assert validated[0].score == 0.2
 
 
 async def test_search_degrades_one_channel_and_caps_same_source() -> None:

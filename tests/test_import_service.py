@@ -212,10 +212,7 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     assert repository.durations["feature_ready"] == 5.0
     assert repository.durations["embedding"] > 0
     assert repository.durations["indexing"] > 0
-    assert (
-        repository.durations["embedding"] / repository.durations["indexing"]
-        == pytest.approx(10)
-    )
+    assert repository.durations["embedding"] / repository.durations["indexing"] == pytest.approx(10)
 
 
 @pytest.mark.asyncio
@@ -369,6 +366,22 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
     assert understanding.features.subject_content.evidence == ["画面中可直接观察"]
     assert understanding.features.asset_usage.value == "动画场景参考"
     assert understanding.features.target_audience.status.value == "unknown"
+
+    inapplicable = AssetUnderstanding.model_validate(
+        {
+            "asset_name": "空场景",
+            "asset_description": "画面中没有人物。",
+            "features": {
+                "character_state_or_psychology": {
+                    "value": "静止",
+                    "status": "not_applicable",
+                    "confidence": 1.0,
+                    "evidence": [],
+                }
+            },
+        }
+    )
+    assert inapplicable.features.character_state_or_psychology.value is None
 
     normalized_terms = AssetUnderstanding.model_validate(
         {

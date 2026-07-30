@@ -24,15 +24,19 @@ from capsule.enums import (
 from capsule.pipeline.cluster_summary import (
     ClusterSummaryRepresentative,
     build_cluster_summary_messages,
+    ensure_path_aware_cluster_summary,
 )
 from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
     HdbscanParameters,
     InsufficientDataError,
     RepresentativeSelection,
+    SemanticMergeParameters,
+    SemanticMergeResult,
     cluster_vectors,
     dataset_hash,
     dynamic_hdbscan_parameters,
+    merge_semantically_overlapping_clusters,
     select_cluster_representatives,
 )
 from capsule.schemas import ClusterCapsuleWrite, ClusterRepresentativeWrite, ClusterSummary
@@ -69,9 +73,9 @@ class EmbeddingTypeClusterResult(BaseModel):
     error: str | None = None
 
 
-#===========================================
+# ===========================================
 #      One Embedding Type per run
-#===========================================
+# ===========================================
 
 
 class ClusterService:
@@ -128,6 +132,16 @@ class ClusterService:
         assets: list[ClusterEmbeddingAsset] = []
         loaded: list[_LoadedClusterVector] = []
         run_id = cluster_run_id
+        semantic_merge_parameters = SemanticMergeParameters(
+            enabled=self._settings.cluster_semantic_merge_enabled,
+            centroid_cosine_threshold=(self._settings.cluster_merge_centroid_cosine_threshold),
+            cross_cluster_mean_cosine_threshold=(
+                self._settings.cluster_merge_cross_mean_cosine_threshold
+            ),
+            merged_member_min_cosine_threshold=(
+                self._settings.cluster_merge_member_min_cosine_threshold
+            ),
+        )
         try:
             assets = await self._embedding_repository.list_indexed_cluster_embeddings(
                 workspace_id=workspace_id,
@@ -142,9 +156,7 @@ class ClusterService:
                 "post_pca_normalization": "l2",
                 "requested_pca_dimension": pca_dimension,
                 "parameter_selection": (
-                    "user_defined_selection_optimized"
-                    if optimize_parameters
-                    else "user_defined"
+                    "user_defined_selection_optimized" if optimize_parameters else "user_defined"
                 ),
                 "indexed_asset_count": len(assets),
                 "missing_vector_count": len(assets) - len(loaded),
@@ -160,6 +172,7 @@ class ClusterService:
                     parameters={
                         "min_cluster_size": min_cluster_size,
                         "min_samples": min_samples,
+                        "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
                     },
                 )
             else:
@@ -173,6 +186,7 @@ class ClusterService:
                     parameters={
                         "min_cluster_size": min_cluster_size,
                         "min_samples": min_samples,
+                        "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
                     },
                 )
         except Exception as exc:
@@ -228,6 +242,21 @@ class ClusterService:
                 ),
                 optimize_parameters=optimize_parameters,
             )
+            semantic_merge = merge_semantically_overlapping_clusters(
+                matrix,
+                clustered.labels,
+                parameters=semantic_merge_parameters,
+            )
+            if semantic_merge.decisions:
+                logger.info(
+                    "merged %s overlapping semantic clusters for workspace=%s "
+                    "embedding_type=%s raw_cluster_count=%s final_cluster_count=%s",
+                    len(semantic_merge.decisions),
+                    workspace_id,
+                    embedding_type.value,
+                    semantic_merge.raw_cluster_count,
+                    semantic_merge.cluster_count,
+                )
             candidates = [
                 ClusterMemberCandidate(
                     asset_id=item.asset.asset_id,
@@ -238,14 +267,14 @@ class ClusterService:
             ]
             selections = select_cluster_representatives(
                 clustered.transformed_vectors,
-                clustered.labels,
+                semantic_merge.labels,
                 candidates,
             )
             capsule_ids = await self._summarize_and_store_capsules(
                 run_id=run_id,
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
-                labels=clustered.labels,
+                labels=semantic_merge.labels,
                 probabilities=clustered.probabilities,
                 transformed_vectors=clustered.transformed_vectors,
                 loaded=loaded,
@@ -254,7 +283,8 @@ class ClusterService:
             await self._cluster_repository.store_memberships(
                 cluster_run_id=run_id,
                 memberships=_build_memberships(
-                    labels=clustered.labels,
+                    raw_labels=clustered.labels,
+                    capsule_labels=semantic_merge.labels,
                     probabilities=clustered.probabilities,
                     transformed_vectors=clustered.transformed_vectors,
                     loaded=loaded,
@@ -264,12 +294,13 @@ class ClusterService:
             )
             await self._cluster_repository.complete_run(
                 cluster_run_id=run_id,
-                cluster_count=clustered.cluster_count,
+                cluster_count=semantic_merge.cluster_count,
                 noise_count=clustered.noise_count,
                 noise_ratio=clustered.noise_ratio,
                 preprocessing={
                     **preprocessing,
                     "pca_dimension": clustered.pca_dimension,
+                    "semantic_merge_vector_space": "original_l2_normalized",
                 },
                 parameters={
                     "min_cluster_size": clustered.parameters.min_cluster_size,
@@ -277,6 +308,10 @@ class ClusterService:
                     "cluster_selection_method": clustered.parameters.cluster_selection_method,
                     "quality_score": clustered.quality_score,
                     "candidates_evaluated": clustered.parameter_candidates_evaluated,
+                    "semantic_merge": _semantic_merge_metadata(
+                        semantic_merge_parameters,
+                        semantic_merge,
+                    ),
                 },
             )
             return EmbeddingTypeClusterResult(
@@ -286,7 +321,7 @@ class ClusterService:
                 indexed_asset_count=len(assets),
                 vector_count=len(loaded),
                 missing_vector_count=len(assets) - len(loaded),
-                cluster_count=clustered.cluster_count,
+                cluster_count=semantic_merge.cluster_count,
                 noise_count=clustered.noise_count,
                 capsule_ids=[capsule_ids[label] for label in sorted(capsule_ids)],
             )
@@ -341,6 +376,9 @@ class ClusterService:
             representatives = selections[label]
             member_indices = np.flatnonzero(labels == label)
             average_probability = float(probabilities[member_indices].mean())
+            member_source_paths = [
+                loaded[int(index)].asset.source_relative_path for index in member_indices
+            ]
             prompt_representatives = [
                 ClusterSummaryRepresentative(
                     asset_id=representative.asset_id,
@@ -352,6 +390,7 @@ class ClusterService:
                     file_tree_context=assets_by_id[representative.asset_id].file_tree_context,
                     membership_probability=representative.membership_probability,
                     distance_to_medoid=representative.distance_to_medoid,
+                    source_relative_path=assets_by_id[representative.asset_id].source_relative_path,
                 )
                 for representative in representatives
             ]
@@ -361,8 +400,18 @@ class ClusterService:
                     member_count=len(member_indices),
                     average_membership_probability=average_probability,
                     representatives=prompt_representatives,
+                    member_source_paths=member_source_paths,
                 )
             )
+            if embedding_type in {
+                EmbeddingType.SUBJECT_CONTENT,
+                EmbeddingType.ASSET_USAGE,
+            }:
+                summary = ensure_path_aware_cluster_summary(
+                    summary,
+                    member_source_paths,
+                    embedding_type=embedding_type.value,
+                )
             stored = await self._cluster_repository.upsert_capsule(
                 ClusterCapsuleWrite(
                     cluster_run_id=run_id,
@@ -390,7 +439,8 @@ class ClusterService:
 
 def _build_memberships(
     *,
-    labels: NDArray[np.int_],
+    raw_labels: NDArray[np.int_],
+    capsule_labels: NDArray[np.int_],
     probabilities: NDArray[np.float64],
     transformed_vectors: NDArray[np.float32],
     loaded: list[_LoadedClusterVector],
@@ -409,21 +459,57 @@ def _build_memberships(
 
     memberships: list[ClusterMembershipWrite] = []
     for index, item in enumerate(loaded):
-        label = int(labels[index])
-        is_noise = label == -1
+        raw_label = int(raw_labels[index])
+        capsule_label = int(capsule_labels[index])
+        is_noise = raw_label == -1
         distance = (
             None
             if is_noise
-            else float(np.linalg.norm(transformed_vectors[index] - medoid_vectors[label]))
+            else float(np.linalg.norm(transformed_vectors[index] - medoid_vectors[capsule_label]))
         )
         memberships.append(
             ClusterMembershipWrite(
                 asset_id=item.asset.asset_id,
-                cluster_capsule_id=None if is_noise else capsule_ids[label],
-                hdbscan_label=label,
+                cluster_capsule_id=None if is_noise else capsule_ids[capsule_label],
+                hdbscan_label=raw_label,
                 membership_probability=float(probabilities[index]),
                 is_noise=is_noise,
                 distance_to_representative=distance,
             )
         )
     return memberships
+
+
+def _semantic_merge_metadata(
+    parameters: SemanticMergeParameters,
+    result: SemanticMergeResult | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "enabled": parameters.enabled,
+        "centroid_cosine_threshold": parameters.centroid_cosine_threshold,
+        "cross_cluster_mean_cosine_threshold": (parameters.cross_cluster_mean_cosine_threshold),
+        "merged_member_min_cosine_threshold": (parameters.merged_member_min_cosine_threshold),
+    }
+    if result is None:
+        return metadata
+    return {
+        **metadata,
+        "raw_cluster_count": result.raw_cluster_count,
+        "merged_cluster_count": result.cluster_count,
+        "merge_count": len(result.decisions),
+        "raw_to_merged_labels": {
+            str(label): merged_label
+            for label, merged_label in sorted(result.raw_to_merged_labels.items())
+        },
+        "decisions": [
+            {
+                "left_label": decision.left_label,
+                "right_label": decision.right_label,
+                "target_label": decision.target_label,
+                "centroid_cosine": decision.centroid_cosine,
+                "cross_cluster_mean_cosine": decision.cross_cluster_mean_cosine,
+                "merged_member_min_cosine": decision.merged_member_min_cosine,
+            }
+            for decision in result.decisions
+        ],
+    }

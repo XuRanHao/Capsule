@@ -69,6 +69,23 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = Field(default=60.0, gt=0)
     milvus_batch_size: int = Field(default=100, ge=1)
 
+    cluster_semantic_merge_enabled: bool = True
+    cluster_merge_centroid_cosine_threshold: float = Field(
+        default=0.92,
+        ge=-1.0,
+        le=1.0,
+    )
+    cluster_merge_cross_mean_cosine_threshold: float = Field(
+        default=0.84,
+        ge=-1.0,
+        le=1.0,
+    )
+    cluster_merge_member_min_cosine_threshold: float = Field(
+        default=0.92,
+        ge=-1.0,
+        le=1.0,
+    )
+
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)
     search_candidate_cap: int = Field(default=300, ge=1)

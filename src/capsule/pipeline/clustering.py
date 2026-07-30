@@ -67,6 +67,41 @@ class RepresentativeSelection:
     membership_probability: float
 
 
+@dataclass(slots=True, frozen=True)
+class SemanticMergeParameters:
+    """Thresholds for consolidating HDBSCAN microclusters in the source vector space."""
+
+    enabled: bool = True
+    centroid_cosine_threshold: float = 0.92
+    cross_cluster_mean_cosine_threshold: float = 0.84
+    merged_member_min_cosine_threshold: float = 0.92
+
+
+@dataclass(slots=True, frozen=True)
+class SemanticMergeDecision:
+    left_label: int
+    right_label: int
+    target_label: int
+    centroid_cosine: float
+    cross_cluster_mean_cosine: float
+    merged_member_min_cosine: float
+
+
+@dataclass(slots=True)
+class SemanticMergeResult:
+    labels: NDArray[np.int_]
+    raw_to_merged_labels: dict[int, int]
+    decisions: list[SemanticMergeDecision]
+
+    @property
+    def raw_cluster_count(self) -> int:
+        return len(self.raw_to_merged_labels)
+
+    @property
+    def cluster_count(self) -> int:
+        return len(set(self.raw_to_merged_labels.values()))
+
+
 def dynamic_hdbscan_parameters(sample_count: int) -> HdbscanParameters:
     if sample_count < 1:
         raise InsufficientDataError("at least one vector is required")
@@ -127,10 +162,7 @@ def cluster_vectors(
         else [base_parameters]
     )
     best = max(
-        (
-            _fit_candidate(transformed, candidate)
-            for candidate in parameter_candidates
-        ),
+        (_fit_candidate(transformed, candidate) for candidate in parameter_candidates),
         key=lambda candidate: candidate.quality_score,
     )
 
@@ -155,6 +187,113 @@ def cluster_vectors(
     )
 
 
+def merge_semantically_overlapping_clusters(
+    vectors: NDArray[np.float32],
+    labels: NDArray[np.int_],
+    *,
+    parameters: SemanticMergeParameters | None = None,
+) -> SemanticMergeResult:
+    """Iteratively merge mutually-nearest clusters that pass all semantic gates.
+
+    HDBSCAN remains the source of the raw labels.  Consolidation uses the original
+    L2-normalized Embedding space, not the PCA projection, so the configured cosine
+    thresholds retain their semantic meaning.  After every accepted merge the
+    centroids are recomputed; this prevents a weak A-B-C similarity chain from
+    collapsing into one group.
+    """
+    if vectors.ndim != 2:
+        raise ValueError("vectors must be a two-dimensional matrix")
+    if len(vectors) != len(labels):
+        raise ValueError("vectors and labels must have the same length")
+
+    resolved = parameters or SemanticMergeParameters()
+    _validate_semantic_merge_parameters(resolved)
+    raw_labels = sorted(set(labels.tolist()) - {-1})
+    raw_to_merged = {label: label for label in raw_labels}
+    if not resolved.enabled or len(raw_labels) < 2:
+        return SemanticMergeResult(
+            labels=np.asarray(labels, dtype=np.int_).copy(),
+            raw_to_merged_labels=raw_to_merged,
+            decisions=[],
+        )
+
+    normalized = _l2_normalize(vectors)
+    groups = {
+        label: np.asarray(np.flatnonzero(labels == label), dtype=np.int_) for label in raw_labels
+    }
+    decisions: list[SemanticMergeDecision] = []
+
+    while len(groups) > 1:
+        centroids = {
+            label: _normalized_centroid(normalized[indices]) for label, indices in groups.items()
+        }
+        nearest = _mutual_nearest_labels(centroids)
+        candidates: list[SemanticMergeDecision] = []
+        for left_label, right_label in nearest:
+            left_vectors = normalized[groups[left_label]]
+            right_vectors = normalized[groups[right_label]]
+            centroid_cosine = float(centroids[left_label] @ centroids[right_label])
+            if centroid_cosine < resolved.centroid_cosine_threshold:
+                continue
+
+            # Mean of all pairwise cross-cluster cosine values, evaluated without
+            # allocating the full |A| x |B| similarity matrix.
+            cross_mean = float(left_vectors.mean(axis=0) @ right_vectors.mean(axis=0))
+            if cross_mean < resolved.cross_cluster_mean_cosine_threshold:
+                continue
+
+            merged_vectors = np.concatenate((left_vectors, right_vectors), axis=0)
+            merged_centroid = _normalized_centroid(merged_vectors)
+            merged_member_min = float(np.min(merged_vectors @ merged_centroid))
+            if merged_member_min < resolved.merged_member_min_cosine_threshold:
+                continue
+
+            candidates.append(
+                SemanticMergeDecision(
+                    left_label=left_label,
+                    right_label=right_label,
+                    target_label=min(left_label, right_label),
+                    centroid_cosine=centroid_cosine,
+                    cross_cluster_mean_cosine=cross_mean,
+                    merged_member_min_cosine=merged_member_min,
+                )
+            )
+
+        if not candidates:
+            break
+
+        decision = min(
+            candidates,
+            key=lambda item: (
+                -item.centroid_cosine,
+                -item.cross_cluster_mean_cosine,
+                -item.merged_member_min_cosine,
+                item.left_label,
+                item.right_label,
+            ),
+        )
+        source_labels = {decision.left_label, decision.right_label}
+        groups[decision.target_label] = np.concatenate(
+            [groups[label] for label in sorted(source_labels)]
+        )
+        for label in source_labels - {decision.target_label}:
+            del groups[label]
+        for raw_label, merged_label in raw_to_merged.items():
+            if merged_label in source_labels:
+                raw_to_merged[raw_label] = decision.target_label
+        decisions.append(decision)
+
+    merged_labels = np.asarray(
+        [-1 if int(label) == -1 else raw_to_merged[int(label)] for label in labels],
+        dtype=np.int_,
+    )
+    return SemanticMergeResult(
+        labels=merged_labels,
+        raw_to_merged_labels=raw_to_merged,
+        decisions=decisions,
+    )
+
+
 @dataclass(slots=True)
 class _CandidateResult:
     labels: NDArray[np.int_]
@@ -169,9 +308,7 @@ def _hdbscan_parameter_candidates(
 ) -> list[HdbscanParameters]:
     """Keep density thresholds fixed while comparing cluster selection methods."""
     del sample_count
-    alternate_method = (
-        "leaf" if base.cluster_selection_method == "eom" else "eom"
-    )
+    alternate_method = "leaf" if base.cluster_selection_method == "eom" else "eom"
     return [
         base,
         HdbscanParameters(
@@ -406,3 +543,41 @@ def _l2_normalize_projection(vectors: NDArray[np.float32]) -> NDArray[np.float32
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     safe_norms = np.where(norms > np.finfo(np.float32).eps, norms, 1.0)
     return np.asarray(vectors / safe_norms, dtype=np.float32)
+
+
+def _validate_semantic_merge_parameters(parameters: SemanticMergeParameters) -> None:
+    thresholds = (
+        parameters.centroid_cosine_threshold,
+        parameters.cross_cluster_mean_cosine_threshold,
+        parameters.merged_member_min_cosine_threshold,
+    )
+    if any(not np.isfinite(value) or value < -1.0 or value > 1.0 for value in thresholds):
+        raise ValueError("semantic merge cosine thresholds must be between -1 and 1")
+
+
+def _normalized_centroid(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
+    centroid = np.asarray(vectors.mean(axis=0), dtype=np.float32)
+    norm = float(np.linalg.norm(centroid))
+    if norm <= np.finfo(np.float32).eps:
+        raise ValueError("semantic cluster centroid has zero length")
+    return np.asarray(centroid / norm, dtype=np.float32)
+
+
+def _mutual_nearest_labels(
+    centroids: dict[int, NDArray[np.float32]],
+) -> list[tuple[int, int]]:
+    nearest: dict[int, int] = {}
+    for label in sorted(centroids):
+        others = [candidate for candidate in sorted(centroids) if candidate != label]
+        nearest[label] = min(
+            others,
+            key=lambda candidate: (
+                -float(centroids[label] @ centroids[candidate]),
+                candidate,
+            ),
+        )
+    return [
+        (left, right)
+        for left, right in sorted(nearest.items())
+        if left < right and nearest.get(right) == left
+    ]

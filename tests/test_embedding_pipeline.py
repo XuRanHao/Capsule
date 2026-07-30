@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -16,7 +17,7 @@ from capsule.db.session import Database
 from capsule.enums import AssetType, EmbeddingStatus, EmbeddingType
 from capsule.parsers.discovery import sha256_file
 from capsule.pipeline.asset_factory import AssetFactory
-from capsule.pipeline.embedding import AssetEmbeddingService
+from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingInputUnavailable
 from capsule.schemas import AssetDraft, DiscoveredFile, EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
 
@@ -170,8 +171,7 @@ async def test_embedding_service_persists_and_reuses_native_vectors(tmp_path: Pa
         assert all(record.status == EmbeddingStatus.INDEXED.value for record in records)
         assert all(record.dimension == 3 for record in records)
         assert all(
-            record.embedding_type == EmbeddingType.NATIVE_MULTIMODAL.value
-            for record in records
+            record.embedding_type == EmbeddingType.NATIVE_MULTIMODAL.value for record in records
         )
         assert all(record.usage == {"total_tokens": 3} for record in records)
     finally:
@@ -286,8 +286,40 @@ async def test_embedding_inputs_use_original_image_bytes_and_playable_video_url(
     assert video_input.input_items == [
         {
             "type": "video_url",
-            "video_url": {
-                "url": "https://objects.example.test/segment.mp4?signature=temporary"
-            },
+            "video_url": {"url": "https://objects.example.test/segment.mp4?signature=temporary"},
+        }
+    ]
+
+    not_applicable = replace(
+        image,
+        asset_features={
+            "character_state_or_psychology": {
+                "value": "错误遗留的人物状态",
+                "status": "not_applicable",
+            }
+        },
+    )
+    with pytest.raises(EmbeddingInputUnavailable):
+        await service._build_input(
+            not_applicable,
+            EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY,
+        )
+
+    usage = replace(
+        image,
+        source_relative_path="海报/素材/20251216-143446.png",
+        asset_features={
+            "asset_usage": {
+                "value": "海报制作",
+                "status": "metadata",
+                "source_path": "海报/素材/20251216-143446.png",
+            }
+        },
+    )
+    usage_input = await service._build_input(usage, EmbeddingType.ASSET_USAGE)
+    assert usage_input.input_items == [
+        {
+            "type": "text",
+            "text": "素材用途：海报制作；来源目录：海报/素材",
         }
     ]

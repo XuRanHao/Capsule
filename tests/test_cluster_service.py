@@ -3,13 +3,16 @@ from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 from pydantic import SecretStr
 
 from capsule.config import Settings
 from capsule.db.repositories import ClusterEmbeddingAsset, ClusterMembershipWrite
 from capsule.enums import ClusterInternalVariance, ClusterRunStatus, EmbeddingType
+from capsule.pipeline import cluster_service as cluster_service_module
 from capsule.pipeline.cluster_service import ClusterService
+from capsule.pipeline.clustering import ClusterResult, HdbscanParameters
 from capsule.schemas import ClusterCapsuleWrite, ClusterSummary
 
 
@@ -139,8 +142,7 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     }
     runs_by_type = {run["embedding_type"]: run for run in repository.runs.values()}
     assert (
-        runs_by_type["native_multimodal"]["preprocessing"]["parameter_selection"]
-        == "user_defined"
+        runs_by_type["native_multimodal"]["preprocessing"]["parameter_selection"] == "user_defined"
     )
     assert runs_by_type["native_multimodal"]["parameters"]["candidates_evaluated"] == 1
     assert (
@@ -191,6 +193,41 @@ async def test_cluster_service_records_insufficient_type_without_model_call() ->
 
 
 @pytest.mark.asyncio
+async def test_asset_usage_capsules_persist_member_path_context() -> None:
+    embedding_type = EmbeddingType.ASSET_USAGE
+    assets = _assets(embedding_type)
+    repository = FakeClusterRepository()
+    summary_client = FakeSummaryClient()
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(
+            {asset.embedding_id: _vector(index) for index, asset in enumerate(assets)}
+        ),
+        model_client=summary_client,
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=embedding_type,
+    )
+
+    assert result.status == ClusterRunStatus.COMPLETED
+    assert repository.capsules
+    assert all("海报/素材/" in capsule.summary.description for capsule in repository.capsules)
+    for messages in summary_client.prompts:
+        payload = json.loads(str(messages[1]["content"]))
+        assert payload["member_source_context"]["directory_counts"]
+        assert payload["member_source_context"]["representative_files"]
+
+
+@pytest.mark.asyncio
 async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     embedding_type = EmbeddingType.NATIVE_MULTIMODAL
     assets = _assets(embedding_type, count=12)
@@ -231,6 +268,76 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     assert len(next(iter(repository.memberships.values()))) == 12
 
 
+@pytest.mark.asyncio
+async def test_cluster_service_merges_capsules_but_preserves_raw_hdbscan_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_type = EmbeddingType.TARGET_AUDIENCE
+    assets = _assets(embedding_type, count=9)
+    angles = [-2, 0, 2, 18, 20, 22, 55, 57, 59]
+    matrix = np.asarray(
+        [[np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))] for angle in angles],
+        dtype=np.float32,
+    )
+    raw_labels = np.repeat(np.asarray([0, 1, 2], dtype=np.int_), 3)
+
+    def fake_cluster_vectors(*_: object, **__: object) -> ClusterResult:
+        return ClusterResult(
+            labels=raw_labels,
+            probabilities=np.ones(9, dtype=np.float64),
+            transformed_vectors=matrix,
+            pca_dimension=2,
+            parameters=HdbscanParameters(min_cluster_size=3, min_samples=1),
+            quality_score=0.8,
+            parameter_candidates_evaluated=1,
+        )
+
+    monkeypatch.setattr(cluster_service_module, "cluster_vectors", fake_cluster_vectors)
+    repository = FakeClusterRepository()
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(
+            {asset.embedding_id: matrix[index].tolist() for index, asset in enumerate(assets)}
+        ),
+        model_client=FakeSummaryClient(),
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=embedding_type,
+    )
+
+    assert result.status == ClusterRunStatus.COMPLETED
+    assert result.cluster_count == 2
+    assert sorted(capsule.member_count for capsule in repository.capsules) == [3, 6]
+
+    run = next(iter(repository.runs.values()))
+    merge_metadata = run["parameters"]["semantic_merge"]
+    assert merge_metadata["raw_cluster_count"] == 3
+    assert merge_metadata["merged_cluster_count"] == 2
+    assert merge_metadata["raw_to_merged_labels"] == {"0": 0, "1": 0, "2": 2}
+
+    memberships = next(iter(repository.memberships.values()))
+    assert {membership.hdbscan_label for membership in memberships} == {0, 1, 2}
+    capsule_ids_by_raw_label = {
+        label: {
+            membership.cluster_capsule_id
+            for membership in memberships
+            if membership.hdbscan_label == label
+        }
+        for label in {0, 1, 2}
+    }
+    assert capsule_ids_by_raw_label[0] == capsule_ids_by_raw_label[1]
+    assert capsule_ids_by_raw_label[0] != capsule_ids_by_raw_label[2]
+
+
 def _assets(
     embedding_type: EmbeddingType,
     *,
@@ -244,8 +351,19 @@ def _assets(
             asset_type="image",
             asset_name=f"测试资产 {index}",
             asset_description=f"测试资产 {index} 的描述。",
-            asset_features={"visual_style": {"value": "测试风格"}},
+            asset_features={
+                "visual_style": {"value": "测试风格"},
+                "asset_usage": {
+                    "value": "海报制作",
+                    "status": "metadata",
+                    "description": (
+                        f"该素材对应相对文件路径「海报/素材/{index}.png」，用于海报制作。"
+                    ),
+                    "source_path": f"海报/素材/{index}.png",
+                },
+            },
             file_tree_context=["test"],
+            source_relative_path=f"海报/素材/{index}.png",
         )
         for index in range(count)
     ]

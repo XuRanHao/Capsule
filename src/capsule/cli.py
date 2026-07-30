@@ -223,6 +223,13 @@ def enrich_command(
         list[str] | None,
         typer.Option("--asset-id", help="Only enrich this Asset ID; repeat as needed."),
     ] = None,
+    force_understanding: Annotated[
+        bool,
+        typer.Option(
+            "--force-understanding",
+            help="Regenerate descriptions and Features before embedding.",
+        ),
+    ] = False,
 ) -> None:
     """Backfill understanding and all embedding channels for stored Assets."""
     result = asyncio.run(
@@ -230,6 +237,7 @@ def enrich_command(
             job_id=job_id,
             workspace_id=workspace,
             asset_ids=asset_ids,
+            force_understanding=force_understanding,
         )
     )
     typer.echo(result.model_dump_json(indent=2))
@@ -322,6 +330,7 @@ async def _enrich_assets(
     job_id: str,
     workspace_id: str,
     asset_ids: list[str] | None,
+    force_understanding: bool = False,
 ) -> AssetEnrichmentResult:
     settings = get_settings()
     database = Database(settings)
@@ -363,6 +372,7 @@ async def _enrich_assets(
                     video_url_signer=storage,
                     image_cache=model_image_cache,
                 ),
+                force_understanding=force_understanding,
             )
     finally:
         await database.dispose()

@@ -5,9 +5,11 @@ from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
     HdbscanParameters,
     InsufficientDataError,
+    SemanticMergeParameters,
     cluster_vectors,
     dataset_hash,
     dynamic_hdbscan_parameters,
+    merge_semantically_overlapping_clusters,
     representative_indices,
     select_cluster_representatives,
 )
@@ -55,6 +57,62 @@ def test_dataset_hash_is_order_independent() -> None:
     assert dataset_hash(["emb_b", "emb_a"]) == dataset_hash(["emb_a", "emb_b"])
 
 
+def test_semantic_merge_consolidates_only_mutually_nearest_overlapping_clusters() -> None:
+    angles = [-2, 0, 2, 18, 20, 22, 55, 57, 59]
+    vectors = np.asarray(
+        [[np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))] for angle in angles],
+        dtype=np.float32,
+    )
+    vectors = np.vstack((vectors, np.asarray([[0.0, -1.0]], dtype=np.float32)))
+    labels = np.asarray([0, 0, 0, 1, 1, 1, 2, 2, 2, -1], dtype=np.int_)
+
+    result = merge_semantically_overlapping_clusters(vectors, labels)
+
+    assert result.labels.tolist() == [0, 0, 0, 0, 0, 0, 2, 2, 2, -1]
+    assert result.raw_to_merged_labels == {0: 0, 1: 0, 2: 2}
+    assert result.raw_cluster_count == 3
+    assert result.cluster_count == 2
+    assert len(result.decisions) == 1
+    assert result.decisions[0].centroid_cosine >= 0.92
+
+
+def test_semantic_merge_recomputes_centroids_to_prevent_chain_merges() -> None:
+    angles = [-1, 0, 1, 19, 20, 21, 39, 40, 41]
+    vectors = np.asarray(
+        [[np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))] for angle in angles],
+        dtype=np.float32,
+    )
+    labels = np.repeat(np.asarray([0, 1, 2], dtype=np.int_), 3)
+
+    result = merge_semantically_overlapping_clusters(
+        vectors,
+        labels,
+        parameters=SemanticMergeParameters(
+            centroid_cosine_threshold=0.92,
+            cross_cluster_mean_cosine_threshold=0.84,
+            merged_member_min_cosine_threshold=0.90,
+        ),
+    )
+
+    assert result.raw_to_merged_labels == {0: 0, 1: 0, 2: 2}
+    assert result.cluster_count == 2
+
+
+def test_semantic_merge_can_be_disabled_without_relabeling() -> None:
+    vectors = np.asarray([[1.0, 0.0], [0.99, 0.01]], dtype=np.float32)
+    labels = np.asarray([4, 7], dtype=np.int_)
+
+    result = merge_semantically_overlapping_clusters(
+        vectors,
+        labels,
+        parameters=SemanticMergeParameters(enabled=False),
+    )
+
+    assert result.labels.tolist() == labels.tolist()
+    assert result.raw_to_merged_labels == {4: 4, 7: 7}
+    assert result.decisions == []
+
+
 def test_representative_indices_excludes_noise() -> None:
     vectors = np.asarray(
         [[0.0, 0.0], [0.1, 0.1], [10.0, 10.0]],
@@ -85,9 +143,7 @@ def test_cluster_vectors_optimization_keeps_fixed_density_parameters() -> None:
             for label in range(cluster_count)
         ]
     ).astype(np.float32)
-    vectors = np.hstack(
-        [vectors, np.full((sample_count, 48), 0.15, dtype=np.float32)]
-    )
+    vectors = np.hstack([vectors, np.full((sample_count, 48), 0.15, dtype=np.float32)])
     adaptive = cluster_vectors(vectors, optimize_parameters=True)
 
     assert adaptive.parameter_candidates_evaluated > 1

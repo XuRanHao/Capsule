@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
@@ -12,11 +12,55 @@ from pydantic import BaseModel, Field
 
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository, EmbeddingAsset, EmbeddingRepository
-from capsule.enums import AssetType
+from capsule.enums import AssetType, FeatureStatus
 from capsule.media.model_image import ModelImageCache
 from capsule.schemas import AssetUnderstanding
 
 logger = logging.getLogger(__name__)
+
+_DESCRIPTION_CONTEXT_RULES = (
+    "asset_name 与 asset_description 必须以素材本身可见或可读内容为主体。"
+    "文件名、相对路径、目录层级、文档标题、标题路径和关联段落只作为语义上下文："
+    "其中与素材内容一致且有实际语义的信息必须自然融入描述，不得写成元数据说明；"
+    "路径或文字与素材内容冲突时，以素材本身为准。忽略纯编号、序号、通用词组成的"
+    "文件名。禁止在结果中机械复述文件名、扩展名、目录、路径、来源路径或"
+    "“位于某文件夹”等措辞。以上限制不适用于 asset_usage.description；素材用途说明"
+    "必须明确写出 metadata.context.source_path。"
+)
+
+_USAGE_PATH_HINTS = (
+    ("海报", "海报制作"),
+    ("宣传", "宣传推广"),
+    ("广告", "广告投放"),
+    ("预告", "预告宣传"),
+    ("封面", "封面设计"),
+    ("头像", "头像制作"),
+    ("壁纸", "壁纸使用"),
+    ("电商", "电商展示"),
+    ("社交媒体", "社交媒体发布"),
+    ("社媒", "社交媒体发布"),
+    ("参考", "创作参考"),
+    ("插画", "插画创作"),
+)
+
+_GENERIC_USAGE_PATH_PARTS = {
+    "asset",
+    "assets",
+    "file",
+    "files",
+    "image",
+    "images",
+    "img",
+    "素材",
+    "文件",
+    "图片",
+    "图像",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "gif",
+}
 
 
 class UnderstandingClient(Protocol):
@@ -69,16 +113,16 @@ class AssetUnderstandingService:
         *,
         workspace_id: str,
         asset_ids: Sequence[str] | None = None,
+        force: bool = False,
     ) -> UnderstandingRunResult:
         assets = await self._embedding_repository.list_assets(
             workspace_id=workspace_id,
             asset_ids=asset_ids,
         )
-        assets = [
-            asset
-            for asset in assets
-            if not asset.asset_description or not asset.asset_features
-        ]
+        if not force:
+            assets = [
+                asset for asset in assets if not asset.asset_description or not asset.asset_features
+            ]
         run_started = time.perf_counter()
         semaphore = asyncio.Semaphore(self._settings.understanding_concurrency)
         outcomes = await asyncio.gather(
@@ -93,9 +137,7 @@ class AssetUnderstandingService:
         model_ms = sum(outcome[2] for outcome in outcomes)
         storage_ms = sum(outcome[3] for outcome in outcomes)
         measured_ms = model_ms + storage_ms
-        understanding_ms = (
-            elapsed_ms * model_ms / measured_ms if measured_ms else elapsed_ms
-        )
+        understanding_ms = elapsed_ms * model_ms / measured_ms if measured_ms else elapsed_ms
         return UnderstandingRunResult(
             workspace_id=workspace_id,
             requested_asset_count=len(assets),
@@ -120,6 +162,7 @@ class AssetUnderstandingService:
                 phase_started = time.perf_counter()
                 try:
                     understanding = await self._model_client.understand_asset(messages)
+                    _attach_asset_usage_path_context(understanding, asset)
                 finally:
                     model_ms = (time.perf_counter() - phase_started) * 1000
                 phase_started = time.perf_counter()
@@ -144,12 +187,23 @@ class AssetUnderstandingService:
                 "十个 Feature 彼此独立，不跨维度重复或推导。asset_name 不超过 20 字；"
                 "asset_description 用 40 到 120 字客观描述可检索内容。每个 Feature 的 value "
                 "只含该维度 0 到 5 个中文关键词，以分号连接；evidence 最多一条且不超过 40 字。"
+                f"{_DESCRIPTION_CONTEXT_RULES}"
                 "维度边界：subject_content=主体与动作；scene_theme=场景题材；"
                 "visual_style=表现技法；color_composition=色彩构图；"
                 "mood_atmosphere=情绪氛围；character_state_or_psychology=人物可观察状态；"
                 "asset_usage=用途；target_audience=受众；provenance=客观来源；"
-                "rights_version_authorship=有证据的权利版本作者。无证据使用 null/unknown，"
-                "不得虚构。只输出约定 JSON，不要 Markdown。"
+                "rights_version_authorship=有证据的权利版本作者。unknown 表示该维度适用但"
+                "当前证据不足；not_applicable 表示当前 Asset 不存在该维度所需对象或该维度"
+                "不适用。status 为 unknown 或 not_applicable 时 value 必须为 null。"
+                "character_state_or_psychology 采用严格适用性判断：图像或视频中只有清晰可见"
+                "的人物或拟人角色，文本中只有明确描述人物状态时才适用；纯场景、建筑、物体、"
+                "树木、遗骸或非拟人怪物必须返回 null/not_applicable。不得根据文件名、IP 背景、"
+                "场景叙事或画面情绪推断不存在的人物，也不得把物体或场景状态写成人物状态。"
+                "asset_usage 必须优先使用 metadata.context.source_path 和 file_tree_context："
+                "当目录名能表达海报、宣传、封面、广告、预告、参考等用途时，status 使用 "
+                "metadata，value 只写规范化用途语义；description 必须自然说明完整相对路径"
+                "及其对应用途，source_path 必须原样返回该相对路径。不得返回本地绝对路径。"
+                "无证据不得虚构。只输出约定 JSON，不要 Markdown。"
             ),
         }
         metadata = _asset_context_payload(asset)
@@ -244,9 +298,7 @@ def _data_uri(mime_type: str, content: bytes) -> str:
 
 def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
     source_contexts = [
-        dict(context)
-        for context in asset.source_contexts
-        if isinstance(context, Mapping)
+        dict(context) for context in asset.source_contexts if isinstance(context, Mapping)
     ]
     associated_text = list(
         dict.fromkeys(
@@ -302,6 +354,87 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
             "file_tree_context": asset.file_tree_context[-12:],
         },
     }
+
+
+def _attach_asset_usage_path_context(
+    understanding: AssetUnderstanding,
+    asset: EmbeddingAsset,
+) -> None:
+    """Make Asset usage path evidence deterministic instead of model-optional."""
+    source_path = _normalized_relative_path(asset.source_relative_path)
+    if source_path is None:
+        return
+
+    usage = understanding.features.asset_usage
+    usage.source_path = source_path
+    path_hint = _usage_hint_from_path(
+        source_path=source_path,
+        file_tree_context=asset.file_tree_context,
+    )
+    if path_hint is not None:
+        if not usage.value:
+            usage.value = path_hint
+        if usage.status in {
+            FeatureStatus.UNKNOWN,
+            FeatureStatus.NOT_APPLICABLE,
+            FeatureStatus.INFERRED,
+        }:
+            usage.status = FeatureStatus.METADATA
+        usage.confidence = max(usage.confidence, 0.9)
+
+    directory = _source_directory(source_path)
+    if usage.value:
+        normalized_usage = usage.value.replace("；", "、")
+        directory_clause = f"，所属目录为「{directory}」" if directory else ""
+        usage.description = (
+            f"该素材对应相对文件路径「{source_path}」{directory_clause}，"
+            f"路径语义与素材信息表明其用途为{normalized_usage}。"
+        )
+    else:
+        usage.description = (
+            f"该素材对应相对文件路径「{source_path}」，"
+            "当前路径和素材内容尚未提供可确认的具体用途。"
+        )
+    usage.evidence = [f"相对文件路径：{source_path}"]
+
+
+def _normalized_relative_path(value: str) -> str | None:
+    normalized = value.strip().replace("\\", "/")
+    if not normalized:
+        return None
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
+def _source_directory(source_path: str) -> str:
+    directory = PurePosixPath(source_path).parent.as_posix()
+    return "" if directory == "." else directory
+
+
+def _usage_hint_from_path(
+    *,
+    source_path: str,
+    file_tree_context: Sequence[str],
+) -> str | None:
+    directory = _source_directory(source_path)
+    context_parts = [
+        item.strip()
+        for item in file_tree_context
+        if isinstance(item, str) and item.strip()
+    ]
+    combined = "/".join([directory, *context_parts])
+    for token, usage in _USAGE_PATH_HINTS:
+        if token in combined:
+            return usage
+
+    meaningful_parts = [
+        part
+        for part in dict.fromkeys([*PurePosixPath(directory).parts, *context_parts])
+        if part and part.lower() not in _GENERIC_USAGE_PATH_PARTS
+    ]
+    return "；".join(meaningful_parts[:3]) or None
 
 
 def _compact_file_info(file_info: Mapping[str, Any]) -> dict[str, Any]:

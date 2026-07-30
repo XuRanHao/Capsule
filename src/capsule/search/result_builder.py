@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from capsule.enums import AssetType, EmbeddingType
+from capsule.features import effective_feature_text, embedding_channel_is_eligible
 from capsule.search.models import (
     ChannelMatch,
     FusedHit,
@@ -42,6 +43,11 @@ class SearchResultBuilder:
                 if (
                     match.embedding_id in asset.indexed_embedding_ids
                     and match.embedding_revision == asset.embedding_revision
+                    and embedding_channel_is_eligible(
+                        embedding_type=match.embedding_type,
+                        asset_features=asset.asset_features,
+                        asset_description=asset.asset_description,
+                    )
                 ):
                     current_by_channel.setdefault(match.channel, match)
             current_channels = list(current_by_channel.values())
@@ -353,14 +359,9 @@ def _matched_feature(
         key = feature_types.get(channel.embedding_type)
         if key is None:
             continue
-        raw = features.get(key)
-        if isinstance(raw, str) and raw:
-            return raw
-        if isinstance(raw, Mapping):
-            for value_key in ("effective_value", "value", "user_value", "model_value"):
-                value = raw.get(value_key)
-                if isinstance(value, str) and value:
-                    return value
+        value = effective_feature_text(features, key)
+        if value is not None:
+            return value
     return None
 
 

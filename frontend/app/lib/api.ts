@@ -29,6 +29,8 @@ export type AssetRecord = {
         status?: string;
         confidence?: number;
         evidence?: string[];
+        description?: string | null;
+        source_path?: string | null;
       }
   >;
   file_tree_context: string[];

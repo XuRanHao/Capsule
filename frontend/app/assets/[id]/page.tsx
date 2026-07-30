@@ -79,6 +79,8 @@ export default function AssetDetailPage() {
       status: feature.status || "unknown",
       confidence: feature.confidence ?? 0,
       evidence: feature.evidence || [],
+      description: feature.description || null,
+      sourcePath: feature.source_path || null,
     };
   });
   const locator = Object.entries(asset.source_locator)
@@ -210,7 +212,13 @@ export default function AssetDetailPage() {
           {features.map((feature) => (
             <div className="feature-row" key={feature.key}>
               <strong>{feature.label}</strong>
-              <span>{feature.value}</span>
+              <span className="feature-value-cell">
+                <b>{feature.value}</b>
+                {feature.description && <small>{feature.description}</small>}
+                {feature.sourcePath && (
+                  <code title={feature.sourcePath}>{feature.sourcePath}</code>
+                )}
+              </span>
               <StatusBadge status={feature.status} />
               <span className="confidence-cell">
                 <i style={{ width: `${feature.confidence * 100}%` }} />

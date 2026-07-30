@@ -373,6 +373,17 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
             "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
             "的对象；value 最多五个关键词，evidence 最多一条，无证据时使用 null 和空数组。"
+            "unknown 表示维度适用但证据不足，not_applicable 表示当前 Asset 不适用该维度；"
+            "这两种状态的 value 必须为 null。人物状态维度在没有清晰可见或明确描述的人物、"
+            "拟人角色时必须使用 not_applicable，禁止用场景、物体或怪物状态代替人物状态。"
+            "asset_name 和 asset_description 必须以素材本身为主体；文件名、相对路径、"
+            "目录层级、标题和关联文字中与素材一致的有效语义必须自然融入描述，但不得"
+            "机械复述文件名、扩展名、目录、路径、来源路径或“位于某文件夹”等元数据措辞。"
+            "路径与素材冲突时以素材为准，纯编号、序号或通用文件名必须忽略。"
+            "唯一例外是 asset_usage：它除了通用字段外还必须返回 description 和 source_path。"
+            "source_path 必须逐字复制输入 metadata.context.source_path；description 必须明确"
+            "说明该完整相对路径及其对应用途。目录语义能确认用途时 status 使用 metadata，"
+            "value 只写用途语义，不得写绝对路径。"
             "下面的手工示例只说明结构，禁止照抄；实际值必须根据输入素材重新判断。"
             f"JSON 结构示例：{example}"
         ),
@@ -392,6 +403,23 @@ def _asset_understanding_json_example() -> dict[str, object]:
         "confidence": 0.0,
         "evidence": [],
     }
+    not_applicable: dict[str, object] = {
+        "value": None,
+        "status": "not_applicable",
+        "confidence": 1.0,
+        "evidence": [],
+    }
+    asset_usage: dict[str, object] = {
+        "value": "海报制作",
+        "status": "metadata",
+        "confidence": 0.95,
+        "evidence": ["相对文件路径：海报/素材/example.png"],
+        "description": (
+            "该素材对应相对文件路径「海报/素材/example.png」，"
+            "所属目录为「海报/素材」，路径语义表明其用于海报制作。"
+        ),
+        "source_path": "海报/素材/example.png",
+    }
     return {
         "asset_name": "基于素材生成的简洁名称",
         "asset_description": "基于素材生成的客观完整描述",
@@ -401,8 +429,8 @@ def _asset_understanding_json_example() -> dict[str, object]:
             "visual_style": observed,
             "color_composition": observed,
             "mood_atmosphere": observed,
-            "character_state_or_psychology": unknown,
-            "asset_usage": unknown,
+            "character_state_or_psychology": not_applicable,
+            "asset_usage": asset_usage,
             "target_audience": unknown,
             "provenance": unknown,
             "rights_version_authorship": unknown,
