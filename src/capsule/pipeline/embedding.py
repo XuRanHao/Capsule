@@ -116,6 +116,9 @@ class AssetEmbeddingService:
             max_entries=settings.model_image_cache_entries,
         )
         self._native_semaphore = asyncio.Semaphore(settings.native_embedding_concurrency)
+        self._video_native_semaphore = asyncio.Semaphore(
+            settings.video_native_embedding_concurrency
+        )
         self._text_semaphore = asyncio.Semaphore(settings.embedding_concurrency)
         self._collection_ready = False
         self._collection_lock = asyncio.Lock()
@@ -230,6 +233,29 @@ class AssetEmbeddingService:
         )
 
     async def _embed_one(
+        self,
+        *,
+        asset: EmbeddingAsset,
+        embedding_type: EmbeddingType,
+        force: bool,
+    ) -> _EmbeddingOutcome:
+        if (
+            embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+            and asset.asset_type == AssetType.VIDEO_SEGMENT.value
+        ):
+            async with self._video_native_semaphore:
+                return await self._embed_one_with_shared_pool(
+                    asset=asset,
+                    embedding_type=embedding_type,
+                    force=force,
+                )
+        return await self._embed_one_with_shared_pool(
+            asset=asset,
+            embedding_type=embedding_type,
+            force=force,
+        )
+
+    async def _embed_one_with_shared_pool(
         self,
         *,
         asset: EmbeddingAsset,

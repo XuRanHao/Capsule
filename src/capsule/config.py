@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     asset_enrichment_queue_size: int = Field(default=64, ge=1)
     search_understanding_concurrency: int = Field(default=4, ge=1)
     native_embedding_concurrency: int = Field(default=24, ge=1)
+    video_native_embedding_concurrency: int = Field(default=2, ge=1)
     embedding_concurrency: int = Field(default=96, ge=1)
     search_embedding_concurrency: int = Field(default=16, ge=1)
     capsule_concurrency: int = Field(default=8, ge=1)
@@ -54,7 +55,7 @@ class Settings(BaseSettings):
     model_image_max_edge: int = Field(default=1536, ge=1)
     model_image_cache_entries: int = Field(default=128, ge=1)
     file_parse_concurrency: int = Field(default=4, ge=1)
-    ffmpeg_concurrency: int = Field(default=2, ge=1)
+    ffmpeg_concurrency: int = Field(default=1, ge=1)
     video_upload_concurrency: int = Field(default=4, ge=1)
     video_spool_root: Path = Path("data/video-spool")
     video_spool_max_items: int = Field(default=32, ge=1)
@@ -82,6 +83,7 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = Field(default=60.0, gt=0)
     milvus_batch_size: int = Field(default=100, ge=1)
 
+    cluster_selection_epsilon: float = Field(default=0.5, ge=0.0, le=2.0)
     cluster_semantic_merge_enabled: bool = True
     cluster_merge_centroid_cosine_threshold: float = Field(
         default=0.92,
@@ -103,6 +105,7 @@ class Settings(BaseSettings):
     search_channel_top_k_cap: int = Field(default=100, ge=1)
     search_candidate_cap: int = Field(default=300, ge=1)
     search_same_source_limit: int = Field(default=3, ge=1)
+    search_cluster_top_k: int = Field(default=12, ge=1, le=100)
     search_rrf_k: int = Field(default=60, ge=1)
     search_hnsw_ef: int = Field(default=128, ge=1)
     search_engine_version: str = "search-v1"

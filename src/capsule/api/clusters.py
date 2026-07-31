@@ -92,6 +92,18 @@ async def submit_cluster_run(
         cluster_run_id = await repository.create_pending_run(
             workspace_id=payload.workspace_id,
             embedding_type=payload.embedding_type.value,
+            preprocessing={
+                "requested_pca_dimension": payload.pca_dimension,
+                "parameter_selection": (
+                    "user_defined_selection_optimized"
+                    if payload.optimize_parameters
+                    else "user_defined"
+                ),
+            },
+            parameters={
+                "min_samples": payload.min_samples,
+                "min_cluster_size": payload.min_cluster_size,
+            },
         )
     except ValueError as exc:
         raise HTTPException(

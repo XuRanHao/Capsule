@@ -49,10 +49,22 @@ class FakeClusterRepository:
             is_favorite=False,
         )
 
-    async def create_pending_run(self, *, workspace_id: str, embedding_type: str) -> str:
+    async def create_pending_run(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        preprocessing: dict[str, object] | None = None,
+        parameters: dict[str, object] | None = None,
+    ) -> str:
         if workspace_id != self.run.workspace_id:
             raise ValueError("workspace does not exist")
         self.run.embedding_type = embedding_type
+        self.run.preprocessing = {
+            "submission_mode": "async_api",
+            **(preprocessing or {}),
+        }
+        self.run.parameters = dict(parameters or {})
         return self.run.cluster_run_id
 
     async def get_run(self, *, cluster_run_id: str, workspace_id: str) -> ClusterRunRecord:
@@ -131,6 +143,9 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
 
     assert submitted.status_code == 202
     assert submitted.json() == {"cluster_run_id": "run_api_test", "status": "pending"}
+    assert repository.run.preprocessing["requested_pca_dimension"] == 8
+    assert repository.run.parameters["min_samples"] == 1
+    assert repository.run.parameters["min_cluster_size"] == 3
     assert service.calls == [
         {
             "workspace_id": "workspace_api_test",
@@ -176,6 +191,9 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
             )
 
     assert response.status_code == 202
+    assert repository.run.preprocessing["requested_pca_dimension"] == 12
+    assert repository.run.parameters["min_samples"] == 2
+    assert repository.run.parameters["min_cluster_size"] == 5
     assert service.calls == [
         {
             "workspace_id": "workspace_api_test",

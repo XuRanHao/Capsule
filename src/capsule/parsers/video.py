@@ -11,6 +11,7 @@ import json
 import platform
 import shutil
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, cast
@@ -132,34 +133,26 @@ class VideoParser:
         _require_video_tools()
         metadata = _probe_metadata(source)
         ranges = _build_video_ranges(source, metadata, self._config)
-        requested_times = sorted(
-            {
-                timestamp
-                for item in ranges
-                for timestamp in candidate_timestamps(
-                    item.start_ms,
-                    item.end_ms,
-                    self._config.sample_interval_seconds,
-                    self._config.max_candidate_frames,
-                )
-            }
-        )
-        candidates_by_request = _extract_candidate_frames(
-            source,
-            requested_times,
-            analysis_frame_max_edge=self._config.analysis_frame_max_edge,
-        )
-        embedder = self._get_embedder()
-
-        drafts: list[AssetDraft] = []
-        for segment_index, item in enumerate(ranges):
-            requested = candidate_timestamps(
+        requested_groups = [
+            candidate_timestamps(
                 item.start_ms,
                 item.end_ms,
                 self._config.sample_interval_seconds,
                 self._config.max_candidate_frames,
             )
-            candidates = [candidates_by_request[timestamp] for timestamp in requested]
+            for item in ranges
+        ]
+        candidate_groups = _iter_candidate_frame_groups(
+            source,
+            requested_groups,
+            analysis_frame_max_edge=self._config.analysis_frame_max_edge,
+        )
+        embedder = self._get_embedder()
+
+        drafts: list[AssetDraft] = []
+        for segment_index, (item, candidates) in enumerate(
+            zip(ranges, candidate_groups, strict=True)
+        ):
             valid = filter_invalid_frames(candidates, self._config)
             selected_pool = valid or [_best_fallback(candidates)]
             embeddings = embedder.embed([candidate.frame for candidate in selected_pool])
@@ -451,12 +444,20 @@ def _probe_metadata(source: Path) -> VideoMetadata:
     )
 
 
-def _extract_candidate_frames(
+def _iter_candidate_frame_groups(
     source: Path,
-    requested_times: list[int],
+    requested_groups: list[list[int]],
     *,
     analysis_frame_max_edge: int,
-) -> dict[int, CandidateFrame]:
+) -> Iterator[list[CandidateFrame]]:
+    """Decode once and retain only one Segment's sampled frames at a time.
+
+    A long source can contain thousands of Segment sample points. Keeping every
+    resized frame until the whole source finishes makes memory scale with video
+    duration. This iterator keeps memory bounded by ``max_candidate_frames``:
+    the caller consumes, embeds, and releases each group before decoding the
+    next one.
+    """
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise VideoToolingError(f"OpenCV cannot decode video: {source}")
@@ -465,48 +466,54 @@ def _extract_candidate_frames(
         capture.release()
         raise VideoToolingError(f"video FPS is unavailable: {source}")
 
-    candidates: dict[int, CandidateFrame] = {}
-    next_index = 0
     frame_index = 0
     previous: tuple[int, np.ndarray] | None = None
+    exhausted = False
     try:
-        while next_index < len(requested_times):
-            succeeded, frame = capture.read()
-            if not succeeded:
-                break
-            timestamp_ms = round(frame_index * 1000 / fps)
-            current = (timestamp_ms, frame)
-            while next_index < len(requested_times) and timestamp_ms >= requested_times[next_index]:
+        for requested_times in requested_groups:
+            candidates: dict[int, CandidateFrame] = {}
+            next_index = 0
+            while next_index < len(requested_times) and not exhausted:
+                succeeded, frame = capture.read()
+                if not succeeded:
+                    exhausted = True
+                    break
+                timestamp_ms = round(frame_index * 1000 / fps)
+                current = (timestamp_ms, frame)
+                while (
+                    next_index < len(requested_times)
+                    and timestamp_ms >= requested_times[next_index]
+                ):
+                    target = requested_times[next_index]
+                    selected_time, selected_frame = _nearest_frame(
+                        previous,
+                        current,
+                        target,
+                    )
+                    candidates[target] = _candidate_frame(
+                        target,
+                        selected_time,
+                        selected_frame,
+                        analysis_frame_max_edge=analysis_frame_max_edge,
+                    )
+                    next_index += 1
+                previous = current
+                frame_index += 1
+
+            if previous is None:
+                raise VideoToolingError(f"video has no decodable frames: {source}")
+            while next_index < len(requested_times):
                 target = requested_times[next_index]
-                selected_time, selected_frame = _nearest_frame(
-                    previous,
-                    (timestamp_ms, frame),
-                    target,
-                )
                 candidates[target] = _candidate_frame(
                     target,
-                    selected_time,
-                    selected_frame,
+                    previous[0],
+                    previous[1],
                     analysis_frame_max_edge=analysis_frame_max_edge,
                 )
                 next_index += 1
-            previous = current
-            frame_index += 1
-
-        if previous is None:
-            raise VideoToolingError(f"video has no decodable frames: {source}")
-        while next_index < len(requested_times):
-            target = requested_times[next_index]
-            candidates[target] = _candidate_frame(
-                target,
-                previous[0],
-                previous[1],
-                analysis_frame_max_edge=analysis_frame_max_edge,
-            )
-            next_index += 1
+            yield [candidates[timestamp] for timestamp in requested_times]
     finally:
         capture.release()
-    return candidates
 
 
 def _candidate_frame(

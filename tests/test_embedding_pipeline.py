@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -323,3 +324,60 @@ async def test_embedding_inputs_use_image_and_video_data_uris(
             "text": "素材用途：海报制作；来源目录：海报/素材",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_video_embedding_has_a_dedicated_memory_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    concurrency = 0
+    maximum_concurrency = 0
+    service = AssetEmbeddingService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_dimension=3,
+            native_embedding_concurrency=24,
+            video_native_embedding_concurrency=2,
+        ),
+        repository=cast(EmbeddingRepository, object()),
+        model_client=FakeEmbeddingClient(),
+        vector_store=FakeVectorStore(),
+    )
+    template = EmbeddingAsset(
+        asset_id="asset_video",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="src_video",
+        asset_type=AssetType.VIDEO_SEGMENT.value,
+        file_type=".mp4",
+        content_hash="b" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 7, 29, tzinfo=UTC),
+        raw_content=None,
+        asset_description=None,
+        asset_features={},
+        derived_file_uri="s3://capsule/segment.mp4",
+        source_storage_uri="file:///unused.mp4",
+        source_mime_type="video/mp4",
+    )
+
+    async def probe(**_: Any) -> None:
+        nonlocal concurrency, maximum_concurrency
+        concurrency += 1
+        maximum_concurrency = max(maximum_concurrency, concurrency)
+        await asyncio.sleep(0.01)
+        concurrency -= 1
+
+    monkeypatch.setattr(service, "_embed_one_with_shared_pool", probe)
+    await asyncio.gather(
+        *(
+            service._embed_one(
+                asset=replace(template, asset_id=f"asset_video_{index}"),
+                embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+                force=False,
+            )
+            for index in range(8)
+        )
+    )
+
+    assert maximum_concurrency == 2

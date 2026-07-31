@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
@@ -92,6 +93,25 @@ class FakeSummaryClient:
             common_features=["向量相近"],
             internal_variance=ClusterInternalVariance.LOW,
         )
+
+
+class ConcurrentSummaryClient(FakeSummaryClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    async def summarize_cluster(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> ClusterSummary:
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().summarize_cluster(messages)
+        finally:
+            self.active_calls -= 1
 
 
 @pytest.mark.asyncio
@@ -265,6 +285,7 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     run = next(iter(repository.runs.values()))
     assert run["parameters"]["min_cluster_size"] == 3
     assert run["parameters"]["min_samples"] == 1
+    assert run["parameters"]["cluster_selection_epsilon"] == 0.5
     assert len(next(iter(repository.memberships.values()))) == 12
 
 
@@ -336,6 +357,59 @@ async def test_cluster_service_merges_capsules_but_preserves_raw_hdbscan_labels(
     }
     assert capsule_ids_by_raw_label[0] == capsule_ids_by_raw_label[1]
     assert capsule_ids_by_raw_label[0] != capsule_ids_by_raw_label[2]
+
+
+@pytest.mark.asyncio
+async def test_cluster_service_generates_capsules_with_configured_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_type = EmbeddingType.VISUAL_STYLE
+    assets = _assets(embedding_type, count=12)
+    matrix = np.asarray(
+        [[1.0, float(index) / 100.0] for index in range(len(assets))],
+        dtype=np.float32,
+    )
+    labels = np.repeat(np.arange(4, dtype=np.int_), 3)
+
+    def fake_cluster_vectors(*_: object, **__: object) -> ClusterResult:
+        return ClusterResult(
+            labels=labels,
+            probabilities=np.ones(len(assets), dtype=np.float64),
+            transformed_vectors=matrix,
+            pca_dimension=2,
+            parameters=HdbscanParameters(min_cluster_size=3, min_samples=1),
+            quality_score=0.8,
+            parameter_candidates_evaluated=1,
+        )
+
+    monkeypatch.setattr(cluster_service_module, "cluster_vectors", fake_cluster_vectors)
+    repository = FakeClusterRepository()
+    summary_client = ConcurrentSummaryClient()
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+            cluster_semantic_merge_enabled=False,
+            capsule_concurrency=3,
+        ),
+        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(
+            {asset.embedding_id: matrix[index].tolist() for index, asset in enumerate(assets)}
+        ),
+        model_client=summary_client,
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=embedding_type,
+    )
+
+    assert result.status == ClusterRunStatus.COMPLETED
+    assert result.cluster_count == 4
+    assert summary_client.max_active_calls == 3
 
 
 def _assets(

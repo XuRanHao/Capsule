@@ -31,8 +31,10 @@ class QueryParser:
         *,
         image_url: str | None,
     ) -> tuple[ParsedQuery, tuple[str, ...]]:
-        if request.query_type is QueryType.IMAGE and not request.precision_mode:
-            return _quick_image_query(), ()
+        if not request.precision_mode:
+            if request.query_type is QueryType.IMAGE:
+                return _quick_image_query(), ()
+            return _quick_semantic_query(request), ()
         if self._client is not None:
             try:
                 parsed = await self._client.parse_search_query(
@@ -43,6 +45,13 @@ class QueryParser:
             except Exception:
                 logger.warning("query parser model call failed; fallback used", exc_info=True)
         return _fallback_query(request), ("query parser fallback used",)
+
+
+def _quick_semantic_query(request: SearchRequest) -> ParsedQuery:
+    """Route ordinary text and image-text searches without a model round trip."""
+    return _fallback_query(request).model_copy(
+        update={"parser_mode": "deterministic_quick"},
+    )
 
 
 def _quick_image_query() -> ParsedQuery:

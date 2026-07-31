@@ -77,7 +77,7 @@ async def test_text_query_builds_fallback_six_normalized_channels() -> None:
         EmbeddingType.MOOD_ATMOSPHERE,
     ]
     assert all(math.isclose(sum(value**2 for value in item.vector), 1.0) for item in plan.vectors)
-    assert len(client.calls) == 6
+    assert client.calls == ["text:蓝紫色黄昏"]
     assert plan.degraded is False
 
 
@@ -103,7 +103,10 @@ async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None
         "target_audience",
     ]
     assert plan.degraded is False
-    assert len(client.calls) == 6
+    assert sorted(client.calls) == [
+        "image_text:https://example.com/query.png:更像黄昏",
+        "text:更像黄昏",
+    ]
 
 
 async def test_image_text_falls_back_to_separate_vectors() -> None:

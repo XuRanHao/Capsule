@@ -105,6 +105,23 @@ function runParameter(value: unknown) {
   return typeof value === "number" ? value : "—";
 }
 
+function runPcaDimension(run: ClusterRun | undefined) {
+  return runParameter(
+    run?.preprocessing.pca_dimension ??
+      run?.preprocessing.requested_pca_dimension,
+  );
+}
+
+function runOptionLabel(run: ClusterRun) {
+  const feature =
+    FEATURE_TYPES.find((item) => item.value === run.embedding_type)?.label ??
+    run.embedding_type;
+  const pca = runPcaDimension(run);
+  const minSamples = runParameter(run.parameters.min_samples);
+  const minClusterSize = runParameter(run.parameters.min_cluster_size);
+  return `${feature} · ${run.status} · ${run.sample_count} 条 · PCA ${pca} / MS ${minSamples} / MCS ${minClusterSize}`;
+}
+
 function placeMemberNodes(
   members: ClusterMember[],
   radius: number,
@@ -384,6 +401,7 @@ export default function ClustersPage() {
   >({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const capsuleCardRefs = useRef(new Map<string, HTMLElement>());
 
   const loadRuns = useCallback(async () => {
     try {
@@ -467,6 +485,13 @@ export default function ClustersPage() {
   const selectedMembers = selectedCapsule
     ? membersByCapsule[selectedCapsule.cluster_capsule_id] || []
     : [];
+
+  useEffect(() => {
+    if (!selectedCapsuleId) return;
+    capsuleCardRefs.current
+      .get(selectedCapsuleId)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [selectedCapsuleId]);
 
   const createRun = async () => {
     setRunning(true);
@@ -610,7 +635,7 @@ export default function ClustersPage() {
               {!runs.length && <option value="">尚无 Run</option>}
               {runs.map((run) => (
                 <option value={run.cluster_run_id} key={run.cluster_run_id}>
-                  {run.embedding_type} · {run.status} · {run.sample_count}
+                  {runOptionLabel(run)}
                 </option>
               ))}
             </select>
@@ -652,9 +677,7 @@ export default function ClustersPage() {
         <div className="run-parameters">
           <span>
             <small>PCA</small>
-            <strong>
-              {runParameter(selectedRun?.preprocessing.pca_dimension)}
-            </strong>
+            <strong>{runPcaDimension(selectedRun)}</strong>
           </span>
           <span>
             <small>MIN SAMPLES</small>
@@ -729,41 +752,59 @@ export default function ClustersPage() {
 
         <section className="cluster-cards">
           <header>
-            <span className="eyebrow">CLUSTER CAPSULES</span>
-            <h2>{capsules.length} 个语义分组</h2>
+            <div>
+              <span className="eyebrow">CLUSTER CAPSULES</span>
+              <h2>语义分组</h2>
+            </div>
+            <strong>{capsules.length}</strong>
           </header>
-          {capsules.map((capsule, index) => (
-            <article
-              className={
-                selectedCapsule?.cluster_capsule_id ===
-                capsule.cluster_capsule_id
-                  ? "active"
-                  : ""
-              }
-              onClick={() => setSelectedCapsuleId(capsule.cluster_capsule_id)}
-              key={capsule.cluster_capsule_id}
-            >
-              <div
-                className="cluster-number"
-                style={{
-                  background: GROUP_COLORS[index % GROUP_COLORS.length],
+          <div className="cluster-card-list">
+            {capsules.map((capsule, index) => (
+              <article
+                className={
+                  selectedCapsule?.cluster_capsule_id ===
+                  capsule.cluster_capsule_id
+                    ? "active"
+                    : ""
+                }
+                onClick={() => setSelectedCapsuleId(capsule.cluster_capsule_id)}
+                ref={(node) => {
+                  if (node) {
+                    capsuleCardRefs.current.set(
+                      capsule.cluster_capsule_id,
+                      node,
+                    );
+                  } else {
+                    capsuleCardRefs.current.delete(
+                      capsule.cluster_capsule_id,
+                    );
+                  }
                 }}
+                key={capsule.cluster_capsule_id}
               >
-                {String(index + 1).padStart(2, "0")}
-              </div>
-              <div>
-                <small>{capsule.embedding_type}</small>
-                <h3>{capsule.effective_name}</h3>
-                <p>{capsule.effective_description}</p>
-                <footer>
-                  <span>{capsule.member_count} MEMBERS</span>
-                  <span>
-                    {capsule.average_membership_probability.toFixed(2)} AVG PROB.
-                  </span>
-                </footer>
-              </div>
-            </article>
-          ))}
+                <div
+                  className="cluster-number"
+                  style={{
+                    background: GROUP_COLORS[index % GROUP_COLORS.length],
+                  }}
+                >
+                  {String(index + 1).padStart(2, "0")}
+                </div>
+                <div>
+                  <small>{capsule.embedding_type}</small>
+                  <h3>{capsule.effective_name}</h3>
+                  <p>{capsule.effective_description}</p>
+                  <footer>
+                    <span>{capsule.member_count} MEMBERS</span>
+                    <span>
+                      {capsule.average_membership_probability.toFixed(2)} AVG
+                      PROB.
+                    </span>
+                  </footer>
+                </div>
+              </article>
+            ))}
+          </div>
         </section>
       </div>
 

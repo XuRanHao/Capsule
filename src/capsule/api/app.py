@@ -136,13 +136,15 @@ def create_app(
             understanding_service=understanding_service,
             embedding_service=embedding_service,
         )
+        search_repository = PostgresAssetSearchRepository(database)
         app.state.search_service = SearchService(
             query_embedding=QueryEmbeddingService(
                 embedding_client,
                 resolved_settings,
             ),
             recall=MultiChannelRecall(vectors, resolved_settings),
-            assets=PostgresAssetSearchRepository(database),
+            assets=search_repository,
+            clusters=search_repository,
             query_parser=QueryParser(embedding_client),
             reranker=SearchReranker(embedding_client),
             history=history,

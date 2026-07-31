@@ -2,7 +2,11 @@ import logging
 from time import perf_counter
 
 from capsule.config import Settings
-from capsule.search.contracts import AssetSearchRepository, QueryImageResolver
+from capsule.search.contracts import (
+    AssetSearchRepository,
+    ClusterSearchRepository,
+    QueryImageResolver,
+)
 from capsule.search.fusion import FusionEngine
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.models import (
@@ -35,6 +39,7 @@ class SearchService:
         settings: Settings,
         query_parser: QueryParser | None = None,
         reranker: SearchReranker | None = None,
+        clusters: ClusterSearchRepository | None = None,
         history: SearchHistoryRepository | None = None,
         image_resolver: QueryImageResolver | None = None,
     ) -> None:
@@ -50,6 +55,7 @@ class SearchService:
         self._result_builder = SearchResultBuilder(
             same_source_limit=settings.search_same_source_limit
         )
+        self._clusters = clusters
         self._history = history
         self._image_resolver = image_resolver
         self._settings = settings
@@ -135,6 +141,32 @@ class SearchService:
             top_k=request.top_k,
             rerank_items=rerank_items,
         )
+        cluster_started = perf_counter()
+        cluster_results = []
+        if self._clusters is not None and results:
+            ranked_scores = {item.asset_id: item.score for item in ranked}
+            asset_scores = {
+                asset_id: ranked_scores.get(asset_id, result.score)
+                for result in results
+                for asset_id in result.folded_asset_ids
+            }
+            try:
+                cluster_results = list(
+                    await self._clusters.search_by_assets(
+                        workspace_id=request.workspace_id,
+                        asset_scores=asset_scores,
+                        embedding_types=tuple(
+                            dict.fromkeys(
+                                vector.embedding_type.value for vector in plan.vectors
+                            )
+                        ),
+                        limit=min(request.top_k, self._settings.search_cluster_top_k),
+                    )
+                )
+            except Exception:
+                logger.warning("cluster result aggregation failed", exc_info=True)
+                reasons.append("cluster result aggregation failed")
+        cluster_ms = _elapsed_ms(cluster_started)
         total_ms = _elapsed_ms(started)
         reasons = list(dict.fromkeys(reasons))
 
@@ -164,12 +196,14 @@ class SearchService:
             fusion_ms=fusion_ms,
             rerank_ms=rerank_ms,
             hydration_ms=hydration_ms,
+            cluster_ms=cluster_ms,
             total_ms=total_ms,
         )
         logger.info(
             "search completed workspace_id=%s query_type=%s results=%d "
             "channels=%d parser_ms=%.2f embedding_ms=%.2f recall_ms=%.2f "
-            "fusion_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f total_ms=%.2f degraded=%s",
+            "fusion_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f "
+            "cluster_ms=%.2f total_ms=%.2f degraded=%s",
             request.workspace_id,
             request.query_type.value,
             len(results),
@@ -180,6 +214,7 @@ class SearchService:
             fusion_ms,
             rerank_ms,
             hydration_ms,
+            cluster_ms,
             total_ms,
             bool(reasons),
         )
@@ -206,9 +241,13 @@ class SearchService:
             execution_id=execution_id,
             capsule_id=capsule_id,
             total=len(results),
+            asset_total=len(results),
+            cluster_total=len(cluster_results),
             degraded=bool(reasons),
             degraded_reasons=reasons,
             timings=timings,
+            assets=results,
+            clusters=cluster_results,
             results=results,
         )
 

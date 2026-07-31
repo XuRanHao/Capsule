@@ -3,6 +3,7 @@ from typing import Protocol
 
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
+    ClusterSearchResult,
     ParsedQuery,
     RerankBatch,
     SearchAssetRecord,
@@ -68,3 +69,14 @@ class AssetSearchRepository(Protocol):
         created_by: str = "user_demo",
         filters: SearchFilters | None = None,
     ) -> Mapping[str, SearchAssetRecord]: ...
+
+
+class ClusterSearchRepository(Protocol):
+    async def search_by_assets(
+        self,
+        *,
+        workspace_id: str,
+        asset_scores: Mapping[str, float],
+        embedding_types: Sequence[str],
+        limit: int,
+    ) -> Sequence[ClusterSearchResult]: ...

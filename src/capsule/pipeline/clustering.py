@@ -21,6 +21,10 @@ class HdbscanParameters:
     min_cluster_size: int
     min_samples: int
     cluster_selection_method: str = "eom"
+    # Merge density-tree branches whose separation is no greater than this
+    # Euclidean distance. PCA projections are L2-normalized, so 0.5 is roughly
+    # equivalent to a cosine similarity of 0.875.
+    cluster_selection_epsilon: float = 0.5
 
 
 @dataclass(slots=True)
@@ -315,6 +319,7 @@ def _hdbscan_parameter_candidates(
             min_cluster_size=base.min_cluster_size,
             min_samples=base.min_samples,
             cluster_selection_method=alternate_method,
+            cluster_selection_epsilon=base.cluster_selection_epsilon,
         ),
     ]
 
@@ -328,6 +333,7 @@ def _fit_candidate(
         min_samples=parameters.min_samples,
         metric="euclidean",
         cluster_selection_method=parameters.cluster_selection_method,
+        cluster_selection_epsilon=parameters.cluster_selection_epsilon,
         allow_single_cluster=False,
         gen_min_span_tree=True,
     )

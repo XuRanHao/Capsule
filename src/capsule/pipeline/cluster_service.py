@@ -1,5 +1,6 @@
 """Run independent HDBSCAN clustering for every configured Embedding Type."""
 
+import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -172,6 +173,9 @@ class ClusterService:
                     parameters={
                         "min_cluster_size": min_cluster_size,
                         "min_samples": min_samples,
+                        "cluster_selection_epsilon": (
+                            self._settings.cluster_selection_epsilon
+                        ),
                         "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
                     },
                 )
@@ -186,6 +190,9 @@ class ClusterService:
                     parameters={
                         "min_cluster_size": min_cluster_size,
                         "min_samples": min_samples,
+                        "cluster_selection_epsilon": (
+                            self._settings.cluster_selection_epsilon
+                        ),
                         "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
                     },
                 )
@@ -239,6 +246,7 @@ class ClusterService:
                 parameters=HdbscanParameters(
                     min_cluster_size=min_cluster_size,
                     min_samples=min_samples,
+                    cluster_selection_epsilon=self._settings.cluster_selection_epsilon,
                 ),
                 optimize_parameters=optimize_parameters,
             )
@@ -306,6 +314,9 @@ class ClusterService:
                     "min_cluster_size": clustered.parameters.min_cluster_size,
                     "min_samples": clustered.parameters.min_samples,
                     "cluster_selection_method": clustered.parameters.cluster_selection_method,
+                    "cluster_selection_epsilon": (
+                        clustered.parameters.cluster_selection_epsilon
+                    ),
                     "quality_score": clustered.quality_score,
                     "candidates_evaluated": clustered.parameter_candidates_evaluated,
                     "semantic_merge": _semantic_merge_metadata(
@@ -371,8 +382,10 @@ class ClusterService:
     ) -> dict[int, str]:
         """Call the naming model with each cluster's selected Asset rows only."""
         assets_by_id = {item.asset.asset_id: item.asset for item in loaded}
-        capsule_ids: dict[int, str] = {}
-        for label in sorted(selections):
+        concurrency = self._settings.capsule_concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def summarize_and_store(label: int) -> tuple[int, str]:
             representatives = selections[label]
             member_indices = np.flatnonzero(labels == label)
             average_probability = float(probabilities[member_indices].mean())
@@ -394,47 +407,60 @@ class ClusterService:
                 )
                 for representative in representatives
             ]
-            summary = await self._model_client.summarize_cluster(
-                build_cluster_summary_messages(
-                    embedding_type=embedding_type.value,
-                    member_count=len(member_indices),
-                    average_membership_probability=average_probability,
-                    representatives=prompt_representatives,
-                    member_source_paths=member_source_paths,
+            async with semaphore:
+                summary = await self._model_client.summarize_cluster(
+                    build_cluster_summary_messages(
+                        embedding_type=embedding_type.value,
+                        member_count=len(member_indices),
+                        average_membership_probability=average_probability,
+                        representatives=prompt_representatives,
+                        member_source_paths=member_source_paths,
+                    )
                 )
-            )
-            if embedding_type in {
-                EmbeddingType.SUBJECT_CONTENT,
-                EmbeddingType.ASSET_USAGE,
-            }:
-                summary = ensure_path_aware_cluster_summary(
-                    summary,
-                    member_source_paths,
-                    embedding_type=embedding_type.value,
+                if embedding_type in {
+                    EmbeddingType.SUBJECT_CONTENT,
+                    EmbeddingType.ASSET_USAGE,
+                }:
+                    summary = ensure_path_aware_cluster_summary(
+                        summary,
+                        member_source_paths,
+                        embedding_type=embedding_type.value,
+                    )
+                stored = await self._cluster_repository.upsert_capsule(
+                    ClusterCapsuleWrite(
+                        cluster_run_id=run_id,
+                        workspace_id=workspace_id,
+                        embedding_type=embedding_type.value,
+                        cluster_label=label,
+                        summary=summary,
+                        member_count=len(member_indices),
+                        average_membership_probability=average_probability,
+                        representatives=[
+                            ClusterRepresentativeWrite(
+                                asset_id=representative.asset_id,
+                                role=ClusterRepresentativeRole(representative.role),
+                                rank=representative.rank,
+                                distance_to_medoid=representative.distance_to_medoid,
+                                membership_probability=representative.membership_probability,
+                            )
+                            for representative in representatives
+                        ],
+                    )
                 )
-            stored = await self._cluster_repository.upsert_capsule(
-                ClusterCapsuleWrite(
-                    cluster_run_id=run_id,
-                    workspace_id=workspace_id,
-                    embedding_type=embedding_type.value,
-                    cluster_label=label,
-                    summary=summary,
-                    member_count=len(member_indices),
-                    average_membership_probability=average_probability,
-                    representatives=[
-                        ClusterRepresentativeWrite(
-                            asset_id=representative.asset_id,
-                            role=ClusterRepresentativeRole(representative.role),
-                            rank=representative.rank,
-                            distance_to_medoid=representative.distance_to_medoid,
-                            membership_probability=representative.membership_probability,
-                        )
-                        for representative in representatives
-                    ],
-                )
-            )
-            capsule_ids[label] = stored.cluster_capsule_id
-        return capsule_ids
+            return label, stored.cluster_capsule_id
+
+        tasks = [
+            asyncio.create_task(summarize_and_store(label))
+            for label in sorted(selections)
+        ]
+        try:
+            stored_capsules = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return dict(stored_capsules)
 
 
 def _build_memberships(

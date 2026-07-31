@@ -447,19 +447,19 @@ class VideoDerivedMediaWriter:
                     except Exception:
                         await asyncio.sleep(max(0.1, self._retry_base_seconds))
                     continue
-                pending = self._pending.pop(str(manifest_path), None)
-                self._recovered_paths.discard(str(manifest_path))
-                if pending is not None and not pending[0].done():
-                    pending[0].set_exception(exc)
                 try:
                     await self._queue.acknowledge(delivery)
                 except Exception:
                     await asyncio.sleep(max(0.1, self._retry_base_seconds))
                     continue
+                self._recovered_paths.discard(str(manifest_path))
                 if manifest is not None:
                     await self._spool.release(manifest_path, manifest.spool_bytes)
                 else:
                     await self._spool.abort(manifest_path.parent)
+                pending = self._pending.pop(str(manifest_path), None)
+                if pending is not None and not pending[0].done():
+                    pending[0].set_exception(exc)
                 continue
 
             try:

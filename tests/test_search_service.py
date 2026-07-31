@@ -10,6 +10,7 @@ from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     ChannelMatch,
+    ClusterSearchResult,
     FusedHit,
     SearchAssetRecord,
     SearchFilters,
@@ -98,6 +99,46 @@ class FakeAssetRepository:
         }
 
 
+class FakeClusterRepository:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def search_by_assets(
+        self,
+        *,
+        workspace_id: str,
+        asset_scores: Mapping[str, float],
+        embedding_types: Sequence[str],
+        limit: int,
+    ) -> Sequence[ClusterSearchResult]:
+        self.calls.append(
+            {
+                "workspace_id": workspace_id,
+                "asset_scores": dict(asset_scores),
+                "embedding_types": tuple(embedding_types),
+                "limit": limit,
+            }
+        )
+        return [
+            ClusterSearchResult(
+                cluster_capsule_id="cc_twilight",
+                cluster_run_id="run_twilight",
+                embedding_type=EmbeddingType.MOOD_ATMOSPHERE,
+                name="蓝紫色黄昏",
+                description="与查询命中素材对应的黄昏氛围聚类。",
+                keywords=["黄昏", "蓝紫色"],
+                common_features=["动画场景"],
+                member_count=8,
+                average_membership_probability=0.91,
+                medoid_asset_id="asset_1",
+                representative_asset_ids=["asset_1", "asset_2"],
+                matched_asset_ids=["asset_1", "asset_2"],
+                matched_asset_count=2,
+                score=0.93,
+            )
+        ]
+
+
 def asset_record(
     asset_id: str,
     workspace_id: str,
@@ -151,7 +192,12 @@ def asset_record(
     )
 
 
-def build_service() -> tuple[SearchService, FakeVectorRepository, FakeAssetRepository]:
+def build_service() -> tuple[
+    SearchService,
+    FakeVectorRepository,
+    FakeAssetRepository,
+    FakeClusterRepository,
+]:
     settings = Settings(
         embedding_dimension=3,
         search_channel_top_k_multiplier=3,
@@ -161,13 +207,15 @@ def build_service() -> tuple[SearchService, FakeVectorRepository, FakeAssetRepos
     )
     vectors = FakeVectorRepository()
     assets = FakeAssetRepository()
+    clusters = FakeClusterRepository()
     service = SearchService(
         query_embedding=QueryEmbeddingService(FakeEmbeddingClient(), settings),
         recall=MultiChannelRecall(vectors, settings),
         assets=assets,
+        clusters=clusters,
         settings=settings,
     )
-    return service, vectors, assets
+    return service, vectors, assets, clusters
 
 
 def test_search_rejects_stale_not_applicable_feature_channel() -> None:
@@ -227,7 +275,7 @@ def test_search_rejects_stale_not_applicable_feature_channel() -> None:
 
 
 async def test_search_degrades_one_channel_and_caps_same_source() -> None:
-    service, vectors, assets = build_service()
+    service, vectors, assets, clusters = build_service()
 
     response = await service.search(
         SearchRequest.model_validate(
@@ -254,10 +302,15 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
     assert len(vectors.calls) == 6
     assert all(call["limit"] == 12 for call in vectors.calls)
     assert all(call["workspace_id"] == "workspace_demo" for call in vectors.calls)
+    assert response.asset_total == 4
+    assert response.assets == response.results
+    assert response.cluster_total == 1
+    assert response.clusters[0].cluster_capsule_id == "cc_twilight"
+    assert len(clusters.calls) == 1
 
 
 async def test_search_api_returns_the_service_response() -> None:
-    service, _, _ = build_service()
+    service, _, _, _ = build_service()
     app = create_app(search_service=service)
     transport = ASGITransport(app=app)
 
@@ -278,11 +331,15 @@ async def test_search_api_returns_the_service_response() -> None:
     payload = response.json()
     assert payload["query"]["query_type"] == "image"
     assert payload["total"] == 2
+    assert payload["asset_total"] == 2
+    assert payload["cluster_total"] == 1
+    assert payload["clusters"][0]["name"] == "蓝紫色黄昏"
+    assert payload["assets"] == payload["results"]
     assert payload["results"][0]["source_contexts"][0]["text"] == "午后-黄昏"
 
 
 async def test_search_api_validates_query_inputs() -> None:
-    service, _, _ = build_service()
+    service, _, _, _ = build_service()
     app = create_app(search_service=service)
     transport = ASGITransport(app=app)
 
@@ -301,7 +358,7 @@ async def test_search_api_validates_query_inputs() -> None:
 
 
 async def test_search_api_allows_configured_frontend_origin() -> None:
-    service, _, _ = build_service()
+    service, _, _, _ = build_service()
     app = create_app(search_service=service)
     transport = ASGITransport(app=app)
 

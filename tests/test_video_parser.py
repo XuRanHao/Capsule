@@ -1,3 +1,5 @@
+import gc
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +10,7 @@ from capsule.parsers.video import (
     VideoParser,
     VideoSegmentationConfig,
     _candidate_frame,
+    _iter_candidate_frame_groups,
     candidate_timestamps,
     filter_invalid_frames,
     merge_short_ranges,
@@ -112,6 +115,24 @@ def test_candidate_frame_bounds_analysis_memory_after_full_resolution_metrics() 
     assert candidate.frame.flags.c_contiguous
     assert candidate.frame.nbytes < original.nbytes
     assert candidate.brightness == pytest.approx(100.0)
+
+
+def test_candidate_frame_iterator_releases_completed_segment_groups() -> None:
+    groups = _iter_candidate_frame_groups(
+        VIDEO_FIXTURE,
+        [[250, 500], [750, 1_000]],
+        analysis_frame_max_edge=128,
+    )
+
+    first = next(groups)
+    first_frame = weakref.ref(first[0].frame)
+    del first
+    second = next(groups)
+    gc.collect()
+
+    assert second
+    assert first_frame() is None
+    groups.close()
 
 
 def test_invalid_frame_filter_rejects_blank_and_duplicate_frames() -> None:

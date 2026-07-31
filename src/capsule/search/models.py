@@ -220,7 +220,25 @@ class SearchTimings(BaseModel):
     fusion_ms: float = 0
     rerank_ms: float = 0
     hydration_ms: float = 0
+    cluster_ms: float = 0
     total_ms: float = 0
+
+
+class ClusterSearchResult(BaseModel):
+    cluster_capsule_id: str
+    cluster_run_id: str
+    embedding_type: EmbeddingType
+    name: str
+    description: str
+    keywords: list[str] = Field(default_factory=list)
+    common_features: list[str] = Field(default_factory=list)
+    member_count: int
+    average_membership_probability: float
+    medoid_asset_id: str | None = None
+    representative_asset_ids: list[str] = Field(default_factory=list)
+    matched_asset_ids: list[str] = Field(default_factory=list)
+    matched_asset_count: int = 0
+    score: float
 
 
 class SearchResponse(BaseModel):
@@ -232,9 +250,13 @@ class SearchResponse(BaseModel):
     execution_id: str | None = None
     capsule_id: str | None = None
     total: int
+    asset_total: int = 0
+    cluster_total: int = 0
     degraded: bool = False
     degraded_reasons: list[str] = Field(default_factory=list)
     timings: SearchTimings = Field(default_factory=SearchTimings)
+    assets: list[SearchResult] = Field(default_factory=list)
+    clusters: list[ClusterSearchResult] = Field(default_factory=list)
     results: list[SearchResult] = Field(default_factory=list)
 
 

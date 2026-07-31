@@ -67,12 +67,16 @@ def test_normalized_weighted_similarity_is_selectable() -> None:
 
 
 class FakeUnderstandingClient:
+    def __init__(self) -> None:
+        self.parse_calls = 0
+
     async def parse_search_query(
         self,
         request: SearchRequest,
         *,
         image_url: str | None,
     ) -> ParsedQuery:
+        self.parse_calls += 1
         assert image_url == "https://example.com/query.jpg"
         return ParsedQuery(
             query_summary="图片中的人物、构图和黄昏氛围",
@@ -142,6 +146,22 @@ async def test_precision_image_parser_keeps_documented_six_routes() -> None:
     assert len(parsed.dimension_queries) == 6
     assert math.isclose(sum(item.weight for item in parsed.dimension_queries), 1)
     assert parsed.dimension_queries[0].weight == 0.45
+
+
+async def test_normal_search_uses_deterministic_parser_without_model_call() -> None:
+    client = FakeUnderstandingClient()
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="蓝紫色黄昏动画场景",
+        precision_mode=False,
+    )
+
+    parsed, reasons = await QueryParser(client).parse(request, image_url=None)
+
+    assert reasons == ()
+    assert parsed.parser_mode == "deterministic_quick"
+    assert client.parse_calls == 0
 
 
 async def test_seed_reranker_reorders_only_hydrated_candidates() -> None:

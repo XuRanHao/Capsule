@@ -1299,7 +1299,14 @@ class ClusterRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    async def create_pending_run(self, *, workspace_id: str, embedding_type: str) -> str:
+    async def create_pending_run(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        preprocessing: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> str:
         """Reserve a ClusterRun ID for an HTTP request before background execution."""
         async with self._database.session() as session, session.begin():
             if await session.get(Workspace, workspace_id) is None:
@@ -1310,8 +1317,11 @@ class ClusterRepository:
                 input_embedding_ids=[],
                 dataset_hash="0" * 64,
                 sample_count=0,
-                preprocessing={"submission_mode": "async_api"},
-                parameters={},
+                preprocessing={
+                    "submission_mode": "async_api",
+                    **(preprocessing or {}),
+                },
+                parameters=dict(parameters or {}),
                 status=ClusterRunStatus.PENDING.value,
             )
             session.add(run)
