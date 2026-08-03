@@ -594,7 +594,17 @@ function ClusterResultCard({
         </div>
         <footer>
           <code>{cluster.cluster_capsule_id}</code>
-          <a href="/clusters">打开聚类页 ↗</a>
+          <a
+            href={`/clusters?cluster_run_id=${encodeURIComponent(
+              cluster.cluster_run_id,
+            )}&cluster_capsule_id=${encodeURIComponent(
+              cluster.cluster_capsule_id,
+            )}`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            打开簇详情 ↗
+          </a>
         </footer>
       </div>
     </article>

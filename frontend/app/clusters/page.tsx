@@ -402,6 +402,21 @@ export default function ClustersPage() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const capsuleCardRefs = useRef(new Map<string, HTMLElement>());
+  const clusterDetailRef = useRef<HTMLElement>(null);
+  const deepLinkTargetRef = useRef(
+    typeof window === "undefined"
+      ? { clusterRunId: "", clusterCapsuleId: "" }
+      : (() => {
+          const searchParams = new URLSearchParams(window.location.search);
+          return {
+            clusterRunId:
+              searchParams.get("cluster_run_id")?.trim() || "",
+            clusterCapsuleId:
+              searchParams.get("cluster_capsule_id")?.trim() || "",
+          };
+        })(),
+  );
+  const deepLinkOpenedRef = useRef(false);
 
   const loadRuns = useCallback(async () => {
     try {
@@ -409,11 +424,20 @@ export default function ClustersPage() {
         `/api/v1/cluster-runs?workspace_id=${WORKSPACE_ID}&limit=100`,
       );
       setRuns(payload.items);
-      setSelectedRunId((current) =>
-        current && payload.items.some((run) => run.cluster_run_id === current)
+      setSelectedRunId((current) => {
+        const deepLinkedRunId = deepLinkTargetRef.current.clusterRunId;
+        if (
+          !deepLinkOpenedRef.current &&
+          deepLinkedRunId &&
+          payload.items.some((run) => run.cluster_run_id === deepLinkedRunId)
+        ) {
+          return deepLinkedRunId;
+        }
+        return current &&
+          payload.items.some((run) => run.cluster_run_id === current)
           ? current
-          : payload.items[0]?.cluster_run_id || "",
-      );
+          : payload.items[0]?.cluster_run_id || "";
+      });
       setError(null);
     } catch (requestError) {
       setError(
@@ -449,14 +473,25 @@ export default function ClustersPage() {
       )
         .then(async (payload) => {
           setCapsules(payload.items);
-          setSelectedCapsuleId((current) =>
-            current &&
-            payload.items.some(
-              (capsule) => capsule.cluster_capsule_id === current,
-            )
+          setSelectedCapsuleId((current) => {
+            const deepLinkedCapsuleId =
+              deepLinkTargetRef.current.clusterCapsuleId;
+            if (
+              deepLinkedCapsuleId &&
+              payload.items.some(
+                (capsule) =>
+                  capsule.cluster_capsule_id === deepLinkedCapsuleId,
+              )
+            ) {
+              return deepLinkedCapsuleId;
+            }
+            return current &&
+              payload.items.some(
+                (capsule) => capsule.cluster_capsule_id === current,
+              )
               ? current
-              : payload.items[0]?.cluster_capsule_id || "",
-          );
+              : payload.items[0]?.cluster_capsule_id || "";
+          });
           const entries = await Promise.all(
             payload.items.map(async (capsule) => {
               const members = await apiFetch<{ items: ClusterMember[] }>(
@@ -492,6 +527,24 @@ export default function ClustersPage() {
       .get(selectedCapsuleId)
       ?.scrollIntoView({ block: "nearest" });
   }, [selectedCapsuleId]);
+
+  useEffect(() => {
+    const deepLinkedCapsuleId = deepLinkTargetRef.current.clusterCapsuleId;
+    if (
+      !deepLinkedCapsuleId ||
+      deepLinkOpenedRef.current ||
+      selectedCapsule?.cluster_capsule_id !== deepLinkedCapsuleId
+    ) {
+      return;
+    }
+    deepLinkOpenedRef.current = true;
+    window.requestAnimationFrame(() => {
+      clusterDetailRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  }, [selectedCapsule?.cluster_capsule_id]);
 
   const createRun = async () => {
     setRunning(true);
@@ -809,7 +862,7 @@ export default function ClustersPage() {
       </div>
 
       {selectedCapsule && (
-        <section className="cluster-detail">
+        <section className="cluster-detail" ref={clusterDetailRef}>
           <header>
             <div>
               <span className="eyebrow">SELECTED CAPSULE</span>

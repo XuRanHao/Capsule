@@ -2133,6 +2133,7 @@ blockquote p {
 .feature-editor,
 .cluster-detail {
   overflow: hidden;
+  scroll-margin-top: 104px;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--card);

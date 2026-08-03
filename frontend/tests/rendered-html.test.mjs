@@ -39,7 +39,7 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /搜到你记得的/);
   assert.match(html, /个人多模态素材库/);
   assert.match(html, /实时服务/);
-  assert.match(html, /12 路召回/);
+  assert.match(html, /多路召回/);
   assert.match(html, /开始检索/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
@@ -113,6 +113,10 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /normalized_weighted_similarity/);
   assert.match(page, /\/api\/v1\/search-capsules/);
   assert.match(page, /\/api\/v1\/query-images/);
+  assert.match(page, /cluster_run_id=/);
+  assert.match(page, /cluster_capsule_id=/);
+  assert.match(page, /target="_blank"/);
+  assert.match(page, /rel="noopener noreferrer"/);
   assert.match(page, /ProductTopbar/);
   assert.match(shell, /ProductTopbar/);
   assert.match(shell, /product-nav-compact/);
@@ -124,6 +128,9 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(detailPage, /asset-video-player/);
   assert.match(detailPage, /asset\.content_url/);
   assert.match(clustersPage, /embedding/);
+  assert.match(clustersPage, /URLSearchParams/);
+  assert.match(clustersPage, /deepLinkTargetRef/);
+  assert.match(clustersPage, /clusterDetailRef/);
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(
