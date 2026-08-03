@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     object_storage_region: str = "us-east-1"
     import_root: Path = Path("data/imports")
     import_file_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
-    assetization_version: str = Field(default="assetization-v4", min_length=1, max_length=64)
+    assetization_version: str = Field(default="assetization-v5", min_length=1, max_length=64)
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
@@ -67,14 +67,23 @@ class Settings(BaseSettings):
     video_upload_claim_idle_ms: int = Field(default=30_000, ge=100)
     video_upload_max_attempts: int = Field(default=4, ge=1, le=20)
     video_upload_retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
-    video_scene_threshold: float = Field(default=38.0, gt=0)
-    video_min_scene_seconds: float = Field(default=1.0, gt=0)
-    video_max_shot_seconds: float = Field(default=10.0, gt=0)
-    video_window_seconds: float = Field(default=2.0, gt=0)
     video_sample_interval_seconds: float = Field(default=0.5, gt=0)
-    video_max_candidate_frames: int = Field(default=20, ge=2)
+    video_min_segment_seconds: float = Field(default=1.0, gt=0)
+    video_distance_quantile: float = Field(default=0.75, ge=0, le=1)
+    video_min_distance_threshold: float = Field(default=0.08, ge=0, le=2)
+    video_max_distance_threshold: float = Field(default=0.25, ge=0, le=2)
+    video_similarity_relaxation: float = Field(default=0.05, ge=0, le=2)
+    video_max_merge_cost: float = Field(default=0.5, ge=0)
+    video_base_target_seconds: float = Field(default=10.0, gt=0)
+    video_max_target_seconds: float = Field(default=20.0, gt=0)
+    video_target_log2_weight: float = Field(default=0.15, ge=0)
+    video_hard_max_duration_factor: float = Field(default=1.5, ge=1)
+    video_activity_sample_fps: float = Field(default=6.0, gt=0)
+    video_activity_envelope_seconds: float = Field(default=0.5, gt=0)
+    video_activity_shift_side_seconds: float = Field(default=1.0, gt=0)
+    video_keyframe_size: int = Field(default=224, ge=224, le=224)
+    video_keyframe_jpeg_quality: int = Field(default=85, ge=1, le=100)
     video_max_representative_frames: int = Field(default=3, ge=1, le=3)
-    video_analysis_frame_max_edge: int = Field(default=512, ge=256)
     mobileclip_model_path: str = "data/models/mobileclip-s0/mobileclip_s0.pt"
     mobileclip_batch_size: int = Field(default=12, ge=1)
     model_max_retries: int = Field(default=4, ge=1, le=10)

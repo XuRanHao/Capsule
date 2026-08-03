@@ -170,6 +170,7 @@ dependencies = [
     { name = "markdown-it-py" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "opencv-python" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -178,7 +179,6 @@ dependencies = [
     { name = "python-multipart" },
     { name = "python-ulid" },
     { name = "redis" },
-    { name = "scenedetect" },
     { name = "scikit-learn" },
     { name = "sqlalchemy" },
     { name = "typer" },
@@ -206,6 +206,7 @@ requires-dist = [
     { name = "markdown-it-py", specifier = ">=3.0,<4" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14,<2" },
     { name = "numpy", specifier = ">=2.1,<3" },
+    { name = "opencv-python", specifier = ">=5.0,<6" },
     { name = "pillow", specifier = ">=11.0,<12" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
@@ -218,7 +219,6 @@ requires-dist = [
     { name = "python-ulid", specifier = ">=3.2,<4" },
     { name = "redis", specifier = ">=5.2,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
-    { name = "scenedetect", specifier = ">=0.7,<1" },
     { name = "scikit-learn", specifier = ">=1.6,<2" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "typer", specifier = ">=0.15,<1" },
@@ -1652,23 +1652,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/76/43/35e4d8aa320bffe8287fe8f65f578fa2d2db0a64212f0e710dce58267854/s3transfer-0.19.2.tar.gz", hash = "sha256:ba0309fd86be3c27dbf78cdd813c13c5e1df16e5874b99d2535ebbdfb9892993", size = 165592, upload-time = "2026-07-22T19:30:44.432Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/e7/5c595c75e9f41a44f30e526eda465ea0b4eec93470e074e4a111b253f13a/s3transfer-0.19.2-py3-none-any.whl", hash = "sha256:d8168eccca828cbb2cd573675333f3bddd254313a9c42494b84c76b539e8ba25", size = 90216, upload-time = "2026-07-22T19:30:43.251Z" },
-]
-
-[[package]]
-name = "scenedetect"
-version = "0.7.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "click" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "opencv-python" },
-    { name = "platformdirs" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e3/b8/a111612a976c80c76f3a4372514d0a66b6200badd43c6dce57c55de0b0bb/scenedetect-0.7.1.tar.gz", hash = "sha256:2bc082056f231d35f9d5eed6d8077a5d417c77c2787d965d7f03be3802cb6f7f", size = 263670, upload-time = "2026-07-22T02:57:10.255Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/a2/938555bc170ee504ecf33f328dc838b40c3b887d58bf4ee8beefb6c33fd8/scenedetect-0.7.1-py3-none-any.whl", hash = "sha256:91b67902275b2e0d29a12f6d70435f04e0bd7852a6dc8a69c901c6069328dffa", size = 146194, upload-time = "2026-07-22T02:57:05.239Z" },
 ]
 
 [[package]]

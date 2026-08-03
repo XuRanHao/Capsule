@@ -8,17 +8,18 @@ Docker application does not need to carry PyTorch or access macOS MPS.
 
 import asyncio
 import json
+import math
 import platform
 import shutil
 import subprocess
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import IO, Protocol, cast
 
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
+from scipy.sparse import diags  # type: ignore[import-untyped]
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics import silhouette_score
 
 from capsule.enums import AssetType
@@ -38,16 +39,25 @@ class VisualEmbedder(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class VideoSegmentationConfig:
-    """First-pass parameters, all measured in source-video time."""
+    """Adaptive content segmentation and representative-frame parameters."""
 
-    scene_threshold: float = 38.0
-    min_scene_seconds: float = 1.0
-    max_shot_seconds: float = 10.0
-    window_seconds: float = 2.0
     sample_interval_seconds: float = 0.5
-    max_candidate_frames: int = 20
+    min_segment_seconds: float = 1.0
+    distance_quantile: float = 0.75
+    min_distance_threshold: float = 0.08
+    max_distance_threshold: float = 0.25
+    similarity_relaxation: float = 0.05
+    max_merge_cost: float = 0.5
+    base_target_seconds: float = 10.0
+    max_target_seconds: float = 20.0
+    target_log2_weight: float = 0.15
+    hard_max_duration_factor: float = 1.5
+    activity_sample_fps: float = 6.0
+    activity_envelope_seconds: float = 0.5
+    activity_shift_side_seconds: float = 1.0
+    keyframe_size: int = 224
+    keyframe_jpeg_quality: int = 85
     max_representative_frames: int = 3
-    analysis_frame_max_edge: int = 512
     dark_luma_max: float = 12.0
     bright_luma_min: float = 243.0
     min_luma_stddev: float = 8.0
@@ -56,14 +66,30 @@ class VideoSegmentationConfig:
     cluster_silhouette_min: float = 0.15
 
     def __post_init__(self) -> None:
-        if self.min_scene_seconds <= 0 or self.max_shot_seconds <= 0:
-            raise ValueError("scene durations must be positive")
-        if self.window_seconds <= 0 or self.sample_interval_seconds <= 0:
-            raise ValueError("window and sample interval must be positive")
-        if self.max_candidate_frames < 2 or self.max_representative_frames < 1:
-            raise ValueError("at least two candidates and one representative are required")
-        if self.analysis_frame_max_edge < 1:
-            raise ValueError("analysis frame maximum edge must be positive")
+        if self.sample_interval_seconds <= 0 or self.min_segment_seconds <= 0:
+            raise ValueError("video sampling and minimum segment durations must be positive")
+        if not 0 <= self.distance_quantile <= 1:
+            raise ValueError("video distance quantile must be between zero and one")
+        if not 0 <= self.min_distance_threshold <= self.max_distance_threshold <= 2:
+            raise ValueError("video distance threshold bounds are invalid")
+        if not 0 <= self.similarity_relaxation <= 2 or self.max_merge_cost < 0:
+            raise ValueError("video second-stage merge parameters are invalid")
+        if min(self.base_target_seconds, self.max_target_seconds) <= 0:
+            raise ValueError("video target durations must be positive")
+        if self.base_target_seconds > self.max_target_seconds:
+            raise ValueError("video base target duration cannot exceed its maximum")
+        if self.target_log2_weight < 0 or self.hard_max_duration_factor < 1:
+            raise ValueError("video adaptive duration parameters are invalid")
+        if self.activity_sample_fps <= 0:
+            raise ValueError("video activity sample rate must be positive")
+        if self.activity_sample_fps * self.sample_interval_seconds < 1:
+            raise ValueError("video activity rate must cover the content sample interval")
+        if self.keyframe_size != 224:
+            raise ValueError("video keyframes must be exactly 224x224")
+        if not 1 <= self.keyframe_jpeg_quality <= 100:
+            raise ValueError("video keyframe JPEG quality must be between 1 and 100")
+        if self.max_representative_frames < 1:
+            raise ValueError("at least one representative frame is required")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +105,7 @@ class VideoMetadata:
 
 @dataclass(frozen=True, slots=True)
 class VideoRange:
-    scene_index: int
-    window_index: int
+    atom_indices: tuple[int, ...]
     start_ms: int
     end_ms: int
 
@@ -89,12 +114,40 @@ class VideoRange:
 class CandidateFrame:
     requested_ms: int
     timestamp_ms: int
-    frame: np.ndarray = field(repr=False)
+    frame: np.ndarray | None = field(repr=False)
     brightness: float
     contrast: float
     sharpness: float
+    jpeg_bytes: bytes | None = field(default=None, repr=False)
+    thumbnail: np.ndarray | None = field(default=None, repr=False)
     is_valid: bool = True
     invalid_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoAnalysis:
+    candidates: list[CandidateFrame]
+    embeddings: np.ndarray
+    activity_envelope: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class _Region:
+    atom_indices: tuple[int, ...]
+    sample_indices: tuple[int, ...]
+    start_ms: int
+    end_ms: int
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.end_ms - self.start_ms) / 1000
+
+    def centroid(self, embeddings: np.ndarray) -> np.ndarray:
+        value = embeddings[list(self.sample_indices)].mean(axis=0)
+        return cast(
+            np.ndarray,
+            value / max(float(np.linalg.norm(value)), np.finfo(np.float32).eps),
+        )
 
 
 class VideoParser:
@@ -109,6 +162,8 @@ class VideoParser:
         mobileclip_model_path: Path | None = None,
         mobileclip_batch_size: int = 12,
     ) -> None:
+        if concurrency < 1 or mobileclip_batch_size < 1:
+            raise ValueError("video concurrency and MobileCLIP batch size must be positive")
         self._semaphore = asyncio.Semaphore(concurrency)
         self._config = config or VideoSegmentationConfig()
         self._embedder = embedder
@@ -132,35 +187,47 @@ class VideoParser:
         source = source.expanduser().resolve()
         _require_video_tools()
         metadata = _probe_metadata(source)
-        ranges = _build_video_ranges(source, metadata, self._config)
-        requested_groups = [
-            candidate_timestamps(
-                item.start_ms,
-                item.end_ms,
-                self._config.sample_interval_seconds,
-                self._config.max_candidate_frames,
-            )
-            for item in ranges
-        ]
-        candidate_groups = _iter_candidate_frame_groups(
+        analysis = _analyze_video(
             source,
-            requested_groups,
-            analysis_frame_max_edge=self._config.analysis_frame_max_edge,
+            metadata,
+            self._config,
+            self._get_embedder(),
+            embedding_batch_size=self._mobileclip_batch_size,
         )
-        embedder = self._get_embedder()
+        atoms, distance_threshold = _content_atoms(analysis, metadata, self._config)
+        ranges, merge_info = _merge_atoms(
+            atoms,
+            analysis,
+            metadata,
+            self._config,
+            distance_threshold=distance_threshold,
+        )
+        candidate_positions = {
+            id(candidate): index
+            for index, candidate in enumerate(analysis.candidates)
+        }
 
         drafts: list[AssetDraft] = []
-        for segment_index, (item, candidates) in enumerate(
-            zip(ranges, candidate_groups, strict=True)
-        ):
+        for segment_index, item in enumerate(ranges):
+            positions = _candidate_positions_for_range(
+                analysis.candidates,
+                item.start_ms,
+                item.end_ms,
+                include_end=segment_index == len(ranges) - 1,
+            )
+            candidates = [analysis.candidates[position] for position in positions]
             valid = filter_invalid_frames(candidates, self._config)
             selected_pool = valid or [_best_fallback(candidates)]
-            embeddings = embedder.embed([candidate.frame for candidate in selected_pool])
+            selected_positions = [candidate_positions[id(candidate)] for candidate in selected_pool]
             representatives = select_representative_frames(
                 selected_pool,
-                embeddings,
+                analysis.embeddings[selected_positions],
                 self._config,
             )
+            keyframe_jpegs = [
+                _required_jpeg(candidate)
+                for candidate in representatives
+            ]
             drafts.append(
                 AssetDraft(
                     asset_type=AssetType.VIDEO_SEGMENT,
@@ -170,9 +237,8 @@ class VideoParser:
                         "segment_index": segment_index,
                         "start_ms": item.start_ms,
                         "end_ms": item.end_ms,
-                        "source": "scene_then_window",
-                        "scene_indices": [item.scene_index],
-                        "window_indices": [item.window_index],
+                        "source": "adaptive_content_two_stage",
+                        "atom_indices": [index + 1 for index in item.atom_indices],
                     },
                     file_info={
                         "width": metadata.width,
@@ -189,8 +255,19 @@ class VideoParser:
                         "representative_frames": [
                             _frame_summary(frame) for frame in representatives
                         ],
+                        "segmentation": {
+                            "first_stage_distance_threshold": round(distance_threshold, 6),
+                            "second_stage_similarity_gate": round(
+                                float(merge_info["similarity_gate"]), 6
+                            ),
+                            "adaptive_target_seconds": round(
+                                float(merge_info["duration_target"]), 6
+                            ),
+                            "max_merge_cost": self._config.max_merge_cost,
+                        },
                     },
                     raw_content=None,
+                    transient_keyframe_jpegs=keyframe_jpegs,
                 )
             )
         return drafts
@@ -207,29 +284,6 @@ class VideoParser:
         return self._embedder
 
 
-def candidate_timestamps(
-    start_ms: int,
-    end_ms: int,
-    interval_seconds: float,
-    maximum: int,
-) -> list[int]:
-    """Sample inside a range without forcing either boundary into the result."""
-    if end_ms < start_ms:
-        raise ValueError("end_ms must be greater than or equal to start_ms")
-    if end_ms == start_ms:
-        return [start_ms]
-
-    interval_ms = max(1, round(interval_seconds * 1000))
-    timestamps = list(range(start_ms + interval_ms, end_ms, interval_ms))
-    if not timestamps:
-        timestamps = [start_ms + (end_ms - start_ms) // 2]
-    if len(timestamps) <= maximum:
-        return timestamps
-
-    selected = {round(index * (len(timestamps) - 1) / (maximum - 1)) for index in range(maximum)}
-    return [timestamp for index, timestamp in enumerate(timestamps) if index in selected]
-
-
 def filter_invalid_frames(
     candidates: list[CandidateFrame],
     config: VideoSegmentationConfig,
@@ -239,7 +293,11 @@ def filter_invalid_frames(
     previous_thumbnail: np.ndarray | None = None
     for candidate in candidates:
         reason = _invalid_reason(candidate, config)
-        thumbnail = _thumbnail(candidate.frame)
+        thumbnail = candidate.thumbnail
+        if thumbnail is None:
+            if candidate.frame is None:
+                raise VideoToolingError("video candidate is missing its duplicate thumbnail")
+            thumbnail = _thumbnail(candidate.frame)
         if reason is None and previous_thumbnail is not None:
             difference = float(
                 np.mean(
@@ -306,104 +364,390 @@ def _choose_cluster_count(matrix: np.ndarray, config: VideoSegmentationConfig) -
     return best_count
 
 
-def _build_video_ranges(
+def _analyze_video(
     source: Path,
     metadata: VideoMetadata,
     config: VideoSegmentationConfig,
-) -> list[VideoRange]:
-    minimum_ms = max(1, round(config.min_scene_seconds * 1000))
-    scene_ranges = merge_short_ranges(
-        _detect_scenes(source, metadata, config),
-        minimum_ms=minimum_ms,
+    embedder: VisualEmbedder,
+    *,
+    embedding_batch_size: int,
+) -> _VideoAnalysis:
+    frame_size = config.keyframe_size
+    activity_fps = config.activity_sample_fps
+    filter_graph = (
+        f"fps={activity_fps:.6f},split=2[activity_source][keyframe_source];"
+        f"[activity_source]scale={frame_size}:{frame_size}:"
+        "force_original_aspect_ratio=decrease,"
+        f"pad={frame_size}:{frame_size}:(ow-iw)/2:(oh-ih)/2[activity];"
+        f"[keyframe_source]scale={frame_size}:{frame_size}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={frame_size}:{frame_size}[keyframe];"
+        "[activity][keyframe]hstack=inputs=2"
     )
-    ranges: list[VideoRange] = []
-    for scene_index, (start_ms, end_ms) in enumerate(scene_ranges):
-        ranges.extend(
-            VideoRange(scene_index, window_index, window_start, window_end)
-            for window_index, (window_start, window_end) in enumerate(
-                split_shot_windows(start_ms, end_ms, config)
+    command = [str(_require_video_tool("ffmpeg")), "-v", "error", "-nostdin"]
+    if platform.system() == "Darwin":
+        command.extend(["-hwaccel", "videotoolbox"])
+    command.extend(
+        [
+            "-i",
+            str(source),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            filter_graph,
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+    )
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise VideoToolingError("FFmpeg did not expose its video analysis pipes")
+
+    candidates: list[CandidateFrame] = []
+    embedding_batches: list[np.ndarray] = []
+    pending_candidates: list[CandidateFrame] = []
+    pending_frames: list[np.ndarray] = []
+    activity_scores: list[float] = []
+    previous_activity_frame: np.ndarray | None = None
+    frame_index = 0
+    next_sample_ms = 0
+    bytes_per_frame = frame_size * frame_size * 2 * 3
+
+    def flush_embeddings() -> None:
+        if not pending_frames:
+            return
+        embedded = np.asarray(embedder.embed(pending_frames), dtype=np.float32)
+        if embedded.ndim != 2 or embedded.shape[0] != len(pending_frames):
+            raise VideoToolingError("visual embedder must return one vector per sampled frame")
+        embedding_batches.append(_l2_normalize(embedded))
+        for candidate in pending_candidates:
+            candidate.frame = None
+        pending_candidates.clear()
+        pending_frames.clear()
+
+    try:
+        while True:
+            payload = _read_exact(process.stdout, bytes_per_frame)
+            if not payload:
+                break
+            if len(payload) != bytes_per_frame:
+                raise VideoToolingError("FFmpeg returned a truncated video analysis frame")
+            combined = np.frombuffer(payload, dtype=np.uint8).reshape(
+                frame_size,
+                frame_size * 2,
+                3,
+            )
+            activity_frame = cv2.cvtColor(combined[:, :frame_size], cv2.COLOR_BGR2HSV)
+            activity_scores.append(
+                _continuous_content_score(previous_activity_frame, activity_frame)
+            )
+            previous_activity_frame = activity_frame
+            timestamp_ms = min(metadata.duration_ms, round(frame_index * 1000 / activity_fps))
+            if timestamp_ms >= next_sample_ms:
+                keyframe = np.ascontiguousarray(combined[:, frame_size:])
+                candidate = _candidate_frame(
+                    timestamp_ms,
+                    timestamp_ms,
+                    keyframe,
+                    jpeg_quality=config.keyframe_jpeg_quality,
+                )
+                candidates.append(candidate)
+                pending_candidates.append(candidate)
+                assert candidate.frame is not None
+                pending_frames.append(candidate.frame)
+                if len(pending_frames) >= max(1, embedding_batch_size):
+                    flush_embeddings()
+                next_sample_ms += max(1, round(config.sample_interval_seconds * 1000))
+            frame_index += 1
+        flush_embeddings()
+        process.stdout.close()
+        stderr = process.stderr.read()
+        return_code = process.wait()
+        if return_code:
+            message = stderr.decode(errors="replace").strip()
+            raise VideoToolingError(message or f"FFmpeg could not decode video: {source}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
+    if not candidates or not embedding_batches:
+        raise VideoToolingError(f"video has no decodable sample frames: {source}")
+    scores = np.asarray(activity_scores, dtype=np.float64)
+    radius = max(1, round(config.activity_envelope_seconds * activity_fps / 2))
+    envelope = _rolling_max(scores, radius)
+    return _VideoAnalysis(
+        candidates=candidates,
+        embeddings=np.concatenate(embedding_batches, axis=0),
+        activity_envelope=envelope,
+    )
+
+
+def _content_atoms(
+    analysis: _VideoAnalysis,
+    metadata: VideoMetadata,
+    config: VideoSegmentationConfig,
+) -> tuple[list[_Region], float]:
+    embeddings = analysis.embeddings
+    if len(embeddings) == 1:
+        return [_Region((0,), (0,), 0, metadata.duration_ms)], config.min_distance_threshold
+    distances = 1.0 - np.sum(embeddings[:-1] * embeddings[1:], axis=1)
+    threshold = float(np.clip(
+        np.quantile(distances, config.distance_quantile),
+        config.min_distance_threshold,
+        config.max_distance_threshold,
+    ))
+    size = len(embeddings)
+    connectivity = diags([np.ones(size - 1), np.ones(size - 1)], [-1, 1], shape=(size, size))
+    labels = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=threshold,
+        metric="cosine",
+        linkage="average",
+        connectivity=connectivity,
+        compute_full_tree=True,
+    ).fit_predict(embeddings)
+    minimum_samples = max(1, round(config.min_segment_seconds / config.sample_interval_seconds))
+    labels = _merge_short_runs(labels, embeddings, minimum_samples)
+    starts, ends = _runs(labels)
+    boundaries = [0]
+    for start in starts[1:]:
+        left = analysis.candidates[int(start) - 1].timestamp_ms
+        right = analysis.candidates[int(start)].timestamp_ms
+        boundaries.append(round((left + right) / 2))
+    boundaries.append(metadata.duration_ms)
+    atoms = [
+        _Region(
+            atom_indices=(index,),
+            sample_indices=tuple(range(int(start), int(end))),
+            start_ms=boundaries[index],
+            end_ms=boundaries[index + 1],
+        )
+        for index, (start, end) in enumerate(zip(starts, ends, strict=True))
+    ]
+    atoms = _merge_short_regions(atoms, embeddings, config.min_segment_seconds)
+    return [
+        _Region((index,), atom.sample_indices, atom.start_ms, atom.end_ms)
+        for index, atom in enumerate(atoms)
+    ], threshold
+
+
+def _merge_atoms(
+    atoms: list[_Region],
+    analysis: _VideoAnalysis,
+    metadata: VideoMetadata,
+    config: VideoSegmentationConfig,
+    *,
+    distance_threshold: float,
+) -> tuple[list[VideoRange], dict[str, float]]:
+    duration_seconds = metadata.duration_ms / 1000
+    duration_target = float(np.clip(
+        config.base_target_seconds
+        * (
+            1.0
+            + config.target_log2_weight
+            * math.log2(
+                max(duration_seconds, config.base_target_seconds)
+                / config.base_target_seconds
+            )
+        ),
+        config.base_target_seconds,
+        config.max_target_seconds,
+    ))
+    similarity_gate = float(np.clip(1.0 - distance_threshold - config.similarity_relaxation, -1, 1))
+    if len(atoms) == 1:
+        only = atoms[0]
+        return [VideoRange(only.atom_indices, only.start_ms, only.end_ms)], {
+            "duration_target": duration_target,
+            "similarity_gate": similarity_gate,
+        }
+
+    raw_shifts = []
+    side = max(1, round(config.activity_shift_side_seconds * config.activity_sample_fps))
+    envelope = analysis.activity_envelope
+    for atom in atoms[:-1]:
+        boundary_frame = int(
+            np.clip(
+                round(atom.end_ms * config.activity_sample_fps / 1000),
+                0,
+                len(envelope) - 1,
             )
         )
-    return ranges or [VideoRange(0, 0, 0, metadata.duration_ms)]
+        left_window = envelope[max(0, boundary_frame - side) : boundary_frame]
+        right_window = envelope[boundary_frame : min(len(envelope), boundary_frame + side)]
+        left_level = float(np.median(left_window)) if len(left_window) else 0.0
+        right_level = float(np.median(right_window)) if len(right_window) else 0.0
+        raw_shifts.append(abs(math.log1p(right_level) - math.log1p(left_level)))
+    shift_values = np.asarray(raw_shifts, dtype=np.float64)
+    shift_low, shift_high = np.quantile(shift_values, [.10, .90])
+    shift_costs = np.clip(
+        (shift_values - shift_low) / max(float(shift_high - shift_low), np.finfo(float).eps),
+        0,
+        1,
+    )
+    hard_max = config.hard_max_duration_factor * duration_target
+    regions = atoms.copy()
+    while len(regions) > 1:
+        eligible: list[tuple[float, int]] = []
+        for index, (left_region, right_region) in enumerate(
+            zip(regions[:-1], regions[1:], strict=True)
+        ):
+            total_duration = left_region.duration_seconds + right_region.duration_seconds
+            similarity = float(
+                left_region.centroid(analysis.embeddings)
+                @ right_region.centroid(analysis.embeddings)
+            )
+            if similarity < similarity_gate or total_duration > hard_max:
+                continue
+            boundary_id = left_region.atom_indices[-1]
+            duration_cost = (total_duration / duration_target) ** 2
+            merge_cost = 0.5 * duration_cost + 0.5 * float(shift_costs[boundary_id])
+            eligible.append((merge_cost, index))
+        if not eligible:
+            break
+        best_cost, best_index = min(eligible)
+        if best_cost > config.max_merge_cost:
+            break
+        left_region, right_region = regions[best_index], regions[best_index + 1]
+        regions[best_index : best_index + 2] = [
+            _Region(
+                atom_indices=left_region.atom_indices + right_region.atom_indices,
+                sample_indices=left_region.sample_indices + right_region.sample_indices,
+                start_ms=left_region.start_ms,
+                end_ms=right_region.end_ms,
+            )
+        ]
+    return [
+        VideoRange(region.atom_indices, region.start_ms, region.end_ms)
+        for region in regions
+    ], {"duration_target": duration_target, "similarity_gate": similarity_gate}
 
 
-def split_shot_windows(
+def _candidate_positions_for_range(
+    candidates: list[CandidateFrame],
     start_ms: int,
     end_ms: int,
-    config: VideoSegmentationConfig,
-) -> list[tuple[int, int]]:
-    """Keep short natural shots intact and use two-second windows for long shots."""
-    if end_ms <= start_ms:
-        return []
-    if end_ms - start_ms <= round(config.max_shot_seconds * 1000):
-        return [(start_ms, end_ms)]
-    window_ms = round(config.window_seconds * 1000)
-    windows = [
-        (window_start, min(window_start + window_ms, end_ms))
-        for window_start in range(start_ms, end_ms, window_ms)
-    ]
-    return merge_short_ranges(
-        windows,
-        minimum_ms=max(1, round(config.min_scene_seconds * 1000)),
-    )
-
-
-def merge_short_ranges(
-    ranges: list[tuple[int, int]],
     *,
-    minimum_ms: int,
-) -> list[tuple[int, int]]:
-    """Merge sub-minimum ranges into a temporal neighbor.
-
-    Interior and trailing short ranges join the preceding range. A short first
-    range joins the following range. A source that is itself shorter than the
-    minimum remains as the only possible Segment.
-    """
-    if minimum_ms < 1:
-        raise ValueError("minimum range duration must be positive")
-    merged: list[tuple[int, int]] = []
-    for start_ms, end_ms in ranges:
-        if end_ms <= start_ms:
-            continue
-        if end_ms - start_ms < minimum_ms and merged:
-            previous_start, previous_end = merged[-1]
-            if start_ms < previous_end:
-                raise ValueError("video ranges must be ordered and non-overlapping")
-            merged[-1] = (previous_start, end_ms)
-            continue
-        merged.append((start_ms, end_ms))
-
-    if len(merged) > 1 and merged[0][1] - merged[0][0] < minimum_ms:
-        first_start, first_end = merged[0]
-        next_start, next_end = merged[1]
-        if next_start < first_end:
-            raise ValueError("video ranges must be ordered and non-overlapping")
-        merged[:2] = [(first_start, next_end)]
-    return merged
-
-
-def _detect_scenes(
-    source: Path,
-    metadata: VideoMetadata,
-    config: VideoSegmentationConfig,
-) -> list[tuple[int, int]]:
-    from scenedetect import ContentDetector, detect
-
-    minimum_frames = max(1, round(metadata.fps * config.min_scene_seconds))
-    detected = detect(
-        str(source),
-        ContentDetector(threshold=config.scene_threshold, min_scene_len=minimum_frames),
-        show_progress=False,
-    )
-    ranges = [
-        (
-            max(0, round(start.get_seconds() * 1000)),
-            min(metadata.duration_ms, round(end.get_seconds() * 1000)),
-        )
-        for start, end in detected
-        if end.get_seconds() > start.get_seconds()
+    include_end: bool,
+) -> list[int]:
+    positions = [
+        index
+        for index, candidate in enumerate(candidates)
+        if candidate.timestamp_ms >= start_ms
+        and (candidate.timestamp_ms <= end_ms if include_end else candidate.timestamp_ms < end_ms)
     ]
-    return ranges or [(0, metadata.duration_ms)]
+    if positions:
+        return positions
+    midpoint = (start_ms + end_ms) / 2
+    return [
+        min(
+            range(len(candidates)),
+            key=lambda index: abs(candidates[index].timestamp_ms - midpoint),
+        )
+    ]
+
+
+def _merge_short_regions(
+    regions: list[_Region],
+    embeddings: np.ndarray,
+    minimum_seconds: float,
+) -> list[_Region]:
+    result = regions.copy()
+    while len(result) > 1:
+        short = next(
+            (
+                index
+                for index, region in enumerate(result)
+                if region.duration_seconds < minimum_seconds
+            ),
+            None,
+        )
+        if short is None:
+            return result
+        center = result[short].centroid(embeddings)
+        choices: list[tuple[float, int]] = []
+        if short:
+            choices.append(
+                (
+                    1.0 - float(center @ result[short - 1].centroid(embeddings)),
+                    short - 1,
+                )
+            )
+        if short + 1 < len(result):
+            choices.append(
+                (
+                    1.0 - float(center @ result[short + 1].centroid(embeddings)),
+                    short + 1,
+                )
+            )
+        neighbor = min(choices)[1]
+        left_index, right_index = sorted((short, neighbor))
+        left_region, right_region = result[left_index], result[right_index]
+        result[left_index : right_index + 1] = [
+            _Region(
+                atom_indices=left_region.atom_indices + right_region.atom_indices,
+                sample_indices=left_region.sample_indices + right_region.sample_indices,
+                start_ms=left_region.start_ms,
+                end_ms=right_region.end_ms,
+            )
+        ]
+    return result
+
+
+def _runs(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    starts = np.r_[0, np.flatnonzero(labels[1:] != labels[:-1]) + 1]
+    return starts, np.r_[starts[1:], len(labels)]
+
+
+def _merge_short_runs(
+    labels: np.ndarray,
+    embeddings: np.ndarray,
+    minimum_samples: int,
+) -> np.ndarray:
+    result = labels.copy()
+    while True:
+        starts, ends = _runs(result)
+        short = next(
+            (
+                index
+                for index, (start, end) in enumerate(zip(starts, ends, strict=True))
+                if end - start < minimum_samples
+            ),
+            None,
+        )
+        if short is None or len(starts) == 1:
+            return result
+        start, end = int(starts[short]), int(ends[short])
+        center = _normalized_centroid(embeddings[start:end])
+        choices: list[tuple[float, int]] = []
+        if short:
+            left = _normalized_centroid(embeddings[starts[short - 1] : ends[short - 1]])
+            choices.append((1.0 - float(center @ left), int(result[start - 1])))
+        if short + 1 < len(starts):
+            right = _normalized_centroid(embeddings[starts[short + 1] : ends[short + 1]])
+            choices.append((1.0 - float(center @ right), int(result[end])))
+        result[start:end] = min(choices)[1]
+
+
+def _normalized_centroid(values: np.ndarray) -> np.ndarray:
+    value = values.mean(axis=0)
+    return cast(
+        np.ndarray,
+        value / max(float(np.linalg.norm(value)), np.finfo(np.float32).eps),
+    )
+
+
+def _rolling_max(values: np.ndarray, radius: int) -> np.ndarray:
+    return np.asarray([
+        np.max(values[max(0, index - radius) : min(len(values), index + radius + 1)])
+        for index in range(len(values))
+    ])
 
 
 def _probe_metadata(source: Path) -> VideoMetadata:
@@ -424,7 +768,10 @@ def _probe_metadata(source: Path) -> VideoMetadata:
     result = subprocess.run(command, capture_output=True, check=False, text=True)
     if result.returncode:
         raise VideoToolingError(result.stderr.strip() or f"ffprobe failed for {source}")
-    payload = json.loads(result.stdout)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise VideoToolingError(f"ffprobe returned invalid metadata for {source}") from exc
     streams = payload.get("streams", [])
     if not streams:
         raise VideoToolingError(f"no video stream found: {source}")
@@ -433,87 +780,23 @@ def _probe_metadata(source: Path) -> VideoMetadata:
     duration = _float_or_none(stream.get("duration")) or _float_or_none(format_info.get("duration"))
     if duration is None or duration <= 0:
         raise VideoToolingError(f"video duration is unavailable: {source}")
+    try:
+        width = int(stream["width"])
+        height = int(stream["height"])
+        file_size_bytes = int(format_info.get("size", source.stat().st_size))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VideoToolingError(f"video dimensions or file size are unavailable: {source}") from exc
+    if width <= 0 or height <= 0 or file_size_bytes < 0:
+        raise VideoToolingError(f"video dimensions or file size are invalid: {source}")
     return VideoMetadata(
-        width=int(stream["width"]),
-        height=int(stream["height"]),
+        width=width,
+        height=height,
         duration_ms=max(1, round(duration * 1000)),
         fps=_parse_frame_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate")),
         codec_name=_string_or_none(stream.get("codec_name")),
         pixel_format=_string_or_none(stream.get("pix_fmt")),
-        file_size_bytes=int(format_info.get("size", source.stat().st_size)),
+        file_size_bytes=file_size_bytes,
     )
-
-
-def _iter_candidate_frame_groups(
-    source: Path,
-    requested_groups: list[list[int]],
-    *,
-    analysis_frame_max_edge: int,
-) -> Iterator[list[CandidateFrame]]:
-    """Decode once and retain only one Segment's sampled frames at a time.
-
-    A long source can contain thousands of Segment sample points. Keeping every
-    resized frame until the whole source finishes makes memory scale with video
-    duration. This iterator keeps memory bounded by ``max_candidate_frames``:
-    the caller consumes, embeds, and releases each group before decoding the
-    next one.
-    """
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        raise VideoToolingError(f"OpenCV cannot decode video: {source}")
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if fps <= 0:
-        capture.release()
-        raise VideoToolingError(f"video FPS is unavailable: {source}")
-
-    frame_index = 0
-    previous: tuple[int, np.ndarray] | None = None
-    exhausted = False
-    try:
-        for requested_times in requested_groups:
-            candidates: dict[int, CandidateFrame] = {}
-            next_index = 0
-            while next_index < len(requested_times) and not exhausted:
-                succeeded, frame = capture.read()
-                if not succeeded:
-                    exhausted = True
-                    break
-                timestamp_ms = round(frame_index * 1000 / fps)
-                current = (timestamp_ms, frame)
-                while (
-                    next_index < len(requested_times)
-                    and timestamp_ms >= requested_times[next_index]
-                ):
-                    target = requested_times[next_index]
-                    selected_time, selected_frame = _nearest_frame(
-                        previous,
-                        current,
-                        target,
-                    )
-                    candidates[target] = _candidate_frame(
-                        target,
-                        selected_time,
-                        selected_frame,
-                        analysis_frame_max_edge=analysis_frame_max_edge,
-                    )
-                    next_index += 1
-                previous = current
-                frame_index += 1
-
-            if previous is None:
-                raise VideoToolingError(f"video has no decodable frames: {source}")
-            while next_index < len(requested_times):
-                target = requested_times[next_index]
-                candidates[target] = _candidate_frame(
-                    target,
-                    previous[0],
-                    previous[1],
-                    analysis_frame_max_edge=analysis_frame_max_edge,
-                )
-                next_index += 1
-            yield [candidates[timestamp] for timestamp in requested_times]
-    finally:
-        capture.release()
 
 
 def _candidate_frame(
@@ -521,42 +804,60 @@ def _candidate_frame(
     timestamp_ms: int,
     frame: np.ndarray,
     *,
-    analysis_frame_max_edge: int,
+    jpeg_quality: int = 85,
 ) -> CandidateFrame:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    encoded, payload = cv2.imencode(
+        ".jpg",
+        frame,
+        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+    )
+    if not encoded:
+        raise VideoToolingError("OpenCV could not encode a sampled video keyframe")
     return CandidateFrame(
         requested_ms=requested_ms,
         timestamp_ms=timestamp_ms,
-        frame=_resize_analysis_frame(frame, max_edge=analysis_frame_max_edge),
+        frame=np.ascontiguousarray(frame),
         brightness=float(np.mean(gray)),
         contrast=float(np.std(gray)),
         sharpness=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+        jpeg_bytes=payload.tobytes(),
+        thumbnail=np.asarray(cv2.resize(gray, (32, 32))),
     )
 
 
-def _resize_analysis_frame(frame: np.ndarray, *, max_edge: int) -> np.ndarray:
-    """Bound temporary candidate memory before duplicate detection and MobileCLIP."""
-    height, width = frame.shape[:2]
-    largest = max(height, width)
-    if largest <= max_edge:
-        return frame.copy()
-    scale = max_edge / largest
-    resized = cv2.resize(
-        frame,
-        (max(1, round(width * scale)), max(1, round(height * scale))),
-        interpolation=cv2.INTER_AREA,
-    )
-    return np.ascontiguousarray(resized)
+def _read_exact(stream: IO[bytes], size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
-def _nearest_frame(
-    previous: tuple[int, np.ndarray] | None,
-    current: tuple[int, np.ndarray],
-    target: int,
-) -> tuple[int, np.ndarray]:
-    if previous is None or abs(current[0] - target) <= abs(previous[0] - target):
-        return current
-    return previous
+def _continuous_content_score(
+    previous_hsv: np.ndarray | None,
+    current_hsv: np.ndarray,
+) -> float:
+    """Return change between two HSV frames without applying scene-cut logic.
+
+    This stable OpenCV implementation uses mean absolute H/S/V channel
+    differences with equal weights.  It deliberately has no threshold,
+    minimum scene length, or cut filtering.
+    """
+    if previous_hsv is None:
+        return 0.0
+    if previous_hsv.shape != current_hsv.shape:
+        current_hsv = cv2.resize(
+            current_hsv,
+            (previous_hsv.shape[1], previous_hsv.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    channel_difference = cv2.absdiff(previous_hsv, current_hsv)
+    return float(np.mean(channel_difference, dtype=np.float64))
 
 
 def _invalid_reason(candidate: CandidateFrame, config: VideoSegmentationConfig) -> str | None:
@@ -581,6 +882,12 @@ def _thumbnail(frame: np.ndarray) -> np.ndarray:
     return np.asarray(cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (32, 32)))
 
 
+def _required_jpeg(candidate: CandidateFrame) -> bytes:
+    if candidate.jpeg_bytes is None:
+        raise VideoToolingError("selected video representative is missing its cached JPEG")
+    return candidate.jpeg_bytes
+
+
 def _frame_summary(candidate: CandidateFrame) -> dict[str, float | int | str | None]:
     return {
         "timestamp_ms": candidate.timestamp_ms,
@@ -592,16 +899,28 @@ def _frame_summary(candidate: CandidateFrame) -> dict[str, float | int | str | N
 
 
 def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
+    if not np.all(np.isfinite(matrix)):
+        raise VideoToolingError("visual embedder returned non-finite values")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    return cast(np.ndarray, matrix / np.maximum(norms, np.finfo(np.float32).eps))
+    if np.any(norms <= np.finfo(np.float32).eps):
+        raise VideoToolingError("visual embedder returned a zero-length vector")
+    return cast(np.ndarray, matrix / norms)
 
 
 def _parse_frame_rate(value: object) -> float:
-    text = str(value)
-    numerator, separator, denominator = text.partition("/")
-    if separator:
-        return float(numerator) / float(denominator) if float(denominator) else 0.0
-    return float(text)
+    try:
+        text = str(value)
+        numerator, separator, denominator = text.partition("/")
+        fps = (
+            float(numerator) / float(denominator)
+            if separator and float(denominator)
+            else float(text)
+        )
+    except (TypeError, ValueError, ZeroDivisionError) as exc:
+        raise VideoToolingError("video FPS is unavailable") from exc
+    if not math.isfinite(fps) or fps <= 0:
+        raise VideoToolingError("video FPS is unavailable")
+    return fps
 
 
 def _float_or_none(value: object) -> float | None:

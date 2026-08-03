@@ -8,8 +8,12 @@ from capsule.model_clients.mobileclip import ResidentMobileClipWorker
 from capsule.parsers.assetizer import AssetizationResult
 from capsule.parsers.discovery import discover_files
 from capsule.pipeline import runner as runner_module
-from capsule.pipeline.runner import PipelineRunner, _collect_image_source_contexts
-from capsule.schemas import AssetDraft
+from capsule.pipeline.runner import (
+    PipelineRunner,
+    _collect_image_source_contexts,
+    _processing_fingerprint,
+)
+from capsule.schemas import AssetDraft, DiscoveredFile
 
 
 def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
@@ -23,6 +27,23 @@ def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
     assert plan.file_count == 3
     assert plan.counts_by_extension == {".md": 1, ".png": 1, ".txt": 1}
     assert plan.workspace_id == "workspace_demo"
+
+
+def test_video_processing_fingerprint_tracks_adaptive_segmentation_settings() -> None:
+    source = DiscoveredFile(
+        path="/tmp/demo.mp4",
+        relative_path="demo.mp4",
+        extension=".mp4",
+        size_bytes=1,
+    )
+
+    baseline = _processing_fingerprint(source, Settings())
+    changed = _processing_fingerprint(
+        source,
+        Settings(video_max_merge_cost=0.75),
+    )
+
+    assert baseline != changed
 
 
 async def test_runner_reuses_resident_video_worker_across_runs(

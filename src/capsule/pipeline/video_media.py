@@ -7,9 +7,11 @@ import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 from capsule.enums import AssetType
@@ -563,39 +565,31 @@ def _render_artifacts(
     output_directory: Path,
     source_has_audio: bool,
 ) -> _RenderedArtifacts:
-    ffmpeg = resolve_video_tool("ffmpeg")
-    if ffmpeg is None:
-        raise VideoToolingError("missing video dependency: ffmpeg")
     locator = asset.source_locator
     start_ms = _required_int(locator, "start_ms")
     end_ms = _required_int(locator, "end_ms")
     if end_ms <= start_ms:
         raise VideoToolingError("video segment end_ms must be greater than start_ms")
 
+    representative_summaries = _representative_summaries(asset)
+    cached_keyframes = asset.transient_keyframe_jpegs
+    if len(cached_keyframes) != len(representative_summaries):
+        raise VideoToolingError("video asset is missing cached 224px representative JPEGs")
+    _validate_cached_keyframes(cached_keyframes)
+
+    ffmpeg = resolve_video_tool("ffmpeg")
+    if ffmpeg is None:
+        raise VideoToolingError("missing video dependency: ffmpeg")
     output_directory.mkdir(parents=True, exist_ok=True)
     encoder, encoder_args = _video_encoder_arguments(ffmpeg)
     segment_path = output_directory / "segment.mp4"
-    representative_summaries = _representative_summaries(asset)
-    fps = _required_float(asset.file_info, "fps")
-    representative_frame_indices = [
-        round((_required_int(summary, "timestamp_ms") - start_ms) * fps / 1000)
-        for summary in representative_summaries
+    keyframe_paths = [
+        output_directory / f"keyframe-{ordinal:02d}.jpg"
+        for ordinal in range(1, len(cached_keyframes) + 1)
     ]
-    if any(frame_index < 0 for frame_index in representative_frame_indices):
-        raise VideoToolingError("video representative frame precedes its Segment")
-    select_expression = "+".join(
-        f"eq(n\\,{frame_index})" for frame_index in representative_frame_indices
-    )
-    filters = [
-        "[0:v:0]split=2[segment_video][keyframe_source]",
-        f"[keyframe_source]select='{select_expression}'[keyframes]",
-    ]
-    if source_has_audio:
-        filters.append(
-            f"[1:a:0]atrim=start={_seconds(start_ms)}:"
-            f"duration={_seconds(end_ms - start_ms)},"
-            "asetpts=PTS-STARTPTS[segment_audio]"
-        )
+    for keyframe_path, payload in zip(keyframe_paths, cached_keyframes, strict=True):
+        keyframe_path.write_bytes(payload)
+
     segment_arguments = [
         "-y",
         "-ss",
@@ -603,23 +597,9 @@ def _render_artifacts(
         "-i",
         str(source),
     ]
+    segment_arguments.extend(["-map", "0:v:0"])
     if source_has_audio:
-        segment_arguments.extend(
-            [
-                "-i",
-                str(source),
-            ]
-        )
-    segment_arguments.extend(
-        [
-            "-filter_complex",
-            ";".join(filters),
-            "-map",
-            "[segment_video]",
-        ]
-    )
-    if source_has_audio:
-        segment_arguments.extend(["-map", "[segment_audio]"])
+        segment_arguments.extend(["-map", "0:a:0"])
     segment_arguments.extend(
         [
             "-t",
@@ -632,17 +612,6 @@ def _render_artifacts(
             "-movflags",
             "+faststart",
             str(segment_path),
-            "-map",
-            "[keyframes]",
-            "-t",
-            _seconds(end_ms - start_ms),
-            "-fps_mode",
-            "vfr",
-            "-q:v",
-            "2",
-            "-start_number",
-            "1",
-            str(output_directory / "keyframe-%02d.jpg"),
         ]
     )
     _run_ffmpeg(
@@ -651,14 +620,6 @@ def _render_artifacts(
     )
     if not segment_path.is_file() or segment_path.stat().st_size == 0:
         raise VideoToolingError("FFmpeg did not create a video segment")
-
-    keyframe_paths = [
-        output_directory / f"keyframe-{ordinal:02d}.jpg"
-        for ordinal in range(1, len(representative_summaries) + 1)
-    ]
-    for keyframe_path in keyframe_paths:
-        if not keyframe_path.is_file() or keyframe_path.stat().st_size == 0:
-            raise VideoToolingError("FFmpeg did not create a representative keyframe")
 
     return _RenderedArtifacts(
         segment_path=segment_path,
@@ -727,6 +688,26 @@ def _representative_summaries(asset: AssetCreate) -> list[dict[str, object]]:
     return summaries
 
 
+def _validate_cached_keyframes(keyframes: list[bytes]) -> None:
+    """Reject parser-cache corruption before it can reach object storage."""
+    for ordinal, payload in enumerate(keyframes, start=1):
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image.load()
+                if image.format != "JPEG" or image.size != (224, 224):
+                    raise VideoToolingError(
+                        "video cached representative keyframe "
+                        f"{ordinal} must be a 224x224 JPEG"
+                    )
+        except VideoToolingError:
+            raise
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise VideoToolingError(
+                "video cached representative keyframe "
+                f"{ordinal} must be a valid 224x224 JPEG"
+            ) from exc
+
+
 def _required_int(value: dict[str, object], key: str) -> int:
     raw = value.get(key)
     if isinstance(raw, bool):
@@ -735,19 +716,6 @@ def _required_int(value: dict[str, object], key: str) -> int:
         return int(cast(int | str | float, raw))
     except (TypeError, ValueError) as exc:
         raise VideoToolingError(f"video metadata {key!r} must be an integer") from exc
-
-
-def _required_float(value: dict[str, object], key: str) -> float:
-    raw = value.get(key)
-    if isinstance(raw, bool):
-        raise VideoToolingError(f"video metadata {key!r} must be a number")
-    try:
-        result = float(cast(int | str | float, raw))
-    except (TypeError, ValueError) as exc:
-        raise VideoToolingError(f"video metadata {key!r} must be a number") from exc
-    if result <= 0:
-        raise VideoToolingError(f"video metadata {key!r} must be positive")
-    return result
 
 
 def _seconds(milliseconds: int) -> str:

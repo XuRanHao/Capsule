@@ -79,6 +79,7 @@ class AssetFactory:
             raw_content=draft.raw_content,
             derived_file_uri=draft.derived_file_uri,
             preview_uri=draft.preview_uri,
+            transient_keyframe_jpegs=draft.transient_keyframe_jpegs,
         )
 
 

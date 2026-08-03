@@ -1,14 +1,28 @@
 import asyncio
 import threading
 import time
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from capsule.enums import AssetType
 from capsule.pipeline import video_media
 from capsule.pipeline.video_media import VideoDerivedMediaWriter
 from capsule.schemas import AssetCreate, DiscoveredFile
+
+
+def _jpeg_bytes(*, size: tuple[int, int] = (224, 224)) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, color="navy").save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (224, 224), color="navy").save(output, format="PNG")
+    return output.getvalue()
 
 
 def test_render_artifacts_seeks_before_opening_input(
@@ -28,6 +42,7 @@ def test_render_artifacts_seeks_before_opening_input(
         content_hash="a" * 64,
         source_locator={"start_ms": 1_250, "end_ms": 2_250},
         file_info={"fps": 30.0, "representative_frames": [{"timestamp_ms": 1_750}]},
+        transient_keyframe_jpegs=[_jpeg_bytes()],
     )
     commands: list[list[str]] = []
 
@@ -35,7 +50,6 @@ def test_render_artifacts_seeks_before_opening_input(
         commands.append(arguments)
         output = tmp_path / "output"
         (output / "segment.mp4").write_bytes(b"segment")
-        (output / "keyframe-01.jpg").write_bytes(b"keyframe")
 
     monkeypatch.setattr(video_media, "resolve_video_tool", lambda _name: Path("ffmpeg"))
     monkeypatch.setattr(
@@ -45,23 +59,21 @@ def test_render_artifacts_seeks_before_opening_input(
     )
     monkeypatch.setattr(video_media, "_run_ffmpeg", fake_run_ffmpeg)
 
-    video_media._render_artifacts(source, asset, tmp_path / "output", True)
+    artifacts = video_media._render_artifacts(source, asset, tmp_path / "output", True)
 
     assert len(commands) == 1
-    assert commands[0][:7] == [
+    assert commands[0][:5] == [
         "-y",
         "-ss",
         "1.250",
         "-i",
         str(source),
-        "-i",
-        str(source),
     ]
-    assert any("[1:a:0]atrim=start=1.250:duration=1.000" in argument for argument in commands[0])
-    assert any("select='eq(n\\,15)'" in argument for argument in commands[0])
-    assert "[segment_video]" in commands[0]
-    assert "[keyframes]" in commands[0]
-    assert "[segment_audio]" in commands[0]
+    assert commands[0].count("-i") == 1
+    assert "0:a:0" in commands[0]
+    assert "-filter_complex" not in commands[0]
+    assert not any("select=" in argument for argument in commands[0])
+    assert artifacts.keyframe_paths[0].read_bytes() == asset.transient_keyframe_jpegs[0]
 
 
 def test_render_artifacts_does_not_require_audio_stream(
@@ -81,6 +93,7 @@ def test_render_artifacts_does_not_require_audio_stream(
         content_hash="b" * 64,
         source_locator={"start_ms": 0, "end_ms": 1_000},
         file_info={"fps": 30.0, "representative_frames": [{"timestamp_ms": 500}]},
+        transient_keyframe_jpegs=[_jpeg_bytes()],
     )
     commands: list[list[str]] = []
 
@@ -88,7 +101,6 @@ def test_render_artifacts_does_not_require_audio_stream(
         commands.append(arguments)
         output = tmp_path / "output"
         (output / "segment.mp4").write_bytes(b"segment")
-        (output / "keyframe-01.jpg").write_bytes(b"keyframe")
 
     monkeypatch.setattr(video_media, "resolve_video_tool", lambda _name: Path("ffmpeg"))
     monkeypatch.setattr(
@@ -102,6 +114,29 @@ def test_render_artifacts_does_not_require_audio_stream(
 
     assert commands[0].count("-i") == 1
     assert "[segment_audio]" not in commands[0]
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (b"not-a-jpeg", "valid 224x224 JPEG"),
+        (_jpeg_bytes(size=(223, 224)), "must be a 224x224 JPEG"),
+        (_png_bytes(), "must be a 224x224 JPEG"),
+    ],
+)
+def test_render_artifacts_rejects_invalid_cached_keyframes(
+    tmp_path: Path,
+    monkeypatch,
+    payload: bytes,
+    error: str,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    asset = _video_asset(source, 0).model_copy(update={"transient_keyframe_jpegs": [payload]})
+
+    monkeypatch.setattr(video_media, "resolve_video_tool", lambda _name: Path("ffmpeg"))
+    with pytest.raises(video_media.VideoToolingError, match=error):
+        video_media._render_artifacts(source, asset, tmp_path / "output", False)
 
 
 async def test_video_media_writer_bounds_work_and_initializes_storage_once(
@@ -432,7 +467,9 @@ async def test_complete_spool_manifest_is_republished_after_restart(tmp_path: Pa
     frame = bundle / "frame.jpg"
     segment.write_bytes(b"segment")
     frame.write_bytes(b"frame")
-    asset = _video_asset(source, 0)
+    asset = _video_asset(source, 0).model_copy(
+        update={"transient_keyframe_jpegs": [_jpeg_bytes()]}
+    )
     manifest = video_media._UploadManifest(
         manifest_id="recovered-manifest",
         asset=asset,
@@ -442,7 +479,9 @@ async def test_complete_spool_manifest_is_republished_after_restart(tmp_path: Pa
         spool_bytes=segment.stat().st_size + frame.stat().st_size,
         generation_asset_count=1,
     )
-    (bundle / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    manifest_json = manifest.model_dump_json()
+    (bundle / "manifest.json").write_text(manifest_json, encoding="utf-8")
+    assert "transient_keyframe_jpegs" not in manifest_json
     committed = asyncio.Event()
 
     class Storage:

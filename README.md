@@ -156,13 +156,18 @@ skipped unless `--force` is set.
 ## Video MPS worker
 
 Video visual features run only on the macOS host because Docker cannot access
-MPS. The first pass uses scene detection at threshold 38, keeps natural shots
-up to 10 seconds intact, splits longer shots into two-second windows, samples
-internal candidate frames every 0.5 seconds (maximum 20), applies quality
-filtering, bounds temporary analysis frames to a 512-pixel longest edge, and
-selects up to three MobileCLIP-S0 representative frames. Each final
-Segment is then rendered once as a playable MP4, cover image and representative
-keyframe images. The derived media is written to the configured private
+MPS. A single FFmpeg decode uses VideoToolbox on macOS and emits only 6 fps of
+224px analysis data instead of transferring every full-resolution frame into
+Python. It measures activity at 6 fps and samples a centered 224x224 frame every
+0.5 seconds for JPEG caching and MobileCLIP-S0 embeddings. Time-constrained
+content clustering derives a
+per-video first-stage distance threshold from the adjacent-distance Q75. A
+second stage greedily merges content-compatible neighbors using adaptive
+duration and sustained activity-shift costs. The cached embeddings select up
+to three quality-filtered representative frames, so keyframes require no
+second extraction or MobileCLIP pass. Each final Segment is then rendered once
+as a playable MP4 while its selected cached 224x224 JPEGs become the cover and
+representative keyframes. The derived media is written to the configured private
 S3-compatible bucket; the Asset keeps the logical time range plus generic
 `derived_file_uri`, `preview_uri`, and video-specific `file_info.keyframes`.
 Both downstream video model paths read their durable private `s3://` objects

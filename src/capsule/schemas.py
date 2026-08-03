@@ -38,6 +38,7 @@ class AssetDraft(BaseModel):
     file_info: dict[str, Any] = Field(default_factory=dict)
     derived_file_uri: str | None = None
     preview_uri: str | None = None
+    transient_keyframe_jpegs: list[bytes] = Field(default_factory=list, exclude=True, repr=False)
 
 
 class AssetCreate(BaseModel):
@@ -60,6 +61,7 @@ class AssetCreate(BaseModel):
     raw_content: str | None = None
     derived_file_uri: str | None = None
     preview_uri: str | None = None
+    transient_keyframe_jpegs: list[bytes] = Field(default_factory=list, exclude=True, repr=False)
     processing_status: ProcessingStatus = ProcessingStatus.PENDING
     feature_revision: int = 1
     embedding_revision: int = 1

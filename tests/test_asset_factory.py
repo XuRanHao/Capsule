@@ -76,3 +76,45 @@ def test_asset_key_is_stable_but_content_hash_tracks_content(tmp_path: Path) -> 
     assert first.asset_key == second.asset_key
     assert first.content_hash != second.content_hash
     assert first.file_tree_context == []
+
+
+def test_transient_keyframes_are_forwarded_without_affecting_hash_or_serialization(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"video")
+    source = DiscoveredFile(
+        path=str(path),
+        relative_path="movie.mp4",
+        extension=".mp4",
+        size_bytes=path.stat().st_size,
+    )
+    common = {
+        "workspace_id": "workspace_demo",
+        "source_file_id": "src_01J00000000000000000000000",
+        "source_sha256": "a" * 64,
+        "source_file": source,
+    }
+    factory = AssetFactory()
+    first = factory.build(
+        **common,
+        draft=AssetDraft(
+            asset_type=AssetType.VIDEO_SEGMENT,
+            file_name=path.name,
+            source_locator={"start_ms": 0, "end_ms": 1_000},
+            transient_keyframe_jpegs=[b"first-cache"],
+        ),
+    )
+    second = factory.build(
+        **common,
+        draft=AssetDraft(
+            asset_type=AssetType.VIDEO_SEGMENT,
+            file_name=path.name,
+            source_locator={"start_ms": 0, "end_ms": 1_000},
+            transient_keyframe_jpegs=[b"second-cache"],
+        ),
+    )
+
+    assert first.transient_keyframe_jpegs == [b"first-cache"]
+    assert first.content_hash == second.content_hash
+    assert "transient_keyframe_jpegs" not in first.model_dump(mode="json")
