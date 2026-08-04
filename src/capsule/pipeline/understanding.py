@@ -227,10 +227,11 @@ class AssetUnderstandingService:
                 }
             )
         elif asset.asset_type == AssetType.IMAGE.value:
+            image_uri = _image_source_uri(asset)
             prepared_image = await self._image_cache.prepare(
                 cache_key=asset.content_hash,
-                mime_type=asset.source_mime_type,
-                loader=lambda: _read_local_source(asset.source_storage_uri),
+                mime_type=_image_mime_type(asset),
+                loader=lambda: _read_local_source(image_uri),
             )
             content.append(
                 {
@@ -243,6 +244,13 @@ class AssetUnderstandingService:
                     },
                 }
             )
+            if asset.raw_content and asset.raw_content.strip():
+                content.append(
+                    {
+                        "type": "text",
+                        "text": f"本地 OCR 识别文字：\n{asset.raw_content[:8_000]}",
+                    }
+                )
         elif asset.asset_type == AssetType.VIDEO_SEGMENT.value:
             keyframes = await self._video_keyframe_data_uris(asset)
             content.extend(
@@ -296,6 +304,17 @@ def _read_local_source(storage_uri: str) -> bytes:
     return path.read_bytes()
 
 
+def _image_source_uri(asset: EmbeddingAsset) -> str:
+    """Document image children point at a materialised image, not the DOCX/PDF."""
+
+    return asset.derived_file_uri or asset.source_storage_uri
+
+
+def _image_mime_type(asset: EmbeddingAsset) -> str:
+    value = asset.file_info.get("mime_type")
+    return value if isinstance(value, str) and value else asset.source_mime_type
+
+
 def _data_uri(mime_type: str, content: bytes) -> str:
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
@@ -309,7 +328,7 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
         dict.fromkeys(
             text.strip()[:2_000]
             for context in source_contexts
-            if context.get("relation_type") in {"caption", "preceding_text"}
+            if context.get("relation_type") in {"caption", "preceding_text", "ocr_text"}
             and isinstance((text := context.get("text")), str)
             and text.strip()
         )

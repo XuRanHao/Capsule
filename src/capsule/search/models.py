@@ -211,6 +211,11 @@ class SearchResult(BaseModel):
     group_kind: str | None = None
     folded_asset_ids: list[str] = Field(default_factory=list)
     available: bool = True
+    # Hierarchical-index metadata lets callers identify the parent document and
+    # preserve a stable order among its retrievable children.
+    parent_asset_id: str | None = None
+    index_role: str = "standalone"
+    child_order: int | None = None
 
 
 class SearchTimings(BaseModel):
@@ -418,3 +423,8 @@ class SearchAssetRecord:
     source_created_at: datetime
     source_updated_at: datetime
     indexed_embedding_ids: frozenset[str]
+    # Keep these trailing defaults so existing repository fakes and hand-built
+    # records remain source-compatible while hierarchy indexing rolls out.
+    parent_asset_id: str | None = None
+    index_role: str = "standalone"
+    child_order: int | None = None

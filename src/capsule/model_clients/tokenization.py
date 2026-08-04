@@ -1,10 +1,12 @@
-"""Batched Ark token counting with a task-local content cache."""
+"""Local and Ark-backed token counters with task-local content caches."""
 
 import hashlib
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from tokenizers import Tokenizer
 
 from capsule.config import Settings
 from capsule.model_clients.doubao import DoubaoConfigurationError, DoubaoResponseError
@@ -12,6 +14,44 @@ from capsule.model_clients.doubao import DoubaoConfigurationError, DoubaoRespons
 
 class TokenCounter(Protocol):
     async def count_many(self, texts: Sequence[str]) -> list[int]: ...
+
+
+DEFAULT_LOCAL_TOKENIZER_PATH = (
+    Path(__file__).parent / "tokenizers" / "deepseek_v3" / "tokenizer.json"
+)
+LOCAL_TOKENIZER_ID = "deepseek-v3-bpe:ecb6f9fc36989434"
+
+
+class LocalTokenCounter:
+    """Count raw-text tokens locally with the bundled DeepSeek V3 tokenizer."""
+
+    def __init__(self, tokenizer_path: Path | None = None, *, batch_size: int = 64) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be greater than zero")
+        self.tokenizer_path = (tokenizer_path or DEFAULT_LOCAL_TOKENIZER_PATH).expanduser()
+        if not self.tokenizer_path.is_file():
+            raise FileNotFoundError(f"local tokenizer file does not exist: {self.tokenizer_path}")
+        self._tokenizer = Tokenizer.from_file(str(self.tokenizer_path))
+        self._batch_size = batch_size
+        self._cache: dict[str, int] = {}
+
+    async def count_many(self, texts: Sequence[str]) -> list[int]:
+        keys = [_cache_key(LOCAL_TOKENIZER_ID, text) for text in texts]
+        missing: dict[str, str] = {}
+        for key, value in zip(keys, texts, strict=True):
+            if key not in self._cache:
+                missing[key] = value
+
+        missing_items = list(missing.items())
+        for start in range(0, len(missing_items), self._batch_size):
+            batch = missing_items[start : start + self._batch_size]
+            encodings = self._tokenizer.encode_batch(
+                [text for _, text in batch],
+                add_special_tokens=False,
+            )
+            for (key, _), encoding in zip(batch, encodings, strict=True):
+                self._cache[key] = len(encoding.ids)
+        return [self._cache[key] for key in keys]
 
 
 class ArkTokenCounter:

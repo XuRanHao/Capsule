@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from capsule.db.base import id_factory
+from capsule.enums import AssetIndexRole
 from capsule.schemas import AssetCreate, AssetDraft, DiscoveredFile
 
 
@@ -24,6 +25,28 @@ class AssetFactory:
         drafts: list[AssetDraft],
         generation: int = 0,
     ) -> list[AssetCreate]:
+        hierarchy_targets: dict[str, AssetDraft] = {}
+        for draft in drafts:
+            if draft.hierarchy_key is None:
+                continue
+            if draft.hierarchy_key in hierarchy_targets:
+                raise ValueError(f"duplicate hierarchy_key: {draft.hierarchy_key}")
+            hierarchy_targets[draft.hierarchy_key] = draft
+
+        parent_asset_keys: dict[int, str] = {}
+        for position, draft in enumerate(drafts):
+            if draft.index_role != AssetIndexRole.CHILD:
+                continue
+            parent = hierarchy_targets.get(draft.parent_hierarchy_key or "")
+            if parent is None:
+                raise ValueError(
+                    "child asset references an unknown parent_hierarchy_key: "
+                    f"{draft.parent_hierarchy_key}"
+                )
+            if parent.index_role != AssetIndexRole.PARENT:
+                raise ValueError("child asset parent_hierarchy_key must reference a parent asset")
+            parent_asset_keys[position] = _asset_key(parent)
+
         return [
             self.build(
                 workspace_id=workspace_id,
@@ -32,8 +55,9 @@ class AssetFactory:
                 source_file=source_file,
                 draft=draft,
                 generation=generation,
+                parent_asset_key=parent_asset_keys.get(position),
             )
-            for draft in drafts
+            for position, draft in enumerate(drafts)
         ]
 
     def build(
@@ -45,9 +69,10 @@ class AssetFactory:
         source_file: DiscoveredFile,
         draft: AssetDraft,
         generation: int = 0,
+        parent_asset_key: str | None = None,
     ) -> AssetCreate:
         locator_json = _canonical_json(draft.source_locator)
-        asset_key = _sha256_text(f"{draft.asset_type.value}\n{locator_json}")
+        asset_key = _asset_key(draft)
         content_hash = _sha256_text(
             "\n".join(
                 (
@@ -70,6 +95,9 @@ class AssetFactory:
             file_name=Path(source_file.path).name,
             file_type=source_file.extension,
             asset_key=asset_key,
+            index_role=draft.index_role,
+            child_order=draft.child_order,
+            parent_asset_key=parent_asset_key,
             generation=generation,
             content_hash=content_hash,
             file_tree_context=_file_tree_context(source_file.relative_path),
@@ -85,6 +113,10 @@ class AssetFactory:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _asset_key(draft: AssetDraft) -> str:
+    return _sha256_text(f"{draft.asset_type.value}\n{_canonical_json(draft.source_locator)}")
 
 
 def _sha256_text(value: str) -> str:

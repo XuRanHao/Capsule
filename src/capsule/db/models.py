@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -90,7 +91,23 @@ class SourceFile(Base, TimestampMixin):
 
 class Asset(Base, TimestampMixin):
     __tablename__ = "assets"
-    __table_args__ = (UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),)
+    __table_args__ = (
+        UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),
+        UniqueConstraint(
+            "parent_asset_id",
+            "child_order",
+            name="uq_asset_parent_child_order",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "(index_role IN ('standalone', 'parent') AND parent_asset_id IS NULL "
+            "AND child_order IS NULL) OR "
+            "(index_role = 'child' AND parent_asset_id IS NOT NULL "
+            "AND child_order IS NOT NULL AND child_order >= 0)",
+            name="ck_assets_index_hierarchy",
+        ),
+    )
 
     asset_id: Mapped[str] = mapped_column(
         String(64),
@@ -115,6 +132,17 @@ class Asset(Base, TimestampMixin):
     file_name: Mapped[str] = mapped_column(String(1024), nullable=False)
     file_type: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    index_role: Mapped[str] = mapped_column(
+        String(16),
+        default="standalone",
+        nullable=False,
+        index=True,
+    )
+    parent_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        index=True,
+    )
+    child_order: Mapped[int | None] = mapped_column(Integer)
     generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     asset_name: Mapped[str | None] = mapped_column(String(1024))

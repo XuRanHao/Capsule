@@ -24,6 +24,7 @@ from capsule.db.models import (
 )
 from capsule.db.session import Database
 from capsule.enums import (
+    AssetIndexRole,
     AssetNameSource,
     AssetType,
     ClusterInternalVariance,
@@ -334,6 +335,7 @@ class AssetRepository:
     ) -> StoredFileResult:
         if any(asset.source_file_id != source_file_id for asset in assets):
             raise ValueError("all assets must belong to the supplied source_file_id")
+        _validate_asset_hierarchy(assets, require_batch_parent=True)
 
         async with self._database.session() as session, session.begin():
             source = await session.get(SourceFile, source_file_id, with_for_update=True)
@@ -347,9 +349,9 @@ class AssetRepository:
                 select(Asset).where(Asset.source_file_id == source_file_id).with_for_update()
             )
             existing = {asset.asset_key: asset for asset in rows}
-            stored_ids: list[str] = []
+            stored_by_key: dict[str, Asset] = {}
 
-            for values in assets:
+            def store(values: AssetCreate) -> Asset:
                 current = existing.pop(values.asset_key, None)
                 if current is None:
                     current = Asset(**_asset_values(values))
@@ -365,7 +367,28 @@ class AssetRepository:
                     if user_name is not None:
                         current.asset_name = user_name
                         current.asset_name_source = AssetNameSource.USER.value
-                stored_ids.append(current.asset_id)
+                stored_by_key[values.asset_key] = current
+                return current
+
+            # A child cannot be inserted until its persisted parent has a real ID:
+            # the database check constraint deliberately disallows dangling children.
+            for values in assets:
+                if values.index_role != AssetIndexRole.CHILD:
+                    store(values)
+
+            await session.flush()
+            for values in assets:
+                if values.index_role != AssetIndexRole.CHILD:
+                    continue
+                current = store(values)
+                _resolve_asset_parent(
+                    asset=current,
+                    values=values,
+                    source_file_id=source_file_id,
+                    possible_parents=stored_by_key,
+                )
+
+            await session.flush()
 
             for stale in existing.values():
                 await session.delete(stale)
@@ -373,7 +396,15 @@ class AssetRepository:
             source.processing_status = ProcessingStatus.COMPLETED.value
             source.error_message = None
             await session.flush()
-            return StoredFileResult(source_file_id=source_file_id, asset_ids=stored_ids)
+            return StoredFileResult(
+                source_file_id=source_file_id,
+                asset_ids=[stored_by_key[asset.asset_key].asset_id for asset in assets],
+                indexable_asset_ids=[
+                    stored_by_key[asset.asset_key].asset_id
+                    for asset in assets
+                    if asset.index_role != AssetIndexRole.PARENT
+                ],
+            )
 
     async def upsert_generated_asset(
         self,
@@ -385,6 +416,7 @@ class AssetRepository:
         """Store one completed Segment, rejecting deliveries from an obsolete run."""
         if asset.source_file_id != source_file_id or asset.generation != generation:
             raise ValueError("asset does not belong to the supplied source generation")
+        _validate_asset_hierarchy([asset], require_batch_parent=False)
         async with self._database.session() as session, session.begin():
             source = await session.get(SourceFile, source_file_id, with_for_update=True)
             if source is None:
@@ -394,6 +426,18 @@ class AssetRepository:
                     f"source generation advanced from {generation} "
                     f"to {source.processing_generation}"
                 )
+            possible_parents: dict[str, Asset] = {}
+            if asset.index_role == AssetIndexRole.CHILD:
+                parent = await session.scalar(
+                    select(Asset)
+                    .where(
+                        Asset.source_file_id == source_file_id,
+                        Asset.asset_key == asset.parent_asset_key,
+                    )
+                    .with_for_update()
+                )
+                if parent is not None:
+                    possible_parents[asset.parent_asset_key or ""] = parent
             current = await session.scalar(
                 select(Asset)
                 .where(
@@ -416,6 +460,15 @@ class AssetRepository:
                 if user_name is not None:
                     current.asset_name = user_name
                     current.asset_name_source = AssetNameSource.USER.value
+            if asset.index_role == AssetIndexRole.CHILD:
+                _resolve_asset_parent(
+                    asset=current,
+                    values=asset,
+                    source_file_id=source_file_id,
+                    possible_parents=possible_parents,
+                )
+            else:
+                current.parent_asset_id = None
             await session.flush()
             return current.asset_id
 
@@ -461,9 +514,9 @@ class AssetRepository:
                     Asset.generation != generation,
                 )
             )
-            asset_ids = list(
-                await session.scalars(
-                    select(Asset.asset_id)
+            stored_assets = list(
+                await session.execute(
+                    select(Asset.asset_id, Asset.index_role)
                     .where(
                         Asset.source_file_id == source_file_id,
                         Asset.generation == generation,
@@ -473,7 +526,16 @@ class AssetRepository:
             )
             source.processing_status = ProcessingStatus.COMPLETED.value
             source.error_message = None
-            return StoredFileResult(source_file_id=source_file_id, asset_ids=asset_ids)
+            asset_ids = [asset_id for asset_id, _ in stored_assets]
+            return StoredFileResult(
+                source_file_id=source_file_id,
+                asset_ids=asset_ids,
+                indexable_asset_ids=[
+                    asset_id
+                    for asset_id, index_role in stored_assets
+                    if index_role != AssetIndexRole.PARENT.value
+                ],
+            )
 
     async def finalize_asset_generation_if_complete(
         self,
@@ -988,6 +1050,9 @@ def _asset_view_record(
         asset_type=AssetType(asset.asset_type),
         file_name=asset.file_name,
         file_type=asset.file_type,
+        index_role=AssetIndexRole(asset.index_role),
+        parent_asset_id=asset.parent_asset_id,
+        child_order=asset.child_order,
         asset_name=asset.asset_name,
         asset_description=asset.asset_description,
         asset_features=dict(asset.asset_features),
@@ -1019,7 +1084,10 @@ def _asset_view_record(
 def _asset_values(values: AssetCreate) -> dict[str, object]:
     data = values.model_dump(mode="json")
     data["asset_type"] = values.asset_type.value
+    data["index_role"] = values.index_role.value
     data["processing_status"] = values.processing_status.value
+    if values.index_role == AssetIndexRole.PARENT:
+        data["processing_status"] = ProcessingStatus.COMPLETED.value
     data["source_contexts"] = [context.model_dump() for context in values.source_contexts]
     return data
 
@@ -1033,6 +1101,10 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
     current.asset_type = values.asset_type.value
     current.file_name = values.file_name
     current.file_type = values.file_type
+    current.index_role = values.index_role.value
+    current.child_order = values.child_order
+    if values.index_role != AssetIndexRole.CHILD:
+        current.parent_asset_id = None
     current.content_hash = values.content_hash
     current.generation = values.generation
     current.file_tree_context = values.file_tree_context
@@ -1042,7 +1114,11 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
     current.raw_content = values.raw_content
     current.derived_file_uri = values.derived_file_uri
     current.preview_uri = values.preview_uri
-    current.processing_status = ProcessingStatus.PENDING.value
+    current.processing_status = (
+        ProcessingStatus.COMPLETED.value
+        if values.index_role == AssetIndexRole.PARENT
+        else ProcessingStatus.PENDING.value
+    )
     current.error_message = None
     if content_changed:
         if current.asset_name_source != AssetNameSource.USER.value:
@@ -1052,6 +1128,56 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
         current.asset_features = {}
         current.feature_revision += 1
         current.embedding_revision += 1
+
+
+def _validate_asset_hierarchy(
+    assets: Sequence[AssetCreate],
+    *,
+    require_batch_parent: bool,
+) -> None:
+    """Reject invalid role/reference shapes before any row is changed."""
+    by_key: dict[str, AssetCreate] = {}
+    for asset in assets:
+        if asset.asset_key in by_key:
+            raise ValueError(f"duplicate asset_key in hierarchy batch: {asset.asset_key}")
+        by_key[asset.asset_key] = asset
+        if asset.index_role == AssetIndexRole.CHILD and not asset.parent_asset_key:
+            raise ValueError("child assets require a parent_asset_key")
+
+    if not require_batch_parent:
+        return
+    for asset in assets:
+        if asset.index_role != AssetIndexRole.CHILD:
+            continue
+        parent = by_key.get(asset.parent_asset_key or "")
+        if parent is None:
+            raise ValueError("child asset parent does not exist in this batch")
+        if parent.index_role != AssetIndexRole.PARENT:
+            raise ValueError("child asset parent must have index_role=parent")
+
+
+def _resolve_asset_parent(
+    *,
+    asset: Asset,
+    values: AssetCreate,
+    source_file_id: str,
+    possible_parents: dict[str, Asset],
+) -> None:
+    """Link a child to a persisted parent in the same source file."""
+    if values.index_role != AssetIndexRole.CHILD:
+        asset.parent_asset_id = None
+        return
+    parent_key = values.parent_asset_key
+    if parent_key is None:
+        raise ValueError("child assets require a parent_asset_key")
+    parent = possible_parents.get(parent_key)
+    if parent is None:
+        raise ValueError(f"child asset parent does not exist: {parent_key}")
+    if parent.source_file_id != source_file_id:
+        raise ValueError("child asset parent must belong to the same source file")
+    if parent.index_role != AssetIndexRole.PARENT.value:
+        raise ValueError("child asset parent must have index_role=parent")
+    asset.parent_asset_id = parent.asset_id
 
 
 # ===========================================
@@ -1084,6 +1210,7 @@ class EmbeddingAsset:
     source_contexts: list[dict[str, Any]] = field(default_factory=list)
     file_info: dict[str, Any] = field(default_factory=dict)
     source_locator: dict[str, Any] = field(default_factory=dict)
+    index_role: str = AssetIndexRole.STANDALONE.value
 
 
 @dataclass(slots=True, frozen=True)
@@ -1114,6 +1241,7 @@ class EmbeddingRepository:
             .where(
                 Asset.workspace_id == workspace_id,
                 Asset.generation == SourceFile.processing_generation,
+                Asset.index_role != AssetIndexRole.PARENT.value,
             )
             .order_by(Asset.created_at, Asset.asset_id)
         )
@@ -1130,6 +1258,7 @@ class EmbeddingRepository:
                 source_file_id=asset.source_file_id,
                 asset_type=asset.asset_type,
                 file_type=asset.file_type,
+                index_role=asset.index_role,
                 content_hash=asset.content_hash,
                 embedding_revision=asset.embedding_revision,
                 created_at=asset.created_at,
@@ -1162,6 +1291,8 @@ class EmbeddingRepository:
         force: bool,
     ) -> PreparedEmbedding:
         """Reserve one stable primary key or return an existing indexed record."""
+        if asset.index_role == AssetIndexRole.PARENT.value:
+            raise ValueError("parent assets must not receive embeddings")
         async with self._database.session() as session, session.begin():
             statement = (
                 select(EmbeddingRecord)
@@ -1256,6 +1387,7 @@ class EmbeddingRepository:
                 EmbeddingRecord.milvus_collection == milvus_collection,
                 EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
                 Asset.generation == SourceFile.processing_generation,
+                Asset.index_role != AssetIndexRole.PARENT.value,
             )
             .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
         )

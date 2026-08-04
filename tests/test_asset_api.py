@@ -16,8 +16,9 @@ from capsule.schemas import (
 
 
 class FakeAssetRepository:
-    def __init__(self, image_path: Path) -> None:
+    def __init__(self, image_path: Path, *, derived_image_path: Path | None = None) -> None:
         self.image_path = image_path
+        self.derived_image_path = derived_image_path
         now = datetime.now(UTC)
         self.asset = AssetViewRecord(
             asset_id="asset_image",
@@ -64,7 +65,9 @@ class FakeAssetRepository:
             source_storage_uri=self.image_path.as_uri(),
             source_mime_type="image/jpeg",
             preview_uri=None,
-            derived_file_uri=None,
+            derived_file_uri=(
+                self.derived_image_path.as_uri() if self.derived_image_path is not None else None
+            ),
         )
 
 
@@ -145,3 +148,36 @@ def test_library_clear_requires_explicit_confirmation(tmp_path: Path) -> None:
         assert cleared.status_code == 200
         assert cleared.json()["assets_deleted"] == 3
         assert clear_service.clear_calls == 1
+
+
+def test_document_image_preview_uses_derived_media_root(tmp_path: Path) -> None:
+    import_root = tmp_path / "imports"
+    import_root.mkdir()
+    document_path = import_root / "report.docx"
+    document_path.write_bytes(b"docx-container")
+    media_root = tmp_path / "document-media"
+    media_root.mkdir()
+    image_path = media_root / "embedded.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    app = create_app(
+        settings=Settings(import_root=import_root, document_media_root=media_root),
+        asset_repository=FakeAssetRepository(  # type: ignore[arg-type]
+            document_path,
+            derived_image_path=image_path,
+        ),
+    )
+
+    with TestClient(app) as client:
+        preview = client.get(
+            "/api/v1/assets/asset_image/preview",
+            params={"workspace_id": "workspace_test"},
+        )
+        content = client.get(
+            "/api/v1/assets/asset_image/content",
+            params={"workspace_id": "workspace_test"},
+        )
+
+    assert preview.status_code == 200
+    assert content.status_code == 200
+    assert preview.content == image_path.read_bytes()
+    assert content.content == image_path.read_bytes()

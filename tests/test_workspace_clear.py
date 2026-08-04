@@ -4,7 +4,7 @@ import pytest
 
 from capsule.config import Settings
 from capsule.db.repositories import LibraryClearSnapshot
-from capsule.pipeline.workspace_clear import LibraryClearService
+from capsule.pipeline.workspace_clear import LibraryClearService, _clear_import_root
 
 
 class FakeRepository:
@@ -39,6 +39,10 @@ async def test_library_clear_removes_external_records_and_staging(tmp_path: Path
     staged_path = import_root / "job_01"
     staged_path.mkdir(parents=True)
     (staged_path / "source.md").write_text("# source", encoding="utf-8")
+    document_media_root = tmp_path / "document-media"
+    cached_document = document_media_root / "source-hash"
+    cached_document.mkdir(parents=True)
+    (cached_document / "image.png").write_bytes(b"image")
     snapshot = LibraryClearSnapshot(
         workspace_count=2,
         asset_count=3,
@@ -50,7 +54,10 @@ async def test_library_clear_removes_external_records_and_staging(tmp_path: Path
     vectors = FakeVectorStore()
     storage = FakeObjectStorage()
     service = LibraryClearService(
-        settings=Settings(import_root=import_root),
+        settings=Settings(
+            import_root=import_root,
+            document_media_root=document_media_root,
+        ),
         repository=repository,
         vector_store=vectors,
         object_storage=storage,
@@ -62,8 +69,14 @@ async def test_library_clear_removes_external_records_and_staging(tmp_path: Path
     assert result.assets_deleted == 3
     assert result.vectors_deleted == 6
     assert result.objects_deleted == 2
-    assert result.staging_paths_deleted == 1
+    assert result.staging_paths_deleted == 2
     assert result.cleanup_warnings == []
     assert vectors.clear_calls == 1
     assert storage.clear_calls == 1
     assert not staged_path.exists()
+    assert not cached_document.exists()
+
+
+def test_managed_root_cleanup_rejects_home_directory() -> None:
+    with pytest.raises(ValueError, match="unsafe managed root"):
+        _clear_import_root(Path.home())

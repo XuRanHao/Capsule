@@ -11,14 +11,21 @@ def test_blank_optional_secrets_are_unset() -> None:
     assert settings.milvus_token is None
 
 
-def test_document_chunk_size_defaults_to_400_tokens() -> None:
-    assert Settings().document_chunk_max_tokens == 400
+def test_document_chunk_size_defaults_to_250_400_500_600_tokens() -> None:
+    settings = Settings()
+
+    assert settings.assetization_version == "assetization-v6"
+    assert settings.document_tokenizer_path is None
+    assert settings.document_chunk_min_tokens == 250
+    assert settings.document_chunk_target_tokens == 400
+    assert settings.document_chunk_max_tokens == 500
+    assert settings.document_chunk_merge_max_tokens == 600
 
 
 def test_video_adaptive_segmentation_defaults_replace_legacy_settings() -> None:
     settings = Settings()
 
-    assert settings.assetization_version == "assetization-v5"
+    assert settings.assetization_version == "assetization-v6"
     assert settings.video_distance_quantile == 0.75
     assert settings.video_activity_sample_fps == 6.0
     assert settings.video_keyframe_jpeg_quality == 85

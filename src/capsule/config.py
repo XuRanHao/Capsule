@@ -2,10 +2,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DOCUMENT_CHUNK_MAX_TOKENS = 400
+DOCUMENT_CHUNK_MIN_TOKENS = 250
+DOCUMENT_CHUNK_TARGET_TOKENS = 400
+DOCUMENT_CHUNK_MAX_TOKENS = 500
+DOCUMENT_CHUNK_MERGE_MAX_TOKENS = 600
 
 
 class Settings(BaseSettings):
@@ -31,7 +34,7 @@ class Settings(BaseSettings):
     object_storage_region: str = "us-east-1"
     import_root: Path = Path("data/imports")
     import_file_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
-    assetization_version: str = Field(default="assetization-v5", min_length=1, max_length=64)
+    assetization_version: str = Field(default="assetization-v6", min_length=1, max_length=64)
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
@@ -39,7 +42,20 @@ class Settings(BaseSettings):
     embedding_model: str = "doubao-embedding-vision-250615"
     embedding_dimension: int = Field(default=1024, ge=1)
     tokenization_batch_size: int = Field(default=64, ge=1, le=256)
+    document_tokenizer_path: Path | None = None
+    document_chunk_min_tokens: int = Field(default=DOCUMENT_CHUNK_MIN_TOKENS, ge=1)
+    document_chunk_target_tokens: int = Field(default=DOCUMENT_CHUNK_TARGET_TOKENS, ge=1)
     document_chunk_max_tokens: int = Field(default=DOCUMENT_CHUNK_MAX_TOKENS, ge=1)
+    document_chunk_merge_max_tokens: int = Field(
+        default=DOCUMENT_CHUNK_MERGE_MAX_TOKENS,
+        ge=1,
+    )
+    document_parent_max_tokens: int = Field(default=2000, ge=1)
+    document_media_root: Path = Path("data/document-media")
+    document_ocr_enabled: bool = True
+    document_ocr_min_confidence: float = Field(default=0.55, ge=0, le=1)
+    document_ocr_min_edge: int = Field(default=32, ge=1)
+    document_ocr_min_area: int = Field(default=4096, ge=1)
 
     understanding_concurrency: int = Field(default=32, ge=1)
     asset_enrichment_queue_size: int = Field(default=64, ge=1)
@@ -137,6 +153,20 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @model_validator(mode="after")
+    def validate_document_chunk_hierarchy(self) -> "Settings":
+        if not (
+            self.document_chunk_min_tokens
+            <= self.document_chunk_target_tokens
+            <= self.document_chunk_max_tokens
+            <= self.document_chunk_merge_max_tokens
+            <= self.document_parent_max_tokens
+        ):
+            raise ValueError(
+                "document token limits must satisfy min <= target <= max <= merge_max <= parent"
+            )
+        return self
 
 
 @lru_cache

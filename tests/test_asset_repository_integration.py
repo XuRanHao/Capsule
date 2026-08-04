@@ -8,14 +8,21 @@ from capsule.config import get_settings
 from capsule.db.models import Asset, ProcessingJob, SourceFile, Workspace
 from capsule.db.repositories import (
     AssetRepository,
+    EmbeddingRepository,
     LibraryClearBusyError,
     StaleAssetGenerationError,
 )
 from capsule.db.session import Database
-from capsule.enums import AssetNameSource, AssetType, JobStatus, ProcessingStatus
+from capsule.enums import (
+    AssetIndexRole,
+    AssetNameSource,
+    AssetType,
+    JobStatus,
+    ProcessingStatus,
+)
 from capsule.parsers.discovery import sha256_file
 from capsule.pipeline.asset_factory import AssetFactory
-from capsule.schemas import AssetDraft, DiscoveredFile
+from capsule.schemas import AssetCreate, AssetDraft, DiscoveredFile
 
 
 @pytest.mark.integration
@@ -136,6 +143,137 @@ async def test_repository_replaces_assets_and_preserves_user_name(tmp_path: Path
                     delete(Workspace).where(
                         Workspace.workspace_id == "workspace_repository_integration"
                     )
+                )
+        finally:
+            await database.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_replace_assets_persists_hierarchy_and_skips_parents_for_embeddings(
+    tmp_path: Path,
+) -> None:
+    database = Database(get_settings())
+    workspace_id = "workspace_hierarchy_repository_integration"
+    try:
+        try:
+            async with database.session() as session:
+                await session.execute(text("select 1"))
+        except SQLAlchemyError:
+            pytest.skip("PostgreSQL integration database is unavailable")
+
+        path = tmp_path / "notes.md"
+        path.write_text("# Notes", encoding="utf-8")
+        discovered = DiscoveredFile(
+            path=str(path),
+            relative_path="docs/notes.md",
+            extension=".md",
+            size_bytes=path.stat().st_size,
+        )
+        repository = AssetRepository(database)
+        source_file_id = await repository.get_or_create_source_file(
+            workspace_id=workspace_id,
+            source_file=discovered,
+            sha256=sha256_file(path),
+            mime_type="text/markdown",
+        )
+        factory = AssetFactory()
+
+        def build_hierarchy(child_positions: list[tuple[int, int]]) -> list[AssetCreate]:
+            return factory.build_many(
+                workspace_id=workspace_id,
+                source_file_id=source_file_id,
+                source_sha256=sha256_file(path),
+                source_file=discovered,
+                drafts=[
+                    AssetDraft(
+                        asset_type=AssetType.MARKDOWN_BLOCK,
+                        file_name=path.name,
+                        index_role=AssetIndexRole.PARENT,
+                        hierarchy_key="section:root",
+                        source_locator={"block_index": 0},
+                        raw_content="Section summary",
+                    ),
+                    *[
+                        AssetDraft(
+                            asset_type=AssetType.MARKDOWN_BLOCK,
+                            file_name=path.name,
+                            parent_hierarchy_key="section:root",
+                            child_order=child_order,
+                            source_locator={"block_index": block_index},
+                            raw_content=f"Section detail {block_index}",
+                        )
+                        for block_index, child_order in child_positions
+                    ],
+                ],
+            )
+
+        assets = build_hierarchy([(1, 0)])
+
+        stored = await repository.replace_assets(source_file_id=source_file_id, assets=assets)
+
+        assert stored.asset_ids == [asset.asset_id for asset in assets]
+        assert stored.indexable_asset_ids == [assets[1].asset_id]
+        async with database.session() as session:
+            rows = {
+                asset.asset_id: asset
+                for asset in await session.scalars(
+                    select(Asset).where(Asset.source_file_id == source_file_id)
+                )
+            }
+        parent, child = assets
+        assert rows[parent.asset_id].index_role == AssetIndexRole.PARENT.value
+        assert rows[parent.asset_id].processing_status == ProcessingStatus.COMPLETED.value
+        assert rows[child.asset_id].index_role == AssetIndexRole.CHILD.value
+        assert rows[child.asset_id].parent_asset_id == parent.asset_id
+        assert rows[child.asset_id].child_order == 0
+
+        embedding_assets = await EmbeddingRepository(database).list_assets(
+            workspace_id=workspace_id,
+            asset_ids=stored.asset_ids,
+        )
+        assert [asset.asset_id for asset in embedding_assets] == [child.asset_id]
+
+        # A new child can reuse a stale child's order under the stable parent.
+        replacement = build_hierarchy([(2, 0)])
+        replacement_stored = await repository.replace_assets(
+            source_file_id=source_file_id,
+            assets=replacement,
+        )
+        replacement_child_id = replacement_stored.asset_ids[1]
+        assert replacement_stored.asset_ids[0] == parent.asset_id
+        assert replacement_child_id != child.asset_id
+        async with database.session() as session:
+            assert await session.get(Asset, child.asset_id) is None
+            replacement_child = await session.get(Asset, replacement_child_id)
+            assert replacement_child is not None
+            assert replacement_child.parent_asset_id == parent.asset_id
+            assert replacement_child.child_order == 0
+
+        # Two stable children can swap orders in one deferred-constraint transaction.
+        swap_seed = build_hierarchy([(2, 0), (3, 1)])
+        swap_seed_stored = await repository.replace_assets(
+            source_file_id=source_file_id,
+            assets=swap_seed,
+        )
+        swapped = build_hierarchy([(2, 1), (3, 0)])
+        swapped_stored = await repository.replace_assets(
+            source_file_id=source_file_id,
+            assets=swapped,
+        )
+        assert swapped_stored.asset_ids == swap_seed_stored.asset_ids
+        async with database.session() as session:
+            first_child = await session.get(Asset, swapped_stored.asset_ids[1])
+            second_child = await session.get(Asset, swapped_stored.asset_ids[2])
+            assert first_child is not None
+            assert second_child is not None
+            assert first_child.child_order == 1
+            assert second_child.child_order == 0
+    finally:
+        try:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(Workspace).where(Workspace.workspace_id == workspace_id)
                 )
         finally:
             await database.dispose()

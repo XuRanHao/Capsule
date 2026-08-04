@@ -8,6 +8,14 @@ class AssetType(StrEnum):
     VIDEO_SEGMENT = "video_segment"
 
 
+class AssetIndexRole(StrEnum):
+    """The place of an Asset in a parent/child retrieval hierarchy."""
+
+    STANDALONE = "standalone"
+    PARENT = "parent"
+    CHILD = "child"
+
+
 class ProcessingStatus(StrEnum):
     PENDING = "pending"
     PROCESSING = "processing"

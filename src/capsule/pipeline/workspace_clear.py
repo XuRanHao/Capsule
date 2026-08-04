@@ -66,6 +66,14 @@ class LibraryClearService:
             label="本地导入暂存文件",
             warnings=warnings,
         )
+        document_media_count = await _best_effort(
+            operation=lambda: asyncio.to_thread(
+                _clear_import_root,
+                self._settings.document_media_root,
+            ),
+            label="文档图片缓存",
+            warnings=warnings,
+        )
 
         return LibraryClearResult(
             workspaces_deleted=snapshot.workspace_count,
@@ -75,7 +83,7 @@ class LibraryClearService:
             jobs_deleted=snapshot.job_count,
             vectors_deleted=vector_count,
             objects_deleted=object_count,
-            staging_paths_deleted=local_path_count,
+            staging_paths_deleted=local_path_count + document_media_count,
             cleanup_warnings=warnings,
         )
 
@@ -95,6 +103,7 @@ async def _best_effort(
 
 def _clear_import_root(import_root: Path) -> int:
     root = import_root.expanduser().resolve()
+    _assert_safe_managed_root(root)
     deleted = 0
     if not root.exists():
         return 0
@@ -105,3 +114,18 @@ def _clear_import_root(import_root: Path) -> int:
             path.unlink()
         deleted += 1
     return deleted
+
+
+def _assert_safe_managed_root(root: Path) -> None:
+    """Fail closed before recursively clearing a configured managed directory."""
+
+    project_root = Path(__file__).resolve().parents[3]
+    protected_paths = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        Path.cwd().resolve(),
+        project_root,
+        (project_root / "data").resolve(),
+    }
+    if any(protected == root or protected.is_relative_to(root) for protected in protected_paths):
+        raise ValueError(f"refusing to clear unsafe managed root: {root}")

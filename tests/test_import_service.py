@@ -269,7 +269,10 @@ async def test_browser_import_enriches_asset_before_runner_finishes(tmp_path: Pa
             await on_assets_stored(["asset_a"])
             await asyncio.wait_for(understanding_started.wait(), timeout=1)
             events.append("runner_finished")
-            return SimpleNamespace(asset_ids=["asset_a"])
+            return SimpleNamespace(
+                asset_ids=["asset_parent", "asset_a"],
+                indexable_asset_ids=["asset_a"],
+            )
 
     class Understanding:
         async def run(self, *, asset_ids: list[str], **_: object) -> SimpleNamespace:

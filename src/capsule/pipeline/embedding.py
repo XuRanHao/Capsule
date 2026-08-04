@@ -391,21 +391,30 @@ class AssetEmbeddingService:
                 source_mode=EmbeddingSourceMode.ORIGINAL_TEXT,
             )
         if asset.asset_type == AssetType.IMAGE.value:
+            image_uri = _image_source_uri(asset)
             prepared_image = await self._image_cache.prepare(
                 cache_key=asset.content_hash,
-                mime_type=asset.source_mime_type,
-                loader=lambda: _read_local_source(asset.source_storage_uri),
+                mime_type=_image_mime_type(asset),
+                loader=lambda: _read_local_source(image_uri),
             )
             image_url = _data_uri(
                 mime_type=prepared_image.mime_type,
                 content=prepared_image.content,
             )
+            input_items: list[dict[str, Any]] = [
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]
+            if asset.raw_content and asset.raw_content.strip():
+                input_items.append(
+                    {"type": "text", "text": f"图中文字：\n{asset.raw_content[:8_000]}"}
+                )
             return _EmbeddingInput(
-                input_items=[{"type": "image_url", "image_url": {"url": image_url}}],
+                input_items=input_items,
                 source_content_hash=_hash_bytes(
                     EmbeddingType.NATIVE_MULTIMODAL.value.encode("utf-8"),
                     EmbeddingSourceMode.ORIGINAL_IMAGE.value.encode("utf-8"),
                     prepared_image.content,
+                    (asset.raw_content or "").encode("utf-8"),
                 ),
                 source_mode=EmbeddingSourceMode.ORIGINAL_IMAGE,
             )
@@ -461,6 +470,17 @@ def _read_local_source(storage_uri: str) -> bytes:
     if not path.is_file():
         raise EmbeddingInputUnavailable(f"image source file no longer exists: {path}")
     return path.read_bytes()
+
+
+def _image_source_uri(asset: EmbeddingAsset) -> str:
+    """Use a materialised document image instead of its container source file."""
+
+    return asset.derived_file_uri or asset.source_storage_uri
+
+
+def _image_mime_type(asset: EmbeddingAsset) -> str:
+    value = asset.file_info.get("mime_type")
+    return value if isinstance(value, str) and value else asset.source_mime_type
 
 
 def _data_uri(*, mime_type: str, content: bytes) -> str:

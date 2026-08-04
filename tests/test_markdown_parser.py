@@ -60,7 +60,7 @@ async def test_long_heading_section_recurses_to_child_heading() -> None:
         start = asset.source_locator["char_start"]
         end = asset.source_locator["char_end"]
         assert asset.raw_content == source[start:end]
-        assert asset.file_info["token_count"] <= 400 or asset.file_info["oversized"]
+        assert asset.file_info["token_count"] <= 500 or asset.file_info["oversized"]
 
 
 @pytest.mark.asyncio
@@ -82,7 +82,7 @@ async def test_oversized_code_fence_is_not_split() -> None:
 
 @pytest.mark.asyncio
 async def test_long_list_splits_only_between_top_level_items() -> None:
-    items = [f"- {letter * 150}\n" for letter in ("甲", "乙", "丙")]
+    items = [f"- {letter * 150}\n" for letter in ("甲", "乙", "丙", "丁")]
     source = "# List\n\n" + "".join(items)
 
     assets = await MarkdownParser().assetize(
@@ -93,7 +93,7 @@ async def test_long_list_splits_only_between_top_level_items() -> None:
 
     assert len(assets) == 2
     assert assets[0].raw_content == "".join(items[:2])
-    assert assets[1].raw_content == items[2]
+    assert assets[1].raw_content == "".join(items[2:])
     assert all(asset.raw_content.startswith("- ") for asset in assets)
 
 
@@ -111,3 +111,55 @@ async def test_adjacent_short_child_sections_merge_under_same_parent() -> None:
     assert assets[1].source_locator["heading_path"] == ["Root"]
     assert "## A" in assets[1].raw_content
     assert "## B" in assets[1].raw_content
+
+
+@pytest.mark.asyncio
+async def test_short_block_merge_may_use_600_token_ceiling() -> None:
+    source = f"# Root\n\n## A\n\n{'甲' * 370}\n\n## B\n\n{'乙' * 170}\n"
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "short-merge.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 1
+    assert 500 < assets[0].file_info["token_count"] <= 600
+    assert "## A" in assets[0].raw_content
+    assert "## B" in assets[0].raw_content
+
+
+@pytest.mark.asyncio
+async def test_long_paragraph_splits_on_sentence_boundaries() -> None:
+    sentences = [f"{letter * 180}。\n" for letter in ("甲", "乙", "丙", "丁")]
+    source = "# 正文\n\n" + "".join(sentences)
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "paragraph.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 2
+    assert assets[0].raw_content == "".join(sentences[:2])
+    assert assets[1].raw_content == "".join(sentences[2:])
+    assert all(250 <= asset.file_info["token_count"] <= 500 for asset in assets)
+
+
+@pytest.mark.asyncio
+async def test_oversized_table_is_never_split() -> None:
+    rows = [f"| 第{index}行 | {'内容' * 40} |\n" for index in range(12)]
+    table = "| 行 | 内容 |\n| --- | --- |\n" + "".join(rows)
+    source = "# 表格\n\n" + table
+
+    assets = await MarkdownParser().assetize(
+        source,
+        "table.md",
+        CharacterTokenCounter(),
+    )
+
+    assert len(assets) == 1
+    assert assets[0].raw_content == table
+    assert assets[0].file_info["token_count"] > 600
+    assert assets[0].file_info["oversized"] is True
+    assert assets[0].file_info["oversized_reason"] == "indivisible_table"

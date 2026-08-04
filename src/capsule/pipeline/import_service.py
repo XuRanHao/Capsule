@@ -503,7 +503,15 @@ class BrowserImportService:
                 on_assets_stored=enrichment_pipeline.submit,
                 finalize_job=False,
             )
-            await enrichment_pipeline.submit(list(getattr(result, "asset_ids", [])))
+            await enrichment_pipeline.submit(
+                list(
+                    getattr(
+                        result,
+                        "indexable_asset_ids",
+                        getattr(result, "asset_ids", []),
+                    )
+                )
+            )
             await enrichment_pipeline.finish()
             return result
         except Exception as exc:

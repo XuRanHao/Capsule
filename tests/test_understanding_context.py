@@ -1,4 +1,7 @@
 from datetime import UTC, datetime
+from pathlib import Path
+
+from PIL import Image
 
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset
@@ -174,3 +177,38 @@ async def test_video_understanding_uses_keyframe_data_uris() -> None:
         "data:image/jpeg;base64,MDEuanBn",
         "data:image/jpeg;base64,MDIuanBn",
     ]
+
+
+async def test_document_image_understanding_uses_materialised_image(tmp_path: Path) -> None:
+    image_path = tmp_path / "extracted.png"
+    Image.new("RGB", (20, 20), "green").save(image_path)
+    asset = EmbeddingAsset(
+        asset_id="asset_document_image",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="source_document",
+        asset_type=AssetType.IMAGE.value,
+        file_type=".docx",
+        content_hash="d" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 7, 30, tzinfo=UTC),
+        raw_content=None,
+        asset_description=None,
+        asset_features={},
+        derived_file_uri=image_path.as_uri(),
+        source_storage_uri="file:///source/document.docx",
+        source_mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        file_info={"mime_type": "image/png", "embedded_in_document": True},
+    )
+    service = AssetUnderstandingService(
+        settings=Settings(),
+        embedding_repository=None,  # type: ignore[arg-type]
+        asset_repository=None,  # type: ignore[arg-type]
+        model_client=None,  # type: ignore[arg-type]
+    )
+
+    messages = await service._messages(asset)
+    content = messages[1]["content"]
+    image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+
+    assert image_urls[0].startswith("data:image/png;base64,")

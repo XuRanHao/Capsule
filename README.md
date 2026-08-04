@@ -1,7 +1,7 @@
 # Capsule
 
 Capsule is a proof-of-concept system for turning local Markdown, plain-text,
-image, and video files into multimodal assets, embeddings, explainable HDBSCAN
+Word, PDF, image, and video files into multimodal assets, embeddings, explainable HDBSCAN
 clusters, and searchable results.
 
 The repository is split at the Asset/Embedding handoff. The role B retrieval
@@ -39,6 +39,9 @@ boundary; retrieval starts from persisted Assets and Embedding Records.
   model-generated descriptions.
 - Native video vectors use the rendered segment MP4 through a temporary signed
   object-storage URL; they record `embedding_source_mode=original_video`.
+- Document chunk token counts run locally with the bundled DeepSeek V3 BPE
+  tokenizer. Ark `/tokenization` remains available only as an explicit
+  validation client and is not required for parsing documents.
 
 ## Local environment
 
@@ -62,8 +65,16 @@ Then put the real Volcengine Ark key in the ignored local `.env` file:
 
 ```dotenv
 CAPSULE_ARK_API_KEY=your-ark-api-key
-# Markdown 与 TXT 均使用这个上限，默认值也是 400
-CAPSULE_DOCUMENT_CHUNK_MAX_TOKENS=400
+# 可选：覆盖项目内置的 DeepSeek V3 tokenizer.json
+# CAPSULE_DOCUMENT_TOKENIZER_PATH=/absolute/path/to/tokenizer.json
+# 子块以 400 token 为目标，低于 250 时与邻块合并，500 是结构化软上限
+CAPSULE_DOCUMENT_CHUNK_MIN_TOKENS=250
+CAPSULE_DOCUMENT_CHUNK_TARGET_TOKENS=400
+CAPSULE_DOCUMENT_CHUNK_MAX_TOKENS=500
+CAPSULE_DOCUMENT_CHUNK_MERGE_MAX_TOKENS=600
+CAPSULE_DOCUMENT_PARENT_MAX_TOKENS=2000
+# Word/PDF 内嵌图片在本地抽取，并按需使用 RapidOCR
+CAPSULE_DOCUMENT_OCR_ENABLED=true
 ```
 
 Start the API and frontend together:
@@ -85,7 +96,7 @@ make test         # backend and frontend quality gates
 make down         # stop containers without deleting persisted data
 ```
 
-The assetization CLI persists Markdown, plain-text, image and video Assets to
+The assetization CLI persists Markdown, plain-text, Word, PDF, image and video Assets to
 PostgreSQL. Video segments additionally persist playable MP4/JPEG artifacts in
 MinIO/S3. A failed file is recorded without aborting the batch. Use the `embed`
 CLI command after import to write `EmbeddingRecord` metadata and vectors to
@@ -137,7 +148,7 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    capsule embed --workspace workspace_demo
    ```
 
-The non-dry-run pipeline persists Markdown, plain-text, image and video Assets
+The non-dry-run pipeline persists Markdown, plain-text, Word, PDF, image and video Assets
 to PostgreSQL. Video input requires the host MPS worker described below; a
 video failure is recorded without aborting the rest of the batch.
 

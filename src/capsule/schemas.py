@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from capsule.enums import (
+    AssetIndexRole,
     AssetType,
     ClusterInternalVariance,
     ClusterRepresentativeRole,
@@ -32,6 +33,10 @@ class DiscoveredFile(BaseModel):
 class AssetDraft(BaseModel):
     asset_type: AssetType
     file_name: str
+    index_role: AssetIndexRole = AssetIndexRole.STANDALONE
+    hierarchy_key: str | None = None
+    parent_hierarchy_key: str | None = None
+    child_order: int | None = Field(default=None, ge=0)
     source_locator: dict[str, Any] = Field(default_factory=dict)
     source_contexts: list[SourceContext] = Field(default_factory=list)
     raw_content: str | None = None
@@ -39,6 +44,23 @@ class AssetDraft(BaseModel):
     derived_file_uri: str | None = None
     preview_uri: str | None = None
     transient_keyframe_jpegs: list[bytes] = Field(default_factory=list, exclude=True, repr=False)
+
+    @model_validator(mode="after")
+    def validate_hierarchy(self) -> "AssetDraft":
+        if self.parent_hierarchy_key is not None:
+            if self.index_role == AssetIndexRole.STANDALONE:
+                self.index_role = AssetIndexRole.CHILD
+            elif self.index_role != AssetIndexRole.CHILD:
+                raise ValueError("only child assets may reference a parent_hierarchy_key")
+        elif self.index_role == AssetIndexRole.CHILD:
+            raise ValueError("child assets require a parent_hierarchy_key")
+        if self.index_role == AssetIndexRole.PARENT and not self.hierarchy_key:
+            raise ValueError("parent assets require a hierarchy_key")
+        if self.index_role == AssetIndexRole.CHILD and self.child_order is None:
+            raise ValueError("child assets require a child_order")
+        if self.index_role != AssetIndexRole.CHILD and self.child_order is not None:
+            raise ValueError("child_order is only valid for child assets")
+        return self
 
 
 class AssetCreate(BaseModel):
@@ -49,6 +71,10 @@ class AssetCreate(BaseModel):
     file_name: str
     file_type: str
     asset_key: str
+    index_role: AssetIndexRole = AssetIndexRole.STANDALONE
+    child_order: int | None = Field(default=None, ge=0)
+    # Stable intra-batch reference only; repositories resolve it to parent_asset_id.
+    parent_asset_key: str | None = Field(default=None, exclude=True, repr=False)
     generation: int = Field(default=0, ge=0)
     content_hash: str
     asset_name: str | None = None
@@ -66,6 +92,18 @@ class AssetCreate(BaseModel):
     feature_revision: int = 1
     embedding_revision: int = 1
 
+    @model_validator(mode="after")
+    def validate_hierarchy(self) -> "AssetCreate":
+        if self.index_role == AssetIndexRole.CHILD and not self.parent_asset_key:
+            raise ValueError("child assets require a parent_asset_key")
+        if self.index_role != AssetIndexRole.CHILD and self.parent_asset_key is not None:
+            raise ValueError("only child assets may reference a parent_asset_key")
+        if self.index_role == AssetIndexRole.CHILD and self.child_order is None:
+            raise ValueError("child assets require a child_order")
+        if self.index_role != AssetIndexRole.CHILD and self.child_order is not None:
+            raise ValueError("child_order is only valid for child assets")
+        return self
+
 
 class AssetRecord(BaseModel):
     asset_id: str
@@ -74,6 +112,9 @@ class AssetRecord(BaseModel):
     asset_type: AssetType
     file_name: str
     file_type: str
+    index_role: AssetIndexRole = AssetIndexRole.STANDALONE
+    parent_asset_id: str | None = None
+    child_order: int | None = None
     asset_name: str | None = None
     asset_description: str | None = None
     asset_features: dict[str, Any] = Field(default_factory=dict)
@@ -116,6 +157,9 @@ class AssetViewRecord(BaseModel):
     asset_type: AssetType
     file_name: str
     file_type: str
+    index_role: AssetIndexRole = AssetIndexRole.STANDALONE
+    parent_asset_id: str | None = None
+    child_order: int | None = None
     asset_name: str | None = None
     asset_description: str | None = None
     asset_features: dict[str, Any] = Field(default_factory=dict)
@@ -158,6 +202,7 @@ class LibraryClearResult(BaseModel):
 class StoredFileResult(BaseModel):
     source_file_id: str
     asset_ids: list[str] = Field(default_factory=list)
+    indexable_asset_ids: list[str] = Field(default_factory=list)
 
 
 class FeatureValue(BaseModel):

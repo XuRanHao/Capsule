@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -19,13 +20,14 @@ from capsule.db.repositories import AssetRepository, StaleAssetGenerationError
 from capsule.db.session import Database
 from capsule.enums import PipelineStage
 from capsule.model_clients.mobileclip import ResidentMobileClipWorker
-from capsule.model_clients.tokenization import ArkTokenCounter, TokenCounter
+from capsule.model_clients.tokenization import LOCAL_TOKENIZER_ID, LocalTokenCounter, TokenCounter
 from capsule.parsers import discover_files
 from capsule.parsers.assetizer import Assetizer
 from capsule.parsers.discovery import sha256_file
+from capsule.parsers.document import DocumentParser
+from capsule.parsers.document_media import DocumentMediaExtractor, RapidOcrEngine
 from capsule.parsers.image import ImageParser
 from capsule.parsers.markdown import MarkdownParser
-from capsule.parsers.text import TextParser
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig, VisualEmbedder
 from capsule.pipeline.asset_factory import AssetFactory
 from capsule.pipeline.video_media import (
@@ -55,6 +57,7 @@ class PipelineRunResult(BaseModel):
     failed_count: int
     asset_count: int
     asset_ids: list[str] = Field(default_factory=list)
+    indexable_asset_ids: list[str] = Field(default_factory=list)
     skipped_count: int = 0
     errors: list[dict[str, str]] = Field(default_factory=list)
 
@@ -64,6 +67,7 @@ class _FileOutcome:
     succeeded: bool
     asset_count: int = 0
     asset_ids: list[str] = field(default_factory=list)
+    indexable_asset_ids: list[str] = field(default_factory=list)
     skipped: bool = False
     error: dict[str, str] | None = None
     stage_durations_ms: dict[str, float] = field(default_factory=dict)
@@ -123,13 +127,13 @@ class PipelineRunner:
         database = self._database or Database(self._settings)
         owns_database = self._database is None
         counter = self._token_counter
-        owns_counter = False
-        if counter is None and any(item.extension in {".md", ".txt"} for item in source_files):
-            try:
-                counter = ArkTokenCounter(self._settings)
-                owns_counter = True
-            except Exception:
-                counter = None
+        if counter is None and any(
+            item.extension in {".md", ".txt", ".docx", ".pdf"} for item in source_files
+        ):
+            counter = LocalTokenCounter(
+                self._settings.document_tokenizer_path,
+                batch_size=self._settings.tokenization_batch_size,
+            )
 
         repository = AssetRepository(database)
         factory = AssetFactory()
@@ -239,6 +243,9 @@ class PipelineRunner:
                 await repository.finalize_job(job_id=job_id)
             errors = [outcome.error for outcome in outcomes if outcome.error is not None]
             asset_ids = [asset_id for outcome in outcomes for asset_id in outcome.asset_ids]
+            indexable_asset_ids = [
+                asset_id for outcome in outcomes for asset_id in outcome.indexable_asset_ids
+            ]
             return PipelineRunResult(
                 job_id=job_id,
                 workspace_id=workspace_id,
@@ -247,12 +254,11 @@ class PipelineRunner:
                 failed_count=sum(not outcome.succeeded for outcome in outcomes),
                 asset_count=sum(outcome.asset_count for outcome in outcomes),
                 asset_ids=asset_ids,
+                indexable_asset_ids=indexable_asset_ids,
                 skipped_count=sum(outcome.skipped for outcome in outcomes),
                 errors=errors,
             )
         finally:
-            if owns_counter and isinstance(counter, ArkTokenCounter):
-                await counter.close()
             if owns_database:
                 await database.dispose()
 
@@ -420,8 +426,11 @@ class PipelineRunner:
                         source_file_id=source_file_id,
                         assets=assets,
                     )
-                    if on_assets_stored is not None and stored.asset_ids:
-                        await on_assets_stored(stored.asset_ids)
+                    indexable_asset_ids = list(
+                        getattr(stored, "indexable_asset_ids", stored.asset_ids)
+                    )
+                    if on_assets_stored is not None and indexable_asset_ids:
+                        await on_assets_stored(indexable_asset_ids)
                 await repository.record_file_success(job_id=job_id)
             finally:
                 stage_durations_ms[PipelineStage.ASSET_STORED.value] += (
@@ -431,6 +440,7 @@ class PipelineRunner:
                 succeeded=True,
                 asset_count=len(stored.asset_ids),
                 asset_ids=stored.asset_ids,
+                indexable_asset_ids=list(getattr(stored, "indexable_asset_ids", stored.asset_ids)),
                 stage_durations_ms=stage_durations_ms,
             )
         except Exception as exc:
@@ -454,8 +464,16 @@ def _build_assetizer(
     settings: Settings,
     video_embedder: VisualEmbedder | None,
 ) -> Assetizer:
-    markdown = MarkdownParser()
-    plain_text = TextParser()
+    document = DocumentParser(
+        media_extractor=DocumentMediaExtractor(
+            settings.document_media_root,
+            ocr_engine=RapidOcrEngine() if settings.document_ocr_enabled else None,
+            min_width=settings.document_ocr_min_edge,
+            min_height=settings.document_ocr_min_edge,
+            min_area=settings.document_ocr_min_area,
+            min_ocr_confidence=settings.document_ocr_min_confidence,
+        )
+    )
     image = ImageParser()
     video = VideoParser(
         concurrency=settings.ffmpeg_concurrency,
@@ -483,28 +501,25 @@ def _build_assetizer(
         mobileclip_batch_size=settings.mobileclip_batch_size,
     )
 
-    async def markdown_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
+    async def document_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
-            raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
-        return await markdown.assetize_file(
+            raise ValueError("a token counter is required to split text documents")
+        return await document.assetize_file(
             Path(source_file.path),
             counter,
+            min_tokens=settings.document_chunk_min_tokens,
+            target_tokens=settings.document_chunk_target_tokens,
             max_tokens=settings.document_chunk_max_tokens,
-        )
-
-    async def plain_text_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
-        if counter is None:
-            raise ValueError("CAPSULE_ARK_API_KEY is required to split text documents")
-        return await plain_text.assetize_file(
-            Path(source_file.path),
-            counter,
-            max_tokens=settings.document_chunk_max_tokens,
+            merge_max_tokens=settings.document_chunk_merge_max_tokens,
+            parent_max_tokens=settings.document_parent_max_tokens,
         )
 
     return Assetizer(
         {
-            ".md": markdown_handler,
-            ".txt": plain_text_handler,
+            ".md": document_handler,
+            ".txt": document_handler,
+            ".docx": document_handler,
+            ".pdf": document_handler,
             ".jpg": image.assetize,
             ".jpeg": image.assetize,
             ".png": image.assetize,
@@ -530,8 +545,41 @@ def _processing_fingerprint(
         "version": settings.assetization_version,
         "extension": source_file.extension,
     }
-    if source_file.extension in {".md", ".txt"}:
-        payload["document_chunk_max_tokens"] = settings.document_chunk_max_tokens
+    if source_file.extension in {".md", ".txt", ".docx", ".pdf"}:
+        document_fingerprint: dict[str, object] = {
+            "schema": "document-hierarchy-v2",
+            "tokenizer": (
+                str(settings.document_tokenizer_path.expanduser().resolve())
+                if settings.document_tokenizer_path is not None
+                else LOCAL_TOKENIZER_ID
+            ),
+            "child_min_tokens": settings.document_chunk_min_tokens,
+            "child_target_tokens": settings.document_chunk_target_tokens,
+            "parent_max_tokens": settings.document_parent_max_tokens,
+            "child_max_tokens": settings.document_chunk_max_tokens,
+            "child_merge_max_tokens": settings.document_chunk_merge_max_tokens,
+        }
+        if source_file.extension != ".md":
+            document_fingerprint["converter"] = _distribution_version("markitdown")
+        if source_file.extension in {".docx", ".pdf"}:
+            document_fingerprint["media"] = {
+                "extractor": "document-media-v2",
+                "media_root": str(settings.document_media_root),
+                "ocr_enabled": settings.document_ocr_enabled,
+                "ocr_engine": (
+                    _distribution_version("rapidocr")
+                    if settings.document_ocr_enabled
+                    else None
+                ),
+                "ocr_min_confidence": settings.document_ocr_min_confidence,
+                "ocr_min_edge": settings.document_ocr_min_edge,
+                "ocr_min_area": settings.document_ocr_min_area,
+            }
+            if source_file.extension == ".pdf":
+                media_fingerprint = document_fingerprint["media"]
+                if isinstance(media_fingerprint, dict):
+                    media_fingerprint["pymupdf"] = _distribution_version("PyMuPDF")
+        payload["document"] = document_fingerprint
     elif source_file.extension in {".mp4", ".mov"}:
         payload["video"] = {
             "sample_interval_seconds": settings.video_sample_interval_seconds,
@@ -559,6 +607,13 @@ def _processing_fingerprint(
         ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _distribution_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return "unavailable"
 
 
 def _collect_image_source_contexts(

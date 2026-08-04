@@ -24,8 +24,8 @@ def test_build_plan_counts_supported_files(tmp_path: Path) -> None:
 
     plan = PipelineRunner().build_plan(tmp_path, "workspace_demo")
 
-    assert plan.file_count == 3
-    assert plan.counts_by_extension == {".md": 1, ".png": 1, ".txt": 1}
+    assert plan.file_count == 4
+    assert plan.counts_by_extension == {".md": 1, ".pdf": 1, ".png": 1, ".txt": 1}
     assert plan.workspace_id == "workspace_demo"
 
 
@@ -268,7 +268,10 @@ async def test_run_emits_committed_assets_and_defers_job_finalization(
             )
 
         async def replace_assets(self, **_values: object) -> SimpleNamespace:
-            return SimpleNamespace(asset_ids=["asset_stream"])
+            return SimpleNamespace(
+                asset_ids=["asset_parent", "asset_stream"],
+                indexable_asset_ids=["asset_stream"],
+            )
 
         async def record_file_success(self, **_values: object) -> None:
             return None
@@ -309,7 +312,8 @@ async def test_run_emits_committed_assets_and_defers_job_finalization(
         finalize_job=False,
     )
 
-    assert result.asset_ids == ["asset_stream"]
+    assert result.asset_ids == ["asset_parent", "asset_stream"]
+    assert result.indexable_asset_ids == ["asset_stream"]
     assert committed == ["asset_stream"]
     assert not repository.finalized
 

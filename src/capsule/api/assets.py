@@ -125,8 +125,9 @@ async def get_asset_preview(
     uri = target.preview_uri
     media_type: str | None = None
     if uri is None and target.asset_type == "image":
-        uri = target.source_storage_uri
-        media_type = target.source_mime_type
+        uri = target.derived_file_uri or target.source_storage_uri
+        if target.derived_file_uri is None:
+            media_type = target.source_mime_type
     if uri is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -142,12 +143,18 @@ async def get_asset_content(
     workspace_id: str = Query(min_length=1, max_length=64),
 ) -> Response:
     target = await _media_target(request, asset_id=asset_id, workspace_id=workspace_id)
-    uri = (
-        target.derived_file_uri
-        if target.asset_type == "video_segment" and target.derived_file_uri
-        else target.source_storage_uri
+    uses_derived_media = (
+        target.asset_type in {"image", "video_segment"}
+        and target.derived_file_uri is not None
     )
-    return await _serve_uri(request, uri=uri, media_type=target.source_mime_type)
+    uri = target.derived_file_uri if uses_derived_media else target.source_storage_uri
+    if uri is None:  # Narrow the optional derived URI for static type checkers.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return await _serve_uri(
+        request,
+        uri=uri,
+        media_type=None if uses_derived_media else target.source_mime_type,
+    )
 
 
 async def _media_target(
@@ -201,17 +208,18 @@ async def _serve_uri(
 
 def _validated_local_path(settings: Settings, raw_path: str) -> Path:
     path = Path(raw_path).resolve()
-    import_root = settings.import_root.expanduser().resolve()
-    try:
-        path.relative_to(import_root)
-    except ValueError as exc:
+    allowed_roots = (
+        settings.import_root.expanduser().resolve(),
+        settings.document_media_root.expanduser().resolve(),
+    )
+    if not any(path.is_relative_to(root) for root in allowed_roots):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "code": "asset_media_outside_import_root",
-                "message": "local media is outside the browser import root",
+                "code": "asset_media_outside_allowed_roots",
+                "message": "local media is outside the configured media roots",
             },
-        ) from exc
+        )
     if not path.is_file():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

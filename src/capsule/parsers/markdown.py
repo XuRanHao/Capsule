@@ -6,7 +6,12 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-from capsule.config import DOCUMENT_CHUNK_MAX_TOKENS
+from capsule.config import (
+    DOCUMENT_CHUNK_MAX_TOKENS,
+    DOCUMENT_CHUNK_MERGE_MAX_TOKENS,
+    DOCUMENT_CHUNK_MIN_TOKENS,
+    DOCUMENT_CHUNK_TARGET_TOKENS,
+)
 from capsule.enums import AssetType
 from capsule.model_clients.tokenization import TokenCounter
 from capsule.schemas import AssetDraft, SourceContext
@@ -138,10 +143,21 @@ class MarkdownParser:
         path: Path,
         token_counter: TokenCounter,
         *,
+        target_tokens: int = DOCUMENT_CHUNK_TARGET_TOKENS,
+        min_tokens: int = DOCUMENT_CHUNK_MIN_TOKENS,
         max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
+        merge_max_tokens: int = DOCUMENT_CHUNK_MERGE_MAX_TOKENS,
     ) -> list[AssetDraft]:
         source = await asyncio.to_thread(_read_markdown, path)
-        return await self.assetize(source, path.name, token_counter, max_tokens=max_tokens)
+        return await self.assetize(
+            source,
+            path.name,
+            token_counter,
+            target_tokens=target_tokens,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            merge_max_tokens=merge_max_tokens,
+        )
 
     async def assetize(
         self,
@@ -149,22 +165,19 @@ class MarkdownParser:
         file_name: str,
         token_counter: TokenCounter,
         *,
+        target_tokens: int = DOCUMENT_CHUNK_TARGET_TOKENS,
+        min_tokens: int = DOCUMENT_CHUNK_MIN_TOKENS,
         max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
+        merge_max_tokens: int = DOCUMENT_CHUNK_MERGE_MAX_TOKENS,
     ) -> list[AssetDraft]:
-        nodes = self._structured_nodes(source)
-        if not _has_content(nodes):
-            return []
-        counts = await token_counter.count_many([node.raw for node in nodes])
-        for node, count in zip(nodes, counts, strict=True):
-            node.token_count = count
-        blocks = await _split_by_heading(
+        blocks = await self.split(
             source,
-            nodes,
             token_counter,
+            target_tokens=target_tokens,
+            min_tokens=min_tokens,
             max_tokens=max_tokens,
-            heading_level=1,
+            merge_max_tokens=merge_max_tokens,
         )
-        blocks = await _merge_short_blocks(source, blocks, token_counter, max_tokens=max_tokens)
         return [
             AssetDraft(
                 asset_type=AssetType.MARKDOWN_BLOCK,
@@ -185,6 +198,48 @@ class MarkdownParser:
             )
             for index, block in enumerate(blocks)
         ]
+
+    async def split(
+        self,
+        source: str,
+        token_counter: TokenCounter,
+        *,
+        target_tokens: int = DOCUMENT_CHUNK_TARGET_TOKENS,
+        min_tokens: int = DOCUMENT_CHUNK_MIN_TOKENS,
+        max_tokens: int = DOCUMENT_CHUNK_MAX_TOKENS,
+        merge_max_tokens: int = DOCUMENT_CHUNK_MERGE_MAX_TOKENS,
+    ) -> list[MarkdownAssetBlock]:
+        """Return structural blocks while retaining offsets in ``source``.
+
+        This lower-level form is shared by the document hierarchy parser: it
+        first builds larger retrieval-context parents, then applies the same
+        structural rules to make indexable children.
+        """
+        if not 1 <= min_tokens <= target_tokens <= max_tokens <= merge_max_tokens:
+            raise ValueError("token limits must satisfy min <= target <= max <= merge_max")
+        nodes = self._structured_nodes(source)
+        if not _has_content(nodes):
+            return []
+        counts = await token_counter.count_many([node.raw for node in nodes])
+        for node, count in zip(nodes, counts, strict=True):
+            node.token_count = count
+        blocks = await _split_by_heading(
+            source,
+            nodes,
+            token_counter,
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            heading_level=1,
+        )
+        blocks = await _merge_short_blocks(
+            source,
+            blocks,
+            token_counter,
+            min_tokens=min_tokens,
+            max_tokens=merge_max_tokens,
+        )
+        return blocks
 
     def _structured_nodes(self, source: str) -> list[MarkdownNode]:
         tokens = self._parser.parse(source)
@@ -255,6 +310,8 @@ async def _split_by_heading(
     nodes: list[MarkdownNode],
     counter: TokenCounter,
     *,
+    min_tokens: int,
+    target_tokens: int,
     max_tokens: int,
     heading_level: int,
 ) -> list[MarkdownAssetBlock]:
@@ -277,6 +334,8 @@ async def _split_by_heading(
                         source,
                         section,
                         counter,
+                        min_tokens=min_tokens,
+                        target_tokens=target_tokens,
                         max_tokens=max_tokens,
                         heading_level=heading_level + 1,
                     )
@@ -287,10 +346,19 @@ async def _split_by_heading(
             source,
             nodes,
             counter,
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
             max_tokens=max_tokens,
             heading_level=heading_level + 1,
         )
-    return await _split_content_nodes(source, nodes, counter, max_tokens=max_tokens)
+    return await _split_content_nodes(
+        source,
+        nodes,
+        counter,
+        min_tokens=min_tokens,
+        target_tokens=target_tokens,
+        max_tokens=max_tokens,
+    )
 
 
 def _partition_at_heading(nodes: list[MarkdownNode], level: int) -> list[list[MarkdownNode]]:
@@ -311,13 +379,17 @@ async def _split_content_nodes(
     nodes: list[MarkdownNode],
     counter: TokenCounter,
     *,
+    min_tokens: int,
+    target_tokens: int,
     max_tokens: int,
 ) -> list[MarkdownAssetBlock]:
     atoms: list[MarkdownNode] = []
     for node in nodes:
         if node.kind in {"heading", "horizontal_rule"}:
             continue
-        if node.token_count <= max_tokens:
+        # Tables are atomic by policy. They may exceed the ideal range and are
+        # marked oversized, but their rows/cells are never split here.
+        if node.kind == "table" or node.token_count <= max_tokens:
             atoms.append(node)
             continue
         if node.kind == "paragraph":
@@ -331,8 +403,25 @@ async def _split_content_nodes(
     groups: list[list[MarkdownNode]] = []
     current: list[MarkdownNode] = []
     current_tokens = 0
-    for atom in atoms:
-        if current and current_tokens + atom.token_count > max_tokens:
+    suffix_tokens = [0] * (len(atoms) + 1)
+    for atom_index in range(len(atoms) - 1, -1, -1):
+        suffix_tokens[atom_index] = suffix_tokens[atom_index + 1] + atoms[atom_index].token_count
+    for atom_index, atom in enumerate(atoms):
+        combined_tokens = current_tokens + atom.token_count
+        remaining_tokens = suffix_tokens[atom_index + 1]
+        should_flush = current and combined_tokens > max_tokens
+        if (
+            current
+            and not should_flush
+            and 0 < remaining_tokens < min_tokens
+            and atom.token_count + remaining_tokens <= max_tokens
+        ):
+            should_flush = True
+        if current and not should_flush and combined_tokens > target_tokens:
+            current_distance = abs(target_tokens - current_tokens)
+            combined_distance = abs(target_tokens - combined_tokens)
+            should_flush = combined_distance >= current_distance
+        if should_flush:
             groups.append(current)
             current = []
             current_tokens = 0
@@ -474,18 +563,30 @@ async def _merge_short_blocks(
     blocks: list[MarkdownAssetBlock],
     counter: TokenCounter,
     *,
+    min_tokens: int,
     max_tokens: int,
-    min_tokens: int = 50,
 ) -> list[MarkdownAssetBlock]:
     merged: list[MarkdownAssetBlock] = []
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
         if not merged:
             merged.append(block)
             continue
         previous = merged[-1]
-        same_parent = previous.heading_path[:-1] == block.heading_path[:-1]
+        same_parent = _same_merge_scope(previous, block)
         eligible = previous.token_count < min_tokens or block.token_count < min_tokens
         if not same_parent or not eligible or previous.oversized or block.oversized:
+            merged.append(block)
+            continue
+        if (
+            previous.token_count >= min_tokens
+            and block.token_count < min_tokens
+            and _forward_run_reaches_minimum(
+                blocks,
+                start_index=block_index,
+                min_tokens=min_tokens,
+                max_tokens=max_tokens,
+            )
+        ):
             merged.append(block)
             continue
         raw = source[previous.char_start : block.char_end]
@@ -501,6 +602,30 @@ async def _merge_short_blocks(
             token_count=combined_count,
         )
     return merged
+
+
+def _forward_run_reaches_minimum(
+    blocks: list[MarkdownAssetBlock],
+    *,
+    start_index: int,
+    min_tokens: int,
+    max_tokens: int,
+) -> bool:
+    first = blocks[start_index]
+    total = 0
+    for block in blocks[start_index:]:
+        if block.oversized or not _same_merge_scope(first, block):
+            break
+        total += block.token_count
+        if total > max_tokens:
+            return False
+        if total >= min_tokens:
+            return True
+    return False
+
+
+def _same_merge_scope(left: MarkdownAssetBlock, right: MarkdownAssetBlock) -> bool:
+    return left.heading_path[:-1] == right.heading_path[:-1]
 
 
 def _shared_prefix(left: list[str], right: list[str]) -> list[str]:

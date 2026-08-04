@@ -291,6 +291,19 @@ async def test_embedding_inputs_use_image_and_video_data_uris(
         }
     ]
 
+    derived_image = replace(
+        image,
+        derived_file_uri=image_path.as_uri(),
+        source_storage_uri="file:///container/document.docx",
+        source_mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        file_info={"mime_type": "image/png", "embedded_in_document": True},
+    )
+    derived_input = await service._build_input(
+        derived_image,
+        EmbeddingType.NATIVE_MULTIMODAL,
+    )
+    assert derived_input.input_items[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
     not_applicable = replace(
         image,
         asset_features={

@@ -40,6 +40,10 @@ class PostgresAssetSearchRepository:
                 SourceFile.workspace_id == workspace_id,
                 Asset.asset_id.in_(asset_ids),
                 Asset.generation == SourceFile.processing_generation,
+                # Parent Assets are context containers, not independently
+                # retrievable units. Exclude stale or mistakenly indexed
+                # parent vectors during PostgreSQL hydration.
+                Asset.index_role != "parent",
             )
         )
         if filters.project_id:
@@ -136,6 +140,9 @@ class PostgresAssetSearchRepository:
                 source_created_at=source_file.created_at,
                 source_updated_at=source_file.updated_at,
                 indexed_embedding_ids=frozenset(indexed_embedding_ids.get(asset.asset_id, set())),
+                parent_asset_id=asset.parent_asset_id,
+                index_role=asset.index_role,
+                child_order=asset.child_order,
             )
             for asset, source_file in rows
         }

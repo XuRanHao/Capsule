@@ -186,6 +186,9 @@ class SearchResultBuilder:
                     matched_reason=reason or _default_reason(ordered_channels),
                     rerank_score=rerank_score,
                     folded_asset_ids=[asset.asset_id],
+                    parent_asset_id=asset.parent_asset_id,
+                    index_role=asset.index_role,
+                    child_order=asset.child_order,
                 )
             )
         return _fold_and_limit(
@@ -240,6 +243,11 @@ def _fold_and_limit(
 
 
 def _can_fold(left: SearchResult, right: SearchResult) -> bool:
+    if (left.index_role, left.parent_asset_id) != (
+        right.index_role,
+        right.parent_asset_id,
+    ):
+        return False
     if left.asset_type is not right.asset_type:
         return False
     if left.asset_type is AssetType.MARKDOWN_BLOCK:

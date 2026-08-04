@@ -2,6 +2,8 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
+import pytest
+
 from capsule.enums import EmbeddingType
 from capsule.search.fusion import FusionEngine
 from capsule.search.models import (
@@ -240,6 +242,70 @@ def test_adjacent_video_segments_are_folded_before_same_source_limit() -> None:
     assert results[0].source_locator["end_ms"] == 10_000
 
 
+@pytest.mark.parametrize(
+    ("left_role", "left_parent", "right_role", "right_parent"),
+    [
+        pytest.param("child", "parent_a", "child", "parent_b", id="different-parents"),
+        pytest.param("child", "parent_a", "standalone", None, id="child-and-standalone"),
+    ],
+)
+def test_adjacent_assets_with_different_hierarchy_identity_are_not_folded(
+    left_role: str,
+    left_parent: str | None,
+    right_role: str,
+    right_parent: str | None,
+) -> None:
+    match = ChannelMatch(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=1,
+        rank=1,
+        similarity=0.9,
+        fusion_contribution=0.1,
+    )
+    assets = {
+        "video_a": _asset(
+            "video_a",
+            source_id="video_source",
+            asset_type="video_segment",
+            locator={"start_ms": 0, "end_ms": 5_000},
+            parent_asset_id=left_parent,
+            index_role=left_role,
+            child_order=0 if left_role == "child" else None,
+        ),
+        "video_b": _asset(
+            "video_b",
+            source_id="video_source",
+            asset_type="video_segment",
+            locator={"start_ms": 6_000, "end_ms": 10_000},
+            parent_asset_id=right_parent,
+            index_role=right_role,
+            child_order=1 if right_role == "child" else None,
+        ),
+    }
+
+    results = SearchResultBuilder(same_source_limit=3).build(
+        ranked_hits=[
+            FusedHit(
+                asset_id=asset.asset_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                score=1.0 - index / 10,
+                matched_channels=[match],
+            )
+            for index, asset in enumerate(assets.values())
+        ],
+        assets=assets,
+        workspace_id="workspace_demo",
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    assert [result.folded_asset_ids for result in results] == [["video_a"], ["video_b"]]
+    assert [result.group_kind for result in results] == [None, None]
+
+
 def test_database_state_rejects_stale_milvus_revision() -> None:
     asset = _asset("image_a", source_id="source_a")
     stale = ChannelMatch(
@@ -318,6 +384,46 @@ def test_database_state_uses_current_embedding_when_stale_vector_ranks_first() -
     assert results[0].source_file.sha256 == "f" * 64
 
 
+def test_result_builder_exposes_hierarchical_index_metadata() -> None:
+    asset = _asset(
+        "chunk_02",
+        source_id="source_a",
+        parent_asset_id="document_01",
+        index_role="child",
+        child_order=2,
+    )
+    match = ChannelMatch(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=1,
+        rank=1,
+        similarity=0.9,
+        fusion_contribution=0.1,
+    )
+
+    results = SearchResultBuilder().build(
+        ranked_hits=[
+            FusedHit(
+                asset_id=asset.asset_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                score=0.1,
+                matched_channels=[match],
+            )
+        ],
+        assets={asset.asset_id: asset},
+        workspace_id=asset.workspace_id,
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    assert len(results) == 1
+    assert results[0].parent_asset_id == "document_01"
+    assert results[0].index_role == "child"
+    assert results[0].child_order == 2
+
+
 def test_result_builder_preserves_reranked_order_after_database_validation() -> None:
     match = ChannelMatch(
         channel="native_multimodal",
@@ -362,6 +468,9 @@ def _asset(
     source_id: str,
     asset_type: str = "image",
     locator: dict[str, object] | None = None,
+    parent_asset_id: str | None = None,
+    index_role: str = "standalone",
+    child_order: int | None = None,
 ) -> SearchAssetRecord:
     created_at = datetime(2026, 7, 29, tzinfo=UTC)
     return SearchAssetRecord(
@@ -406,4 +515,7 @@ def _asset(
         source_created_at=created_at,
         source_updated_at=created_at,
         indexed_embedding_ids=frozenset({"embedding_current"}),
+        parent_asset_id=parent_asset_id,
+        index_role=index_role,
+        child_order=child_order,
     )
