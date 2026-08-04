@@ -4,7 +4,6 @@ import math
 from collections.abc import Awaitable
 
 from capsule.config import Settings
-from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.contracts import QueryEmbeddingClient
 from capsule.search.models import (
@@ -105,9 +104,7 @@ class QueryEmbeddingService:
         image_url: str | None,
         operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
     ) -> tuple[QueryVector, str | None]:
-        if dimension.embedding_type is not EmbeddingType.NATIVE_MULTIMODAL:
-            operation_key = ("text", dimension.query)
-        elif dimension.source is QueryDimensionSource.IMAGE:
+        if dimension.source is QueryDimensionSource.IMAGE:
             if image_url is None:
                 raise QueryEmbeddingError("image route requires a resolved image URL")
             operation_key = ("image", image_url)
@@ -131,8 +128,7 @@ class QueryEmbeddingService:
             )
         except Exception as exc:
             if (
-                dimension.embedding_type is EmbeddingType.NATIVE_MULTIMODAL
-                and dimension.source is QueryDimensionSource.JOINT
+                dimension.source is QueryDimensionSource.JOINT
                 and image_url is not None
             ):
                 logger.warning(

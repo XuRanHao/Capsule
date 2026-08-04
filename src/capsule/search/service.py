@@ -232,6 +232,7 @@ class SearchService:
                 query_text=request.query_text,
                 query_image_url=request.query_image_url,
                 query_image_upload_id=request.query_image_upload_id,
+                embedding_types=request.embedding_types,
                 precision_mode=request.precision_mode,
             ),
             parsed_query=parsed_query,

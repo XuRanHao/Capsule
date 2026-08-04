@@ -39,7 +39,24 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /搜到你记得的/);
   assert.match(html, /个人多模态素材库/);
   assert.match(html, /实时服务/);
-  assert.match(html, /多路召回/);
+  assert.match(html, /默认检索原始内容/);
+  assert.match(html, /检索维度/);
+  assert.match(html, /原始内容/);
+  assert.match(html, /目标素材类型/);
+  assert.match(html, /Markdown 段落/);
+  assert.match(html, /纯文本块/);
+  const targetTypeInputs = [
+    ...html.matchAll(/<input[^>]*name="target_asset_types"[^>]*>/g),
+  ].map((match) => match[0]);
+  assert.equal(targetTypeInputs.length, 4);
+  const dimensionInputs = [
+    ...html.matchAll(/<input[^>]*name="embedding_types"[^>]*>/g),
+  ].map((match) => match[0]);
+  assert.equal(dimensionInputs.length, 12);
+  assert.match(
+    dimensionInputs.find((input) => /value="native_multimodal"/.test(input)) ?? "",
+    /checked=""/,
+  );
   assert.match(html, /开始检索/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });

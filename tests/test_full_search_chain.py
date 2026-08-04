@@ -81,7 +81,6 @@ class FakeUnderstandingClient:
         self.parse_calls += 1
         assert image_url == "https://example.com/query.jpg"
         return ParsedQuery(
-            query_summary="图片中的人物、构图和黄昏氛围",
             dimension_queries=[
                 DimensionQuery(
                     embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
@@ -132,12 +131,20 @@ class FakeUnderstandingClient:
         )
 
 
-async def test_precision_image_parser_keeps_documented_six_routes() -> None:
+async def test_precision_image_parser_keeps_user_selected_routes() -> None:
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=QueryType.IMAGE,
         query_image_url="https://example.com/query.jpg",
         precision_mode=True,
+        embedding_types=[
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.SUBJECT_CONTENT,
+            EmbeddingType.SCENE_THEME,
+            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.COLOR_COMPOSITION,
+            EmbeddingType.MOOD_ATMOSPHERE,
+        ],
     )
     parsed, reasons = await QueryParser(FakeUnderstandingClient()).parse(
         request,
@@ -147,7 +154,66 @@ async def test_precision_image_parser_keeps_documented_six_routes() -> None:
     assert reasons == ()
     assert len(parsed.dimension_queries) == 6
     assert math.isclose(sum(item.weight for item in parsed.dimension_queries), 1)
-    assert parsed.dimension_queries[0].weight == 0.45
+    assert all(
+        math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries
+    )
+
+
+class WeightedTextUnderstandingClient:
+    async def parse_search_query(
+        self,
+        request: SearchRequest,
+        *,
+        image_url: str | None,
+    ) -> ParsedQuery:
+        source = (
+            QueryDimensionSource.JOINT
+            if request.query_type is QueryType.IMAGE_TEXT
+            else QueryDimensionSource.TEXT
+        )
+        return ParsedQuery(
+            dimension_queries=[
+                DimensionQuery(
+                    embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+                    query=request.query_text or "参考图片",
+                    weight=0.2,
+                    source=source,
+                ),
+                DimensionQuery(
+                    embedding_type=EmbeddingType.VISUAL_STYLE,
+                    query="重点匹配动画电影风格",
+                    weight=0.8,
+                ),
+            ],
+        )
+
+
+@pytest.mark.parametrize("query_type", [QueryType.TEXT, QueryType.IMAGE_TEXT])
+async def test_precision_text_bearing_queries_preserve_intent_weights(
+    query_type: QueryType,
+) -> None:
+    image_url = (
+        "https://example.com/query.jpg" if query_type is QueryType.IMAGE_TEXT else None
+    )
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=query_type,
+        query_text="重点看动画风格，原始内容其次",
+        query_image_url=image_url,
+        precision_mode=True,
+        embedding_types=[
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ],
+    )
+
+    parsed, reasons = await QueryParser(WeightedTextUnderstandingClient()).parse(
+        request,
+        image_url=image_url,
+    )
+
+    assert reasons == ()
+    assert [item.weight for item in parsed.dimension_queries] == [0.2, 0.8]
 
 
 async def test_normal_search_uses_deterministic_parser_without_model_call() -> None:
@@ -162,7 +228,28 @@ async def test_normal_search_uses_deterministic_parser_without_model_call() -> N
     parsed, reasons = await QueryParser(client).parse(request, image_url=None)
 
     assert reasons == ()
-    assert parsed.parser_mode == "deterministic_quick"
+    assert [item.embedding_type for item in parsed.dimension_queries] == [
+        EmbeddingType.NATIVE_MULTIMODAL
+    ]
+    assert client.parse_calls == 0
+
+
+async def test_precision_native_only_skips_model_parser() -> None:
+    client = FakeUnderstandingClient()
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="蓝紫色黄昏动画场景",
+        precision_mode=True,
+        embedding_types=[EmbeddingType.NATIVE_MULTIMODAL],
+    )
+
+    parsed, reasons = await QueryParser(client).parse(request, image_url=None)
+
+    assert reasons == ()
+    assert [item.embedding_type for item in parsed.dimension_queries] == [
+        EmbeddingType.NATIVE_MULTIMODAL
+    ]
     assert client.parse_calls == 0
 
 

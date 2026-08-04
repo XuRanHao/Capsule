@@ -165,12 +165,12 @@ export default function CapsulesPage() {
 
   const name = selected
     ? selected.kind === "search"
-      ? selected.search.query_summary
+      ? selected.search.query_text || "参考图片检索"
       : selected.cluster.effective_name
     : "";
   const summary = selected
     ? selected.kind === "search"
-      ? selected.search.query_text || selected.search.query_summary
+      ? selected.search.query_text || "参考图片检索"
       : selected.cluster.effective_description
     : "";
 
@@ -237,7 +237,7 @@ export default function CapsulesPage() {
               {visible.map((record) => {
                 const recordName =
                   record.kind === "search"
-                    ? record.search.query_summary
+                    ? record.search.query_text || "参考图片检索"
                     : record.cluster.effective_name;
                 const count =
                   record.kind === "search"

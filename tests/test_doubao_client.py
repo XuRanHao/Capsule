@@ -5,6 +5,7 @@ import pytest
 from pydantic import SecretStr
 
 from capsule.config import Settings
+from capsule.enums import EmbeddingType
 from capsule.model_clients.doubao import DoubaoClient, DoubaoResponseError, _extract_embedding
 from capsule.search.models import QueryType, SearchRequest
 
@@ -38,7 +39,9 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
     ]
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/responses":
+        assert request.url.path == "/responses"
+        payload = json.loads(request.content)
+        if "required_embedding_types" not in str(payload["input"]):
             content = {
                 "asset_name": "测试素材",
                 "asset_description": "一条用于验证独立并发池的素材描述。",
@@ -52,25 +55,18 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
                     for name in feature_names
                 },
             }
-            return httpx.Response(200, json={"output_text": json.dumps(content)})
-        content = {
-            "query_summary": "蓝色湖泊",
-            "dimension_queries": [
-                {
-                    "embedding_type": "native_multimodal",
-                    "query": "蓝色湖泊",
-                    "weight": 1.0,
-                    "source": "text",
-                    "constraint": "match",
-                }
-            ],
-            "negative_terms": [],
-            "parser_mode": "model",
-        }
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps(content)}}]},
-        )
+        else:
+            content = {
+                "dimension_queries": [
+                    {
+                        "embedding_type": "native_multimodal",
+                        "query": "蓝色湖泊",
+                        "weight": 1.0,
+                        "source": "text",
+                    }
+                ],
+            }
+        return httpx.Response(200, json={"output_text": json.dumps(content)})
 
     client = DoubaoClient(
         Settings(
@@ -99,6 +95,91 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
 
     assert client.asset_understanding_pool.max_observed == 1
     assert client.search_understanding_pool.max_observed == 1
+
+
+@pytest.mark.asyncio
+async def test_search_parser_uses_responses_api_with_bounded_non_thinking_output() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/responses"
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "output_text": json.dumps(
+                    {
+                        "dimension_queries": [
+                            {
+                                "embedding_type": "native_multimodal",
+                                "query": "蓝色湖泊",
+                                "weight": 0.2,
+                                "source": "text",
+                            },
+                            {
+                                "embedding_type": "visual_style",
+                                "query": "清透的自然摄影",
+                                "weight": 0.6,
+                                "source": "text",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        )
+
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            search_parser_max_output_tokens=400,
+        )
+    )
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        parsed = await client.parse_search_query(
+            SearchRequest(
+                workspace_id="workspace_test",
+                query_type=QueryType.TEXT,
+                query_text="蓝色湖泊",
+                embedding_types=[
+                    EmbeddingType.NATIVE_MULTIMODAL,
+                    EmbeddingType.VISUAL_STYLE,
+                ],
+                precision_mode=True,
+            ),
+            image_url=None,
+        )
+    finally:
+        await client.close()
+
+    assert captured["thinking"] == {"type": "disabled"}
+    assert captured["model"] == "doubao-seed-2-0-mini-260428"
+    assert captured["max_output_tokens"] == 400
+    assert captured["text"] == {"format": {"type": "json_object"}}
+    assert "weight 必须反映 query_text 对已选维度的明确倾向" in str(
+        captured["input"]
+    )
+    assert "根节点只能包含 dimension_queries" in str(captured["input"])
+    assert "required_embedding_types=native_multimodal,visual_style" in str(
+        captured["input"]
+    )
+    assert [item.embedding_type for item in parsed.dimension_queries] == [
+        EmbeddingType.NATIVE_MULTIMODAL,
+        EmbeddingType.VISUAL_STYLE,
+    ]
+    assert [item.weight for item in parsed.dimension_queries] == pytest.approx(
+        [0.25, 0.75]
+    )
+    assert set(parsed.model_dump()) == {"dimension_queries"}
+    assert all(
+        set(item.model_dump()) == {"embedding_type", "query", "weight", "source"}
+        for item in parsed.dimension_queries
+    )
 
 
 @pytest.mark.asyncio

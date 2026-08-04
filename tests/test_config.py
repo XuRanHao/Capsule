@@ -15,6 +15,7 @@ def test_document_chunk_size_defaults_to_250_400_500_600_tokens() -> None:
     settings = Settings()
 
     assert settings.assetization_version == "assetization-v6"
+    assert settings.search_parser_model == "doubao-seed-2-0-mini-260428"
     assert settings.document_tokenizer_path is None
     assert settings.document_chunk_min_tokens == 250
     assert settings.document_chunk_target_tokens == 400

@@ -119,6 +119,12 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    cp .env.example .env
    ```
 
+   Model workloads are configured independently: `CAPSULE_SEARCH_PARSER_MODEL`
+   controls Query Parser calls, `CAPSULE_UNDERSTANDING_MODEL` controls asset and
+   cluster understanding, and `CAPSULE_EMBEDDING_MODEL` controls the shared
+   multimodal embedding space. Changing the embedding model requires rebuilding
+   its indexes; changing only the Parser model does not.
+
 2. Start local infrastructure.
 
    ```bash
@@ -300,12 +306,22 @@ query
 ```
 
 The available embedding routes are `native_multimodal`, `asset_description`,
-and all ten Asset Feature dimensions. Text fallback uses the documented six
-routes. Quick image search uses native multimodal only; precise image search
-parses the image into six weighted routes. Image-text search preserves image
-constraints and applies text additions, modifications, and exclusions through
-late fusion and reranking. Any failed route is removed, surviving weights are
-renormalized, and the response reports `degraded=true`.
+and all ten Asset Feature dimensions. Requests default to `native_multimodal`
+only and may explicitly select multiple routes with `embedding_types`; selected
+routes receive equal weights in quick mode. A native-only request always skips
+model parsing; multi-route precision parsing rewrites only the selected routes
+with model thinking disabled. For text and image-text precision queries, explicit
+dimension preferences in the query determine normalized route weights; pure-image
+precision queries remain equal-weighted. Image-text search preserves image constraints and applies text additions,
+modifications, and exclusions through late fusion and reranking. Any failed route
+is removed, surviving weights are renormalized, and the response reports
+`degraded=true`.
+
+Search dimensions are validated against the target `filters.asset_type` values.
+`visual_style` and `color_composition` are available only for images and video
+segments; Markdown and plain-text assets skip those channels during indexing.
+Mixed target-type searches use union semantics, so visual channels remain
+available but apply only to their image/video subset.
 
 Search filter names follow PostgreSQL columns. In particular, use
 `filters.model_name` for the Embedding model and `filters.file_type` for the

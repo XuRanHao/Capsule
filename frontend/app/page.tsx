@@ -4,22 +4,31 @@ import { FormEvent, KeyboardEvent, useMemo, useState } from "react";
 import { ProductTopbar } from "./components/DemoShell";
 
 type QueryType = "text" | "image" | "image_text";
-type AssetType = "image" | "video_segment" | "markdown_block";
+type AssetType = "image" | "video_segment" | "markdown_block" | "text_block";
 type FusionMethod = "weighted_rrf" | "normalized_weighted_similarity";
+type EmbeddingType =
+  | "native_multimodal"
+  | "asset_description"
+  | "subject_content"
+  | "scene_theme"
+  | "visual_style"
+  | "color_composition"
+  | "mood_atmosphere"
+  | "character_state_or_psychology"
+  | "asset_usage"
+  | "target_audience"
+  | "provenance"
+  | "rights_version_authorship";
 
 type DimensionQuery = {
   embedding_type: string;
   query: string;
   weight: number;
   source: "text" | "image" | "joint";
-  constraint: string;
 };
 
 type ParsedQuery = {
-  query_summary: string;
   dimension_queries: DimensionQuery[];
-  negative_terms: string[];
-  parser_mode: string;
 };
 
 type MatchedChannel = {
@@ -84,6 +93,7 @@ type SearchResponse = {
     query_image_url: string | null;
     query_image_upload_id: string | null;
     precision_mode: boolean;
+    embedding_types: EmbeddingType[];
   };
   parsed_query: ParsedQuery | null;
   fusion_method: FusionMethod;
@@ -107,7 +117,6 @@ type CapsuleSummary = {
   query_type: QueryType;
   query_text: string | null;
   query_image_uri: string | null;
-  query_summary: string;
   fusion_method: FusionMethod;
   rerank_method: string;
   is_favorite: boolean;
@@ -136,7 +145,7 @@ const QUERY_TYPES: Array<{ value: QueryType; label: string; marker: string }> = 
 ];
 
 const CHANNEL_LABELS: Record<string, string> = {
-  native_multimodal: "原生多模态",
+  native_multimodal: "原始内容",
   asset_description: "内容描述",
   subject_content: "主体内容",
   scene_theme: "场景主题",
@@ -150,11 +159,41 @@ const CHANNEL_LABELS: Record<string, string> = {
   rights_version_authorship: "版权版本",
 };
 
+const SEARCH_DIMENSIONS = Object.entries(CHANNEL_LABELS).map(
+  ([value, label]) => ({ value: value as EmbeddingType, label }),
+);
+
 const ASSET_LABELS: Record<AssetType, string> = {
   image: "图片",
   video_segment: "视频片段",
-  markdown_block: "文字段落",
+  markdown_block: "Markdown 段落",
+  text_block: "纯文本块",
 };
+
+const VISUAL_ASSET_TYPES = new Set<AssetType>(["image", "video_segment"]);
+const VISUAL_ONLY_DIMENSIONS = new Set<EmbeddingType>([
+  "visual_style",
+  "color_composition",
+]);
+
+function dimensionSupportCount(
+  embeddingType: EmbeddingType,
+  targetAssetTypes: AssetType[],
+) {
+  if (!VISUAL_ONLY_DIMENSIONS.has(embeddingType)) {
+    return targetAssetTypes.length;
+  }
+  return targetAssetTypes.filter((assetType) =>
+    VISUAL_ASSET_TYPES.has(assetType),
+  ).length;
+}
+
+function dimensionSupportsTargets(
+  embeddingType: EmbeddingType,
+  targetAssetTypes: AssetType[],
+) {
+  return dimensionSupportCount(embeddingType, targetAssetTypes) > 0;
+}
 
 const DEMO_RESULTS: SearchResult[] = [
   {
@@ -325,41 +364,40 @@ const DEMO_RESPONSE: SearchResponse = {
     query_image_url: null,
     query_image_upload_id: null,
     precision_mode: true,
+    embedding_types: [
+      "asset_description",
+      "native_multimodal",
+      "subject_content",
+      "visual_style",
+    ],
   },
   parsed_query: {
-    query_summary: "蓝紫色黄昏中的动画叙事场景",
     dimension_queries: [
       {
         embedding_type: "asset_description",
         query: "蓝紫色黄昏动画场景",
         weight: 0.35,
         source: "text",
-        constraint: "match",
       },
       {
         embedding_type: "native_multimodal",
         query: "蓝紫色黄昏动画场景",
         weight: 0.35,
         source: "text",
-        constraint: "match",
       },
       {
         embedding_type: "subject_content",
         query: "黄昏中的人物与环境",
         weight: 0.15,
         source: "text",
-        constraint: "match",
       },
       {
         embedding_type: "visual_style",
         query: "动画电影质感",
         weight: 0.15,
         source: "text",
-        constraint: "match",
       },
     ],
-    negative_terms: [],
-    parser_mode: "model",
   },
   fusion_method: "weighted_rrf",
   rerank_method: "doubao_seed_2_lite",
@@ -385,6 +423,7 @@ const EMPTY_RESPONSE: SearchResponse = {
     query_image_url: null,
     query_image_upload_id: null,
     precision_mode: false,
+    embedding_types: ["native_multimodal"],
   },
   parsed_query: null,
   fusion_method: "weighted_rrf",
@@ -466,7 +505,12 @@ function SearchResultCard({
           />
         ) : (
           <div className="visual-placeholder" aria-hidden="true">
-            <span>{result.asset_type === "markdown_block" ? "¶" : "C"}</span>
+            <span>
+              {result.asset_type === "markdown_block" ||
+              result.asset_type === "text_block"
+                ? "¶"
+                : "C"}
+            </span>
             <i />
           </div>
         )}
@@ -617,8 +661,6 @@ function QueryPlan({ parsed }: { parsed: ParsedQuery | null }) {
     <section className="query-plan">
       <div>
         <span className="eyebrow">QUERY PLAN</span>
-        <strong>{parsed.query_summary}</strong>
-        <small>{parsed.parser_mode}</small>
       </div>
       <div className="dimension-strip">
         {parsed.dimension_queries.map((dimension) => (
@@ -628,15 +670,10 @@ function QueryPlan({ parsed }: { parsed: ParsedQuery | null }) {
                 dimension.embedding_type}
             </span>
             <b>{Math.round(dimension.weight * 100)}%</b>
-            <small>
-              {dimension.source} · {dimension.constraint}
-            </small>
+            <small>{dimension.source}</small>
           </div>
         ))}
       </div>
-      {parsed.negative_terms.length > 0 && (
-        <p>排除：{parsed.negative_terms.join("、")}</p>
-      )}
     </section>
   );
 }
@@ -655,6 +692,9 @@ export default function Home() {
   const [assetTypes, setAssetTypes] = useState<AssetType[]>([
     "image",
     "video_segment",
+  ]);
+  const [embeddingTypes, setEmbeddingTypes] = useState<EmbeddingType[]>([
+    "native_multimodal",
   ]);
   const [precisionMode, setPrecisionMode] = useState(false);
   const [fusionMethod, setFusionMethod] =
@@ -684,6 +724,8 @@ export default function Home() {
 
   const validationMessage = useMemo(() => {
     if (!workspaceId.trim()) return "请填写 Workspace ID";
+    if (assetTypes.length === 0) return "请至少选择一种目标素材类型";
+    if (embeddingTypes.length === 0) return "请至少选择一个检索维度";
     if (textQueryEnabled && !queryText.trim()) return "请输入检索文字";
     if (
       imageQueryEnabled &&
@@ -694,7 +736,9 @@ export default function Home() {
     }
     return null;
   }, [
+    assetTypes,
     imageQueryEnabled,
+    embeddingTypes,
     queryImageFile,
     queryImageUrl,
     queryText,
@@ -750,6 +794,7 @@ export default function Home() {
           query_image_url:
             imageQueryEnabled && !upload ? queryImageUrl.trim() : null,
           query_image_upload_id: upload?.upload_id ?? null,
+          embedding_types: embeddingTypes,
           precision_mode: precisionMode,
           fusion_method: fusionMethod,
           rerank: rerank ? "doubao_seed_2_lite" : "off",
@@ -906,11 +951,28 @@ export default function Home() {
   };
 
   const toggleAssetType = (assetType: AssetType) => {
-    setAssetTypes((current) =>
-      current.includes(assetType)
-        ? current.filter((item) => item !== assetType)
-        : [...current, assetType],
-    );
+    const next = assetTypes.includes(assetType)
+      ? assetTypes.filter((item) => item !== assetType)
+      : [...assetTypes, assetType];
+    if (next.length === 0) return;
+    setAssetTypes(next);
+    setEmbeddingTypes((current) => {
+      const compatible = current.filter((embeddingType) =>
+        dimensionSupportsTargets(embeddingType, next),
+      );
+      return compatible.length > 0 ? compatible : ["native_multimodal"];
+    });
+  };
+  const toggleEmbeddingType = (embeddingType: EmbeddingType) => {
+    if (!dimensionSupportsTargets(embeddingType, assetTypes)) return;
+    setEmbeddingTypes((current) => {
+      if (current.includes(embeddingType)) {
+        return current.length === 1
+          ? current
+          : current.filter((item) => item !== embeddingType);
+      }
+      return [...current, embeddingType];
+    });
   };
   const assetResults =
     response.assets.length > 0 ? response.assets : response.results;
@@ -934,7 +996,7 @@ export default function Home() {
                 <br />
                 那一幕。
               </h1>
-              <p>快速路由、多路召回、融合与结果折叠一次完成；精搜按需启用模型解析。</p>
+              <p>默认检索原始内容，也可以按需组合主体、场景、风格等多个维度。</p>
             </div>
 
             <form onSubmit={submitSearch}>
@@ -996,6 +1058,80 @@ export default function Home() {
                 </div>
               )}
 
+              <fieldset className="asset-filters target-asset-types">
+                <legend>目标素材类型</legend>
+                {(Object.keys(ASSET_LABELS) as AssetType[]).map((assetType) => (
+                  <label key={assetType}>
+                    <input
+                      type="checkbox"
+                      name="target_asset_types"
+                      value={assetType}
+                      checked={assetTypes.includes(assetType)}
+                      disabled={
+                        assetTypes.includes(assetType) && assetTypes.length === 1
+                      }
+                      onChange={() => toggleAssetType(assetType)}
+                    />
+                    <span aria-hidden="true" />
+                    {ASSET_LABELS[assetType]}
+                  </label>
+                ))}
+                <p>维度选项会随目标素材类型变化。</p>
+              </fieldset>
+
+              <details className="dimension-select">
+                <summary>
+                  <span>
+                    <small>检索维度</small>
+                    <strong>
+                      {embeddingTypes.length === 1
+                        ? CHANNEL_LABELS[embeddingTypes[0]]
+                        : `已选择 ${embeddingTypes.length} 个维度`}
+                    </strong>
+                  </span>
+                  <b aria-hidden="true">⌄</b>
+                </summary>
+                <div className="dimension-options">
+                  {SEARCH_DIMENSIONS.map((dimension) => {
+                    const checked = embeddingTypes.includes(dimension.value);
+                    const supportCount = dimensionSupportCount(
+                      dimension.value,
+                      assetTypes,
+                    );
+                    const available = supportCount > 0;
+                    const partiallyAvailable =
+                      available && supportCount < assetTypes.length;
+                    return (
+                      <label
+                        key={dimension.value}
+                        className={!available ? "dimension-unavailable" : undefined}
+                      >
+                        <input
+                          type="checkbox"
+                          name="embedding_types"
+                          value={dimension.value}
+                          checked={checked}
+                          disabled={
+                            !available || (checked && embeddingTypes.length === 1)
+                          }
+                          onChange={() => toggleEmbeddingType(dimension.value)}
+                        />
+                        <span aria-hidden="true" />
+                        <em>{dimension.label}</em>
+                        <code>
+                          {!available
+                            ? "当前类型不可用"
+                            : partiallyAvailable
+                              ? "仅图片 / 视频"
+                              : dimension.value}
+                        </code>
+                      </label>
+                    );
+                  })}
+                </div>
+                <p>普通模式等权；精搜按查询中的维度倾向分配权重。</p>
+              </details>
+
               <div className="search-options">
                 <label>
                   <input
@@ -1030,6 +1166,7 @@ export default function Home() {
                 融合算法
                 <select
                   value={fusionMethod}
+                  disabled={embeddingTypes.length === 1}
                   onChange={(event) =>
                     setFusionMethod(event.target.value as FusionMethod)
                   }
@@ -1040,21 +1177,6 @@ export default function Home() {
                   </option>
                 </select>
               </label>
-
-              <fieldset className="asset-filters">
-                <legend>素材类型</legend>
-                {(Object.keys(ASSET_LABELS) as AssetType[]).map((assetType) => (
-                  <label key={assetType}>
-                    <input
-                      type="checkbox"
-                      checked={assetTypes.includes(assetType)}
-                      onChange={() => toggleAssetType(assetType)}
-                    />
-                    <span aria-hidden="true" />
-                    {ASSET_LABELS[assetType]}
-                  </label>
-                ))}
-              </fieldset>
 
               <details className="advanced-filters">
                 <summary>高级过滤</summary>
@@ -1275,7 +1397,7 @@ export default function Home() {
                     <small>
                       {capsule.query_type} · {capsule.result_count} results
                     </small>
-                    <strong>{capsule.query_summary}</strong>
+                    <strong>{capsule.query_text || "参考图片检索"}</strong>
                     <span>
                       {new Date(capsule.last_used_at).toLocaleString("zh-CN")}
                     </span>
@@ -1299,7 +1421,9 @@ export default function Home() {
                   <header>
                     <div>
                       <small>历史快照</small>
-                      <h2>{selectedCapsule.query_summary}</h2>
+                      <h2>
+                        {selectedCapsule.query_text || "参考图片检索"}
+                      </h2>
                       <span>
                         {selectedCapsule.executions.length} 次执行 ·{" "}
                         {selectedCapsule.latest_snapshot.results.length} 个结果

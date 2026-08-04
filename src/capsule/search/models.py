@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from capsule.enums import AssetType, EmbeddingType
+from capsule.features import embedding_type_supports_any_asset_type
 
 
 class QueryType(StrEnum):
@@ -28,14 +29,6 @@ class QueryDimensionSource(StrEnum):
     TEXT = "text"
     IMAGE = "image"
     JOINT = "joint"
-
-
-class QueryConstraint(StrEnum):
-    MATCH = "match"
-    MAINTAIN = "maintain"
-    ADD = "add"
-    EXCLUDE = "exclude"
-    MODIFY = "modify"
 
 
 class SearchFilters(BaseModel):
@@ -74,6 +67,11 @@ class SearchRequest(BaseModel):
     query_text: str | None = Field(default=None, max_length=100_000)
     query_image_url: str | None = Field(default=None, max_length=16_384)
     query_image_upload_id: str | None = Field(default=None, max_length=128)
+    embedding_types: list[EmbeddingType] = Field(
+        default_factory=lambda: [EmbeddingType.NATIVE_MULTIMODAL],
+        min_length=1,
+        max_length=len(EmbeddingType),
+    )
     precision_mode: bool = False
     fusion_method: FusionMethod = FusionMethod.WEIGHTED_RRF
     rerank: RerankMethod | bool = RerankMethod.OFF
@@ -105,6 +103,22 @@ class SearchRequest(BaseModel):
         self.query_image_upload_id = upload_id
         if isinstance(self.rerank, bool):
             self.rerank = RerankMethod.DOUBAO_SEED_2_LITE if self.rerank else RerankMethod.OFF
+        if len(self.embedding_types) != len(set(self.embedding_types)):
+            raise ValueError("embedding_types must contain unique values")
+        unsupported = [
+            embedding_type.value
+            for embedding_type in self.embedding_types
+            if not embedding_type_supports_any_asset_type(
+                embedding_type=embedding_type,
+                asset_types=self.filters.asset_type,
+            )
+        ]
+        if unsupported:
+            targets = ", ".join(item.value for item in self.filters.asset_type)
+            raise ValueError(
+                f"embedding_types {', '.join(unsupported)} are not supported "
+                f"for target asset types {targets}"
+            )
         return self
 
     @property
@@ -118,14 +132,10 @@ class DimensionQuery(BaseModel):
     query: str = Field(min_length=1, max_length=8_000)
     weight: float = Field(gt=0, le=1)
     source: QueryDimensionSource = QueryDimensionSource.TEXT
-    constraint: QueryConstraint = QueryConstraint.MATCH
 
 
 class ParsedQuery(BaseModel):
-    query_summary: str = Field(min_length=1, max_length=8_000)
     dimension_queries: list[DimensionQuery] = Field(min_length=1, max_length=12)
-    negative_terms: list[str] = Field(default_factory=list)
-    parser_mode: str = "model"
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> "ParsedQuery":
@@ -143,6 +153,9 @@ class SearchQueryEcho(BaseModel):
     query_text: str | None
     query_image_url: str | None
     query_image_upload_id: str | None = None
+    embedding_types: list[EmbeddingType] = Field(
+        default_factory=lambda: [EmbeddingType.NATIVE_MULTIMODAL]
+    )
     precision_mode: bool = False
 
 
@@ -283,7 +296,6 @@ class SearchCapsuleSummary(BaseModel):
     query_type: QueryType
     query_text: str | None
     query_image_uri: str | None
-    query_summary: str
     fusion_method: FusionMethod
     rerank_method: RerankMethod
     is_favorite: bool

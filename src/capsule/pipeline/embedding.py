@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType, EmbeddingSourceMode, EmbeddingType
-from capsule.features import asset_usage_embedding_text, effective_feature_text
+from capsule.features import (
+    asset_usage_embedding_text,
+    effective_feature_text,
+    embedding_type_supports_asset_type,
+)
 from capsule.media.model_image import ModelImageCache
 from capsule.schemas import EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
@@ -360,6 +364,13 @@ class AssetEmbeddingService:
         asset: EmbeddingAsset,
         embedding_type: EmbeddingType,
     ) -> _EmbeddingInput:
+        if not embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=asset.asset_type,
+        ):
+            raise EmbeddingInputUnavailable(
+                f"{embedding_type.value} is not supported for {asset.asset_type}"
+            )
         if embedding_type is EmbeddingType.NATIVE_MULTIMODAL:
             return await self._native_input(asset)
         if embedding_type is EmbeddingType.ASSET_DESCRIPTION:

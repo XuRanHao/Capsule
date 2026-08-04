@@ -4,12 +4,55 @@ from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Any
 
-from capsule.enums import EmbeddingType, FeatureStatus
+from capsule.enums import AssetType, EmbeddingType, FeatureStatus
 
 _NULL_FEATURE_STATUSES = {
     FeatureStatus.UNKNOWN.value,
     FeatureStatus.NOT_APPLICABLE.value,
 }
+
+_VISUAL_ASSET_TYPES = frozenset({AssetType.IMAGE, AssetType.VIDEO_SEGMENT})
+_VISUAL_ONLY_EMBEDDING_TYPES = frozenset(
+    {EmbeddingType.VISUAL_STYLE, EmbeddingType.COLOR_COMPOSITION}
+)
+
+
+def embedding_type_supports_asset_type(
+    *,
+    embedding_type: EmbeddingType | str,
+    asset_type: AssetType | str,
+) -> bool:
+    """Return whether an embedding channel is meaningful for an Asset type."""
+
+    resolved_embedding_type = (
+        embedding_type
+        if isinstance(embedding_type, EmbeddingType)
+        else EmbeddingType(embedding_type)
+    )
+    resolved_asset_type = (
+        asset_type if isinstance(asset_type, AssetType) else AssetType(asset_type)
+    )
+    return (
+        resolved_embedding_type not in _VISUAL_ONLY_EMBEDDING_TYPES
+        or resolved_asset_type in _VISUAL_ASSET_TYPES
+    )
+
+
+def embedding_type_supports_any_asset_type(
+    *,
+    embedding_type: EmbeddingType | str,
+    asset_types: list[AssetType] | tuple[AssetType, ...],
+) -> bool:
+    """Use union semantics when a search targets multiple Asset types."""
+
+    targets = tuple(asset_types) or tuple(AssetType)
+    return any(
+        embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=asset_type,
+        )
+        for asset_type in targets
+    )
 
 
 def effective_feature_text(

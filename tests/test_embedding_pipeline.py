@@ -319,6 +319,20 @@ async def test_embedding_inputs_use_image_and_video_data_uris(
             EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY,
         )
 
+    text_with_visual_metadata = replace(
+        image,
+        asset_type=AssetType.MARKDOWN_BLOCK.value,
+        raw_content="一段带有模型视觉标签的文字。",
+        asset_features={
+            "visual_style": {"value": "赛博朋克", "status": "observed"}
+        },
+    )
+    with pytest.raises(EmbeddingInputUnavailable, match="not supported"):
+        await service._build_input(
+            text_with_visual_metadata,
+            EmbeddingType.VISUAL_STYLE,
+        )
+
     usage = replace(
         image,
         source_relative_path="海报/素材/20251216-143446.png",

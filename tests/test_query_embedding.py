@@ -56,7 +56,7 @@ def settings() -> Settings:
     )
 
 
-async def test_text_query_builds_fallback_six_normalized_channels() -> None:
+async def test_text_query_defaults_to_native_content_only() -> None:
     client = FakeEmbeddingClient()
     service = QueryEmbeddingService(client, settings())
 
@@ -69,12 +69,7 @@ async def test_text_query_builds_fallback_six_normalized_channels() -> None:
     )
 
     assert [item.embedding_type for item in plan.vectors] == [
-        EmbeddingType.ASSET_DESCRIPTION,
         EmbeddingType.NATIVE_MULTIMODAL,
-        EmbeddingType.SUBJECT_CONTENT,
-        EmbeddingType.SCENE_THEME,
-        EmbeddingType.VISUAL_STYLE,
-        EmbeddingType.MOOD_ATMOSPHERE,
     ]
     assert all(math.isclose(sum(value**2 for value in item.vector), 1.0) for item in plan.vectors)
     assert client.calls == ["text:蓝紫色黄昏"]
@@ -91,6 +86,14 @@ async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None
             query_type=QueryType.IMAGE_TEXT,
             query_text="更像黄昏",
             query_image_url="https://example.com/query.png",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.ASSET_DESCRIPTION,
+                EmbeddingType.SUBJECT_CONTENT,
+                EmbeddingType.VISUAL_STYLE,
+                EmbeddingType.MOOD_ATMOSPHERE,
+                EmbeddingType.TARGET_AUDIENCE,
+            ],
         )
     )
 
@@ -123,7 +126,7 @@ async def test_image_text_falls_back_to_separate_vectors() -> None:
     )
 
     assert plan.vectors[0].channel == "native_multimodal"
-    assert plan.vectors[0].weight == 0.35
+    assert plan.vectors[0].weight == 1.0
     assert plan.degraded is True
     assert "image:https://example.com/query.png" in client.calls
 
@@ -138,7 +141,35 @@ async def test_image_text_embeddings_run_concurrently() -> None:
             query_type=QueryType.IMAGE_TEXT,
             query_text="并发查询",
             query_image_url="https://example.com/query.png",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.ASSET_DESCRIPTION,
+            ],
         )
     )
 
     assert client.max_observed == 2
+
+
+async def test_image_query_reuses_image_vector_for_selected_semantic_channels() -> None:
+    client = FakeEmbeddingClient()
+    service = QueryEmbeddingService(client, settings())
+
+    plan = await service.embed(
+        SearchRequest(
+            workspace_id="workspace_demo",
+            query_type=QueryType.IMAGE,
+            query_image_url="https://example.com/query.png",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.VISUAL_STYLE,
+            ],
+        )
+    )
+
+    assert [item.embedding_type for item in plan.vectors] == [
+        EmbeddingType.NATIVE_MULTIMODAL,
+        EmbeddingType.VISUAL_STYLE,
+    ]
+    assert client.calls == ["image:https://example.com/query.png"]
+    assert [item.weight for item in plan.vectors] == [0.5, 0.5]

@@ -41,7 +41,7 @@ async def test_search_capsule_snapshot_refresh_state_and_favorite() -> None:
             created_by=request.created_by,
         )
         assert detail.latest_snapshot.execution_id == execution_id
-        assert detail.query_summary == "蓝紫色黄昏"
+        assert detail.query_text == "蓝紫色黄昏"
 
         updated = await history.set_favorite(
             capsule_id=capsule_id,

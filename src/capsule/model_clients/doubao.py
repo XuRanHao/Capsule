@@ -3,14 +3,36 @@ from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from capsule.config import Settings
+from capsule.enums import EmbeddingType
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
-from capsule.search.models import ParsedQuery, RerankBatch, SearchRequest
+from capsule.search.models import (
+    DimensionQuery,
+    ParsedQuery,
+    QueryDimensionSource,
+    RerankBatch,
+    SearchRequest,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+class _SearchParserDimension(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    embedding_type: EmbeddingType
+    query: str = Field(min_length=1, max_length=8_000)
+    weight: float = Field(gt=0, le=1)
+    source: QueryDimensionSource = QueryDimensionSource.TEXT
+
+
+class _SearchParserOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dimension_queries: list[_SearchParserDimension] = Field(min_length=1, max_length=12)
 
 
 class DoubaoConfigurationError(RuntimeError):
@@ -152,26 +174,29 @@ class DoubaoClient:
         *,
         image_url: str | None,
     ) -> ParsedQuery:
-        """Parse a text/image query into the weighted routes frozen in the POC spec."""
+        """Parse a text/image query and normalize user-intent route weights."""
         system = {
             "role": "system",
             "content": (
-                "你是多模态素材检索 Query Parser。只输出 JSON。返回 query_summary、"
-                "dimension_queries、negative_terms、parser_mode。dimension_queries 每项必须含"
-                " embedding_type、query、weight、source、constraint；weight 总和必须为 1，"
+                "你是多模态素材检索 Query Parser。只输出 JSON，根节点只能包含 "
+                "dimension_queries。dimension_queries 必须且只能包含"
+                "用户指令 required_embedding_types 中列出的维度，每项必须含"
+                " embedding_type、query、weight、source。"
                 "embedding_type 只能从 native_multimodal、asset_description、"
                 "subject_content、scene_theme、visual_style、color_composition、"
                 "mood_atmosphere、character_state_or_psychology、asset_usage、"
                 "target_audience、provenance、rights_version_authorship 中选择且不得重复。"
-                "source 只能是 text/image/joint，constraint 只能是 match/maintain/add/"
-                "exclude/modify。图片精搜优先 native=.45、subject=.15、scene=.10、"
-                "visual=.10、color=.10、mood=.10。图文检索要识别保持、更像、排除、"
-                "只看、风格相似等约束，使用 Late Fusion，不要把约束丢掉。"
+                "source 只能是 text/image/joint。weight 必须反映 query_text 对已选维度的"
+                "明确倾向且总和为 1；"
+                "出现“重点、主要、更看重、其次”等表达时拉开权重，没有倾向时等权。"
+                "禁止通过权重增加或删除 required_embedding_types。"
             ),
         }
         instruction = (
             f"query_type={request.query_type.value}; "
             f"precision_mode={request.precision_mode}; "
+            "required_embedding_types="
+            f"{','.join(item.value for item in request.embedding_types)}; "
             f"query_text={request.query_text or ''}"
         )
         content: list[dict[str, object]] = [{"type": "text", "text": instruction}]
@@ -182,11 +207,32 @@ class DoubaoClient:
                     "image_url": {"url": image_url},
                 }
             )
-        return await self._chat_json(
+        parsed = await self._responses_json(
             messages=[system, {"role": "user", "content": content}],
-            output_type=ParsedQuery,
+            output_type=_SearchParserOutput,
             pool=self.search_understanding_pool,
             timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=self._settings.search_parser_max_output_tokens,
+            model=self._settings.search_parser_model,
+        )
+        returned_types = [item.embedding_type for item in parsed.dimension_queries]
+        if len(returned_types) != len(set(returned_types)) or set(returned_types) != set(
+            request.embedding_types
+        ):
+            raise DoubaoResponseError(
+                "search parser dimensions do not match required_embedding_types"
+            )
+        total_weight = sum(item.weight for item in parsed.dimension_queries)
+        return ParsedQuery(
+            dimension_queries=[
+                DimensionQuery(
+                    embedding_type=item.embedding_type,
+                    query=item.query,
+                    weight=item.weight / total_weight,
+                    source=item.source,
+                )
+                for item in parsed.dimension_queries
+            ],
         )
 
     async def rerank_search_results(
@@ -333,6 +379,8 @@ class DoubaoClient:
         output_type: type[ModelT],
         pool: AsyncCallPool,
         timeout_seconds: float,
+        max_output_tokens: int | None = None,
+        model: str | None = None,
     ) -> ModelT:
         """Call Ark Responses API for the Lite model with thinking disabled."""
 
@@ -342,10 +390,14 @@ class DoubaoClient:
             response = await self._client.post(
                 "/responses",
                 json={
-                    "model": self._settings.understanding_model,
+                    "model": model or self._settings.understanding_model,
                     "input": response_input,
                     "thinking": {"type": "disabled"},
-                    "max_output_tokens": self._settings.understanding_max_output_tokens,
+                    "max_output_tokens": (
+                        max_output_tokens
+                        if max_output_tokens is not None
+                        else self._settings.understanding_max_output_tokens
+                    ),
                     "text": {"format": {"type": "json_object"}},
                 },
                 timeout=timeout_seconds,

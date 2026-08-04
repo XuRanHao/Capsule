@@ -283,6 +283,14 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
                 "workspace_id": "workspace_demo",
                 "query_type": "text",
                 "query_text": "蓝紫色黄昏动画场景",
+                "embedding_types": [
+                    "asset_description",
+                    "native_multimodal",
+                    "subject_content",
+                    "scene_theme",
+                    "visual_style",
+                    "mood_atmosphere",
+                ],
                 "filters": {"asset_type": ["image"]},
                 "top_k": 4,
             }
@@ -330,6 +338,7 @@ async def test_search_api_returns_the_service_response() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["query"]["query_type"] == "image"
+    assert payload["query"]["embedding_types"] == ["native_multimodal"]
     assert payload["total"] == 2
     assert payload["asset_total"] == 2
     assert payload["cluster_total"] == 1
@@ -355,6 +364,50 @@ async def test_search_api_validates_query_inputs() -> None:
             )
 
     assert response.status_code == 422
+
+
+async def test_search_api_rejects_visual_dimensions_for_text_only_targets() -> None:
+    service, _, _, _ = build_service()
+    app = create_app(search_service=service)
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/search",
+                json={
+                    "workspace_id": "workspace_demo",
+                    "query_type": "text",
+                    "query_text": "蓝紫色黄昏",
+                    "embedding_types": ["visual_style"],
+                    "filters": {"asset_type": ["markdown_block", "text_block"]},
+                },
+            )
+
+    assert response.status_code == 422
+    assert "visual_style" in response.text
+
+
+async def test_search_api_allows_visual_dimensions_for_mixed_targets() -> None:
+    service, _, _, _ = build_service()
+    app = create_app(search_service=service)
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/search",
+                json={
+                    "workspace_id": "workspace_demo",
+                    "query_type": "text",
+                    "query_text": "蓝紫色黄昏",
+                    "embedding_types": ["color_composition"],
+                    "filters": {"asset_type": ["image", "markdown_block"]},
+                    "top_k": 2,
+                },
+            )
+
+    assert response.status_code == 200
 
 
 async def test_search_api_allows_configured_frontend_origin() -> None:

@@ -5,7 +5,6 @@ from capsule.search.contracts import SearchUnderstandingClient
 from capsule.search.models import (
     DimensionQuery,
     ParsedQuery,
-    QueryConstraint,
     QueryDimensionSource,
     QueryType,
     SearchRequest,
@@ -31,49 +30,52 @@ class QueryParser:
         *,
         image_url: str | None,
     ) -> tuple[ParsedQuery, tuple[str, ...]]:
-        if not request.precision_mode:
+        native_only = request.embedding_types == [EmbeddingType.NATIVE_MULTIMODAL]
+        if not request.precision_mode or native_only:
             if request.query_type is QueryType.IMAGE:
-                return _quick_image_query(), ()
-            return _quick_semantic_query(request), ()
+                return _select_requested_dimensions(_quick_image_query(), request), ()
+            return _select_requested_dimensions(_quick_semantic_query(request), request), ()
         if self._client is not None:
             try:
                 parsed = await self._client.parse_search_query(
                     request,
                     image_url=image_url,
                 )
-                return _normalize_weights(parsed), ()
+                return _select_requested_dimensions(
+                    _normalize_weights(parsed),
+                    request,
+                    preserve_weights=request.query_type
+                    in {QueryType.TEXT, QueryType.IMAGE_TEXT},
+                ), ()
             except Exception:
                 logger.warning("query parser model call failed; fallback used", exc_info=True)
-        return _fallback_query(request), ("query parser fallback used",)
+        return _select_requested_dimensions(
+            _fallback_query(request),
+            request,
+        ), ("query parser fallback used",)
 
 
 def _quick_semantic_query(request: SearchRequest) -> ParsedQuery:
     """Route ordinary text and image-text searches without a model round trip."""
-    return _fallback_query(request).model_copy(
-        update={"parser_mode": "deterministic_quick"},
-    )
+    return _fallback_query(request)
 
 
 def _quick_image_query() -> ParsedQuery:
     return ParsedQuery(
-        query_summary="按参考图片进行原生多模态快速检索",
         dimension_queries=[
             DimensionQuery(
                 embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
                 query="参考图片",
                 weight=1.0,
                 source=QueryDimensionSource.IMAGE,
-                constraint=QueryConstraint.MATCH,
             )
         ],
-        parser_mode="deterministic_quick",
     )
 
 
 def _fallback_query(request: SearchRequest) -> ParsedQuery:
     if request.query_type is QueryType.IMAGE:
         return ParsedQuery(
-            query_summary="图片精搜降级为原生多模态检索",
             dimension_queries=[
                 DimensionQuery(
                     embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
@@ -82,64 +84,52 @@ def _fallback_query(request: SearchRequest) -> ParsedQuery:
                     source=QueryDimensionSource.IMAGE,
                 )
             ],
-            parser_mode="fallback",
         )
 
     text = request.query_text or "参考图片"
-    negative_terms = _extract_negative_terms(text)
     if request.query_type is QueryType.IMAGE_TEXT:
         return ParsedQuery(
-            query_summary=text,
             dimension_queries=[
                 DimensionQuery(
                     embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
                     query=text,
                     weight=0.35,
                     source=QueryDimensionSource.JOINT,
-                    constraint=QueryConstraint.MAINTAIN,
                 ),
                 DimensionQuery(
                     embedding_type=EmbeddingType.ASSET_DESCRIPTION,
                     query=text,
                     weight=0.20,
                     source=QueryDimensionSource.TEXT,
-                    constraint=QueryConstraint.MODIFY,
                 ),
                 DimensionQuery(
                     embedding_type=EmbeddingType.SUBJECT_CONTENT,
                     query=text,
                     weight=0.15,
                     source=QueryDimensionSource.TEXT,
-                    constraint=QueryConstraint.MAINTAIN,
                 ),
                 DimensionQuery(
                     embedding_type=EmbeddingType.VISUAL_STYLE,
                     query=text,
                     weight=0.10,
                     source=QueryDimensionSource.TEXT,
-                    constraint=QueryConstraint.MODIFY,
                 ),
                 DimensionQuery(
                     embedding_type=EmbeddingType.MOOD_ATMOSPHERE,
                     query=text,
                     weight=0.10,
                     source=QueryDimensionSource.TEXT,
-                    constraint=QueryConstraint.MODIFY,
                 ),
                 DimensionQuery(
                     embedding_type=EmbeddingType.TARGET_AUDIENCE,
                     query=text,
                     weight=0.10,
                     source=QueryDimensionSource.TEXT,
-                    constraint=QueryConstraint.MODIFY,
                 ),
             ],
-            negative_terms=negative_terms,
-            parser_mode="fallback",
         )
 
     return ParsedQuery(
-        query_summary=text,
         dimension_queries=[
             DimensionQuery(
                 embedding_type=EmbeddingType.ASSET_DESCRIPTION,
@@ -172,21 +162,7 @@ def _fallback_query(request: SearchRequest) -> ParsedQuery:
                 weight=0.05,
             ),
         ],
-        negative_terms=negative_terms,
-        parser_mode="fallback",
     )
-
-
-def _extract_negative_terms(text: str) -> list[str]:
-    markers = ("排除", "不要", "不含", "去掉")
-    terms: list[str] = []
-    for marker in markers:
-        if marker not in text:
-            continue
-        suffix = text.split(marker, 1)[1].strip(" ：:，,。")
-        if suffix:
-            terms.append(suffix[:100])
-    return terms
 
 
 def _normalize_weights(parsed: ParsedQuery) -> ParsedQuery:
@@ -200,4 +176,61 @@ def _normalize_weights(parsed: ParsedQuery) -> ParsedQuery:
                 for item in parsed.dimension_queries
             ]
         }
+    )
+
+
+def _select_requested_dimensions(
+    parsed: ParsedQuery,
+    request: SearchRequest,
+    *,
+    preserve_weights: bool = False,
+) -> ParsedQuery:
+    """Keep user-selected channels and optionally preserve model intent weights."""
+
+    parsed_by_type = {
+        dimension.embedding_type: dimension for dimension in parsed.dimension_queries
+    }
+    all_dimensions_were_parsed = all(
+        embedding_type in parsed_by_type for embedding_type in request.embedding_types
+    )
+    dimensions = []
+    for embedding_type in request.embedding_types:
+        dimension = parsed_by_type.get(embedding_type) or _default_dimension(
+            request,
+            embedding_type,
+        )
+        dimensions.append(dimension)
+    if preserve_weights and all_dimensions_were_parsed:
+        total_weight = sum(dimension.weight for dimension in dimensions)
+        dimensions = [
+            dimension.model_copy(update={"weight": dimension.weight / total_weight})
+            for dimension in dimensions
+        ]
+    else:
+        equal_weight = 1.0 / len(dimensions)
+        dimensions = [
+            dimension.model_copy(update={"weight": equal_weight})
+            for dimension in dimensions
+        ]
+    return parsed.model_copy(update={"dimension_queries": dimensions})
+
+
+def _default_dimension(
+    request: SearchRequest,
+    embedding_type: EmbeddingType,
+) -> DimensionQuery:
+    if request.query_type is QueryType.IMAGE:
+        source = QueryDimensionSource.IMAGE
+    elif (
+        request.query_type is QueryType.IMAGE_TEXT
+        and embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+    ):
+        source = QueryDimensionSource.JOINT
+    else:
+        source = QueryDimensionSource.TEXT
+    return DimensionQuery(
+        embedding_type=embedding_type,
+        query=request.query_text or "参考图片",
+        weight=1.0,
+        source=source,
     )

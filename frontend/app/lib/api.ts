@@ -144,7 +144,6 @@ export type SearchCapsule = {
   query_type: string;
   query_text: string | null;
   query_image_uri: string | null;
-  query_summary: string;
   fusion_method: string;
   rerank_method: string;
   is_favorite: boolean;

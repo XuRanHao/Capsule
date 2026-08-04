@@ -1,9 +1,49 @@
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
 from capsule.features import (
     asset_usage_embedding_text,
     effective_feature_text,
     embedding_channel_is_eligible,
+    embedding_type_supports_any_asset_type,
+    embedding_type_supports_asset_type,
 )
+
+
+def test_visual_dimensions_only_support_visual_asset_types() -> None:
+    for embedding_type in (
+        EmbeddingType.VISUAL_STYLE,
+        EmbeddingType.COLOR_COMPOSITION,
+    ):
+        assert embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=AssetType.IMAGE,
+        )
+        assert embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=AssetType.VIDEO_SEGMENT,
+        )
+        assert not embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=AssetType.MARKDOWN_BLOCK,
+        )
+        assert not embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=AssetType.TEXT_BLOCK,
+        )
+
+
+def test_mixed_target_types_use_union_dimension_support() -> None:
+    assert embedding_type_supports_any_asset_type(
+        embedding_type=EmbeddingType.VISUAL_STYLE,
+        asset_types=[AssetType.IMAGE, AssetType.MARKDOWN_BLOCK],
+    )
+    assert not embedding_type_supports_any_asset_type(
+        embedding_type=EmbeddingType.VISUAL_STYLE,
+        asset_types=[AssetType.MARKDOWN_BLOCK, AssetType.TEXT_BLOCK],
+    )
+    assert embedding_type_supports_any_asset_type(
+        embedding_type=EmbeddingType.MOOD_ATMOSPHERE,
+        asset_types=[AssetType.MARKDOWN_BLOCK, AssetType.TEXT_BLOCK],
+    )
 
 
 def test_null_feature_statuses_never_expose_stale_text() -> None:

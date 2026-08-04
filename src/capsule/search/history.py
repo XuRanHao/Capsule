@@ -296,7 +296,6 @@ class SearchHistoryRepository:
                     )
                     or 0
                 )
-        parsed = ParsedQuery.model_validate(capsule.parsed_query)
         return SearchCapsuleSummary(
             capsule_id=capsule.capsule_id,
             workspace_id=capsule.workspace_id,
@@ -304,7 +303,6 @@ class SearchHistoryRepository:
             query_type=QueryType(capsule.query_type),
             query_text=capsule.query_text,
             query_image_uri=capsule.query_image_uri,
-            query_summary=parsed.query_summary,
             fusion_method=FusionMethod(capsule.fusion_method),
             rerank_method=RerankMethod(capsule.rerank_method),
             is_favorite=capsule.is_favorite,
