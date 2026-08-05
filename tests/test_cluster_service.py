@@ -9,7 +9,11 @@ import pytest
 from pydantic import SecretStr
 
 from capsule.config import Settings
-from capsule.db.repositories import ClusterEmbeddingAsset, ClusterMembershipWrite
+from capsule.db.repositories import (
+    ClusterEmbeddingAsset,
+    ClusterMembershipWrite,
+    CurrentClusterPublish,
+)
 from capsule.enums import ClusterInternalVariance, ClusterRunStatus, EmbeddingType
 from capsule.pipeline import cluster_service as cluster_service_module
 from capsule.pipeline.cluster_service import ClusterService
@@ -58,6 +62,24 @@ class FakeClusterRepository:
         memberships: list[ClusterMembershipWrite],
     ) -> None:
         self.memberships[cluster_run_id] = memberships
+
+
+class FakeCurrentClusterRepository:
+    def __init__(self, resident_asset_ids: set[str]) -> None:
+        self.resident_asset_ids = resident_asset_ids
+        self.publish_calls: list[list[CurrentClusterPublish]] = []
+
+    async def list_resident_asset_ids(self, **_: object) -> set[str]:
+        return set(self.resident_asset_ids)
+
+    async def publish_dynamic_clusters(
+        self,
+        *,
+        clusters: Sequence[CurrentClusterPublish],
+        **_: object,
+    ) -> list[object]:
+        self.publish_calls.append(list(clusters))
+        return []
 
 
 class FakeVectorStore:
@@ -410,6 +432,74 @@ async def test_cluster_service_generates_capsules_with_configured_concurrency(
     assert result.status == ClusterRunStatus.COMPLETED
     assert result.cluster_count == 4
     assert summary_client.max_active_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_cluster_service_excludes_residents_and_publishes_only_dynamic_clusters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_type = EmbeddingType.VISUAL_STYLE
+    assets = _assets(embedding_type, count=12)
+    resident_ids = {asset.asset_id for asset in assets[:3]}
+    dynamic_assets = assets[3:]
+    matrix = np.asarray(
+        [[1.0, index / 100.0] for index in range(len(dynamic_assets))],
+        dtype=np.float32,
+    )
+
+    def fake_cluster_vectors(vectors: np.ndarray, **_: object) -> ClusterResult:
+        assert len(vectors) == len(dynamic_assets)
+        return ClusterResult(
+            labels=np.asarray([0, 0, 0, 1, 1, 1, 1, 1, 1], dtype=np.int_),
+            probabilities=np.ones(len(dynamic_assets), dtype=np.float64),
+            transformed_vectors=matrix,
+            pca_dimension=2,
+            parameters=HdbscanParameters(min_cluster_size=3, min_samples=1),
+            quality_score=0.8,
+            parameter_candidates_evaluated=1,
+        )
+
+    monkeypatch.setattr(cluster_service_module, "cluster_vectors", fake_cluster_vectors)
+    history = FakeClusterRepository()
+    current = FakeCurrentClusterRepository(resident_ids)
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+            cluster_semantic_merge_enabled=False,
+        ),
+        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
+        cluster_repository=history,  # type: ignore[arg-type]
+        current_cluster_repository=current,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(
+            {
+                asset.embedding_id: matrix[index].tolist()
+                for index, asset in enumerate(dynamic_assets)
+            }
+        ),
+        model_client=FakeSummaryClient(),
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=embedding_type,
+    )
+
+    assert result.status == ClusterRunStatus.COMPLETED
+    run = next(iter(history.runs.values()))
+    assert run["preprocessing"]["resident_excluded_count"] == 3
+    assert set(run["embedding_ids"]).isdisjoint(
+        {asset.embedding_id for asset in assets[:3]}
+    )
+    published_asset_ids = {
+        member.asset_id
+        for cluster in current.publish_calls[0]
+        for member in cluster.members
+    }
+    assert published_asset_ids == {asset.asset_id for asset in dynamic_assets}
+    assert published_asset_ids.isdisjoint(resident_ids)
 
 
 def _assets(

@@ -101,6 +101,22 @@ class ClusterRunStatus(StrEnum):
     FAILED = "failed"
 
 
+class ClusterMode(StrEnum):
+    """Whether a current cluster is rebuilt or kept across clustering runs."""
+
+    DYNAMIC = "dynamic"
+    RESIDENT_OPEN = "resident_open"
+    RESIDENT_MANUAL = "resident_manual"
+
+
+class ClusterMemberSource(StrEnum):
+    """The actor/process that established a current cluster membership."""
+
+    FULL_CLUSTER = "full_cluster"
+    INCREMENTAL = "incremental"
+    USER = "user"
+
+
 class ClusterRepresentativeRole(StrEnum):
     """How an Asset represents a Cluster Capsule."""
 

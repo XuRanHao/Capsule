@@ -37,3 +37,12 @@ def test_video_adaptive_segmentation_defaults_replace_legacy_settings() -> None:
 def test_video_keyframe_size_cannot_diverge_from_media_writer_contract() -> None:
     with pytest.raises(ValidationError):
         Settings(video_keyframe_size=256)
+
+
+def test_incremental_cluster_defaults_are_conservative() -> None:
+    settings = Settings()
+
+    assert settings.cluster_incremental_assignment_threshold == 0.92
+    assert settings.cluster_recluster_ratio_threshold == 0.10
+    assert settings.cluster_recluster_minimum_count == 50
+    assert settings.cluster_recluster_concurrency == 1

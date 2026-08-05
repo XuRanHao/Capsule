@@ -1,11 +1,12 @@
 """Browser folder import staging, with one retriable request per source file."""
 
 import asyncio
+import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, Protocol
 from uuid import uuid4
 
 from fastapi import UploadFile
@@ -18,6 +19,8 @@ from capsule.parsers.discovery import SUPPORTED_EXTENSIONS, discover_files
 from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.runner import PipelineRunner, PipelineRunResult
 from capsule.pipeline.understanding import AssetUnderstandingService
+
+logger = logging.getLogger(__name__)
 
 
 class ImportSubmissionError(ValueError):
@@ -56,6 +59,16 @@ class _EnrichmentBatchResult:
     stage_durations_ms: dict[str, float]
 
 
+class IncrementalClusterProcessor(Protocol):
+    async def process_assets(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: EmbeddingType,
+        asset_ids: list[str],
+    ) -> object: ...
+
+
 async def enrich_assets(
     *,
     job_id: str,
@@ -64,6 +77,7 @@ async def enrich_assets(
     repository: AssetRepository,
     understanding_service: AssetUnderstandingService,
     embedding_service: AssetEmbeddingService,
+    incremental_cluster_processor: IncrementalClusterProcessor | None = None,
     force_understanding: bool = False,
 ) -> AssetEnrichmentResult:
     """Overlap native embedding with understanding, then fan out text channels."""
@@ -77,6 +91,7 @@ async def enrich_assets(
         asset_ids=asset_ids,
         understanding_service=understanding_service,
         embedding_service=embedding_service,
+        incremental_cluster_processor=incremental_cluster_processor,
         force_understanding=force_understanding,
     )
     await repository.set_job_stage(
@@ -117,6 +132,7 @@ async def _run_enrichment_batch(
     asset_ids: list[str],
     understanding_service: AssetUnderstandingService,
     embedding_service: AssetEmbeddingService,
+    incremental_cluster_processor: IncrementalClusterProcessor | None = None,
     force_understanding: bool = False,
 ) -> _EnrichmentBatchResult:
     """Enrich a committed Asset batch without mutating aggregate Job state."""
@@ -191,10 +207,45 @@ async def _run_enrichment_batch(
             }
             for error in embedding.errors
         )
+    if incremental_cluster_processor is not None:
+        await _process_incremental_clusters(
+            processor=incremental_cluster_processor,
+            workspace_id=workspace_id,
+            embedding_types=[EmbeddingType(embedding.embedding_type) for embedding in embeddings],
+            asset_ids=list(asset_ids),
+        )
     return _EnrichmentBatchResult(
         errors=errors,
         stage_durations_ms=stage_durations_ms,
     )
+
+
+async def _process_incremental_clusters(
+    *,
+    processor: IncrementalClusterProcessor,
+    workspace_id: str,
+    embedding_types: list[EmbeddingType],
+    asset_ids: list[str],
+) -> None:
+    outcomes = await asyncio.gather(
+        *(
+            processor.process_assets(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                asset_ids=asset_ids,
+            )
+            for embedding_type in embedding_types
+        ),
+        return_exceptions=True,
+    )
+    for embedding_type, outcome in zip(embedding_types, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "incremental clustering failed for workspace=%s embedding_type=%s: %s",
+                workspace_id,
+                embedding_type.value,
+                str(outcome) or type(outcome).__name__,
+            )
 
 
 class AssetEnrichmentPipeline:
@@ -209,12 +260,14 @@ class AssetEnrichmentPipeline:
         repository: AssetRepository,
         understanding_service: AssetUnderstandingService,
         embedding_service: AssetEmbeddingService,
+        incremental_cluster_processor: IncrementalClusterProcessor | None = None,
     ) -> None:
         self._job_id = job_id
         self._workspace_id = workspace_id
         self._repository = repository
         self._understanding_service = understanding_service
         self._embedding_service = embedding_service
+        self._incremental_cluster_processor = incremental_cluster_processor
         self._worker_count = settings.understanding_concurrency
         self._queue: asyncio.Queue[str | None] = asyncio.Queue(
             maxsize=settings.asset_enrichment_queue_size
@@ -268,6 +321,14 @@ class AssetEnrichmentPipeline:
             await self._queue.put(None)
         await asyncio.gather(*self._workers)
         self._closed = True
+
+        if self._asset_ids and self._incremental_cluster_processor is not None:
+            await _process_incremental_clusters(
+                processor=self._incremental_cluster_processor,
+                workspace_id=self._workspace_id,
+                embedding_types=list(EmbeddingType),
+                asset_ids=list(self._asset_ids),
+            )
 
         if not self._asset_ids:
             await self._repository.finalize_job(job_id=self._job_id)
@@ -400,12 +461,14 @@ class BrowserImportService:
         runner: PipelineRunner,
         understanding_service: AssetUnderstandingService | None = None,
         embedding_service: AssetEmbeddingService | None = None,
+        incremental_cluster_processor: IncrementalClusterProcessor | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._runner = runner
         self._understanding_service = understanding_service
         self._embedding_service = embedding_service
+        self._incremental_cluster_processor = incremental_cluster_processor
 
     async def create_job(self, *, workspace_id: str) -> BrowserImportJob:
         root = self._settings.import_root.expanduser().resolve()
@@ -487,6 +550,7 @@ class BrowserImportService:
                     repository=self._repository,
                     understanding_service=self._understanding_service,
                     embedding_service=self._embedding_service,
+                    incremental_cluster_processor=self._incremental_cluster_processor,
                 )
                 await enrichment_pipeline.start()
             if enrichment_pipeline is None:

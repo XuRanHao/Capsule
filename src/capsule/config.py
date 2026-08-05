@@ -127,6 +127,14 @@ class Settings(BaseSettings):
         ge=-1.0,
         le=1.0,
     )
+    cluster_incremental_assignment_threshold: float = Field(
+        default=0.92,
+        ge=-1.0,
+        le=1.0,
+    )
+    cluster_recluster_ratio_threshold: float = Field(default=0.10, gt=0.0, le=1.0)
+    cluster_recluster_minimum_count: int = Field(default=50, ge=1)
+    cluster_recluster_concurrency: int = Field(default=1, ge=1)
 
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)

@@ -11,13 +11,23 @@ from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.config import Settings, get_settings
-from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
+from capsule.db.repositories import (
+    AssetRepository,
+    ClusterRepository,
+    CurrentClusterRepository,
+    EmbeddingRepository,
+)
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.import_service import BrowserImportService
+from capsule.pipeline.incremental_clustering import (
+    IncrementalAssignmentThresholds,
+    IncrementalClusterCoordinator,
+    IncrementalClusterService,
+)
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.pipeline.workspace_clear import LibraryClearService
@@ -39,6 +49,7 @@ def create_app(
     search_service: SearchService | None = None,
     cluster_service: ClusterService | None = None,
     cluster_repository: ClusterRepository | None = None,
+    current_cluster_repository: CurrentClusterRepository | None = None,
     import_service: BrowserImportService | None = None,
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
@@ -52,6 +63,7 @@ def create_app(
             search_service is not None
             or cluster_service is not None
             or cluster_repository is not None
+            or current_cluster_repository is not None
             or import_service is not None
             or asset_repository is not None
             or library_clear_service is not None
@@ -59,6 +71,8 @@ def create_app(
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
             app.state.cluster_repository = cluster_repository
+            if current_cluster_repository is not None:
+                app.state.current_cluster_repository = current_cluster_repository
             app.state.import_service = import_service
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
@@ -74,6 +88,7 @@ def create_app(
         app.state.query_image_service = query_images
         app.state.object_storage = storage
         cluster_repo = ClusterRepository(database)
+        current_cluster_repo = CurrentClusterRepository(database)
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
         vectors = MilvusVectorStore(resolved_settings)
@@ -83,6 +98,7 @@ def create_app(
             object_storage=storage,
         )
         app.state.cluster_repository = cluster_repo
+        app.state.current_cluster_repository = current_cluster_repo
         app.state.asset_repository = asset_repo
         app.state.library_clear_service = LibraryClearService(
             settings=resolved_settings,
@@ -129,13 +145,6 @@ def create_app(
             artifact_reader=storage,
             image_cache=model_image_cache,
         )
-        app.state.import_service = BrowserImportService(
-            settings=resolved_settings,
-            repository=asset_repo,
-            runner=pipeline_runner,
-            understanding_service=understanding_service,
-            embedding_service=embedding_service,
-        )
         search_repository = PostgresAssetSearchRepository(database)
         app.state.search_service = SearchService(
             query_embedding=QueryEmbeddingService(
@@ -151,16 +160,42 @@ def create_app(
             image_resolver=query_images,
             settings=resolved_settings,
         )
-        app.state.cluster_service = ClusterService(
+        cluster_service_instance = ClusterService(
             settings=resolved_settings,
             embedding_repository=embedding_repository,
             cluster_repository=cluster_repo,
+            current_cluster_repository=current_cluster_repo,
             vector_store=vectors,
             model_client=embedding_client,
+        )
+        app.state.cluster_service = cluster_service_instance
+        assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold
+        incremental_coordinator = IncrementalClusterCoordinator(
+            settings=resolved_settings,
+            assignment_service=IncrementalClusterService(
+                repository=current_cluster_repo,
+                vector_store=vectors,
+                default_thresholds=IncrementalAssignmentThresholds(
+                    resident_open=assignment_threshold,
+                    dynamic=assignment_threshold,
+                ),
+            ),
+            repository=current_cluster_repo,
+            cluster_runner=cluster_service_instance,
+        )
+        app.state.incremental_cluster_coordinator = incremental_coordinator
+        app.state.import_service = BrowserImportService(
+            settings=resolved_settings,
+            repository=asset_repo,
+            runner=pipeline_runner,
+            understanding_service=understanding_service,
+            embedding_service=embedding_service,
+            incremental_cluster_processor=incremental_coordinator,
         )
         try:
             yield
         finally:
+            await incremental_coordinator.close()
             await embedding_client.close()
             await database.dispose()
 

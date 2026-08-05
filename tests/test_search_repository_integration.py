@@ -2,7 +2,6 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import delete, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from capsule.config import get_settings
 from capsule.db.models import (
@@ -10,6 +9,8 @@ from capsule.db.models import (
     ClusterCapsule,
     ClusterMembership,
     ClusterRun,
+    CurrentCluster,
+    CurrentClusterMember,
     EmbeddingRecord,
     SourceFile,
     Workspace,
@@ -31,11 +32,13 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
     cluster_run_id = f"run_search_fields_{suffix}"
     cluster_capsule_id = f"cc_search_fields_{suffix}"
     model_name = "doubao-embedding-vision-250615"
+    database_available = False
     try:
         try:
             async with database.session() as session:
                 await session.execute(text("select 1"))
-        except SQLAlchemyError:
+            database_available = True
+        except Exception:
             pytest.skip("PostgreSQL integration database is unavailable")
 
         async with database.session() as session, session.begin():
@@ -155,6 +158,28 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
                     distance_to_representative=0,
                 )
             )
+            session.add(
+                CurrentCluster(
+                    cluster_id=cluster_capsule_id,
+                    workspace_id=workspace_id,
+                    embedding_type="native_multimodal",
+                    mode="dynamic",
+                    name="黄昏场景",
+                    description="包含蓝紫色黄昏素材的聚类。",
+                    representative_asset_id=asset_id,
+                    source_run_id=cluster_run_id,
+                )
+            )
+            await session.flush()
+            session.add(
+                CurrentClusterMember(
+                    cluster_id=cluster_capsule_id,
+                    asset_id=asset_id,
+                    embedding_type="native_multimodal",
+                    source="full_cluster",
+                    score=0.95,
+                )
+            )
 
         repository = PostgresAssetSearchRepository(database)
         records = await repository.get_by_ids(
@@ -190,10 +215,9 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
         assert clusters[0].cluster_capsule_id == cluster_capsule_id
         assert clusters[0].matched_asset_ids == [asset_id]
     finally:
-        try:
+        if database_available:
             async with database.session() as session, session.begin():
                 await session.execute(
                     delete(Workspace).where(Workspace.workspace_id == workspace_id)
                 )
-        finally:
-            await database.dispose()
+        await database.dispose()

@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -430,6 +431,104 @@ class ClusterMembership(Base):
     membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
     is_noise: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     distance_to_representative: Mapped[float | None] = mapped_column(Float)
+
+
+class CurrentCluster(Base, TimestampMixin):
+    """The currently published identity and user-controlled mode of a cluster."""
+
+    __tablename__ = "clusters"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('dynamic', 'resident_open', 'resident_manual')",
+            name="ck_clusters_mode",
+        ),
+        Index(
+            "ix_clusters_workspace_embedding_mode",
+            "workspace_id",
+            "embedding_type",
+            "mode",
+        ),
+    )
+
+    cluster_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=id_factory("cluster"),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    embedding_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="dynamic")
+    name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    representative_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="SET NULL"),
+        index=True,
+    )
+    source_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("cluster_runs.cluster_run_id", ondelete="SET NULL"),
+        index=True,
+    )
+
+
+class CurrentClusterMember(Base):
+    """The single current cluster assignment for an Asset and embedding dimension."""
+
+    __tablename__ = "cluster_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "asset_id",
+            "embedding_type",
+            name="uq_cluster_member_asset_embedding",
+        ),
+        CheckConstraint(
+            "source IN ('full_cluster', 'incremental', 'user')",
+            name="ck_cluster_members_source",
+        ),
+    )
+
+    cluster_id: Mapped[str] = mapped_column(
+        ForeignKey("clusters.cluster_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    embedding_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    score: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class ClusterExclusion(Base):
+    """A user rule preventing one Asset from being auto-assigned to one cluster."""
+
+    __tablename__ = "cluster_exclusions"
+
+    cluster_id: Mapped[str] = mapped_column(
+        ForeignKey("clusters.cluster_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class UserFavorite(Base):

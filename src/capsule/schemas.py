@@ -1,12 +1,14 @@
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from capsule.enums import (
     AssetIndexRole,
     AssetType,
     ClusterInternalVariance,
+    ClusterMemberSource,
+    ClusterMode,
     ClusterRepresentativeRole,
     FeatureStatus,
     ProcessingStatus,
@@ -427,6 +429,65 @@ class ClusterMemberRecord(BaseModel):
 
 class ClusterRunListResponse(BaseModel):
     items: list[ClusterRunRecord] = Field(default_factory=list)
+
+
+class CurrentClusterRecord(BaseModel):
+    """One currently active logical cluster, independent of a historical run snapshot."""
+
+    cluster_id: str
+    workspace_id: str
+    embedding_type: str
+    mode: ClusterMode
+    name: str
+    description: str
+    representative_asset_id: str | None
+    source_run_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CurrentClusterMemberRecord(BaseModel):
+    """One Asset's current assignment for an embedding dimension."""
+
+    cluster_id: str
+    asset_id: str
+    embedding_type: str
+    source: ClusterMemberSource
+    score: float | None
+    created_at: datetime
+
+
+class CurrentClusterListResponse(BaseModel):
+    items: list[CurrentClusterRecord] = Field(default_factory=list)
+
+
+class CurrentClusterMemberListResponse(BaseModel):
+    items: list[CurrentClusterMemberRecord] = Field(default_factory=list)
+
+
+class CurrentClusterPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ClusterMode
+
+
+AssetId = Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class CurrentClusterMemberMutation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_ids: list[AssetId] = Field(min_length=1, max_length=500)
+
+    @field_validator("asset_ids")
+    @classmethod
+    def deduplicate_asset_ids(cls, asset_ids: list[str]) -> list[str]:
+        return list(dict.fromkeys(asset_ids))
+
+
+class CurrentClusterMemberMutationResponse(BaseModel):
+    cluster_id: str
+    asset_ids: list[str] = Field(default_factory=list)
 
 
 class ProcessingJobRecord(BaseModel):

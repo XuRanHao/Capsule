@@ -137,6 +137,33 @@ export type ClusterMember = {
   preview_url: string | null;
 };
 
+export type CurrentClusterMode =
+  | "dynamic"
+  | "resident_open"
+  | "resident_manual";
+
+export type CurrentCluster = {
+  cluster_id: string;
+  workspace_id: string;
+  embedding_type: string;
+  mode: CurrentClusterMode;
+  name: string;
+  description: string;
+  representative_asset_id: string | null;
+  source_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CurrentClusterMember = {
+  cluster_id: string;
+  asset_id: string;
+  embedding_type: string;
+  source: "full_cluster" | "incremental" | "user";
+  score: number | null;
+  created_at: string;
+};
+
 export type SearchCapsule = {
   capsule_id: string;
   workspace_id: string;

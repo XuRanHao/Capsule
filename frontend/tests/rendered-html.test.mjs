@@ -110,6 +110,16 @@ test("cluster selector renders exactly the ten Feature dimensions", async () => 
   ]);
 });
 
+test("cluster workspace keeps history and exposes current resident controls", async () => {
+  const response = await render("/clusters");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+
+  assert.match(html, /当前聚类/);
+  assert.match(html, /Cluster Run/);
+  assert.match(html, /正在读取当前簇/);
+});
+
 test("removes all disposable starter-preview references", async () => {
   const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -148,6 +158,11 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /URLSearchParams/);
   assert.match(clustersPage, /deepLinkTargetRef/);
   assert.match(clustersPage, /clusterDetailRef/);
+  assert.match(clustersPage, /\/api\/v1\/clusters\?/);
+  assert.match(clustersPage, /members:attach/);
+  assert.match(clustersPage, /members:detach/);
+  assert.match(clustersPage, /开放常驻/);
+  assert.match(clustersPage, /人工常驻/);
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(

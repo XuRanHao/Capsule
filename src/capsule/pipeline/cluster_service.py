@@ -15,6 +15,9 @@ from capsule.db.repositories import (
     ClusterEmbeddingAsset,
     ClusterMembershipWrite,
     ClusterRepository,
+    CurrentClusterMemberWrite,
+    CurrentClusterPublish,
+    CurrentClusterRepository,
     EmbeddingRepository,
 )
 from capsule.enums import (
@@ -61,6 +64,12 @@ class _LoadedClusterVector:
     vector: list[float]
 
 
+@dataclass(slots=True, frozen=True)
+class _StoredClusterCapsule:
+    cluster_capsule_id: str
+    summary: ClusterSummary
+
+
 class EmbeddingTypeClusterResult(BaseModel):
     embedding_type: EmbeddingType
     cluster_run_id: str
@@ -88,12 +97,14 @@ class ClusterService:
         settings: Settings,
         embedding_repository: EmbeddingRepository,
         cluster_repository: ClusterRepository,
+        current_cluster_repository: CurrentClusterRepository | None = None,
         vector_store: ClusterVectorStore,
         model_client: ClusterSummaryClient,
     ) -> None:
         self._settings = settings
         self._embedding_repository = embedding_repository
         self._cluster_repository = cluster_repository
+        self._current_cluster_repository = current_cluster_repository
         self._vector_store = vector_store
         self._model_client = model_client
 
@@ -151,6 +162,15 @@ class ClusterService:
                 dimension=self._settings.embedding_dimension,
                 milvus_collection=self._settings.milvus_collection,
             )
+            resident_asset_ids = (
+                await self._current_cluster_repository.list_resident_asset_ids(
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type.value,
+                )
+                if self._current_cluster_repository is not None
+                else set()
+            )
+            assets = [asset for asset in assets if asset.asset_id not in resident_asset_ids]
             loaded = await self._load_vectors(assets)
             preprocessing = {
                 "normalization": "l2",
@@ -161,6 +181,7 @@ class ClusterService:
                 ),
                 "indexed_asset_count": len(assets),
                 "missing_vector_count": len(assets) - len(loaded),
+                "resident_excluded_count": len(resident_asset_ids),
             }
             embedding_ids = [item.asset.embedding_id for item in loaded]
             if run_id is None:
@@ -228,6 +249,13 @@ class ClusterService:
                 noise_ratio=1.0 if loaded else 0.0,
                 status=ClusterRunStatus.INSUFFICIENT_DATA,
             )
+            if self._current_cluster_repository is not None:
+                await self._current_cluster_repository.publish_dynamic_clusters(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type.value,
+                    clusters=[],
+                )
             return EmbeddingTypeClusterResult(
                 embedding_type=embedding_type,
                 cluster_run_id=run_id,
@@ -278,7 +306,7 @@ class ClusterService:
                 semantic_merge.labels,
                 candidates,
             )
-            capsule_ids = await self._summarize_and_store_capsules(
+            stored_clusters = await self._summarize_and_store_capsules(
                 run_id=run_id,
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
@@ -288,6 +316,10 @@ class ClusterService:
                 loaded=loaded,
                 selections=selections,
             )
+            capsule_ids = {
+                label: stored.cluster_capsule_id
+                for label, stored in stored_clusters.items()
+            }
             await self._cluster_repository.store_memberships(
                 cluster_run_id=run_id,
                 memberships=_build_memberships(
@@ -325,6 +357,19 @@ class ClusterService:
                     ),
                 },
             )
+            if self._current_cluster_repository is not None:
+                await self._current_cluster_repository.publish_dynamic_clusters(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type.value,
+                    clusters=_build_current_cluster_publish(
+                        labels=semantic_merge.labels,
+                        probabilities=clustered.probabilities,
+                        loaded=loaded,
+                        selections=selections,
+                        stored_clusters=stored_clusters,
+                    ),
+                )
             return EmbeddingTypeClusterResult(
                 embedding_type=embedding_type,
                 cluster_run_id=run_id,
@@ -379,13 +424,15 @@ class ClusterService:
         transformed_vectors: NDArray[np.float32],
         loaded: list[_LoadedClusterVector],
         selections: Mapping[int, list[RepresentativeSelection]],
-    ) -> dict[int, str]:
+    ) -> dict[int, _StoredClusterCapsule]:
         """Call the naming model with each cluster's selected Asset rows only."""
         assets_by_id = {item.asset.asset_id: item.asset for item in loaded}
         concurrency = self._settings.capsule_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def summarize_and_store(label: int) -> tuple[int, str]:
+        async def summarize_and_store(
+            label: int,
+        ) -> tuple[int, _StoredClusterCapsule]:
             representatives = selections[label]
             member_indices = np.flatnonzero(labels == label)
             average_probability = float(probabilities[member_indices].mean())
@@ -447,7 +494,10 @@ class ClusterService:
                         ],
                     )
                 )
-            return label, stored.cluster_capsule_id
+            return label, _StoredClusterCapsule(
+                cluster_capsule_id=stored.cluster_capsule_id,
+                summary=summary,
+            )
 
         tasks = [
             asyncio.create_task(summarize_and_store(label))
@@ -461,6 +511,40 @@ class ClusterService:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         return dict(stored_capsules)
+
+
+def _build_current_cluster_publish(
+    *,
+    labels: NDArray[np.int_],
+    probabilities: NDArray[np.float64],
+    loaded: list[_LoadedClusterVector],
+    selections: Mapping[int, list[RepresentativeSelection]],
+    stored_clusters: Mapping[int, _StoredClusterCapsule],
+) -> list[CurrentClusterPublish]:
+    publishes: list[CurrentClusterPublish] = []
+    for label in sorted(stored_clusters):
+        stored = stored_clusters[label]
+        medoid = next(
+            representative
+            for representative in selections[label]
+            if representative.role == ClusterRepresentativeRole.MEDOID.value
+        )
+        member_indices = np.flatnonzero(labels == label)
+        publishes.append(
+            CurrentClusterPublish(
+                name=stored.summary.name,
+                description=stored.summary.description,
+                representative_asset_id=medoid.asset_id,
+                members=[
+                    CurrentClusterMemberWrite(
+                        asset_id=loaded[int(index)].asset.asset_id,
+                        score=float(probabilities[int(index)]),
+                    )
+                    for index in member_indices
+                ],
+            )
+        )
+    return publishes
 
 
 def _build_memberships(

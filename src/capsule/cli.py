@@ -11,7 +11,12 @@ from alembic.config import Config
 from capsule import __version__
 from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
-from capsule.db.repositories import AssetRepository, ClusterRepository, EmbeddingRepository
+from capsule.db.repositories import (
+    AssetRepository,
+    ClusterRepository,
+    CurrentClusterRepository,
+    EmbeddingRepository,
+)
 from capsule.db.session import Database
 from capsule.enums import EmbeddingType
 from capsule.media.model_image import ModelImageCache
@@ -313,6 +318,7 @@ async def _cluster_assets(
                 settings=settings,
                 embedding_repository=EmbeddingRepository(database),
                 cluster_repository=ClusterRepository(database),
+                current_cluster_repository=CurrentClusterRepository(database),
                 vector_store=MilvusVectorStore(settings),
                 model_client=model_client,
             )

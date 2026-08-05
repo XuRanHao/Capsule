@@ -1,21 +1,30 @@
 """Asynchronous front-end API for one Embedding Type clustering run."""
 
-from typing import cast
+import logging
+from typing import Protocol, cast
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from capsule.db.repositories import ClusterRepository
-from capsule.enums import ClusterRunStatus, EmbeddingType
+from capsule.enums import ClusterMemberSource, ClusterMode, ClusterRunStatus, EmbeddingType
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.schemas import (
     ClusterCapsuleRecord,
     ClusterMemberRecord,
     ClusterRunListResponse,
     ClusterRunRecord,
+    CurrentClusterListResponse,
+    CurrentClusterMemberListResponse,
+    CurrentClusterMemberMutation,
+    CurrentClusterMemberMutationResponse,
+    CurrentClusterMemberRecord,
+    CurrentClusterPatch,
+    CurrentClusterRecord,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["cluster-runs"])
+logger = logging.getLogger(__name__)
 
 
 class ClusterRunCreate(BaseModel):
@@ -49,6 +58,67 @@ class ClusterCapsuleOverridePatch(BaseModel):
     description: str | None = Field(default=None, max_length=20_000)
 
 
+class CurrentClusterRepositoryProtocol(Protocol):
+    async def list_clusters(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        modes: list[ClusterMode] | None = None,
+    ) -> list[CurrentClusterRecord]: ...
+
+    async def get_cluster(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+    ) -> CurrentClusterRecord: ...
+
+    async def list_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+    ) -> list[CurrentClusterMemberRecord]: ...
+
+    async def set_mode(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        mode: ClusterMode,
+    ) -> CurrentClusterRecord: ...
+
+    async def attach_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        asset_ids: list[str],
+        source: ClusterMemberSource = ClusterMemberSource.USER,
+        scores: dict[str, float] | None = None,
+    ) -> list[CurrentClusterMemberRecord]: ...
+
+    async def detach_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        asset_ids: list[str],
+        created_by: str | None = None,
+    ) -> list[str]: ...
+
+
+class CurrentClusterProcessorProtocol(Protocol):
+    async def process_assets(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: EmbeddingType,
+        asset_ids: list[str],
+    ) -> object: ...
+
+
 def _cluster_service(request: Request) -> ClusterService:
     service = getattr(request.app.state, "cluster_service", None)
     if service is None:
@@ -73,6 +143,149 @@ def _cluster_repository(request: Request) -> ClusterRepository:
             },
         )
     return cast(ClusterRepository, repository)
+
+
+def _current_cluster_repository(request: Request) -> CurrentClusterRepositoryProtocol:
+    repository = getattr(request.app.state, "current_cluster_repository", None)
+    if repository is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "current_cluster_repository_not_ready",
+                "message": "current cluster persistence is not ready",
+            },
+        )
+    return cast(CurrentClusterRepositoryProtocol, repository)
+
+
+@router.get("/clusters", response_model=CurrentClusterListResponse, tags=["clusters"])
+async def list_current_clusters(
+    request: Request,
+    embedding_type: EmbeddingType,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> CurrentClusterListResponse:
+    items = await _current_cluster_repository(request).list_clusters(
+        workspace_id=workspace_id,
+        embedding_type=embedding_type.value,
+    )
+    return CurrentClusterListResponse(items=items)
+
+
+@router.get(
+    "/clusters/{cluster_id}/members",
+    response_model=CurrentClusterMemberListResponse,
+    tags=["clusters"],
+)
+async def list_current_cluster_members(
+    cluster_id: str,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> CurrentClusterMemberListResponse:
+    repository = _current_cluster_repository(request)
+    try:
+        # Verify ownership so an empty member list does not hide an unknown Cluster.
+        await repository.get_cluster(cluster_id=cluster_id, workspace_id=workspace_id)
+        items = await repository.list_members(
+            cluster_id=cluster_id,
+            workspace_id=workspace_id,
+        )
+    except ValueError as exc:
+        raise _current_cluster_not_found(cluster_id) from exc
+    return CurrentClusterMemberListResponse(items=items)
+
+
+@router.patch(
+    "/clusters/{cluster_id}",
+    response_model=CurrentClusterRecord,
+    tags=["clusters"],
+)
+async def patch_current_cluster(
+    cluster_id: str,
+    payload: CurrentClusterPatch,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> CurrentClusterRecord:
+    try:
+        return await _current_cluster_repository(request).set_mode(
+            cluster_id=cluster_id,
+            workspace_id=workspace_id,
+            mode=payload.mode,
+        )
+    except ValueError as exc:
+        raise _current_cluster_not_found(cluster_id) from exc
+
+
+@router.post(
+    "/clusters/{cluster_id}/members:attach",
+    response_model=CurrentClusterMemberMutationResponse,
+    tags=["clusters"],
+)
+async def attach_current_cluster_members(
+    cluster_id: str,
+    payload: CurrentClusterMemberMutation,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> CurrentClusterMemberMutationResponse:
+    try:
+        await _current_cluster_repository(request).attach_members(
+            cluster_id=cluster_id,
+            workspace_id=workspace_id,
+            asset_ids=payload.asset_ids,
+            source=ClusterMemberSource.USER,
+        )
+    except ValueError as exc:
+        raise _current_cluster_mutation_error(cluster_id, exc) from exc
+    return CurrentClusterMemberMutationResponse(
+        cluster_id=cluster_id,
+        asset_ids=payload.asset_ids,
+    )
+
+
+@router.post(
+    "/clusters/{cluster_id}/members:detach",
+    response_model=CurrentClusterMemberMutationResponse,
+    tags=["clusters"],
+)
+async def detach_current_cluster_members(
+    cluster_id: str,
+    payload: CurrentClusterMemberMutation,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> CurrentClusterMemberMutationResponse:
+    repository = _current_cluster_repository(request)
+    try:
+        cluster = await repository.get_cluster(
+            cluster_id=cluster_id,
+            workspace_id=workspace_id,
+        )
+        await repository.detach_members(
+            cluster_id=cluster_id,
+            workspace_id=workspace_id,
+            asset_ids=payload.asset_ids,
+        )
+    except ValueError as exc:
+        raise _current_cluster_mutation_error(cluster_id, exc) from exc
+    processor = cast(
+        CurrentClusterProcessorProtocol | None,
+        getattr(request.app.state, "incremental_cluster_coordinator", None),
+    )
+    if processor is not None:
+        try:
+            await processor.process_assets(
+                workspace_id=workspace_id,
+                embedding_type=EmbeddingType(cluster.embedding_type),
+                asset_ids=payload.asset_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "post-detach incremental clustering failed for cluster=%s: %s",
+                cluster_id,
+                str(exc) or type(exc).__name__,
+            )
+    return CurrentClusterMemberMutationResponse(
+        cluster_id=cluster_id,
+        asset_ids=payload.asset_ids,
+    )
 
 
 @router.post(
@@ -283,4 +496,36 @@ def _run_not_found(cluster_run_id: str) -> HTTPException:
             "code": "cluster_run_not_found",
             "message": f"Cluster run {cluster_run_id!r} was not found",
         },
+    )
+
+
+def _current_cluster_not_found(cluster_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "current_cluster_not_found",
+            "message": f"Current cluster {cluster_id!r} was not found",
+        },
+    )
+
+
+def _current_cluster_mutation_error(cluster_id: str, exc: ValueError) -> HTTPException:
+    message = str(exc)
+    normalized = message.lower()
+    if "cluster" in normalized and any(
+        marker in normalized
+        for marker in ("not found", "does not exist", "another workspace")
+    ):
+        return _current_cluster_not_found(cluster_id)
+    if any(
+        marker in normalized
+        for marker in ("resident", "conflict", "already assigned", "another cluster", "locked")
+    ):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "cluster_membership_conflict", "message": message},
+        )
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={"code": "invalid_cluster_membership_change", "message": message},
     )

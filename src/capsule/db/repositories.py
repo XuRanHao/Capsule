@@ -13,9 +13,12 @@ from capsule.db.base import id_factory
 from capsule.db.models import (
     Asset,
     ClusterCapsule,
+    ClusterExclusion,
     ClusterMembership,
     ClusterRepresentativeAsset,
     ClusterRun,
+    CurrentCluster,
+    CurrentClusterMember,
     EmbeddingRecord,
     ModelCallLog,
     ProcessingJob,
@@ -28,6 +31,8 @@ from capsule.enums import (
     AssetNameSource,
     AssetType,
     ClusterInternalVariance,
+    ClusterMemberSource,
+    ClusterMode,
     ClusterRunStatus,
     EmbeddingStatus,
     JobStatus,
@@ -1421,6 +1426,633 @@ class EmbeddingRepository:
 
 
 # ===========================================
+#      Current cluster persistence
+# ===========================================
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterRecord:
+    cluster_id: str
+    workspace_id: str
+    embedding_type: str
+    mode: ClusterMode
+    name: str
+    description: str
+    representative_asset_id: str | None
+    source_run_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterMemberRecord:
+    cluster_id: str
+    asset_id: str
+    embedding_type: str
+    source: ClusterMemberSource
+    score: float | None
+    created_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterExclusionRecord:
+    cluster_id: str
+    asset_id: str
+    created_by: str | None
+    created_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterEmbedding:
+    asset_id: str
+    embedding_id: str
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterReclusterCounts:
+    baseline_dynamic_count: int
+    delta_dynamic_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterMemberWrite:
+    asset_id: str
+    score: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class CurrentClusterPublish:
+    name: str
+    description: str
+    representative_asset_id: str | None
+    members: Sequence[CurrentClusterMemberWrite]
+    cluster_id: str | None = None
+
+
+class CurrentClusterRepository:
+    """Persist the currently effective clusters separately from immutable run history."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+        self._new_cluster_id = id_factory("cluster")
+
+    async def list_clusters(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        modes: Sequence[ClusterMode] | None = None,
+    ) -> list[CurrentClusterRecord]:
+        statement = select(CurrentCluster).where(
+            CurrentCluster.workspace_id == workspace_id,
+            CurrentCluster.embedding_type == embedding_type,
+        )
+        if modes is not None:
+            mode_values = [ClusterMode(mode).value for mode in modes]
+            if not mode_values:
+                return []
+            statement = statement.where(CurrentCluster.mode.in_(mode_values))
+        statement = statement.order_by(CurrentCluster.created_at, CurrentCluster.cluster_id)
+        async with self._database.session() as session:
+            rows = await session.scalars(statement)
+            return [_current_cluster_record(cluster) for cluster in rows]
+
+    async def get_cluster(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+    ) -> CurrentClusterRecord:
+        async with self._database.session() as session:
+            cluster = await session.scalar(
+                select(CurrentCluster).where(
+                    CurrentCluster.cluster_id == cluster_id,
+                    CurrentCluster.workspace_id == workspace_id,
+                )
+            )
+            if cluster is None:
+                raise ValueError(f"current cluster does not exist: {cluster_id}")
+            return _current_cluster_record(cluster)
+
+    async def list_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+    ) -> list[CurrentClusterMemberRecord]:
+        async with self._database.session() as session:
+            await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+            )
+            rows = await session.scalars(
+                select(CurrentClusterMember)
+                .where(CurrentClusterMember.cluster_id == cluster_id)
+                .order_by(CurrentClusterMember.created_at, CurrentClusterMember.asset_id)
+            )
+            return [_current_cluster_member_record(member) for member in rows]
+
+    async def list_resident_asset_ids(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+    ) -> set[str]:
+        async with self._database.session() as session:
+            rows = await session.scalars(
+                select(CurrentClusterMember.asset_id)
+                .join(CurrentCluster, CurrentCluster.cluster_id == CurrentClusterMember.cluster_id)
+                .where(
+                    CurrentCluster.workspace_id == workspace_id,
+                    CurrentCluster.embedding_type == embedding_type,
+                    CurrentCluster.mode.in_(
+                        [ClusterMode.RESIDENT_OPEN.value, ClusterMode.RESIDENT_MANUAL.value]
+                    ),
+                )
+            )
+            return set(rows)
+
+    async def set_mode(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        mode: ClusterMode,
+    ) -> CurrentClusterRecord:
+        parsed_mode = ClusterMode(mode)
+        async with self._database.session() as session, session.begin():
+            cluster = await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                for_update=True,
+            )
+            cluster.mode = parsed_mode.value
+            await session.flush()
+            await session.refresh(cluster)
+            return _current_cluster_record(cluster)
+
+    async def attach_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        asset_ids: Sequence[str],
+        source: ClusterMemberSource = ClusterMemberSource.USER,
+        scores: dict[str, float] | None = None,
+    ) -> list[CurrentClusterMemberRecord]:
+        """Atomically attach Assets; algorithmic writes never override existing assignments."""
+        requested_ids = list(dict.fromkeys(asset_ids))
+        if not requested_ids:
+            return []
+        parsed_source = ClusterMemberSource(source)
+        unknown_scores = set(scores or {}) - set(requested_ids)
+        if unknown_scores:
+            raise ValueError("scores contain Assets that were not requested")
+
+        async with self._database.session() as session, session.begin():
+            cluster = await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                for_update=True,
+            )
+            if (
+                parsed_source is ClusterMemberSource.USER
+                and cluster.mode == ClusterMode.DYNAMIC.value
+            ):
+                raise ValueError("manual assignments require a resident cluster")
+            if (
+                parsed_source is not ClusterMemberSource.USER
+                and cluster.mode == ClusterMode.RESIDENT_MANUAL.value
+            ):
+                raise ValueError("resident_manual clusters only accept user assignments")
+            await _validate_indexed_assets(
+                session,
+                workspace_id=workspace_id,
+                embedding_type=cluster.embedding_type,
+                asset_ids=requested_ids,
+            )
+
+            current_rows = list(
+                await session.scalars(
+                    select(CurrentClusterMember)
+                    .where(
+                        CurrentClusterMember.asset_id.in_(requested_ids),
+                        CurrentClusterMember.embedding_type == cluster.embedding_type,
+                    )
+                    .with_for_update()
+                )
+            )
+            current_by_asset = {member.asset_id: member for member in current_rows}
+            exclusion_rows = list(
+                await session.scalars(
+                    select(ClusterExclusion)
+                    .where(
+                        ClusterExclusion.cluster_id == cluster_id,
+                        ClusterExclusion.asset_id.in_(requested_ids),
+                    )
+                    .with_for_update()
+                )
+            )
+            exclusions = {item.asset_id: item for item in exclusion_rows}
+
+            attached: dict[str, CurrentClusterMember] = {}
+            for asset_id in requested_ids:
+                existing = current_by_asset.get(asset_id)
+                exclusion = exclusions.get(asset_id)
+                if parsed_source is not ClusterMemberSource.USER:
+                    if exclusion is not None or existing is not None:
+                        if existing is not None and existing.cluster_id == cluster_id:
+                            attached[asset_id] = existing
+                        continue
+                else:
+                    if exclusion is not None:
+                        await session.delete(exclusion)
+                    if existing is not None:
+                        if existing.cluster_id == cluster_id:
+                            existing.source = parsed_source.value
+                            existing.score = (scores or {}).get(asset_id)
+                            attached[asset_id] = existing
+                            continue
+                        await session.delete(existing)
+                        await session.flush()
+
+                member = CurrentClusterMember(
+                    cluster_id=cluster_id,
+                    asset_id=asset_id,
+                    embedding_type=cluster.embedding_type,
+                    source=parsed_source.value,
+                    score=(scores or {}).get(asset_id),
+                )
+                session.add(member)
+                attached[asset_id] = member
+
+            await session.flush()
+            return [
+                _current_cluster_member_record(attached[asset_id])
+                for asset_id in requested_ids
+                if asset_id in attached
+            ]
+
+    async def detach_members(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        asset_ids: Sequence[str],
+        created_by: str | None = None,
+    ) -> list[str]:
+        """Remove current members and add a durable do-not-reenter rule."""
+        requested_ids = list(dict.fromkeys(asset_ids))
+        if not requested_ids:
+            return []
+        async with self._database.session() as session, session.begin():
+            await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                for_update=True,
+            )
+            members = list(
+                await session.scalars(
+                    select(CurrentClusterMember)
+                    .where(
+                        CurrentClusterMember.cluster_id == cluster_id,
+                        CurrentClusterMember.asset_id.in_(requested_ids),
+                    )
+                    .with_for_update()
+                )
+            )
+            member_by_asset = {member.asset_id: member for member in members}
+            detached_ids = [asset_id for asset_id in requested_ids if asset_id in member_by_asset]
+            if not detached_ids:
+                return []
+
+            existing_exclusions = set(
+                await session.scalars(
+                    select(ClusterExclusion.asset_id).where(
+                        ClusterExclusion.cluster_id == cluster_id,
+                        ClusterExclusion.asset_id.in_(detached_ids),
+                    )
+                )
+            )
+            for asset_id in detached_ids:
+                await session.delete(member_by_asset[asset_id])
+                if asset_id not in existing_exclusions:
+                    session.add(
+                        ClusterExclusion(
+                            cluster_id=cluster_id,
+                            asset_id=asset_id,
+                            created_by=created_by,
+                        )
+                    )
+            return detached_ids
+
+    async def list_exclusions(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        asset_ids: Sequence[str] | None = None,
+    ) -> list[CurrentClusterExclusionRecord]:
+        async with self._database.session() as session:
+            await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+            )
+            statement = select(ClusterExclusion).where(
+                ClusterExclusion.cluster_id == cluster_id
+            )
+            if asset_ids is not None:
+                requested_ids = list(dict.fromkeys(asset_ids))
+                if not requested_ids:
+                    return []
+                statement = statement.where(ClusterExclusion.asset_id.in_(requested_ids))
+            rows = await session.scalars(
+                statement.order_by(ClusterExclusion.created_at, ClusterExclusion.asset_id)
+            )
+            return [_current_cluster_exclusion_record(exclusion) for exclusion in rows]
+
+    async def list_excluded_pairs(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        cluster_ids: Sequence[str],
+        asset_ids: Sequence[str],
+    ) -> set[tuple[str, str]]:
+        requested_clusters = list(dict.fromkeys(cluster_ids))
+        requested_assets = list(dict.fromkeys(asset_ids))
+        if not requested_clusters or not requested_assets:
+            return set()
+        async with self._database.session() as session:
+            rows = (
+                await session.execute(
+                    select(ClusterExclusion.cluster_id, ClusterExclusion.asset_id)
+                    .join(CurrentCluster, CurrentCluster.cluster_id == ClusterExclusion.cluster_id)
+                    .where(
+                        CurrentCluster.workspace_id == workspace_id,
+                        CurrentCluster.embedding_type == embedding_type,
+                        ClusterExclusion.cluster_id.in_(requested_clusters),
+                        ClusterExclusion.asset_id.in_(requested_assets),
+                    )
+                )
+            ).all()
+            return {(cluster_id, asset_id) for cluster_id, asset_id in rows}
+
+    async def list_indexed_asset_embeddings(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        asset_ids: Sequence[str],
+    ) -> list[CurrentClusterEmbedding]:
+        requested_ids = list(dict.fromkeys(asset_ids))
+        if not requested_ids:
+            return []
+        statement = (
+            select(EmbeddingRecord.asset_id, EmbeddingRecord.embedding_id)
+            .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+            .where(
+                EmbeddingRecord.workspace_id == workspace_id,
+                EmbeddingRecord.embedding_type == embedding_type,
+                EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+                EmbeddingRecord.asset_id.in_(requested_ids),
+                Asset.generation == SourceFile.processing_generation,
+                Asset.index_role != AssetIndexRole.PARENT.value,
+            )
+            .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
+        )
+        async with self._database.session() as session:
+            rows = (await session.execute(statement)).all()
+        latest: dict[str, CurrentClusterEmbedding] = {}
+        for asset_id, embedding_id in rows:
+            latest.setdefault(
+                asset_id,
+                CurrentClusterEmbedding(asset_id=asset_id, embedding_id=embedding_id),
+            )
+        return [latest[asset_id] for asset_id in requested_ids if asset_id in latest]
+
+    async def get_recluster_counts(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        milvus_collection: str,
+    ) -> CurrentClusterReclusterCounts:
+        """Derive one dimension's baseline and post-run delta without counter tables."""
+        async with self._database.session() as session:
+            latest_run = await session.scalar(
+                select(ClusterRun)
+                .where(
+                    ClusterRun.workspace_id == workspace_id,
+                    ClusterRun.embedding_type == embedding_type,
+                    ClusterRun.status == ClusterRunStatus.COMPLETED.value,
+                )
+                .order_by(
+                    ClusterRun.completed_at.desc().nullslast(),
+                    ClusterRun.cluster_run_id.desc(),
+                )
+                .limit(1)
+            )
+            baseline_asset_ids = (
+                set(
+                    await session.scalars(
+                        select(ClusterMembership.asset_id).where(
+                            ClusterMembership.cluster_run_id == latest_run.cluster_run_id
+                        )
+                    )
+                )
+                if latest_run is not None
+                else set()
+            )
+            resident_asset_ids = set(
+                await session.scalars(
+                    select(CurrentClusterMember.asset_id)
+                    .join(
+                        CurrentCluster,
+                        CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
+                    )
+                    .where(
+                        CurrentCluster.workspace_id == workspace_id,
+                        CurrentCluster.embedding_type == embedding_type,
+                        CurrentCluster.mode.in_(
+                            [
+                                ClusterMode.RESIDENT_OPEN.value,
+                                ClusterMode.RESIDENT_MANUAL.value,
+                            ]
+                        ),
+                    )
+                )
+            )
+            current_member_asset_ids = set(
+                await session.scalars(
+                    select(CurrentClusterMember.asset_id)
+                    .join(
+                        CurrentCluster,
+                        CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
+                    )
+                    .where(
+                        CurrentCluster.workspace_id == workspace_id,
+                        CurrentCluster.embedding_type == embedding_type,
+                    )
+                )
+            )
+            excluded_asset_ids = set(
+                await session.scalars(
+                    select(ClusterExclusion.asset_id)
+                    .join(
+                        CurrentCluster,
+                        CurrentCluster.cluster_id == ClusterExclusion.cluster_id,
+                    )
+                    .where(
+                        CurrentCluster.workspace_id == workspace_id,
+                        CurrentCluster.embedding_type == embedding_type,
+                    )
+                )
+            )
+            rows = (
+                await session.execute(
+                    select(EmbeddingRecord.asset_id, Asset)
+                    .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
+                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+                    .where(
+                        EmbeddingRecord.workspace_id == workspace_id,
+                        EmbeddingRecord.embedding_type == embedding_type,
+                        EmbeddingRecord.model_name == model_name,
+                        EmbeddingRecord.dimension == dimension,
+                        EmbeddingRecord.milvus_collection == milvus_collection,
+                        EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+                        Asset.generation == SourceFile.processing_generation,
+                        Asset.index_role != AssetIndexRole.PARENT.value,
+                    )
+                    .order_by(
+                        EmbeddingRecord.created_at.desc(),
+                        EmbeddingRecord.embedding_id.desc(),
+                    )
+                )
+            ).all()
+
+        eligible_asset_ids: set[str] = set()
+        for asset_id, asset in rows:
+            if asset_id in eligible_asset_ids:
+                continue
+            if embedding_channel_is_eligible(
+                embedding_type=embedding_type,
+                asset_features=asset.asset_features,
+                asset_description=asset.asset_description,
+            ):
+                eligible_asset_ids.add(asset_id)
+        current_dynamic_ids = eligible_asset_ids - resident_asset_ids
+        baseline_dynamic_ids = baseline_asset_ids - resident_asset_ids
+        manually_detached_ids = (
+            excluded_asset_ids - current_member_asset_ids
+        ) & current_dynamic_ids
+        return CurrentClusterReclusterCounts(
+            baseline_dynamic_count=len(baseline_dynamic_ids),
+            delta_dynamic_count=len(
+                (current_dynamic_ids - baseline_asset_ids) | manually_detached_ids
+            ),
+        )
+
+    async def publish_dynamic_clusters(
+        self,
+        *,
+        run_id: str,
+        workspace_id: str,
+        embedding_type: str,
+        clusters: Sequence[CurrentClusterPublish],
+    ) -> list[CurrentClusterRecord]:
+        """Atomically replace only one dimension's dynamic current clusters."""
+        published = list(clusters)
+        _validate_current_cluster_publish(published)
+        async with self._database.session() as session, session.begin():
+            run = await session.get(ClusterRun, run_id, with_for_update=True)
+            if run is None:
+                raise ValueError(f"cluster run does not exist: {run_id}")
+            if run.workspace_id != workspace_id or run.embedding_type != embedding_type:
+                raise ValueError("cluster run workspace or embedding type does not match publish")
+
+            all_asset_ids = [member.asset_id for item in published for member in item.members]
+            representative_ids = [
+                item.representative_asset_id
+                for item in published
+                if item.representative_asset_id is not None
+            ]
+            await _validate_workspace_assets(
+                session,
+                workspace_id=workspace_id,
+                asset_ids=[*all_asset_ids, *representative_ids],
+            )
+
+            resident_asset_ids = set(
+                await session.scalars(
+                    select(CurrentClusterMember.asset_id)
+                    .join(
+                        CurrentCluster,
+                        CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
+                    )
+                    .where(
+                        CurrentCluster.workspace_id == workspace_id,
+                        CurrentCluster.embedding_type == embedding_type,
+                        CurrentCluster.mode.in_(
+                            [ClusterMode.RESIDENT_OPEN.value, ClusterMode.RESIDENT_MANUAL.value]
+                        ),
+                    )
+                    .with_for_update()
+                )
+            )
+            overlap = sorted(resident_asset_ids.intersection(all_asset_ids))
+            if overlap:
+                raise ValueError(
+                    "dynamic publish contains resident Assets: " + ", ".join(overlap)
+                )
+
+            await session.execute(
+                delete(CurrentCluster).where(
+                    CurrentCluster.workspace_id == workspace_id,
+                    CurrentCluster.embedding_type == embedding_type,
+                    CurrentCluster.mode == ClusterMode.DYNAMIC.value,
+                )
+            )
+
+            stored: list[CurrentCluster] = []
+            for item in published:
+                cluster = CurrentCluster(
+                    cluster_id=item.cluster_id or self._new_cluster_id(),
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type,
+                    mode=ClusterMode.DYNAMIC.value,
+                    name=item.name,
+                    description=item.description,
+                    representative_asset_id=item.representative_asset_id,
+                    source_run_id=run_id,
+                )
+                session.add(cluster)
+                stored.append(cluster)
+                session.add_all(
+                    [
+                        CurrentClusterMember(
+                            cluster_id=cluster.cluster_id,
+                            asset_id=member.asset_id,
+                            embedding_type=embedding_type,
+                            source=ClusterMemberSource.FULL_CLUSTER.value,
+                            score=member.score,
+                        )
+                        for member in item.members
+                    ]
+                )
+            await session.flush()
+            return [_current_cluster_record(cluster) for cluster in stored]
+
+
+# ===========================================
 #      Cluster Capsule persistence
 # ===========================================
 
@@ -1818,6 +2450,144 @@ class ClusterRepository:
                 capsule.effective_description = description or capsule.model_generated_description
             await session.flush()
             return _cluster_capsule_record(capsule)
+
+
+def _current_cluster_record(cluster: CurrentCluster) -> CurrentClusterRecord:
+    return CurrentClusterRecord(
+        cluster_id=cluster.cluster_id,
+        workspace_id=cluster.workspace_id,
+        embedding_type=cluster.embedding_type,
+        mode=ClusterMode(cluster.mode),
+        name=cluster.name,
+        description=cluster.description,
+        representative_asset_id=cluster.representative_asset_id,
+        source_run_id=cluster.source_run_id,
+        created_at=cluster.created_at,
+        updated_at=cluster.updated_at,
+    )
+
+
+def _current_cluster_member_record(
+    member: CurrentClusterMember,
+) -> CurrentClusterMemberRecord:
+    return CurrentClusterMemberRecord(
+        cluster_id=member.cluster_id,
+        asset_id=member.asset_id,
+        embedding_type=member.embedding_type,
+        source=ClusterMemberSource(member.source),
+        score=member.score,
+        created_at=member.created_at,
+    )
+
+
+def _current_cluster_exclusion_record(
+    exclusion: ClusterExclusion,
+) -> CurrentClusterExclusionRecord:
+    return CurrentClusterExclusionRecord(
+        cluster_id=exclusion.cluster_id,
+        asset_id=exclusion.asset_id,
+        created_by=exclusion.created_by,
+        created_at=exclusion.created_at,
+    )
+
+
+async def _load_current_cluster(
+    session: AsyncSession,
+    *,
+    cluster_id: str,
+    workspace_id: str,
+    for_update: bool = False,
+) -> CurrentCluster:
+    statement = select(CurrentCluster).where(
+        CurrentCluster.cluster_id == cluster_id,
+        CurrentCluster.workspace_id == workspace_id,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    cluster = await session.scalar(statement)
+    if cluster is None:
+        raise ValueError(f"current cluster does not exist: {cluster_id}")
+    return cluster
+
+
+async def _validate_workspace_assets(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    asset_ids: Sequence[str],
+) -> None:
+    requested_ids = set(asset_ids)
+    if not requested_ids:
+        return
+    rows = await session.scalars(
+        select(Asset.asset_id)
+        .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+        .where(
+            Asset.workspace_id == workspace_id,
+            Asset.asset_id.in_(requested_ids),
+            Asset.generation == SourceFile.processing_generation,
+        )
+        .with_for_update()
+    )
+    missing = sorted(requested_ids - set(rows))
+    if missing:
+        raise ValueError("Assets do not exist in workspace: " + ", ".join(missing))
+
+
+async def _validate_indexed_assets(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    embedding_type: str,
+    asset_ids: Sequence[str],
+) -> None:
+    await _validate_workspace_assets(
+        session,
+        workspace_id=workspace_id,
+        asset_ids=asset_ids,
+    )
+    indexed_ids = set(
+        await session.scalars(
+            select(EmbeddingRecord.asset_id)
+            .where(
+                EmbeddingRecord.workspace_id == workspace_id,
+                EmbeddingRecord.embedding_type == embedding_type,
+                EmbeddingRecord.asset_id.in_(asset_ids),
+                EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+            )
+            .distinct()
+        )
+    )
+    missing = sorted(set(asset_ids) - indexed_ids)
+    if missing:
+        raise ValueError(
+            f"Assets do not have indexed {embedding_type} embeddings: " + ", ".join(missing)
+        )
+
+
+def _validate_current_cluster_publish(clusters: Sequence[CurrentClusterPublish]) -> None:
+    cluster_ids = [item.cluster_id for item in clusters if item.cluster_id is not None]
+    if len(cluster_ids) != len(set(cluster_ids)):
+        raise ValueError("published cluster IDs must be unique")
+    all_asset_ids: list[str] = []
+    for item in clusters:
+        if not item.name.strip():
+            raise ValueError("published cluster name must not be blank")
+        if not item.description.strip():
+            raise ValueError("published cluster description must not be blank")
+        member_ids = [member.asset_id for member in item.members]
+        if not member_ids:
+            raise ValueError("published dynamic clusters must contain at least one Asset")
+        if len(member_ids) != len(set(member_ids)):
+            raise ValueError("published cluster member IDs must be unique")
+        if (
+            item.representative_asset_id is not None
+            and item.representative_asset_id not in member_ids
+        ):
+            raise ValueError("representative Asset must be a member of its published cluster")
+        all_asset_ids.extend(member_ids)
+    if len(all_asset_ids) != len(set(all_asset_ids)):
+        raise ValueError("an Asset may only appear in one published cluster per embedding type")
 
 
 def _validate_representatives(representatives: list[ClusterRepresentativeWrite]) -> None:

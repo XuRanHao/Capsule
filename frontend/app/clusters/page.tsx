@@ -18,6 +18,9 @@ import {
   type ClusterCapsule,
   type ClusterMember,
   type ClusterRun,
+  type CurrentCluster,
+  type CurrentClusterMember,
+  type CurrentClusterMode,
   WORKSPACE_ID,
   apiFetch,
 } from "../lib/api";
@@ -55,6 +58,40 @@ const GROUP_COLORS = [
 const GRAPH_MIN_SCALE = 0.35;
 const GRAPH_MAX_SCALE = 2.4;
 const GRAPH_MEMBER_LIMIT = 32;
+
+const CURRENT_CLUSTER_MODES: Array<{
+  value: CurrentClusterMode;
+  label: string;
+  help: string;
+}> = [
+  {
+    value: "dynamic",
+    label: "动态簇",
+    help: "参与下一次全量聚类",
+  },
+  {
+    value: "resident_open",
+    label: "开放常驻",
+    help: "保留成员，并允许算法加入",
+  },
+  {
+    value: "resident_manual",
+    label: "人工常驻",
+    help: "保留成员，仅允许用户加入",
+  },
+];
+
+function currentClusterModeLabel(mode: CurrentClusterMode) {
+  return (
+    CURRENT_CLUSTER_MODES.find((item) => item.value === mode)?.label ?? mode
+  );
+}
+
+function parseAssetIds(value: string) {
+  return [...new Set(value.split(/[\s,，]+/).map((item) => item.trim()))].filter(
+    Boolean,
+  );
+}
 
 type GraphMemberNode = {
   member: ClusterMember;
@@ -399,8 +436,20 @@ export default function ClustersPage() {
   const [membersByCapsule, setMembersByCapsule] = useState<
     Record<string, ClusterMember[]>
   >({});
+  const [currentClusters, setCurrentClusters] = useState<CurrentCluster[]>([]);
+  const [selectedCurrentClusterId, setSelectedCurrentClusterId] = useState("");
+  const [currentMembers, setCurrentMembers] = useState<CurrentClusterMember[]>(
+    [],
+  );
+  const [currentLoading, setCurrentLoading] = useState(true);
+  const [currentMutation, setCurrentMutation] = useState("");
+  const [currentError, setCurrentError] = useState<string | null>(null);
+  const [currentNotice, setCurrentNotice] = useState<string | null>(null);
+  const [assetIdsInput, setAssetIdsInput] = useState("");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const currentClusterRequestRef = useRef(0);
+  const currentMemberRequestRef = useRef(0);
   const capsuleCardRefs = useRef(new Map<string, HTMLElement>());
   const clusterDetailRef = useRef<HTMLElement>(null);
   const deepLinkTargetRef = useRef(
@@ -454,6 +503,87 @@ export default function ClustersPage() {
       window.clearInterval(polling);
     };
   }, [loadRuns]);
+
+  const loadCurrentClusters = useCallback(async () => {
+    const requestId = ++currentClusterRequestRef.current;
+    setCurrentLoading(true);
+    try {
+      const params = new URLSearchParams({
+        workspace_id: WORKSPACE_ID,
+        embedding_type: embeddingType,
+      });
+      const payload = await apiFetch<{ items: CurrentCluster[] }>(
+        `/api/v1/clusters?${params}`,
+      );
+      if (requestId !== currentClusterRequestRef.current) return;
+      setCurrentClusters(payload.items);
+      setSelectedCurrentClusterId((current) =>
+        payload.items.some((cluster) => cluster.cluster_id === current)
+          ? current
+          : payload.items[0]?.cluster_id || "",
+      );
+      setCurrentError(null);
+    } catch (requestError) {
+      if (requestId !== currentClusterRequestRef.current) return;
+      setCurrentClusters([]);
+      setSelectedCurrentClusterId("");
+      setCurrentError(
+        requestError instanceof Error
+          ? requestError.message
+          : "当前聚类加载失败",
+      );
+    } finally {
+      if (requestId === currentClusterRequestRef.current) {
+        setCurrentLoading(false);
+      }
+    }
+  }, [embeddingType]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setCurrentClusters([]);
+      setSelectedCurrentClusterId("");
+      setCurrentMembers([]);
+      setCurrentNotice(null);
+      setAssetIdsInput("");
+      void loadCurrentClusters();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadCurrentClusters]);
+
+  const selectedCurrentCluster =
+    currentClusters.find(
+      (cluster) => cluster.cluster_id === selectedCurrentClusterId,
+    ) ?? currentClusters[0];
+
+  const loadCurrentMembers = useCallback(async () => {
+    const requestId = ++currentMemberRequestRef.current;
+    setCurrentMembers([]);
+    if (!selectedCurrentCluster) {
+      return;
+    }
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const payload = await apiFetch<{ items: CurrentClusterMember[] }>(
+        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members?${params}`,
+      );
+      if (requestId === currentMemberRequestRef.current) {
+        setCurrentMembers(payload.items);
+        setCurrentError(null);
+      }
+    } catch (requestError) {
+      if (requestId !== currentMemberRequestRef.current) return;
+      setCurrentMembers([]);
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "簇成员加载失败",
+      );
+    }
+  }, [selectedCurrentCluster]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadCurrentMembers(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadCurrentMembers]);
 
   const selectedRun =
     runs.find((run) => run.cluster_run_id === selectedRunId) ?? runs[0];
@@ -610,6 +740,93 @@ export default function ClustersPage() {
     );
   };
 
+  const updateCurrentMode = async (mode: CurrentClusterMode) => {
+    if (!selectedCurrentCluster || selectedCurrentCluster.mode === mode) return;
+    setCurrentMutation("mode");
+    setCurrentError(null);
+    setCurrentNotice(null);
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const updated = await apiFetch<CurrentCluster>(
+        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}?${params}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ mode }),
+        },
+      );
+      setCurrentClusters((current) =>
+        current.map((cluster) =>
+          cluster.cluster_id === updated.cluster_id ? updated : cluster,
+        ),
+      );
+      setCurrentNotice(`已切换为${currentClusterModeLabel(updated.mode)}`);
+    } catch (requestError) {
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "簇模式更新失败",
+      );
+    } finally {
+      setCurrentMutation("");
+    }
+  };
+
+  const attachCurrentMembers = async () => {
+    if (!selectedCurrentCluster) return;
+    const assetIds = parseAssetIds(assetIdsInput);
+    if (!assetIds.length) {
+      setCurrentError("请输入至少一个 Asset ID");
+      return;
+    }
+    setCurrentMutation("attach");
+    setCurrentError(null);
+    setCurrentNotice(null);
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
+        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members:attach?${params}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ asset_ids: assetIds }),
+        },
+      );
+      setAssetIdsInput("");
+      setCurrentNotice(`已加入 ${assetIds.length} 个 Asset`);
+      await loadCurrentMembers();
+    } catch (requestError) {
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "成员加入失败",
+      );
+    } finally {
+      setCurrentMutation("");
+    }
+  };
+
+  const detachCurrentMember = async (assetId: string) => {
+    if (!selectedCurrentCluster) return;
+    setCurrentMutation(`detach:${assetId}`);
+    setCurrentError(null);
+    setCurrentNotice(null);
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
+        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members:detach?${params}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ asset_ids: [assetId] }),
+        },
+      );
+      setCurrentMembers((current) =>
+        current.filter((member) => member.asset_id !== assetId),
+      );
+      setCurrentNotice(`已移出 Asset ${assetId}`);
+    } catch (requestError) {
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "成员移出失败",
+      );
+    } finally {
+      setCurrentMutation("");
+    }
+  };
+
   const graphLayout = useMemo(() => {
     const columnCount = Math.max(
       1,
@@ -764,6 +981,165 @@ export default function ClustersPage() {
             <small>STATUS</small>
             <StatusBadge status={selectedRun?.status || "pending"} />
           </span>
+        </div>
+      </section>
+
+      <section className="current-cluster-workspace">
+        <header>
+          <div>
+            <span className="eyebrow">CURRENT CLUSTERS</span>
+            <h2>当前聚类</h2>
+            <p>
+              当前维度为
+              {FEATURE_TYPES.find((item) => item.value === embeddingType)
+                ?.label || embeddingType}
+              ，常驻簇不会进入该维度的下一次全量聚类。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="secondary-action"
+            disabled={currentLoading}
+            onClick={() => void loadCurrentClusters()}
+          >
+            {currentLoading ? "加载中…" : "刷新当前簇"}
+          </button>
+        </header>
+
+        <div className="current-cluster-layout">
+          <nav aria-label="当前簇列表">
+            {!currentClusters.length && (
+              <p>{currentLoading ? "正在读取当前簇…" : "当前维度尚无簇"}</p>
+            )}
+            {currentClusters.map((cluster, index) => (
+              <button
+                type="button"
+                className={
+                  selectedCurrentCluster?.cluster_id === cluster.cluster_id
+                    ? "active"
+                    : ""
+                }
+                aria-pressed={
+                  selectedCurrentCluster?.cluster_id === cluster.cluster_id
+                }
+                onClick={() => setSelectedCurrentClusterId(cluster.cluster_id)}
+                key={cluster.cluster_id}
+              >
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <strong>{cluster.name}</strong>
+                <small className={`cluster-mode-badge ${cluster.mode}`}>
+                  {currentClusterModeLabel(cluster.mode)}
+                </small>
+              </button>
+            ))}
+          </nav>
+
+          <div className="current-cluster-detail">
+            {!selectedCurrentCluster ? (
+              <div className="current-cluster-empty">
+                {currentError || "选择一个当前簇进行维护"}
+              </div>
+            ) : (
+              <>
+                <div className="current-cluster-heading">
+                  <div>
+                    <small>{selectedCurrentCluster.embedding_type}</small>
+                    <h3>{selectedCurrentCluster.name}</h3>
+                    <p>
+                      {selectedCurrentCluster.description || "暂无簇描述"}
+                    </p>
+                  </div>
+                  <strong>{currentMembers.length} MEMBERS</strong>
+                </div>
+
+                <div className="cluster-mode-controls" role="group" aria-label="簇模式">
+                  {CURRENT_CLUSTER_MODES.map((mode) => (
+                    <button
+                      type="button"
+                      className={
+                        selectedCurrentCluster.mode === mode.value
+                          ? "active"
+                          : ""
+                      }
+                      disabled={Boolean(currentMutation)}
+                      title={mode.help}
+                      onClick={() => void updateCurrentMode(mode.value)}
+                      key={mode.value}
+                    >
+                      <strong>{mode.label}</strong>
+                      <small>{mode.help}</small>
+                    </button>
+                  ))}
+                </div>
+
+                {selectedCurrentCluster.mode !== "dynamic" && (
+                  <div className="current-cluster-attach">
+                    <label htmlFor="resident-asset-ids">
+                      手动加入 Asset
+                      <input
+                        id="resident-asset-ids"
+                        value={assetIdsInput}
+                        placeholder="输入 Asset ID，使用逗号、空格或换行分隔"
+                        onChange={(event) => setAssetIdsInput(event.target.value)}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="primary-action"
+                      disabled={Boolean(currentMutation)}
+                      onClick={() => void attachCurrentMembers()}
+                    >
+                      {currentMutation === "attach" ? "正在加入…" : "批量加入"}
+                    </button>
+                  </div>
+                )}
+
+                {(currentError || currentNotice) && (
+                  <div
+                    className={`current-cluster-message ${currentError ? "error" : "success"}`}
+                  >
+                    {currentError || currentNotice}
+                  </div>
+                )}
+
+                <div className="current-member-table">
+                  <div className="current-member-row current-member-head">
+                    <span>Asset ID</span>
+                    <span>来源</span>
+                    <span>归类分数</span>
+                    <span>操作</span>
+                  </div>
+                  {!currentMembers.length && (
+                    <p>这个簇当前没有成员。</p>
+                  )}
+                  {currentMembers.map((member) => (
+                    <div className="current-member-row" key={member.asset_id}>
+                      <strong title={member.asset_id}>{member.asset_id}</strong>
+                      <span>{member.source}</span>
+                      <span>
+                        {member.score == null ? "人工指定" : member.score.toFixed(3)}
+                      </span>
+                      <span>
+                        {selectedCurrentCluster.mode !== "dynamic" ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(currentMutation)}
+                            onClick={() => void detachCurrentMember(member.asset_id)}
+                          >
+                            {currentMutation === `detach:${member.asset_id}`
+                              ? "移出中…"
+                              : "移出"}
+                          </button>
+                        ) : (
+                          "—"
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </section>
 
