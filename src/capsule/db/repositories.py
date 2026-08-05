@@ -36,10 +36,14 @@ from capsule.enums import (
     ClusterRunStatus,
     EmbeddingStatus,
     JobStatus,
+    NewAssetClusterStatus,
     PipelineStage,
     ProcessingStatus,
 )
-from capsule.features import embedding_channel_is_eligible
+from capsule.features import (
+    embedding_channel_is_eligible,
+    embedding_type_supports_asset_type,
+)
 from capsule.schemas import (
     AssetCreate,
     AssetEmbeddingState,
@@ -1469,9 +1473,44 @@ class CurrentClusterEmbedding:
 
 
 @dataclass(slots=True, frozen=True)
-class CurrentClusterReclusterCounts:
-    baseline_dynamic_count: int
-    delta_dynamic_count: int
+class ClusterBootstrapState:
+    """Current channel size and full-run state used by bootstrap coordination."""
+
+    has_baseline: bool
+    run_in_progress: bool
+    eligible_asset_count: int
+    latest_run_id: str | None
+    latest_sample_count: int | None
+
+
+@dataclass(slots=True, frozen=True)
+class NewAssetClusterStatusItemRecord:
+    asset_id: str
+    asset_type: AssetType
+    file_name: str
+    asset_name: str | None
+    status: NewAssetClusterStatus
+    cluster_id: str | None
+    cluster_name: str | None
+    cluster_mode: ClusterMode | None
+    member_source: ClusterMemberSource | None
+    score: float | None
+    created_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class NewAssetClusterStatusRecord:
+    has_baseline: bool
+    baseline_cluster_run_id: str | None
+    baseline_sample_count: int | None
+    eligible_asset_count: int
+    items: tuple[NewAssetClusterStatusItemRecord, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class _EligibleClusterAsset:
+    embedding_id: str
+    asset: Asset
 
 
 @dataclass(slots=True, frozen=True)
@@ -1516,6 +1555,150 @@ class CurrentClusterRepository:
         async with self._database.session() as session:
             rows = await session.scalars(statement)
             return [_current_cluster_record(cluster) for cluster in rows]
+
+    async def get_cluster_bootstrap_state(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        milvus_collection: str,
+    ) -> ClusterBootstrapState:
+        """Return enough durable state to decide whether initial clustering may start."""
+        async with self._database.session() as session:
+            latest_run = await _latest_cluster_baseline(
+                session,
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+            )
+            run_in_progress = bool(
+                await session.scalar(
+                    select(func.count(ClusterRun.cluster_run_id)).where(
+                        ClusterRun.workspace_id == workspace_id,
+                        ClusterRun.embedding_type == embedding_type,
+                        ClusterRun.status.in_(
+                            [
+                                ClusterRunStatus.PENDING.value,
+                                ClusterRunStatus.RUNNING.value,
+                            ]
+                        ),
+                    )
+                )
+            )
+            eligible_assets = await _latest_eligible_cluster_assets(
+                session,
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                model_name=model_name,
+                dimension=dimension,
+                milvus_collection=milvus_collection,
+            )
+        return ClusterBootstrapState(
+            has_baseline=latest_run is not None,
+            run_in_progress=run_in_progress,
+            eligible_asset_count=len(eligible_assets),
+            latest_run_id=(latest_run.cluster_run_id if latest_run is not None else None),
+            latest_sample_count=(latest_run.sample_count if latest_run is not None else None),
+        )
+
+    async def get_new_asset_cluster_status(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        milvus_collection: str,
+    ) -> NewAssetClusterStatusRecord:
+        """Classify current eligible embeddings that are absent from the latest baseline."""
+        async with self._database.session() as session:
+            latest_run = await _latest_cluster_baseline(
+                session,
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+            )
+            eligible_assets = await _latest_eligible_cluster_assets(
+                session,
+                workspace_id=workspace_id,
+                embedding_type=embedding_type,
+                model_name=model_name,
+                dimension=dimension,
+                milvus_collection=milvus_collection,
+            )
+            baseline_embedding_ids = (
+                set(latest_run.input_embedding_ids) if latest_run is not None else set()
+            )
+            new_assets = [
+                item
+                for item in eligible_assets
+                if item.embedding_id not in baseline_embedding_ids
+            ]
+            new_asset_ids = [item.asset.asset_id for item in new_assets]
+            member_rows = (
+                (
+                    await session.execute(
+                        select(CurrentClusterMember, CurrentCluster)
+                        .join(
+                            CurrentCluster,
+                            CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
+                        )
+                        .where(
+                            CurrentCluster.workspace_id == workspace_id,
+                            CurrentCluster.embedding_type == embedding_type,
+                            CurrentClusterMember.asset_id.in_(new_asset_ids),
+                        )
+                    )
+                ).all()
+                if new_asset_ids
+                else []
+            )
+        membership_by_asset = {
+            member.asset_id: (member, cluster) for member, cluster in member_rows
+        }
+        items: list[NewAssetClusterStatusItemRecord] = []
+        for eligible in sorted(
+            new_assets,
+            key=lambda item: (item.asset.created_at, item.asset.asset_id),
+            reverse=True,
+        ):
+            asset = eligible.asset
+            membership = membership_by_asset.get(asset.asset_id)
+            member, cluster = membership if membership is not None else (None, None)
+            if cluster is None:
+                cluster_status = NewAssetClusterStatus.PENDING
+            elif cluster.mode == ClusterMode.RESIDENT_MANUAL.value:
+                cluster_status = NewAssetClusterStatus.MANUAL_MANAGEMENT
+            else:
+                cluster_status = NewAssetClusterStatus.INCREMENTALLY_CLUSTERED
+            items.append(
+                NewAssetClusterStatusItemRecord(
+                    asset_id=asset.asset_id,
+                    asset_type=AssetType(asset.asset_type),
+                    file_name=asset.file_name,
+                    asset_name=asset.asset_name,
+                    status=cluster_status,
+                    cluster_id=cluster.cluster_id if cluster is not None else None,
+                    cluster_name=cluster.name if cluster is not None else None,
+                    cluster_mode=(ClusterMode(cluster.mode) if cluster is not None else None),
+                    member_source=(
+                        ClusterMemberSource(member.source) if member is not None else None
+                    ),
+                    score=member.score if member is not None else None,
+                    created_at=asset.created_at,
+                )
+            )
+        return NewAssetClusterStatusRecord(
+            has_baseline=latest_run is not None,
+            baseline_cluster_run_id=(
+                latest_run.cluster_run_id if latest_run is not None else None
+            ),
+            baseline_sample_count=(
+                latest_run.sample_count if latest_run is not None else None
+            ),
+            eligible_asset_count=len(eligible_assets),
+            items=tuple(items),
+        )
 
     async def get_cluster(
         self,
@@ -1836,130 +2019,6 @@ class CurrentClusterRepository:
                 CurrentClusterEmbedding(asset_id=asset_id, embedding_id=embedding_id),
             )
         return [latest[asset_id] for asset_id in requested_ids if asset_id in latest]
-
-    async def get_recluster_counts(
-        self,
-        *,
-        workspace_id: str,
-        embedding_type: str,
-        model_name: str,
-        dimension: int,
-        milvus_collection: str,
-    ) -> CurrentClusterReclusterCounts:
-        """Derive one dimension's baseline and post-run delta without counter tables."""
-        async with self._database.session() as session:
-            latest_run = await session.scalar(
-                select(ClusterRun)
-                .where(
-                    ClusterRun.workspace_id == workspace_id,
-                    ClusterRun.embedding_type == embedding_type,
-                    ClusterRun.status == ClusterRunStatus.COMPLETED.value,
-                )
-                .order_by(
-                    ClusterRun.completed_at.desc().nullslast(),
-                    ClusterRun.cluster_run_id.desc(),
-                )
-                .limit(1)
-            )
-            baseline_asset_ids = (
-                set(
-                    await session.scalars(
-                        select(ClusterMembership.asset_id).where(
-                            ClusterMembership.cluster_run_id == latest_run.cluster_run_id
-                        )
-                    )
-                )
-                if latest_run is not None
-                else set()
-            )
-            resident_asset_ids = set(
-                await session.scalars(
-                    select(CurrentClusterMember.asset_id)
-                    .join(
-                        CurrentCluster,
-                        CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
-                    )
-                    .where(
-                        CurrentCluster.workspace_id == workspace_id,
-                        CurrentCluster.embedding_type == embedding_type,
-                        CurrentCluster.mode.in_(
-                            [
-                                ClusterMode.RESIDENT_OPEN.value,
-                                ClusterMode.RESIDENT_MANUAL.value,
-                            ]
-                        ),
-                    )
-                )
-            )
-            current_member_asset_ids = set(
-                await session.scalars(
-                    select(CurrentClusterMember.asset_id)
-                    .join(
-                        CurrentCluster,
-                        CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
-                    )
-                    .where(
-                        CurrentCluster.workspace_id == workspace_id,
-                        CurrentCluster.embedding_type == embedding_type,
-                    )
-                )
-            )
-            excluded_asset_ids = set(
-                await session.scalars(
-                    select(ClusterExclusion.asset_id)
-                    .join(
-                        CurrentCluster,
-                        CurrentCluster.cluster_id == ClusterExclusion.cluster_id,
-                    )
-                    .where(
-                        CurrentCluster.workspace_id == workspace_id,
-                        CurrentCluster.embedding_type == embedding_type,
-                    )
-                )
-            )
-            rows = (
-                await session.execute(
-                    select(EmbeddingRecord.asset_id, Asset)
-                    .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
-                    .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
-                    .where(
-                        EmbeddingRecord.workspace_id == workspace_id,
-                        EmbeddingRecord.embedding_type == embedding_type,
-                        EmbeddingRecord.model_name == model_name,
-                        EmbeddingRecord.dimension == dimension,
-                        EmbeddingRecord.milvus_collection == milvus_collection,
-                        EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
-                        Asset.generation == SourceFile.processing_generation,
-                        Asset.index_role != AssetIndexRole.PARENT.value,
-                    )
-                    .order_by(
-                        EmbeddingRecord.created_at.desc(),
-                        EmbeddingRecord.embedding_id.desc(),
-                    )
-                )
-            ).all()
-
-        eligible_asset_ids: set[str] = set()
-        for asset_id, asset in rows:
-            if asset_id in eligible_asset_ids:
-                continue
-            if embedding_channel_is_eligible(
-                embedding_type=embedding_type,
-                asset_features=asset.asset_features,
-                asset_description=asset.asset_description,
-            ):
-                eligible_asset_ids.add(asset_id)
-        current_dynamic_ids = eligible_asset_ids - resident_asset_ids
-        baseline_dynamic_ids = baseline_asset_ids - resident_asset_ids
-        manually_detached_ids = (
-            excluded_asset_ids - current_member_asset_ids
-        ) & current_dynamic_ids
-        return CurrentClusterReclusterCounts(
-            baseline_dynamic_count=len(baseline_dynamic_ids),
-            delta_dynamic_count=len(
-                (current_dynamic_ids - baseline_asset_ids) | manually_detached_ids
-            ),
-        )
 
     async def publish_dynamic_clusters(
         self,
@@ -2450,6 +2509,88 @@ class ClusterRepository:
                 capsule.effective_description = description or capsule.model_generated_description
             await session.flush()
             return _cluster_capsule_record(capsule)
+
+
+async def _latest_cluster_baseline(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    embedding_type: str,
+) -> ClusterRun | None:
+    return cast(
+        ClusterRun | None,
+        await session.scalar(
+            select(ClusterRun)
+            .where(
+                ClusterRun.workspace_id == workspace_id,
+                ClusterRun.embedding_type == embedding_type,
+                ClusterRun.status.in_(
+                    [
+                        ClusterRunStatus.COMPLETED.value,
+                        ClusterRunStatus.INSUFFICIENT_DATA.value,
+                    ]
+                ),
+            )
+            .order_by(
+                ClusterRun.completed_at.desc().nullslast(),
+                ClusterRun.started_at.desc().nullslast(),
+                ClusterRun.cluster_run_id.desc(),
+            )
+            .limit(1)
+        ),
+    )
+
+
+async def _latest_eligible_cluster_assets(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    embedding_type: str,
+    model_name: str,
+    dimension: int,
+    milvus_collection: str,
+) -> list[_EligibleClusterAsset]:
+    rows = (
+        await session.execute(
+            select(EmbeddingRecord, Asset)
+            .join(Asset, Asset.asset_id == EmbeddingRecord.asset_id)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+            .where(
+                EmbeddingRecord.workspace_id == workspace_id,
+                EmbeddingRecord.embedding_type == embedding_type,
+                EmbeddingRecord.model_name == model_name,
+                EmbeddingRecord.dimension == dimension,
+                EmbeddingRecord.milvus_collection == milvus_collection,
+                EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+                Asset.generation == SourceFile.processing_generation,
+                Asset.index_role != AssetIndexRole.PARENT.value,
+            )
+            .order_by(
+                EmbeddingRecord.created_at.desc(),
+                EmbeddingRecord.embedding_id.desc(),
+            )
+        )
+    ).all()
+    selected: dict[str, _EligibleClusterAsset] = {}
+    for embedding, asset in rows:
+        if asset.asset_id in selected:
+            continue
+        if not embedding_type_supports_asset_type(
+            embedding_type=embedding_type,
+            asset_type=asset.asset_type,
+        ):
+            continue
+        if not embedding_channel_is_eligible(
+            embedding_type=embedding_type,
+            asset_features=asset.asset_features,
+            asset_description=asset.asset_description,
+        ):
+            continue
+        selected[asset.asset_id] = _EligibleClusterAsset(
+            embedding_id=embedding.embedding_id,
+            asset=asset,
+        )
+    return list(selected.values())
 
 
 def _current_cluster_record(cluster: CurrentCluster) -> CurrentClusterRecord:

@@ -61,10 +61,12 @@ Milvus collection, and seeds `workspace_demo`.
 make setup
 ```
 
-Then put the real Volcengine Ark key in the ignored local `.env` file:
+Then put the real provider keys in the ignored local `.env` file:
 
 ```dotenv
 CAPSULE_ARK_API_KEY=your-ark-api-key
+CAPSULE_DEEPSEEK_API_KEY=your-deepseek-api-key
+CAPSULE_DEEPSEEK_BASE_URL=https://api.deepseek.com
 # 可选：覆盖项目内置的 DeepSeek V3 tokenizer.json
 # CAPSULE_DOCUMENT_TOKENIZER_PATH=/absolute/path/to/tokenizer.json
 # 子块以 400 token 为目标，低于 250 时与邻块合并，500 是结构化软上限
@@ -120,10 +122,10 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    ```
 
    Model workloads are configured independently: `CAPSULE_SEARCH_QUERY_MODEL`
-   controls text Dimension Query Enhancer calls, `CAPSULE_UNDERSTANDING_MODEL`
-   controls asset and cluster understanding, and `CAPSULE_EMBEDDING_MODEL` controls
-   the shared multimodal embedding space. Changing the embedding model requires
-   rebuilding its indexes; changing only the Query Enhancer model does not.
+   and `CAPSULE_DEEPSEEK_API_KEY` control text Dimension Query Enhancer calls;
+   `CAPSULE_UNDERSTANDING_MODEL`, `CAPSULE_EMBEDDING_MODEL`, and
+   `CAPSULE_ARK_API_KEY` control the Ark workloads. Changing the embedding model
+   requires rebuilding its indexes; changing only the Query Enhancer model does not.
 
 2. Start local infrastructure.
 
@@ -169,6 +171,19 @@ multimodal: Markdown uses the block text, images are sent inline as their
 original bytes, and video uses the derived playable MP4 inline as a Base64 Data
 URI. Repeat `--asset-id` to limit a batch; already indexed logical inputs are
 skipped unless `--force` is set.
+
+## Cluster lifecycle
+
+Automatic clustering is scoped independently by workspace and embedding type.
+Before a dimension has a completed or insufficient-data baseline, eligible
+Assets accumulate until `CAPSULE_CLUSTER_BOOTSTRAP_MINIMUM_COUNT` (default 50),
+then one automatic full bootstrap run is scheduled. Pending or running runs
+suppress duplicate bootstrap scheduling. After any baseline exists, newly
+embedded Assets are handled only by incremental assignment into resident-open
+or dynamic clusters; resident-manual clusters are never automatic candidates.
+The service does not automatically rebuild clusters based on later Asset counts
+or growth ratios. Users can explicitly request a full rebuild through
+`POST /api/v1/cluster-runs`.
 
 ## Video MPS worker
 
@@ -228,7 +243,8 @@ Without Homebrew, this checkout can use the ignored project-local binaries at
 `tmp/tools/ffmpeg/bin/`; the macOS parser discovers them automatically. Docker
 continues to use its Linux FFmpeg instead.
 
-6. Start the search API after configuring `CAPSULE_ARK_API_KEY`.
+6. Start the search API after configuring `CAPSULE_ARK_API_KEY` and
+   `CAPSULE_DEEPSEEK_API_KEY`.
 
    ```bash
    uv run uvicorn capsule.api.app:app --host 0.0.0.0 --port 8010

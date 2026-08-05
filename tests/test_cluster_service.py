@@ -306,7 +306,7 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     assert result.cluster_count > 0
     run = next(iter(repository.runs.values()))
     assert run["parameters"]["min_cluster_size"] == 3
-    assert run["parameters"]["min_samples"] == 1
+    assert run["parameters"]["min_samples"] == 3
     assert run["parameters"]["cluster_selection_epsilon"] == 0.5
     assert len(next(iter(repository.memberships.values()))) == 12
 

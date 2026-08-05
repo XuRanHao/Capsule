@@ -10,7 +10,9 @@ from capsule.enums import (
     ClusterMemberSource,
     ClusterMode,
     ClusterRepresentativeRole,
+    EmbeddingType,
     FeatureStatus,
+    NewAssetClusterStatus,
     ProcessingStatus,
 )
 
@@ -434,6 +436,8 @@ class ClusterRunListResponse(BaseModel):
 class CurrentClusterRecord(BaseModel):
     """One currently active logical cluster, independent of a historical run snapshot."""
 
+    model_config = ConfigDict(from_attributes=True)
+
     cluster_id: str
     workspace_id: str
     embedding_type: str
@@ -449,6 +453,8 @@ class CurrentClusterRecord(BaseModel):
 class CurrentClusterMemberRecord(BaseModel):
     """One Asset's current assignment for an embedding dimension."""
 
+    model_config = ConfigDict(from_attributes=True)
+
     cluster_id: str
     asset_id: str
     embedding_type: str
@@ -463,6 +469,37 @@ class CurrentClusterListResponse(BaseModel):
 
 class CurrentClusterMemberListResponse(BaseModel):
     items: list[CurrentClusterMemberRecord] = Field(default_factory=list)
+
+
+class NewAssetClusterStatusItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    asset_id: str
+    asset_type: AssetType
+    file_name: str
+    asset_name: str | None = None
+    status: NewAssetClusterStatus
+    cluster_id: str | None = None
+    cluster_name: str | None = None
+    cluster_mode: ClusterMode | None = None
+    member_source: ClusterMemberSource | None = None
+    score: float | None = None
+    created_at: datetime
+
+
+class NewAssetClusterStatusResponse(BaseModel):
+    workspace_id: str
+    embedding_type: EmbeddingType
+    initialized: bool
+    bootstrap_minimum_count: int = Field(ge=1)
+    baseline_cluster_run_id: str | None = None
+    baseline_sample_count: int | None = Field(default=None, ge=0)
+    eligible_asset_count: int = Field(ge=0)
+    new_asset_count: int = Field(ge=0)
+    incrementally_clustered_count: int = Field(ge=0)
+    pending_count: int = Field(ge=0)
+    manual_management_count: int = Field(ge=0)
+    items: list[NewAssetClusterStatusItem] = Field(default_factory=list)
 
 
 class CurrentClusterPatch(BaseModel):

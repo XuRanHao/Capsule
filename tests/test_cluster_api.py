@@ -144,7 +144,7 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
     assert submitted.status_code == 202
     assert submitted.json() == {"cluster_run_id": "run_api_test", "status": "pending"}
     assert repository.run.preprocessing["requested_pca_dimension"] == 8
-    assert repository.run.parameters["min_samples"] == 1
+    assert repository.run.parameters["min_samples"] == 3
     assert repository.run.parameters["min_cluster_size"] == 3
     assert service.calls == [
         {
@@ -152,7 +152,7 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "embedding_type": EmbeddingType.NATIVE_MULTIMODAL,
             "cluster_run_id": "run_api_test",
             "pca_dimension": 8,
-            "min_samples": 1,
+            "min_samples": 3,
             "min_cluster_size": 3,
             "optimize_parameters": False,
         }

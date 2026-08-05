@@ -6,15 +6,14 @@ from dataclasses import dataclass
 import pytest
 
 from capsule.config import Settings
-from capsule.db.repositories import CurrentClusterReclusterCounts
+from capsule.db.repositories import ClusterBootstrapState
 from capsule.enums import ClusterMemberSource, ClusterMode, EmbeddingType
 from capsule.pipeline.incremental_clustering import (
     IncrementalAssignmentThresholds,
     IncrementalClusterCoordinator,
     IncrementalClusterService,
-    ReclusterThreshold,
     cosine_similarity,
-    evaluate_recluster_threshold,
+    evaluate_cluster_bootstrap,
 )
 
 
@@ -123,25 +122,36 @@ class FakeRepository:
 
 
 class FakeCoordinatorRepository(FakeRepository):
-    async def get_recluster_counts(self, **_: object) -> CurrentClusterReclusterCounts:
-        return CurrentClusterReclusterCounts(
-            baseline_dynamic_count=10,
-            delta_dynamic_count=2,
-        )
+    def __init__(
+        self,
+        *,
+        bootstrap_state: ClusterBootstrapState,
+    ) -> None:
+        super().__init__(clusters=[], embeddings=[])
+        self.bootstrap_state = bootstrap_state
+        self.bootstrap_calls: list[dict[str, object]] = []
+
+    async def get_cluster_bootstrap_state(
+        self,
+        **kwargs: object,
+    ) -> ClusterBootstrapState:
+        self.bootstrap_calls.append(dict(kwargs))
+        return self.bootstrap_state
 
 
 class FakeClusterRunner:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, EmbeddingType]] = []
+        self.calls: list[tuple[str, EmbeddingType, str]] = []
 
     async def run(
         self,
         *,
         workspace_id: str,
         embedding_type: EmbeddingType,
+        trigger: str = "user",
         **_: object,
     ) -> object:
-        self.calls.append((workspace_id, embedding_type))
+        self.calls.append((workspace_id, embedding_type, trigger))
         return object()
 
 
@@ -341,50 +351,45 @@ async def test_embedding_type_specific_threshold_is_used_for_one_dimension() -> 
     assert repository.exclusion_calls[0]["embedding_type"] == "mood_atmosphere"
 
 
-def test_recluster_condition_requires_ratio_and_minimum_for_one_dimension() -> None:
-    threshold = ReclusterThreshold(ratio=0.1, minimum=50)
+def _bootstrap_state(
+    *,
+    has_baseline: bool = False,
+    run_in_progress: bool = False,
+    eligible_asset_count: int = 50,
+) -> ClusterBootstrapState:
+    return ClusterBootstrapState(
+        has_baseline=has_baseline,
+        run_in_progress=run_in_progress,
+        eligible_asset_count=eligible_asset_count,
+        latest_run_id=None,
+        latest_sample_count=0,
+    )
 
-    below_minimum = evaluate_recluster_threshold(
+
+@pytest.mark.parametrize(
+    ("state", "should_bootstrap"),
+    [
+        (_bootstrap_state(eligible_asset_count=49), False),
+        (_bootstrap_state(eligible_asset_count=50), True),
+        (_bootstrap_state(has_baseline=True, eligible_asset_count=500), False),
+        (_bootstrap_state(run_in_progress=True, eligible_asset_count=500), False),
+    ],
+    ids=["below-minimum", "first-baseline", "baseline-exists", "run-in-progress"],
+)
+def test_bootstrap_requires_minimum_without_baseline_or_active_run(
+    state: ClusterBootstrapState,
+    should_bootstrap: bool,
+) -> None:
+    decision = evaluate_cluster_bootstrap(
         workspace_id="workspace_a",
         embedding_type=EmbeddingType.VISUAL_STYLE,
-        baseline_dynamic_count=100,
-        delta_dynamic_count=20,
-        threshold=threshold,
-    )
-    below_ratio = evaluate_recluster_threshold(
-        workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
-        baseline_dynamic_count=1000,
-        delta_dynamic_count=50,
-        threshold=threshold,
-    )
-    reached = evaluate_recluster_threshold(
-        workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
-        baseline_dynamic_count=500,
-        delta_dynamic_count=50,
-        threshold=threshold,
+        state=state,
+        minimum_asset_count=50,
     )
 
-    assert below_minimum.delta_ratio == pytest.approx(0.2)
-    assert not below_minimum.should_recluster
-    assert not below_ratio.should_recluster
-    assert reached.should_recluster
-    assert reached.embedding_type is EmbeddingType.VISUAL_STYLE
-
-
-def test_recluster_condition_handles_empty_baseline_without_cross_type_state() -> None:
-    decision = evaluate_recluster_threshold(
-        workspace_id="workspace_a",
-        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
-        baseline_dynamic_count=0,
-        delta_dynamic_count=10,
-        threshold=ReclusterThreshold(ratio=0.1, minimum=10),
-    )
-
-    assert decision.delta_ratio == 10.0
-    assert decision.should_recluster
-    assert decision.workspace_id == "workspace_a"
+    assert decision.should_bootstrap is should_bootstrap
+    assert decision.eligible_asset_count == state.eligible_asset_count
+    assert decision.embedding_type is EmbeddingType.VISUAL_STYLE
 
 
 def test_cosine_similarity_rejects_invalid_vectors() -> None:
@@ -395,14 +400,15 @@ def test_cosine_similarity_rejects_invalid_vectors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_coordinator_schedules_recluster_independently_per_dimension() -> None:
-    repository = FakeCoordinatorRepository(clusters=[], embeddings=[])
+async def test_coordinator_schedules_first_bootstrap_independently_per_dimension() -> None:
+    repository = FakeCoordinatorRepository(
+        bootstrap_state=_bootstrap_state(eligible_asset_count=2)
+    )
     runner = FakeClusterRunner()
     coordinator = IncrementalClusterCoordinator(
         settings=Settings(
-            cluster_recluster_ratio_threshold=0.1,
-            cluster_recluster_minimum_count=2,
-            cluster_recluster_concurrency=1,
+            cluster_bootstrap_minimum_count=2,
+            cluster_bootstrap_concurrency=1,
         ),
         assignment_service=IncrementalClusterService(
             repository=repository,
@@ -424,9 +430,40 @@ async def test_coordinator_schedules_recluster_independently_per_dimension() -> 
     )
     await coordinator.close()
 
-    assert visual.recluster_scheduled
-    assert subject.recluster_scheduled
+    assert visual.bootstrap_scheduled
+    assert subject.bootstrap_scheduled
     assert runner.calls == [
-        ("workspace_a", EmbeddingType.VISUAL_STYLE),
-        ("workspace_a", EmbeddingType.SUBJECT_CONTENT),
+        ("workspace_a", EmbeddingType.VISUAL_STYLE, "automatic_bootstrap"),
+        ("workspace_a", EmbeddingType.SUBJECT_CONTENT, "automatic_bootstrap"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_coordinator_never_reclusters_automatically_after_baseline() -> None:
+    repository = FakeCoordinatorRepository(
+        bootstrap_state=_bootstrap_state(
+            has_baseline=True,
+            eligible_asset_count=10_000,
+        )
+    )
+    runner = FakeClusterRunner()
+    coordinator = IncrementalClusterCoordinator(
+        settings=Settings(cluster_bootstrap_minimum_count=2),
+        assignment_service=IncrementalClusterService(
+            repository=repository,
+            vector_store=FakeVectorStore({}),
+        ),
+        repository=repository,
+        cluster_runner=runner,
+    )
+
+    result = await coordinator.process_assets(
+        workspace_id="workspace_a",
+        embedding_type=EmbeddingType.VISUAL_STYLE,
+        asset_ids=["new_asset"],
+    )
+    await coordinator.close()
+
+    assert not result.bootstrap.should_bootstrap
+    assert not result.bootstrap_scheduled
+    assert runner.calls == []

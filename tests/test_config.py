@@ -5,9 +5,10 @@ from capsule.config import Settings
 
 
 def test_blank_optional_secrets_are_unset() -> None:
-    settings = Settings(ark_api_key="", milvus_token="")
+    settings = Settings(ark_api_key="", deepseek_api_key="", milvus_token="")
 
     assert settings.ark_api_key is None
+    assert settings.deepseek_api_key is None
     assert settings.milvus_token is None
 
 
@@ -15,7 +16,8 @@ def test_document_chunk_size_defaults_to_250_400_500_600_tokens() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.assetization_version == "assetization-v6"
-    assert settings.search_query_model == "doubao-seed-2-0-mini-260428"
+    assert settings.deepseek_base_url == "https://api.deepseek.com"
+    assert settings.search_query_model == "deepseek-v4-flash"
     assert settings.search_query_max_output_tokens == 500
     assert settings.document_tokenizer_path is None
     assert settings.document_chunk_min_tokens == 250
@@ -86,6 +88,7 @@ def test_incremental_cluster_defaults_are_conservative() -> None:
     settings = Settings()
 
     assert settings.cluster_incremental_assignment_threshold == 0.92
-    assert settings.cluster_recluster_ratio_threshold == 0.10
-    assert settings.cluster_recluster_minimum_count == 50
-    assert settings.cluster_recluster_concurrency == 1
+    assert settings.cluster_bootstrap_minimum_count == 50
+    assert settings.cluster_bootstrap_concurrency == 1
+    assert "cluster_recluster_ratio_threshold" not in Settings.model_fields
+    assert "cluster_recluster_minimum_count" not in Settings.model_fields

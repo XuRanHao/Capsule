@@ -164,6 +164,35 @@ export type CurrentClusterMember = {
   created_at: string;
 };
 
+export type ClusterAssetStatusItem = {
+  asset_id: string;
+  asset_type: AssetRecord["asset_type"];
+  file_name: string;
+  asset_name: string | null;
+  status: "incrementally_clustered" | "pending" | "manual_management";
+  cluster_id: string | null;
+  cluster_name: string | null;
+  cluster_mode: CurrentClusterMode | null;
+  member_source: CurrentClusterMember["source"] | null;
+  score: number | null;
+  created_at: string;
+};
+
+export type ClusterAssetStatus = {
+  workspace_id: string;
+  embedding_type: string;
+  initialized: boolean;
+  bootstrap_minimum_count: number;
+  baseline_cluster_run_id: string | null;
+  baseline_sample_count: number | null;
+  eligible_asset_count: number;
+  new_asset_count: number;
+  incrementally_clustered_count: number;
+  pending_count: number;
+  manual_management_count: number;
+  items: ClusterAssetStatusItem[];
+};
+
 export type SearchCapsule = {
   capsule_id: string;
   workspace_id: string;
@@ -183,6 +212,17 @@ export function endpoint(path: string) {
   return `${API_BASE_URL.replace(/\/$/, "")}${path}`;
 }
 
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(endpoint(path), {
     ...init,
@@ -193,13 +233,19 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   });
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as
-      | { detail?: string | { message?: string } }
+      | { detail?: string | { code?: string; message?: string } }
       | null;
     const message =
       typeof payload?.detail === "string"
         ? payload.detail
         : payload?.detail?.message;
-    throw new Error(message || `请求失败（${response.status}）`);
+    const code =
+      typeof payload?.detail === "object" ? payload.detail?.code : undefined;
+    throw new ApiRequestError(
+      message || `请求失败（${response.status}）`,
+      response.status,
+      code,
+    );
   }
   return (await response.json()) as T;
 }

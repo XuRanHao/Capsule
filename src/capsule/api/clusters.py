@@ -6,8 +6,14 @@ from typing import Protocol, cast
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from capsule.db.repositories import ClusterRepository
-from capsule.enums import ClusterMemberSource, ClusterMode, ClusterRunStatus, EmbeddingType
+from capsule.db.repositories import ClusterRepository, NewAssetClusterStatusRecord
+from capsule.enums import (
+    ClusterMemberSource,
+    ClusterMode,
+    ClusterRunStatus,
+    EmbeddingType,
+    NewAssetClusterStatus,
+)
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.schemas import (
     ClusterCapsuleRecord,
@@ -21,6 +27,8 @@ from capsule.schemas import (
     CurrentClusterMemberRecord,
     CurrentClusterPatch,
     CurrentClusterRecord,
+    NewAssetClusterStatusItem,
+    NewAssetClusterStatusResponse,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["cluster-runs"])
@@ -33,7 +41,7 @@ class ClusterRunCreate(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=64)
     embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL
     pca_dimension: int = Field(default=8, ge=2, le=1024)
-    min_samples: int = Field(default=1, ge=1, le=10_000)
+    min_samples: int = Field(default=3, ge=1, le=10_000)
     min_cluster_size: int = Field(default=3, ge=2, le=10_000)
     optimize_parameters: bool = False
 
@@ -59,6 +67,16 @@ class ClusterCapsuleOverridePatch(BaseModel):
 
 
 class CurrentClusterRepositoryProtocol(Protocol):
+    async def get_new_asset_cluster_status(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        model_name: str,
+        dimension: int,
+        milvus_collection: str,
+    ) -> NewAssetClusterStatusRecord: ...
+
     async def list_clusters(
         self,
         *,
@@ -169,6 +187,53 @@ async def list_current_clusters(
         embedding_type=embedding_type.value,
     )
     return CurrentClusterListResponse(items=items)
+
+
+@router.get(
+    "/clusters/assets/status",
+    response_model=NewAssetClusterStatusResponse,
+    tags=["clusters"],
+)
+async def get_new_asset_cluster_status(
+    request: Request,
+    embedding_type: EmbeddingType,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> NewAssetClusterStatusResponse:
+    settings = request.app.state.settings
+    result = await _current_cluster_repository(request).get_new_asset_cluster_status(
+        workspace_id=workspace_id,
+        embedding_type=embedding_type.value,
+        model_name=settings.embedding_model,
+        dimension=settings.embedding_dimension,
+        milvus_collection=settings.milvus_collection,
+    )
+    incrementally_clustered_count = sum(
+        item.status is NewAssetClusterStatus.INCREMENTALLY_CLUSTERED
+        for item in result.items
+    )
+    pending_count = sum(
+        item.status is NewAssetClusterStatus.PENDING for item in result.items
+    )
+    manual_management_count = sum(
+        item.status is NewAssetClusterStatus.MANUAL_MANAGEMENT for item in result.items
+    )
+    return NewAssetClusterStatusResponse(
+        workspace_id=workspace_id,
+        embedding_type=embedding_type,
+        initialized=result.has_baseline,
+        bootstrap_minimum_count=settings.cluster_bootstrap_minimum_count,
+        baseline_cluster_run_id=result.baseline_cluster_run_id,
+        baseline_sample_count=result.baseline_sample_count,
+        eligible_asset_count=result.eligible_asset_count,
+        new_asset_count=len(result.items),
+        incrementally_clustered_count=incrementally_clustered_count,
+        pending_count=pending_count,
+        manual_management_count=manual_management_count,
+        items=[
+            NewAssetClusterStatusItem.model_validate(item, from_attributes=True)
+            for item in result.items
+        ],
+    )
 
 
 @router.get(
@@ -306,6 +371,7 @@ async def submit_cluster_run(
             workspace_id=payload.workspace_id,
             embedding_type=payload.embedding_type.value,
             preprocessing={
+                "trigger": "user",
                 "requested_pca_dimension": payload.pca_dimension,
                 "parameter_selection": (
                     "user_defined_selection_optimized"

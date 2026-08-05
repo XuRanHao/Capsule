@@ -84,6 +84,26 @@ class DoubaoClient:
                 ),
             ),
         )
+        self._deepseek_client = (
+            httpx.AsyncClient(
+                base_url=settings.deepseek_base_url.rstrip("/"),
+                headers={
+                    "Authorization": (
+                        f"Bearer {settings.deepseek_api_key.get_secret_value()}"
+                    ),
+                    "Content-Type": "application/json",
+                },
+                limits=httpx.Limits(
+                    max_connections=settings.http_max_connections,
+                    max_keepalive_connections=min(
+                        settings.http_max_keepalive_connections,
+                        settings.http_max_connections,
+                    ),
+                ),
+            )
+            if settings.deepseek_api_key is not None
+            else None
+        )
         self.asset_understanding_pool = AsyncCallPool(
             name="asset_understanding",
             concurrency=settings.understanding_concurrency,
@@ -112,6 +132,8 @@ class DoubaoClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+        if self._deepseek_client is not None:
+            await self._deepseek_client.aclose()
 
     async def __aenter__(self) -> "DoubaoClient":
         return self
@@ -237,7 +259,7 @@ class DoubaoClient:
             ensure_ascii=False,
         )
         try:
-            parsed = await self._responses_json(
+            parsed = await self._deepseek_json(
                 messages=[system, {"role": "user", "content": instruction}],
                 output_type=_SearchQueryOutput,
                 pool=self.search_understanding_pool,
@@ -388,6 +410,46 @@ class DoubaoClient:
                 {"type": "text", "text": text},
             ]
         )
+
+    async def _deepseek_json(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        output_type: type[ModelT],
+        pool: AsyncCallPool,
+        timeout_seconds: float,
+        max_output_tokens: int,
+        model: str,
+    ) -> ModelT:
+        """Call DeepSeek Chat Completions with JSON output and thinking disabled."""
+        client = self._deepseek_client
+        if client is None:
+            raise DoubaoConfigurationError(
+                "CAPSULE_DEEPSEEK_API_KEY is required for query enhancement"
+            )
+
+        async def request() -> ModelT:
+            response = await client.post(
+                "/chat/completions",
+                json={
+                    "model": model,
+                    "messages": list(messages),
+                    "thinking": {"type": "disabled"},
+                    "max_tokens": max_output_tokens,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            content = _extract_message_content(payload)
+            try:
+                decoded = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise DoubaoResponseError("model response is not valid JSON") from exc
+            return output_type.model_validate(decoded)
+
+        return await pool.run(request)
 
     async def _chat_json(
         self,

@@ -103,10 +103,17 @@ class ObjectStorage:
         if parsed.scheme != "s3" or parsed.netloc != self._bucket or not parsed.path.lstrip("/"):
             raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
 
+        return await self.download_object(unquote(parsed.path.lstrip("/")))
+
+    async def download_object(self, object_key: str) -> bytes:
+        """Download one object by key without exposing a private storage URL."""
+        if not object_key:
+            raise ValueError("object key must not be empty")
+
         def download() -> bytes:
             response = self._client.get_object(
                 Bucket=self._bucket,
-                Key=unquote(parsed.path.lstrip("/")),
+                Key=object_key,
             )
             body = response["Body"]
             try:

@@ -20,12 +20,12 @@ def test_dynamic_hdbscan_parameters() -> None:
         dynamic_hdbscan_parameters(0)
 
     assert dynamic_hdbscan_parameters(1).min_cluster_size == 3
-    assert dynamic_hdbscan_parameters(1).min_samples == 1
+    assert dynamic_hdbscan_parameters(1).min_samples == 3
     assert dynamic_hdbscan_parameters(1).cluster_selection_epsilon == 0.5
     for sample_count in (2, 14, 15, 50, 200, 1000):
         parameters = dynamic_hdbscan_parameters(sample_count)
         assert parameters.min_cluster_size == 3
-        assert parameters.min_samples == 1
+        assert parameters.min_samples == 3
         assert parameters.cluster_selection_epsilon == 0.5
 
 
@@ -50,7 +50,7 @@ def test_cluster_vectors_clusters_fewer_than_fifteen_vectors() -> None:
 
     result = cluster_vectors(vectors)
 
-    assert result.parameters == HdbscanParameters(min_cluster_size=3, min_samples=1)
+    assert result.parameters == HdbscanParameters(min_cluster_size=3, min_samples=3)
     assert result.cluster_count > 0
     assert result.noise_count == 0
 
@@ -150,7 +150,7 @@ def test_cluster_vectors_optimization_keeps_fixed_density_parameters() -> None:
 
     assert adaptive.parameter_candidates_evaluated > 1
     assert adaptive.parameters.min_cluster_size == 3
-    assert adaptive.parameters.min_samples == 1
+    assert adaptive.parameters.min_samples == 3
     assert adaptive.parameters.cluster_selection_epsilon == 0.5
 
 

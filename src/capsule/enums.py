@@ -117,6 +117,14 @@ class ClusterMemberSource(StrEnum):
     USER = "user"
 
 
+class NewAssetClusterStatus(StrEnum):
+    """How one post-baseline Asset is handled by the current cluster view."""
+
+    INCREMENTALLY_CLUSTERED = "incrementally_clustered"
+    PENDING = "pending"
+    MANUAL_MANAGEMENT = "manual_management"
+
+
 class ClusterRepresentativeRole(StrEnum):
     """How an Asset represents a Cluster Capsule."""
 

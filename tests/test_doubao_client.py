@@ -37,39 +37,44 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
         "rights_version_authorship",
     ]
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def ark_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/responses"
-        payload = json.loads(request.content)
-        if "required_embedding_types" not in str(payload["input"]):
-            content = {
-                "asset_name": "测试素材",
-                "asset_description": "一条用于验证独立并发池的素材描述。",
-                "features": {
-                    name: {
-                        "value": "测试值",
-                        "status": "observed",
-                        "confidence": 0.9,
-                        "evidence": ["测试证据"],
-                    }
-                    for name in feature_names
-                },
-            }
-        else:
-            content = {
-                "queries": {
-                    "native_multimodal": "重点看视觉风格，内容其次",
-                    "visual_style": "视觉风格",
-                },
-                "weights": {
-                    "native_multimodal": 0.25,
-                    "visual_style": 0.75,
-                },
-            }
+        content = {
+            "asset_name": "测试素材",
+            "asset_description": "一条用于验证独立并发池的素材描述。",
+            "features": {
+                name: {
+                    "value": "测试值",
+                    "status": "observed",
+                    "confidence": 0.9,
+                    "evidence": ["测试证据"],
+                }
+                for name in feature_names
+            },
+        }
         return httpx.Response(200, json={"output_text": json.dumps(content)})
+
+    async def deepseek_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/chat/completions"
+        content = {
+            "queries": {
+                "native_multimodal": "重点看视觉风格，内容其次",
+                "visual_style": "视觉风格",
+            },
+            "weights": {
+                "native_multimodal": 0.25,
+                "visual_style": 0.75,
+            },
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(content)}}]},
+        )
 
     client = DoubaoClient(
         Settings(
             ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
             understanding_concurrency=1,
             search_understanding_concurrency=1,
         )
@@ -77,7 +82,11 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
     await client.close()
     client._client = httpx.AsyncClient(
         base_url="https://example.test",
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(ark_handler),
+    )
+    client._deepseek_client = httpx.AsyncClient(
+        base_url="https://deepseek.example.test",
+        transport=httpx.MockTransport(deepseek_handler),
     )
     try:
         await client.understand_asset([{"role": "user", "content": "分析测试素材"}])
@@ -96,40 +105,49 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_enhancer_uses_responses_api_with_bounded_non_thinking_output() -> None:
+async def test_query_enhancer_uses_deepseek_chat_with_bounded_non_thinking_output() -> None:
     captured: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/responses"
+        assert request.url.path == "/chat/completions"
+        assert request.headers["authorization"] == "Bearer deepseek-test-key"
         captured.update(json.loads(request.content))
         return httpx.Response(
             200,
             json={
-                "output_text": json.dumps(
+                "choices": [
                     {
-                        "queries": {
-                            "native_multimodal": "蓝色湖泊",
-                            "visual_style": "清透的自然摄影风格",
-                        },
-                        "weights": {
-                            "native_multimodal": 0.2,
-                            "visual_style": 0.6,
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "queries": {
+                                        "native_multimodal": "蓝色湖泊",
+                                        "visual_style": "清透的自然摄影风格",
+                                    },
+                                    "weights": {
+                                        "native_multimodal": 0.2,
+                                        "visual_style": 0.6,
+                                    },
+                                },
+                                ensure_ascii=False,
+                            )
                         }
-                    },
-                    ensure_ascii=False,
-                )
+                    }
+                ]
             },
         )
 
     client = DoubaoClient(
         Settings(
             ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
             search_query_max_output_tokens=400,
         )
     )
     await client.close()
-    client._client = httpx.AsyncClient(
+    client._deepseek_client = httpx.AsyncClient(
         base_url="https://example.test",
+        headers={"Authorization": "Bearer deepseek-test-key"},
         transport=httpx.MockTransport(handler),
     )
     try:
@@ -144,27 +162,27 @@ async def test_query_enhancer_uses_responses_api_with_bounded_non_thinking_outpu
         await client.close()
 
     assert captured["thinking"] == {"type": "disabled"}
-    assert captured["model"] == "doubao-seed-2-0-mini-260428"
-    assert captured["max_output_tokens"] == 400
-    assert captured["text"] == {"format": {"type": "json_object"}}
-    assert "根节点必须且只能包含 queries 和 weights" in str(captured["input"])
+    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["max_tokens"] == 400
+    assert captured["response_format"] == {"type": "json_object"}
+    assert "根节点必须且只能包含 queries 和 weights" in str(captured["messages"])
     assert '"required_embedding_types": ["native_multimodal", "visual_style"]' in str(
-        captured["input"]
+        captured["messages"]
     )
-    assert "原始内容" in str(captured["input"])
-    assert "媒介类型、艺术流派" in str(captured["input"])
-    assert "不能把其中的类别示例或枚举词复制进 query" in str(captured["input"])
-    assert "以目标维度为中心提高该维度信息密度" in str(captured["input"])
-    assert "只保留必要上下文" in str(captured["input"])
-    assert "允许保留能说明目标维度的跨维度关联" in str(captured["input"])
-    assert "不要机械地按词或维度删除" in str(captured["input"])
-    assert "保守的维度化表达" in str(captured["input"])
-    assert "权重控制意图应体现在 weights 中" in str(captured["input"])
-    assert '"scene_theme"' not in str(captured["input"])
+    assert "原始内容" in str(captured["messages"])
+    assert "媒介类型、艺术流派" in str(captured["messages"])
+    assert "不能把其中的类别示例或枚举词复制进 query" in str(captured["messages"])
+    assert "以目标维度为中心提高该维度信息密度" in str(captured["messages"])
+    assert "只保留必要上下文" in str(captured["messages"])
+    assert "允许保留能说明目标维度的跨维度关联" in str(captured["messages"])
+    assert "不要机械地按词或维度删除" in str(captured["messages"])
+    assert "保守的维度化表达" in str(captured["messages"])
+    assert "权重控制意图应体现在 weights 中" in str(captured["messages"])
+    assert '"scene_theme"' not in str(captured["messages"])
     assert "蓝色湖泊，重点看清透自然摄影风格，原始内容其次" in str(
-        captured["input"]
+        captured["messages"]
     )
-    assert "input_image" not in str(captured["input"])
+    assert "input_image" not in str(captured["messages"])
     assert enhancement.queries == {
         EmbeddingType.NATIVE_MULTIMODAL: "蓝色湖泊",
         EmbeddingType.VISUAL_STYLE: "清透的自然摄影风格",
@@ -218,12 +236,20 @@ async def test_query_enhancer_uses_responses_api_with_bounded_non_thinking_outpu
 )
 async def test_query_enhancer_rejects_invalid_output(content: object) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/responses"
-        return httpx.Response(200, json={"output_text": json.dumps(content)})
+        assert request.url.path == "/chat/completions"
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(content)}}]},
+        )
 
-    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
+        )
+    )
     await client.close()
-    client._client = httpx.AsyncClient(
+    client._deepseek_client = httpx.AsyncClient(
         base_url="https://example.test",
         transport=httpx.MockTransport(handler),
     )

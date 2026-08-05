@@ -109,7 +109,7 @@ class SemanticMergeResult:
 def dynamic_hdbscan_parameters(sample_count: int) -> HdbscanParameters:
     if sample_count < 1:
         raise InsufficientDataError("at least one vector is required")
-    return HdbscanParameters(min_cluster_size=3, min_samples=1)
+    return HdbscanParameters(min_cluster_size=3, min_samples=3)
 
 
 def dataset_hash(embedding_ids: list[str]) -> str:

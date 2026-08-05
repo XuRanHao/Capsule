@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 from uuid import uuid4
 
@@ -61,4 +62,6 @@ class QueryImageService:
             )
         if record is None:
             raise QueryImageNotFoundError(upload_id)
-        return await self._storage.presigned_get_url(record.object_key)
+        content = await self._storage.download_object(record.object_key)
+        encoded = base64.b64encode(content).decode("ascii")
+        return f"data:{record.content_type};base64,{encoded}"

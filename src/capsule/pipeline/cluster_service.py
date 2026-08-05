@@ -115,9 +115,10 @@ class ClusterService:
         embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL,
         cluster_run_id: str | None = None,
         pca_dimension: int = 8,
-        min_samples: int = 1,
+        min_samples: int = 3,
         min_cluster_size: int = 3,
         optimize_parameters: bool = False,
+        trigger: str = "user",
     ) -> EmbeddingTypeClusterResult:
         """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
         return await self._run_embedding_type(
@@ -128,6 +129,7 @@ class ClusterService:
             min_samples=min_samples,
             min_cluster_size=min_cluster_size,
             optimize_parameters=optimize_parameters,
+            trigger=trigger,
         )
 
     async def _run_embedding_type(
@@ -140,6 +142,7 @@ class ClusterService:
         min_samples: int,
         min_cluster_size: int,
         optimize_parameters: bool,
+        trigger: str,
     ) -> EmbeddingTypeClusterResult:
         assets: list[ClusterEmbeddingAsset] = []
         loaded: list[_LoadedClusterVector] = []
@@ -173,6 +176,7 @@ class ClusterService:
             assets = [asset for asset in assets if asset.asset_id not in resident_asset_ids]
             loaded = await self._load_vectors(assets)
             preprocessing = {
+                "trigger": trigger,
                 "normalization": "l2",
                 "post_pca_normalization": "l2",
                 "requested_pca_dimension": pca_dimension,

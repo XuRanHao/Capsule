@@ -38,9 +38,11 @@ class Settings(BaseSettings):
 
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
     understanding_model: str = "doubao-seed-2-0-lite-260215"
     search_query_model: str = Field(
-        default="doubao-seed-2-0-mini-260428",
+        default="deepseek-v4-flash",
         validation_alias=AliasChoices(
             "search_query_model",
             "CAPSULE_SEARCH_QUERY_MODEL",
@@ -150,9 +152,8 @@ class Settings(BaseSettings):
         ge=-1.0,
         le=1.0,
     )
-    cluster_recluster_ratio_threshold: float = Field(default=0.10, gt=0.0, le=1.0)
-    cluster_recluster_minimum_count: int = Field(default=50, ge=1)
-    cluster_recluster_concurrency: int = Field(default=1, ge=1)
+    cluster_bootstrap_minimum_count: int = Field(default=50, ge=1)
+    cluster_bootstrap_concurrency: int = Field(default=1, ge=1)
 
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)
@@ -175,7 +176,7 @@ class Settings(BaseSettings):
         ]
     )
 
-    @field_validator("ark_api_key", "milvus_token", mode="before")
+    @field_validator("ark_api_key", "deepseek_api_key", "milvus_token", mode="before")
     @classmethod
     def empty_secret_is_unset(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():

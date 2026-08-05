@@ -3552,6 +3552,194 @@ blockquote p {
   font-weight: 500;
 }
 
+.full-recluster-note {
+  margin: -8px 0 0;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: #fff9e8;
+  color: #775f1f;
+  font-size: 8px;
+  line-height: 1.6;
+}
+
+.cluster-asset-status {
+  overflow: hidden;
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+
+.cluster-asset-status > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 17px 19px;
+  border-bottom: 1px solid var(--line);
+  gap: 20px;
+}
+
+.cluster-asset-status > header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.cluster-asset-status > header p {
+  max-width: 720px;
+  margin: 6px 0 0;
+  color: var(--muted-ink);
+  font-size: 9px;
+  line-height: 1.6;
+}
+
+.asset-status-phase {
+  flex: none;
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: #fff0d1;
+  color: #805c12;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+}
+
+.asset-status-phase.initialized {
+  background: #e0f1e7;
+  color: #357157;
+}
+
+.asset-status-summary {
+  display: grid;
+  border-bottom: 1px solid var(--line);
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.asset-status-summary > span {
+  display: grid;
+  min-width: 0;
+  padding: 13px 14px;
+  border-right: 1px solid var(--line);
+  gap: 3px;
+}
+
+.asset-status-summary > span:last-child {
+  border-right: 0;
+}
+
+.asset-status-summary small,
+.asset-status-summary em,
+.asset-status-row small,
+.asset-status-row em {
+  overflow: hidden;
+  color: var(--muted-ink);
+  font-size: 7px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-status-summary strong {
+  overflow: hidden;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 18px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+}
+
+.asset-status-table {
+  overflow-x: auto;
+}
+
+.asset-status-row {
+  display: grid;
+  min-width: 720px;
+  min-height: 52px;
+  align-items: center;
+  padding: 9px 19px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted-ink);
+  gap: 14px;
+  grid-template-columns: minmax(220px, 1.5fr) minmax(150px, 0.75fr) minmax(180px, 1fr) 70px;
+  font-size: 8px;
+}
+
+.asset-status-row:last-child {
+  border-bottom: 0;
+}
+
+.asset-status-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.asset-status-row strong {
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-status-head {
+  min-height: 34px;
+  background: #ede9e1;
+  color: #8f8b83;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.asset-status-identity {
+  position: relative;
+  padding-right: 62px;
+}
+
+.asset-status-identity > em {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 3px 5px;
+  border-radius: 999px;
+  background: #ede9e1;
+}
+
+.asset-status-label {
+  justify-self: start;
+  padding: 4px 6px;
+  border-radius: 999px;
+  background: #fff0d1;
+  color: #805c12 !important;
+  font-size: 7px;
+}
+
+.asset-status-label.incrementally_clustered {
+  background: #e0f1e7;
+  color: #357157 !important;
+}
+
+.asset-status-label.manual_management {
+  background: #ebe8ff;
+  color: #564ba5 !important;
+}
+
+.asset-status-score {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11px;
+}
+
+.asset-status-message {
+  margin: 0;
+  padding: 22px 19px;
+  color: var(--muted-ink);
+  font-size: 9px;
+}
+
+.asset-status-message.error {
+  background: #fff0ea;
+  color: #9a3d29;
+}
+
 .current-cluster-workspace {
   overflow: hidden;
   margin-bottom: 18px;
@@ -3800,6 +3988,16 @@ blockquote p {
   overflow-x: auto;
 }
 
+.current-member-help {
+  margin: 0;
+  padding: 10px 19px;
+  border-bottom: 1px solid var(--line);
+  background: #fff9e8;
+  color: #775f1f;
+  font-size: 8px;
+  line-height: 1.6;
+}
+
 .current-member-table > p {
   margin: 0;
   padding: 24px 19px;
@@ -3809,14 +4007,14 @@ blockquote p {
 
 .current-member-row {
   display: grid;
-  min-width: 580px;
+  min-width: 850px;
   min-height: 45px;
   align-items: center;
   padding: 8px 19px;
   border-bottom: 1px solid var(--line);
   color: var(--muted-ink);
   gap: 12px;
-  grid-template-columns: minmax(180px, 1.5fr) 110px 100px 64px;
+  grid-template-columns: minmax(180px, 1.5fr) 110px 100px minmax(320px, 1fr);
   font-family: var(--font-geist-mono), monospace;
   font-size: 8px;
 }
@@ -3840,6 +4038,29 @@ blockquote p {
   color: #9a3d29;
   cursor: pointer;
   font-size: 8px;
+}
+
+.current-member-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.current-member-actions select {
+  min-width: 150px;
+  height: 29px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 8px;
+}
+
+.current-member-row .move-button {
+  border-color: #aaa1ee;
+  background: #f1efff;
+  color: #5548c9;
 }
 
 .current-member-head {
@@ -4220,13 +4441,36 @@ blockquote p {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
-.cluster-cards > header > strong {
+.cluster-card-header-actions {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
+.cluster-card-header-actions > strong {
   min-width: 48px;
   color: var(--ink);
   font-family: var(--font-geist-mono), monospace;
   font-size: 24px;
   font-weight: 400;
   text-align: right;
+}
+
+.cluster-card-header-actions > button {
+  min-height: 27px;
+  padding: 0 9px;
+  border: 1px solid var(--orange);
+  border-radius: 5px;
+  background: #fff4ef;
+  color: #a7422d;
+  cursor: pointer;
+  font-size: 8px;
+  font-weight: 650;
+}
+
+.cluster-card-header-actions > button:hover {
+  background: var(--orange);
+  color: white;
 }
 
 .cluster-card-list {
@@ -4839,6 +5083,10 @@ blockquote p {
     padding-left: 0;
   }
 
+  .asset-status-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .cluster-overview {
     grid-template-columns: 1fr;
   }
@@ -5129,6 +5377,15 @@ blockquote p {
     min-width: 33%;
     padding: 7px;
     border: 0;
+  }
+
+  .cluster-asset-status > header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .asset-status-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .current-cluster-workspace > header {

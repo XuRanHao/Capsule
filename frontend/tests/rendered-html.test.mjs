@@ -93,7 +93,7 @@ test("server-renders every POC workspace page", async () => {
   }
 });
 
-test("cluster selector renders exactly the ten Feature dimensions", async () => {
+test("cluster selector renders every searchable embedding dimension", async () => {
   const response = await render("/clusters");
   assert.equal(response.status, 200);
   const html = await response.text();
@@ -102,6 +102,8 @@ test("cluster selector renders exactly the ten Feature dimensions", async () => 
     .filter(Boolean);
 
   assert.deepEqual(optionValues, [
+    "native_multimodal",
+    "asset_description",
     "subject_content",
     "scene_theme",
     "visual_style",
@@ -123,10 +125,20 @@ test("cluster workspace keeps history and exposes current resident controls", as
   assert.match(html, /当前聚类/);
   assert.match(html, /Cluster Run/);
   assert.match(html, /正在读取当前簇/);
+  assert.match(html, /全量重聚类当前维度/);
+  assert.match(html, /只有点击/);
+  assert.match(html, /首次达到/);
+  assert.match(html, /只增量归簇/);
+  assert.match(html, /基线样本数/);
+  assert.match(html, /当前 eligible/);
+  assert.match(html, /新增 Asset/);
+  assert.match(html, /已增量归簇/);
+  assert.match(html, /待聚类/);
+  assert.match(html, /手动管理/);
 });
 
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage, api] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -137,6 +149,7 @@ test("removes all disposable starter-preview references", async () => {
     readFile(new URL("../app/assets/[id]/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/clusters/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/capsules/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/v1\/search/);
@@ -169,8 +182,25 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /\/api\/v1\/clusters\?/);
   assert.match(clustersPage, /members:attach/);
   assert.match(clustersPage, /members:detach/);
+  assert.match(clustersPage, /moveCurrentMember/);
+  assert.match(clustersPage, /移动到其他簇/);
+  assert.match(clustersPage, /选择目标常驻簇/);
+  assert.match(clustersPage, /暂无常驻目标簇/);
+  assert.match(clustersPage, /每个 Asset 的操作在表格最右侧/);
+  assert.match(clustersPage, /管理当前簇/);
+  assert.match(clustersPage, /currentClusterWorkspaceRef/);
+  assert.match(clustersPage, /current_cluster_not_found/);
+  assert.match(clustersPage, /\/api\/v1\/clusters\/assets\/status\?/);
+  assert.match(clustersPage, /refreshClusterDimension/);
+  assert.doesNotMatch(clustersPage, /setInterval\(/);
+  assert.match(clustersPage, /assetStatus\?\.items/);
+  assert.match(api, /type ClusterAssetStatus =/);
+  assert.match(api, /baseline_sample_count: number \| null/);
+  assert.match(api, /class ApiRequestError extends Error/);
+  assert.match(clustersPage, /setMinSamples\] = useState\("3"\)/);
   assert.match(clustersPage, /开放常驻/);
-  assert.match(clustersPage, /人工常驻/);
+  assert.match(clustersPage, /手动管理/);
+  assert.match(clustersPage, /簇内成员由用户手动管理/);
   assert.match(capsulesPage, /Search Capsule/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(

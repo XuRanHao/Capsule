@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from capsule.config import Settings
-from capsule.db.repositories import CurrentClusterReclusterCounts
+from capsule.db.repositories import ClusterBootstrapState
 from capsule.enums import ClusterMemberSource, ClusterMode, EmbeddingType
 
 logger = logging.getLogger(__name__)
@@ -85,8 +85,8 @@ class IncrementalVectorStore(Protocol):
     async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]: ...
 
 
-class ReclusterCountRepository(Protocol):
-    async def get_recluster_counts(
+class ClusterBootstrapRepository(Protocol):
+    async def get_cluster_bootstrap_state(
         self,
         *,
         workspace_id: str,
@@ -94,7 +94,7 @@ class ReclusterCountRepository(Protocol):
         model_name: str,
         dimension: int,
         milvus_collection: str,
-    ) -> CurrentClusterReclusterCounts: ...
+    ) -> ClusterBootstrapState: ...
 
 
 class FullClusterRunner(Protocol):
@@ -105,9 +105,10 @@ class FullClusterRunner(Protocol):
         embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL,
         cluster_run_id: str | None = None,
         pca_dimension: int = 8,
-        min_samples: int = 1,
+        min_samples: int = 3,
         min_cluster_size: int = 3,
         optimize_parameters: bool = False,
+        trigger: str = "user",
     ) -> object: ...
 
 
@@ -170,34 +171,21 @@ class IncrementalAssignmentResult:
 
 
 @dataclass(slots=True, frozen=True)
-class ReclusterThreshold:
-    """Trigger policy for one independent embedding dimension."""
-
-    ratio: float
-    minimum: int
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.ratio) or not 0.0 <= self.ratio <= 1.0:
-            raise ValueError("recluster ratio threshold must be between 0 and 1")
-        if self.minimum < 1:
-            raise ValueError("recluster minimum must be at least 1")
-
-
-@dataclass(slots=True, frozen=True)
-class ReclusterDecision:
+class ClusterBootstrapDecision:
     workspace_id: str
     embedding_type: EmbeddingType
-    baseline_dynamic_count: int
-    delta_dynamic_count: int
-    delta_ratio: float
-    should_recluster: bool
+    has_baseline: bool
+    run_in_progress: bool
+    eligible_asset_count: int
+    minimum_asset_count: int
+    should_bootstrap: bool
 
 
 @dataclass(slots=True, frozen=True)
 class IncrementalClusterProcessResult:
     assignment: IncrementalAssignmentResult
-    recluster: ReclusterDecision
-    recluster_scheduled: bool
+    bootstrap: ClusterBootstrapDecision
+    bootstrap_scheduled: bool
 
 
 class IncrementalClusterService:
@@ -365,21 +353,21 @@ class IncrementalClusterService:
 
 
 class IncrementalClusterCoordinator:
-    """Assign one dimension, then independently schedule its full rebuild if due."""
+    """Assign new assets and schedule only the first baseline clustering run."""
 
     def __init__(
         self,
         *,
         settings: Settings,
         assignment_service: IncrementalClusterService,
-        repository: ReclusterCountRepository,
+        repository: ClusterBootstrapRepository,
         cluster_runner: FullClusterRunner,
     ) -> None:
         self._settings = settings
         self._assignment_service = assignment_service
         self._repository = repository
         self._cluster_runner = cluster_runner
-        self._semaphore = asyncio.Semaphore(settings.cluster_recluster_concurrency)
+        self._semaphore = asyncio.Semaphore(settings.cluster_bootstrap_concurrency)
         self._running_keys: set[tuple[str, EmbeddingType]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -395,82 +383,80 @@ class IncrementalClusterCoordinator:
             embedding_type=embedding_type,
             asset_ids=asset_ids,
         )
-        counts = await self._repository.get_recluster_counts(
+        state = await self._repository.get_cluster_bootstrap_state(
             workspace_id=workspace_id,
             embedding_type=embedding_type.value,
             model_name=self._settings.embedding_model,
             dimension=self._settings.embedding_dimension,
             milvus_collection=self._settings.milvus_collection,
         )
-        decision = evaluate_recluster_threshold(
+        decision = evaluate_cluster_bootstrap(
             workspace_id=workspace_id,
             embedding_type=embedding_type,
-            baseline_dynamic_count=counts.baseline_dynamic_count,
-            delta_dynamic_count=counts.delta_dynamic_count,
-            threshold=ReclusterThreshold(
-                ratio=self._settings.cluster_recluster_ratio_threshold,
-                minimum=self._settings.cluster_recluster_minimum_count,
-            ),
+            state=state,
+            minimum_asset_count=self._settings.cluster_bootstrap_minimum_count,
         )
         key = (workspace_id, embedding_type)
-        scheduled = decision.should_recluster and key not in self._running_keys
+        scheduled = decision.should_bootstrap and key not in self._running_keys
         if scheduled:
             self._running_keys.add(key)
-            task = asyncio.create_task(self._run_recluster(key))
+            task = asyncio.create_task(self._run_bootstrap(key))
             self._tasks.add(task)
-            task.add_done_callback(self._recluster_done)
+            task.add_done_callback(self._bootstrap_done)
         return IncrementalClusterProcessResult(
             assignment=assignment,
-            recluster=decision,
-            recluster_scheduled=scheduled,
+            bootstrap=decision,
+            bootstrap_scheduled=scheduled,
         )
 
     async def close(self) -> None:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _run_recluster(self, key: tuple[str, EmbeddingType]) -> None:
+    async def _run_bootstrap(self, key: tuple[str, EmbeddingType]) -> None:
         workspace_id, embedding_type = key
         try:
             async with self._semaphore:
                 await self._cluster_runner.run(
                     workspace_id=workspace_id,
                     embedding_type=embedding_type,
+                    trigger="automatic_bootstrap",
                 )
         finally:
             self._running_keys.discard(key)
 
-    def _recluster_done(self, task: asyncio.Task[None]) -> None:
+    def _bootstrap_done(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
         try:
             task.result()
         except Exception:
-            logger.exception("background dimension reclustering failed")
+            logger.exception("background dimension bootstrap clustering failed")
 
 
-def evaluate_recluster_threshold(
+def evaluate_cluster_bootstrap(
     *,
     workspace_id: str,
     embedding_type: EmbeddingType,
-    baseline_dynamic_count: int,
-    delta_dynamic_count: int,
-    threshold: ReclusterThreshold,
-) -> ReclusterDecision:
-    """Evaluate one dimension only; callers must invoke it separately per type."""
+    state: ClusterBootstrapState,
+    minimum_asset_count: int,
+) -> ClusterBootstrapDecision:
+    """Decide whether one dimension needs its first automatic baseline run."""
 
-    if baseline_dynamic_count < 0:
-        raise ValueError("baseline_dynamic_count cannot be negative")
-    if delta_dynamic_count < 0:
-        raise ValueError("delta_dynamic_count cannot be negative")
-    ratio = delta_dynamic_count / max(1, baseline_dynamic_count)
-    return ReclusterDecision(
+    if minimum_asset_count < 1:
+        raise ValueError("minimum_asset_count must be at least 1")
+    if state.eligible_asset_count < 0:
+        raise ValueError("eligible_asset_count cannot be negative")
+    return ClusterBootstrapDecision(
         workspace_id=workspace_id,
         embedding_type=embedding_type,
-        baseline_dynamic_count=baseline_dynamic_count,
-        delta_dynamic_count=delta_dynamic_count,
-        delta_ratio=ratio,
-        should_recluster=(
-            delta_dynamic_count >= threshold.minimum and ratio >= threshold.ratio
+        has_baseline=state.has_baseline,
+        run_in_progress=state.run_in_progress,
+        eligible_asset_count=state.eligible_asset_count,
+        minimum_asset_count=minimum_asset_count,
+        should_bootstrap=(
+            not state.has_baseline
+            and not state.run_in_progress
+            and state.eligible_asset_count >= minimum_asset_count
         ),
     )
 

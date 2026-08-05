@@ -15,6 +15,9 @@ import DemoShell, {
   StatusBadge,
 } from "../components/DemoShell";
 import {
+  ApiRequestError,
+  type ClusterAssetStatus,
+  type ClusterAssetStatusItem,
   type ClusterCapsule,
   type ClusterMember,
   type ClusterRun,
@@ -26,6 +29,8 @@ import {
 } from "../lib/api";
 
 const FEATURE_TYPES = [
+  { value: "native_multimodal", label: "原始内容" },
+  { value: "asset_description", label: "素材完整描述" },
   { value: "subject_content", label: "主体与内容" },
   { value: "scene_theme", label: "场景与题材" },
   { value: "visual_style", label: "视觉风格" },
@@ -76,8 +81,8 @@ const CURRENT_CLUSTER_MODES: Array<{
   },
   {
     value: "resident_manual",
-    label: "人工常驻",
-    help: "保留成员，仅允许用户加入",
+    label: "手动管理",
+    help: "簇内成员由用户手动管理",
   },
 ];
 
@@ -85,6 +90,14 @@ function currentClusterModeLabel(mode: CurrentClusterMode) {
   return (
     CURRENT_CLUSTER_MODES.find((item) => item.value === mode)?.label ?? mode
   );
+}
+
+function clusterAssetStatusLabel(status: ClusterAssetStatusItem["status"]) {
+  return {
+    incrementally_clustered: "已增量归簇",
+    pending: "待聚类",
+    manual_management: "手动管理",
+  }[status];
 }
 
 function parseAssetIds(value: string) {
@@ -429,7 +442,7 @@ export default function ClustersPage() {
     FEATURE_TYPES[0].value,
   );
   const [pcaDimension, setPcaDimension] = useState("8");
-  const [minSamples, setMinSamples] = useState("1");
+  const [minSamples, setMinSamples] = useState("3");
   const [minClusterSize, setMinClusterSize] = useState("3");
   const [capsules, setCapsules] = useState<ClusterCapsule[]>([]);
   const [selectedCapsuleId, setSelectedCapsuleId] = useState("");
@@ -437,6 +450,11 @@ export default function ClustersPage() {
     Record<string, ClusterMember[]>
   >({});
   const [currentClusters, setCurrentClusters] = useState<CurrentCluster[]>([]);
+  const [assetStatus, setAssetStatus] = useState<ClusterAssetStatus | null>(
+    null,
+  );
+  const [assetStatusLoading, setAssetStatusLoading] = useState(true);
+  const [assetStatusError, setAssetStatusError] = useState<string | null>(null);
   const [selectedCurrentClusterId, setSelectedCurrentClusterId] = useState("");
   const [currentMembers, setCurrentMembers] = useState<CurrentClusterMember[]>(
     [],
@@ -446,10 +464,13 @@ export default function ClustersPage() {
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [currentNotice, setCurrentNotice] = useState<string | null>(null);
   const [assetIdsInput, setAssetIdsInput] = useState("");
+  const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentClusterRequestRef = useRef(0);
+  const assetStatusRequestRef = useRef(0);
   const currentMemberRequestRef = useRef(0);
+  const currentClusterWorkspaceRef = useRef<HTMLElement>(null);
   const capsuleCardRefs = useRef(new Map<string, HTMLElement>());
   const clusterDetailRef = useRef<HTMLElement>(null);
   const deepLinkTargetRef = useRef(
@@ -497,11 +518,7 @@ export default function ClustersPage() {
 
   useEffect(() => {
     const initial = window.setTimeout(() => void loadRuns(), 0);
-    const polling = window.setInterval(() => void loadRuns(), 2500);
-    return () => {
-      window.clearTimeout(initial);
-      window.clearInterval(polling);
-    };
+    return () => window.clearTimeout(initial);
   }, [loadRuns]);
 
   const loadCurrentClusters = useCallback(async () => {
@@ -539,33 +556,74 @@ export default function ClustersPage() {
     }
   }, [embeddingType]);
 
+  const loadAssetStatus = useCallback(async () => {
+    const requestId = ++assetStatusRequestRef.current;
+    setAssetStatusLoading(true);
+    try {
+      const params = new URLSearchParams({
+        workspace_id: WORKSPACE_ID,
+        embedding_type: embeddingType,
+      });
+      const payload = await apiFetch<ClusterAssetStatus>(
+        `/api/v1/clusters/assets/status?${params}`,
+      );
+      if (requestId !== assetStatusRequestRef.current) return;
+      setAssetStatus(payload);
+      setAssetStatusError(null);
+    } catch (requestError) {
+      if (requestId !== assetStatusRequestRef.current) return;
+      setAssetStatus(null);
+      setAssetStatusError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Asset 聚类状态加载失败",
+      );
+    } finally {
+      if (requestId === assetStatusRequestRef.current) {
+        setAssetStatusLoading(false);
+      }
+    }
+  }, [embeddingType]);
+
+  const refreshClusterDimension = useCallback(async () => {
+    await Promise.all([loadCurrentClusters(), loadAssetStatus()]);
+  }, [loadAssetStatus, loadCurrentClusters]);
+
   useEffect(() => {
-    const timer = window.setTimeout(() => {
+    const initial = window.setTimeout(() => {
       setCurrentClusters([]);
+      setAssetStatus(null);
+      setAssetStatusError(null);
       setSelectedCurrentClusterId("");
       setCurrentMembers([]);
       setCurrentNotice(null);
       setAssetIdsInput("");
-      void loadCurrentClusters();
+      void refreshClusterDimension();
     }, 0);
-    return () => window.clearTimeout(timer);
-  }, [loadCurrentClusters]);
+    return () => window.clearTimeout(initial);
+  }, [refreshClusterDimension]);
 
   const selectedCurrentCluster =
     currentClusters.find(
       (cluster) => cluster.cluster_id === selectedCurrentClusterId,
     ) ?? currentClusters[0];
+  const activeCurrentClusterId = selectedCurrentCluster?.cluster_id ?? "";
+  const availableMoveTargets = currentClusters.filter(
+    (cluster) =>
+      cluster.cluster_id !== selectedCurrentCluster?.cluster_id &&
+      cluster.mode !== "dynamic",
+  );
 
   const loadCurrentMembers = useCallback(async () => {
     const requestId = ++currentMemberRequestRef.current;
     setCurrentMembers([]);
-    if (!selectedCurrentCluster) {
+    if (!activeCurrentClusterId) {
       return;
     }
     try {
       const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
       const payload = await apiFetch<{ items: CurrentClusterMember[] }>(
-        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members?${params}`,
+        `/api/v1/clusters/${encodeURIComponent(activeCurrentClusterId)}/members?${params}`,
       );
       if (requestId === currentMemberRequestRef.current) {
         setCurrentMembers(payload.items);
@@ -574,11 +632,20 @@ export default function ClustersPage() {
     } catch (requestError) {
       if (requestId !== currentMemberRequestRef.current) return;
       setCurrentMembers([]);
+      if (
+        requestError instanceof ApiRequestError &&
+        requestError.status === 404 &&
+        requestError.code === "current_cluster_not_found"
+      ) {
+        setCurrentError(null);
+        await loadCurrentClusters();
+        return;
+      }
       setCurrentError(
         requestError instanceof Error ? requestError.message : "簇成员加载失败",
       );
     }
-  }, [selectedCurrentCluster]);
+  }, [activeCurrentClusterId, loadCurrentClusters]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadCurrentMembers(), 0);
@@ -712,10 +779,12 @@ export default function ClustersPage() {
         },
       );
       setSelectedRunId(submitted.cluster_run_id);
-      await loadRuns();
+      await Promise.all([loadRuns(), loadAssetStatus()]);
     } catch (requestError) {
       setError(
-        requestError instanceof Error ? requestError.message : "创建聚类失败",
+        requestError instanceof Error
+          ? requestError.message
+          : "全量重聚类启动失败",
       );
     } finally {
       setRunning(false);
@@ -827,6 +896,45 @@ export default function ClustersPage() {
     }
   };
 
+  const moveCurrentMember = async (assetId: string) => {
+    const targetClusterId = moveTargets[assetId];
+    const targetCluster = currentClusters.find(
+      (cluster) => cluster.cluster_id === targetClusterId,
+    );
+    if (!targetCluster) {
+      setCurrentError("请选择目标簇");
+      return;
+    }
+    setCurrentMutation(`move:${assetId}`);
+    setCurrentError(null);
+    setCurrentNotice(null);
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
+        `/api/v1/clusters/${encodeURIComponent(targetCluster.cluster_id)}/members:attach?${params}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ asset_ids: [assetId] }),
+        },
+      );
+      setCurrentMembers((current) =>
+        current.filter((member) => member.asset_id !== assetId),
+      );
+      setMoveTargets((current) => {
+        const next = { ...current };
+        delete next[assetId];
+        return next;
+      });
+      setCurrentNotice(`已将 Asset ${assetId} 移动到 ${targetCluster.name}`);
+    } catch (requestError) {
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "成员移动失败",
+      );
+    } finally {
+      setCurrentMutation("");
+    }
+  };
+
   const graphLayout = useMemo(() => {
     const columnCount = Math.max(
       1,
@@ -874,10 +982,15 @@ export default function ClustersPage() {
       active="clusters"
       eyebrow="CLUSTER LAB / LIVE"
       title="从相似中，看见结构。"
-      description="Cluster Run、Capsule 和成员全部来自 PostgreSQL 与 Milvus，不再使用固定散点。"
+      description="首次达到样本阈值会自动初始化；之后新增 Asset 只做增量归簇，全量重聚类由用户手动启动。"
       actions={
-        <button className="primary-action" disabled={running} onClick={createRun}>
-          {running ? "正在创建 Run…" : "＋ 创建 Cluster Run"}
+        <button
+          className="primary-action"
+          disabled={running}
+          title="只有点击此按钮，才会对当前维度执行全量重聚类"
+          onClick={createRun}
+        >
+          {running ? "正在启动全量重聚类…" : "＋ 全量重聚类当前维度"}
         </button>
       }
     >
@@ -982,9 +1095,118 @@ export default function ClustersPage() {
             <StatusBadge status={selectedRun?.status || "pending"} />
           </span>
         </div>
+        <p className="full-recluster-note">
+          历史 Cluster Run 仅供查看；只有点击“全量重聚类当前维度”才会重新计算全部动态样本。
+        </p>
       </section>
 
-      <section className="current-cluster-workspace">
+      <section className="cluster-asset-status">
+        <header>
+          <div>
+            <span className="eyebrow">INCREMENTAL STATUS</span>
+            <h2>Asset 聚类进度</h2>
+            <p>
+              首次达到
+              {assetStatus?.bootstrap_minimum_count == null
+                ? "配置的"
+                : ` ${assetStatus.bootstrap_minimum_count} 条`}
+              样本阈值会自动初始化；初始化后新增 Asset 只增量归簇，不会自动触发全量重聚类。
+            </p>
+          </div>
+          <span
+            className={`asset-status-phase ${assetStatus?.initialized ? "initialized" : "waiting"}`}
+          >
+            {assetStatusLoading
+              ? "同步中…"
+              : assetStatus?.initialized
+                ? "增量运行中"
+                : "等待首次初始化"}
+          </span>
+        </header>
+
+        <div className="asset-status-summary">
+          <span>
+            <small>基线样本数</small>
+            <strong>{assetStatus?.baseline_sample_count ?? "—"}</strong>
+            <em>{assetStatus?.baseline_cluster_run_id || "尚无基线 Run"}</em>
+          </span>
+          <span>
+            <small>当前 eligible</small>
+            <strong>{assetStatus?.eligible_asset_count ?? "—"}</strong>
+            <em>当前维度可参与样本</em>
+          </span>
+          <span>
+            <small>新增 Asset</small>
+            <strong>{assetStatus?.new_asset_count ?? "—"}</strong>
+            <em>相对基线新增</em>
+          </span>
+          <span>
+            <small>已增量归簇</small>
+            <strong>{assetStatus?.incrementally_clustered_count ?? "—"}</strong>
+            <em>自动加入动态 / 开放常驻簇</em>
+          </span>
+          <span>
+            <small>待聚类</small>
+            <strong>{assetStatus?.pending_count ?? "—"}</strong>
+            <em>等待下次增量处理</em>
+          </span>
+          <span>
+            <small>手动管理</small>
+            <strong>{assetStatus?.manual_management_count ?? "—"}</strong>
+            <em>不由算法自动调整</em>
+          </span>
+        </div>
+
+        <div className="asset-status-table">
+          <div className="asset-status-row asset-status-head">
+            <span>新增 Asset</span>
+            <span>状态</span>
+            <span>目标簇</span>
+            <span>分数</span>
+          </div>
+          {assetStatusError && (
+            <p className="asset-status-message error">{assetStatusError}</p>
+          )}
+          {!assetStatusError && assetStatusLoading && !assetStatus && (
+            <p className="asset-status-message">正在读取 Asset 聚类状态…</p>
+          )}
+          {!assetStatusError && !assetStatusLoading && !assetStatus?.items.length && (
+            <p className="asset-status-message">当前维度暂无新增 Asset。</p>
+          )}
+          {assetStatus?.items.map((item) => (
+            <div className="asset-status-row" key={item.asset_id}>
+              <span className="asset-status-identity">
+                <strong>{item.asset_name || item.file_name || item.asset_id}</strong>
+                <small title={item.asset_id}>{item.asset_id}</small>
+                <em>{item.asset_type}</em>
+              </span>
+              <span>
+                <strong className={`asset-status-label ${item.status}`}>
+                  {clusterAssetStatusLabel(item.status)}
+                </strong>
+                <small>{item.member_source || "尚无成员来源"}</small>
+              </span>
+              <span>
+                <strong>{item.cluster_name || item.cluster_id || "尚未分配"}</strong>
+                <small>
+                  {item.cluster_mode
+                    ? currentClusterModeLabel(item.cluster_mode)
+                    : "—"}
+                </small>
+              </span>
+              <strong className="asset-status-score">
+                {item.score == null ? "—" : item.score.toFixed(3)}
+              </strong>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section
+        className="current-cluster-workspace"
+        id="current-clusters"
+        ref={currentClusterWorkspaceRef}
+      >
         <header>
           <div>
             <span className="eyebrow">CURRENT CLUSTERS</span>
@@ -993,16 +1215,16 @@ export default function ClustersPage() {
               当前维度为
               {FEATURE_TYPES.find((item) => item.value === embeddingType)
                 ?.label || embeddingType}
-              ，常驻簇不会进入该维度的下一次全量聚类。
+              。新增 Asset 日常只走增量；仅点击页面顶部按钮才执行全量重聚类。
             </p>
           </div>
           <button
             type="button"
             className="secondary-action"
-            disabled={currentLoading}
-            onClick={() => void loadCurrentClusters()}
+            disabled={currentLoading || assetStatusLoading}
+            onClick={() => void refreshClusterDimension()}
           >
-            {currentLoading ? "加载中…" : "刷新当前簇"}
+            {currentLoading || assetStatusLoading ? "加载中…" : "刷新状态"}
           </button>
         </header>
 
@@ -1102,12 +1324,16 @@ export default function ClustersPage() {
                   </div>
                 )}
 
+                <p className="current-member-help">
+                  每个 Asset 的操作在表格最右侧。移动目标只显示常驻簇；若没有目标，先在左侧选择另一个簇并设为开放常驻或手动管理。
+                </p>
+
                 <div className="current-member-table">
                   <div className="current-member-row current-member-head">
                     <span>Asset ID</span>
                     <span>来源</span>
                     <span>归类分数</span>
-                    <span>操作</span>
+                    <span>移动 / 移出</span>
                   </div>
                   {!currentMembers.length && (
                     <p>这个簇当前没有成员。</p>
@@ -1119,20 +1345,55 @@ export default function ClustersPage() {
                       <span>
                         {member.score == null ? "人工指定" : member.score.toFixed(3)}
                       </span>
-                      <span>
-                        {selectedCurrentCluster.mode !== "dynamic" ? (
-                          <button
-                            type="button"
-                            disabled={Boolean(currentMutation)}
-                            onClick={() => void detachCurrentMember(member.asset_id)}
-                          >
-                            {currentMutation === `detach:${member.asset_id}`
-                              ? "移出中…"
-                              : "移出"}
-                          </button>
-                        ) : (
-                          "—"
-                        )}
+                      <span className="current-member-actions">
+                        <select
+                          aria-label={`为 ${member.asset_id} 选择目标簇`}
+                          title="移动到其他簇"
+                          value={moveTargets[member.asset_id] || ""}
+                          disabled={Boolean(currentMutation)}
+                          onChange={(event) =>
+                            setMoveTargets((current) => ({
+                              ...current,
+                              [member.asset_id]: event.target.value,
+                            }))
+                          }
+                        >
+                          <option value="">
+                            {availableMoveTargets.length
+                              ? "选择目标常驻簇"
+                              : "暂无常驻目标簇"}
+                          </option>
+                          {availableMoveTargets.map((cluster) => (
+                              <option
+                                value={cluster.cluster_id}
+                                key={cluster.cluster_id}
+                              >
+                                {cluster.name}
+                              </option>
+                            ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="move-button"
+                          disabled={
+                            Boolean(currentMutation) ||
+                            !moveTargets[member.asset_id]
+                          }
+                          onClick={() => void moveCurrentMember(member.asset_id)}
+                        >
+                          {currentMutation === `move:${member.asset_id}`
+                            ? "移动中…"
+                            : "移动"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(currentMutation)}
+                          onClick={() => void detachCurrentMember(member.asset_id)}
+                        >
+                          {currentMutation === `detach:${member.asset_id}`
+                            ? "移出中…"
+                            : "移出"}
+                        </button>
                       </span>
                     </div>
                   ))}
@@ -1185,7 +1446,20 @@ export default function ClustersPage() {
               <span className="eyebrow">CLUSTER CAPSULES</span>
               <h2>语义分组</h2>
             </div>
-            <strong>{capsules.length}</strong>
+            <div className="cluster-card-header-actions">
+              <strong>{capsules.length}</strong>
+              <button
+                type="button"
+                onClick={() =>
+                  currentClusterWorkspaceRef.current?.scrollIntoView({
+                    behavior: "smooth",
+                    block: "start",
+                  })
+                }
+              >
+                管理当前簇
+              </button>
+            </div>
           </header>
           <div className="cluster-card-list">
             {capsules.map((capsule, index) => (
