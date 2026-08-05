@@ -1,10 +1,10 @@
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
+from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     ClusterSearchResult,
-    ParsedQuery,
     RerankBatch,
     SearchAssetRecord,
     SearchFilters,
@@ -22,12 +22,12 @@ class QueryEmbeddingClient(Protocol):
 
 
 class SearchUnderstandingClient(Protocol):
-    async def parse_search_query(
+    async def resolve_query_weights(
         self,
-        request: SearchRequest,
         *,
-        image_url: str | None,
-    ) -> ParsedQuery: ...
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, float]: ...
 
     async def rerank_search_results(
         self,

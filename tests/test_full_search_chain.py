@@ -9,10 +9,8 @@ from capsule.search.fusion import FusionEngine
 from capsule.search.models import (
     ChannelMatch,
     ChannelRecall,
-    DimensionQuery,
     FusedHit,
     FusionMethod,
-    ParsedQuery,
     QueryDimensionSource,
     QueryType,
     QueryVector,
@@ -70,51 +68,16 @@ def test_normalized_weighted_similarity_is_selectable() -> None:
 
 class FakeUnderstandingClient:
     def __init__(self) -> None:
-        self.parse_calls = 0
+        self.weight_calls = 0
 
-    async def parse_search_query(
+    async def resolve_query_weights(
         self,
-        request: SearchRequest,
         *,
-        image_url: str | None,
-    ) -> ParsedQuery:
-        self.parse_calls += 1
-        assert image_url == "https://example.com/query.jpg"
-        return ParsedQuery(
-            dimension_queries=[
-                DimensionQuery(
-                    embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
-                    query="参考图片",
-                    weight=0.45,
-                    source=QueryDimensionSource.IMAGE,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.SUBJECT_CONTENT,
-                    query="人物",
-                    weight=0.15,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.SCENE_THEME,
-                    query="户外黄昏",
-                    weight=0.10,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.VISUAL_STYLE,
-                    query="动画电影",
-                    weight=0.10,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.COLOR_COMPOSITION,
-                    query="蓝紫色与暖金色",
-                    weight=0.10,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.MOOD_ATMOSPHERE,
-                    query="安静而有叙事感",
-                    weight=0.10,
-                ),
-            ],
-        )
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, float]:
+        self.weight_calls += 1
+        return {embedding_type: 1 for embedding_type in embedding_types}
 
     async def rerank_search_results(
         self,
@@ -131,12 +94,13 @@ class FakeUnderstandingClient:
         )
 
 
-async def test_precision_image_parser_keeps_user_selected_routes() -> None:
+async def test_image_query_uses_equal_weight_selected_routes_without_model() -> None:
+    client = FakeUnderstandingClient()
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=QueryType.IMAGE,
+        query_text="重点看风格，内容其次",
         query_image_url="https://example.com/query.jpg",
-        precision_mode=True,
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
             EmbeddingType.SUBJECT_CONTENT,
@@ -146,7 +110,7 @@ async def test_precision_image_parser_keeps_user_selected_routes() -> None:
             EmbeddingType.MOOD_ATMOSPHERE,
         ],
     )
-    parsed, reasons = await QueryParser(FakeUnderstandingClient()).parse(
+    parsed, reasons = await QueryParser(client).parse(
         request,
         image_url=request.query_image_url,
     )
@@ -157,39 +121,30 @@ async def test_precision_image_parser_keeps_user_selected_routes() -> None:
     assert all(
         math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries
     )
+    assert all(item.source is QueryDimensionSource.IMAGE for item in parsed.dimension_queries)
+    assert client.weight_calls == 0
 
 
 class WeightedTextUnderstandingClient:
-    async def parse_search_query(
+    async def resolve_query_weights(
         self,
-        request: SearchRequest,
         *,
-        image_url: str | None,
-    ) -> ParsedQuery:
-        source = (
-            QueryDimensionSource.JOINT
-            if request.query_type is QueryType.IMAGE_TEXT
-            else QueryDimensionSource.TEXT
-        )
-        return ParsedQuery(
-            dimension_queries=[
-                DimensionQuery(
-                    embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
-                    query=request.query_text or "参考图片",
-                    weight=0.2,
-                    source=source,
-                ),
-                DimensionQuery(
-                    embedding_type=EmbeddingType.VISUAL_STYLE,
-                    query="重点匹配动画电影风格",
-                    weight=0.8,
-                ),
-            ],
-        )
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, float]:
+        assert query_text == "重点看动画风格，原始内容其次"
+        assert list(embedding_types) == [
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ]
+        return {
+            EmbeddingType.NATIVE_MULTIMODAL: 2,
+            EmbeddingType.VISUAL_STYLE: 8,
+        }
 
 
 @pytest.mark.parametrize("query_type", [QueryType.TEXT, QueryType.IMAGE_TEXT])
-async def test_precision_text_bearing_queries_preserve_intent_weights(
+async def test_text_bearing_queries_resolve_explicit_intent_weights(
     query_type: QueryType,
 ) -> None:
     image_url = (
@@ -200,7 +155,6 @@ async def test_precision_text_bearing_queries_preserve_intent_weights(
         query_type=query_type,
         query_text="重点看动画风格，原始内容其次",
         query_image_url=image_url,
-        precision_mode=True,
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
             EmbeddingType.VISUAL_STYLE,
@@ -214,33 +168,44 @@ async def test_precision_text_bearing_queries_preserve_intent_weights(
 
     assert reasons == ()
     assert [item.weight for item in parsed.dimension_queries] == [0.2, 0.8]
+    assert all(item.query == request.query_text for item in parsed.dimension_queries)
+    expected_sources = (
+        [QueryDimensionSource.JOINT, QueryDimensionSource.TEXT]
+        if query_type is QueryType.IMAGE_TEXT
+        else [QueryDimensionSource.TEXT, QueryDimensionSource.TEXT]
+    )
+    assert [item.source for item in parsed.dimension_queries] == expected_sources
 
 
-async def test_normal_search_uses_deterministic_parser_without_model_call() -> None:
+async def test_text_without_weight_intent_uses_equal_weights_without_model_call() -> None:
     client = FakeUnderstandingClient()
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=QueryType.TEXT,
-        query_text="蓝紫色黄昏动画场景",
-        precision_mode=False,
+        query_text="蓝紫色黄昏动画场景，主要人物在中央",
+        embedding_types=[
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ],
     )
 
     parsed, reasons = await QueryParser(client).parse(request, image_url=None)
 
     assert reasons == ()
     assert [item.embedding_type for item in parsed.dimension_queries] == [
-        EmbeddingType.NATIVE_MULTIMODAL
+        EmbeddingType.NATIVE_MULTIMODAL,
+        EmbeddingType.VISUAL_STYLE,
     ]
-    assert client.parse_calls == 0
+    assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
+    assert client.weight_calls == 0
 
 
-async def test_precision_native_only_skips_model_parser() -> None:
+async def test_native_only_skips_weight_resolver() -> None:
     client = FakeUnderstandingClient()
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=QueryType.TEXT,
-        query_text="蓝紫色黄昏动画场景",
-        precision_mode=True,
+        query_text="重点看原始内容",
         embedding_types=[EmbeddingType.NATIVE_MULTIMODAL],
     )
 
@@ -250,7 +215,37 @@ async def test_precision_native_only_skips_model_parser() -> None:
     assert [item.embedding_type for item in parsed.dimension_queries] == [
         EmbeddingType.NATIVE_MULTIMODAL
     ]
-    assert client.parse_calls == 0
+    assert client.weight_calls == 0
+
+
+class InvalidWeightClient:
+    async def resolve_query_weights(
+        self,
+        *,
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, float]:
+        return {EmbeddingType.NATIVE_MULTIMODAL: 1.0}
+
+
+async def test_invalid_resolved_weights_fall_back_to_equal_weights() -> None:
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="重点看风格，内容其次",
+        embedding_types=[
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ],
+    )
+
+    parsed, reasons = await QueryParser(InvalidWeightClient()).parse(
+        request,
+        image_url=None,
+    )
+
+    assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
+    assert reasons == ("query weight resolution fallback used",)
 
 
 async def test_seed_reranker_reorders_only_hydrated_candidates() -> None:

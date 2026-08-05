@@ -92,7 +92,6 @@ type SearchResponse = {
     query_text: string | null;
     query_image_url: string | null;
     query_image_upload_id: string | null;
-    precision_mode: boolean;
     embedding_types: EmbeddingType[];
   };
   parsed_query: ParsedQuery | null;
@@ -363,7 +362,6 @@ const DEMO_RESPONSE: SearchResponse = {
     query_text: "蓝紫色黄昏动画场景",
     query_image_url: null,
     query_image_upload_id: null,
-    precision_mode: true,
     embedding_types: [
       "asset_description",
       "native_multimodal",
@@ -387,13 +385,13 @@ const DEMO_RESPONSE: SearchResponse = {
       },
       {
         embedding_type: "subject_content",
-        query: "黄昏中的人物与环境",
+        query: "蓝紫色黄昏动画场景",
         weight: 0.15,
         source: "text",
       },
       {
         embedding_type: "visual_style",
-        query: "动画电影质感",
+        query: "蓝紫色黄昏动画场景",
         weight: 0.15,
         source: "text",
       },
@@ -422,7 +420,6 @@ const EMPTY_RESPONSE: SearchResponse = {
     query_text: null,
     query_image_url: null,
     query_image_upload_id: null,
-    precision_mode: false,
     embedding_types: ["native_multimodal"],
   },
   parsed_query: null,
@@ -696,7 +693,6 @@ export default function Home() {
   const [embeddingTypes, setEmbeddingTypes] = useState<EmbeddingType[]>([
     "native_multimodal",
   ]);
-  const [precisionMode, setPrecisionMode] = useState(false);
   const [fusionMethod, setFusionMethod] =
     useState<FusionMethod>("weighted_rrf");
   const [rerank, setRerank] = useState(false);
@@ -795,7 +791,6 @@ export default function Home() {
             imageQueryEnabled && !upload ? queryImageUrl.trim() : null,
           query_image_upload_id: upload?.upload_id ?? null,
           embedding_types: embeddingTypes,
-          precision_mode: precisionMode,
           fusion_method: fusionMethod,
           rerank: rerank ? "doubao_seed_2_lite" : "off",
           save_capsule: saveCapsule,
@@ -1129,19 +1124,13 @@ export default function Home() {
                     );
                   })}
                 </div>
-                <p>普通模式等权；精搜按查询中的维度倾向分配权重。</p>
+                <p>
+                  系统默认等权；仅在多维且检索文字明确表达倾向时自动解析权重，
+                  图片 / 视频本身不参与权重解析。
+                </p>
               </details>
 
               <div className="search-options">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={precisionMode}
-                    onChange={(event) => setPrecisionMode(event.target.checked)}
-                  />
-                  <span />
-                  精搜模式
-                </label>
                 <label>
                   <input
                     type="checkbox"

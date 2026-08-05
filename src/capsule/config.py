@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DOCUMENT_CHUNK_MIN_TOKENS = 250
@@ -39,7 +39,14 @@ class Settings(BaseSettings):
     ark_api_key: SecretStr | None = None
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     understanding_model: str = "doubao-seed-2-0-lite-260215"
-    search_parser_model: str = "doubao-seed-2-0-mini-260428"
+    search_weight_model: str = Field(
+        default="doubao-seed-2-0-mini-260428",
+        validation_alias=AliasChoices(
+            "search_weight_model",
+            "CAPSULE_SEARCH_WEIGHT_MODEL",
+            "CAPSULE_SEARCH_PARSER_MODEL",
+        ),
+    )
     embedding_model: str = "doubao-embedding-vision-250615"
     embedding_dimension: int = Field(default=1024, ge=1)
     tokenization_batch_size: int = Field(default=64, ge=1, le=256)
@@ -106,7 +113,16 @@ class Settings(BaseSettings):
     model_max_retries: int = Field(default=4, ge=1, le=10)
     understanding_timeout_seconds: float = Field(default=180.0, gt=0)
     understanding_max_output_tokens: int = Field(default=2048, ge=256)
-    search_parser_max_output_tokens: int = Field(default=500, ge=128, le=1024)
+    search_weight_max_output_tokens: int = Field(
+        default=128,
+        ge=64,
+        le=512,
+        validation_alias=AliasChoices(
+            "search_weight_max_output_tokens",
+            "CAPSULE_SEARCH_WEIGHT_MAX_OUTPUT_TOKENS",
+            "CAPSULE_SEARCH_PARSER_MAX_OUTPUT_TOKENS",
+        ),
+    )
     embedding_timeout_seconds: float = Field(default=60.0, gt=0)
     milvus_batch_size: int = Field(default=100, ge=1)
 

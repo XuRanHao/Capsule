@@ -339,6 +339,9 @@ async def test_search_api_returns_the_service_response() -> None:
     payload = response.json()
     assert payload["query"]["query_type"] == "image"
     assert payload["query"]["embedding_types"] == ["native_multimodal"]
+    assert "precision_mode" not in payload["query"]
+    assert "weight_resolution_ms" in payload["timings"]
+    assert "parser_ms" not in payload["timings"]
     assert payload["total"] == 2
     assert payload["asset_total"] == 2
     assert payload["cluster_total"] == 1
@@ -360,6 +363,26 @@ async def test_search_api_validates_query_inputs() -> None:
                     "workspace_id": "workspace_demo",
                     "query_type": "image_text",
                     "query_text": "缺少图片",
+                },
+            )
+
+    assert response.status_code == 422
+
+
+async def test_search_api_rejects_removed_precision_mode() -> None:
+    service, _, _, _ = build_service()
+    app = create_app(search_service=service)
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/search",
+                json={
+                    "workspace_id": "workspace_demo",
+                    "query_type": "text",
+                    "query_text": "蓝紫色黄昏",
+                    "precision_mode": True,
                 },
             )
 

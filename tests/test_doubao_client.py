@@ -7,7 +7,6 @@ from pydantic import SecretStr
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.model_clients.doubao import DoubaoClient, DoubaoResponseError, _extract_embedding
-from capsule.search.models import QueryType, SearchRequest
 
 
 def test_extract_embedding_accepts_openai_list_shape() -> None:
@@ -57,14 +56,10 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
             }
         else:
             content = {
-                "dimension_queries": [
-                    {
-                        "embedding_type": "native_multimodal",
-                        "query": "蓝色湖泊",
-                        "weight": 1.0,
-                        "source": "text",
-                    }
-                ],
+                "weights": {
+                    "native_multimodal": 0.25,
+                    "visual_style": 0.75,
+                },
             }
         return httpx.Response(200, json={"output_text": json.dumps(content)})
 
@@ -82,13 +77,12 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
     )
     try:
         await client.understand_asset([{"role": "user", "content": "分析测试素材"}])
-        await client.parse_search_query(
-            SearchRequest(
-                workspace_id="workspace_test",
-                query_type=QueryType.TEXT,
-                query_text="蓝色湖泊",
-            ),
-            image_url=None,
+        await client.resolve_query_weights(
+            query_text="重点看视觉风格，内容其次",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.VISUAL_STYLE,
+            ],
         )
     finally:
         await client.close()
@@ -98,7 +92,7 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_parser_uses_responses_api_with_bounded_non_thinking_output() -> None:
+async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_output() -> None:
     captured: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -109,20 +103,10 @@ async def test_search_parser_uses_responses_api_with_bounded_non_thinking_output
             json={
                 "output_text": json.dumps(
                     {
-                        "dimension_queries": [
-                            {
-                                "embedding_type": "native_multimodal",
-                                "query": "蓝色湖泊",
-                                "weight": 0.2,
-                                "source": "text",
-                            },
-                            {
-                                "embedding_type": "visual_style",
-                                "query": "清透的自然摄影",
-                                "weight": 0.6,
-                                "source": "text",
-                            },
-                        ],
+                        "weights": {
+                            "native_multimodal": 0.2,
+                            "visual_style": 0.6,
+                        }
                     },
                     ensure_ascii=False,
                 )
@@ -132,7 +116,7 @@ async def test_search_parser_uses_responses_api_with_bounded_non_thinking_output
     client = DoubaoClient(
         Settings(
             ark_api_key=SecretStr("test-key"),
-            search_parser_max_output_tokens=400,
+            search_weight_max_output_tokens=192,
         )
     )
     await client.close()
@@ -141,45 +125,68 @@ async def test_search_parser_uses_responses_api_with_bounded_non_thinking_output
         transport=httpx.MockTransport(handler),
     )
     try:
-        parsed = await client.parse_search_query(
-            SearchRequest(
-                workspace_id="workspace_test",
-                query_type=QueryType.TEXT,
-                query_text="蓝色湖泊",
-                embedding_types=[
-                    EmbeddingType.NATIVE_MULTIMODAL,
-                    EmbeddingType.VISUAL_STYLE,
-                ],
-                precision_mode=True,
-            ),
-            image_url=None,
+        weights = await client.resolve_query_weights(
+            query_text="重点看视觉风格，原始内容其次",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.VISUAL_STYLE,
+            ],
         )
     finally:
         await client.close()
 
     assert captured["thinking"] == {"type": "disabled"}
     assert captured["model"] == "doubao-seed-2-0-mini-260428"
-    assert captured["max_output_tokens"] == 400
+    assert captured["max_output_tokens"] == 192
     assert captured["text"] == {"format": {"type": "json_object"}}
-    assert "weight 必须反映 query_text 对已选维度的明确倾向" in str(
+    assert "根节点只能包含 weights" in str(captured["input"])
+    assert '"required_embedding_types": ["native_multimodal", "visual_style"]' in str(
         captured["input"]
     )
-    assert "根节点只能包含 dimension_queries" in str(captured["input"])
-    assert "required_embedding_types=native_multimodal,visual_style" in str(
-        captured["input"]
+    assert "重点看视觉风格，原始内容其次" in str(captured["input"])
+    assert "input_image" not in str(captured["input"])
+    assert weights == pytest.approx(
+        {
+            EmbeddingType.NATIVE_MULTIMODAL: 0.25,
+            EmbeddingType.VISUAL_STYLE: 0.75,
+        }
     )
-    assert [item.embedding_type for item in parsed.dimension_queries] == [
-        EmbeddingType.NATIVE_MULTIMODAL,
-        EmbeddingType.VISUAL_STYLE,
-    ]
-    assert [item.weight for item in parsed.dimension_queries] == pytest.approx(
-        [0.25, 0.75]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"weights": {"native_multimodal": 1.0}, "query": "不应出现"},
+        {"weights": {"native_multimodal": 0.5, "scene_theme": 0.5}},
+        {"weights": {"native_multimodal": 0.0, "visual_style": 1.0}},
+        {"weights": {"native_multimodal": float("inf"), "visual_style": 1.0}},
+        {"weights": {"native_multimodal": True, "visual_style": 1.0}},
+        {"weights": {"native_multimodal": "0.5", "visual_style": 0.5}},
+    ],
+)
+async def test_weight_resolver_rejects_invalid_output(content: object) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/responses"
+        return httpx.Response(200, json={"output_text": json.dumps(content)})
+
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
     )
-    assert set(parsed.model_dump()) == {"dimension_queries"}
-    assert all(
-        set(item.model_dump()) == {"embedding_type", "query", "weight", "source"}
-        for item in parsed.dimension_queries
-    )
+    try:
+        with pytest.raises(DoubaoResponseError):
+            await client.resolve_query_weights(
+                query_text="重点看视觉风格",
+                embedding_types=[
+                    EmbeddingType.NATIVE_MULTIMODAL,
+                    EmbeddingType.VISUAL_STYLE,
+                ],
+            )
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

@@ -1,38 +1,27 @@
 import json
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
-from capsule.search.models import (
-    DimensionQuery,
-    ParsedQuery,
-    QueryDimensionSource,
-    RerankBatch,
-    SearchRequest,
-)
+from capsule.search.models import RerankBatch, SearchRequest
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-class _SearchParserDimension(BaseModel):
+class _SearchWeightOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    embedding_type: EmbeddingType
-    query: str = Field(min_length=1, max_length=8_000)
-    weight: float = Field(gt=0, le=1)
-    source: QueryDimensionSource = QueryDimensionSource.TEXT
-
-
-class _SearchParserOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    dimension_queries: list[_SearchParserDimension] = Field(min_length=1, max_length=12)
+    weights: dict[EmbeddingType, StrictFloat | StrictInt] = Field(
+        min_length=1,
+        max_length=12,
+    )
 
 
 class DoubaoConfigurationError(RuntimeError):
@@ -168,72 +157,66 @@ class DoubaoClient:
                 timeout_seconds=self._settings.understanding_timeout_seconds,
             )
 
-    async def parse_search_query(
+    async def resolve_query_weights(
         self,
-        request: SearchRequest,
         *,
-        image_url: str | None,
-    ) -> ParsedQuery:
-        """Parse a text/image query and normalize user-intent route weights."""
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> dict[EmbeddingType, float]:
+        """Resolve text-expressed route preferences into normalized weights."""
+        requested_types = list(embedding_types)
+        if not requested_types or len(requested_types) != len(set(requested_types)):
+            raise DoubaoResponseError(
+                "embedding_types must be non-empty and contain no duplicates"
+            )
         system = {
             "role": "system",
             "content": (
-                "你是多模态素材检索 Query Parser。只输出 JSON，根节点只能包含 "
-                "dimension_queries。dimension_queries 必须且只能包含"
-                "用户指令 required_embedding_types 中列出的维度，每项必须含"
-                " embedding_type、query、weight、source。"
-                "embedding_type 只能从 native_multimodal、asset_description、"
-                "subject_content、scene_theme、visual_style、color_composition、"
-                "mood_atmosphere、character_state_or_psychology、asset_usage、"
-                "target_audience、provenance、rights_version_authorship 中选择且不得重复。"
-                "source 只能是 text/image/joint。weight 必须反映 query_text 对已选维度的"
-                "明确倾向且总和为 1；"
-                "出现“重点、主要、更看重、其次”等表达时拉开权重，没有倾向时等权。"
-                "禁止通过权重增加或删除 required_embedding_types。"
+                "你是素材检索维度权重解析器。只根据用户文本中明确表达的维度倾向分配"
+                "权重。只输出 JSON，根节点只能包含 weights；weights 必须是对象，键必须"
+                "且只能是 required_embedding_types 中列出的全部维度，不能增加、删除或"
+                "重复维度。每个值必须是大于 0 的有限数字，总和应为 1。出现“重点、主要、"
+                "更看重、其次、优先、侧重、为主”等表达时拉开权重；不要改写查询，不要"
+                "输出 query、source、embedding_type 列表或解释。"
             ),
         }
-        instruction = (
-            f"query_type={request.query_type.value}; "
-            f"precision_mode={request.precision_mode}; "
-            "required_embedding_types="
-            f"{','.join(item.value for item in request.embedding_types)}; "
-            f"query_text={request.query_text or ''}"
+        instruction = json.dumps(
+            {
+                "required_embedding_types": [item.value for item in requested_types],
+                "query_text": query_text,
+            },
+            ensure_ascii=False,
         )
-        content: list[dict[str, object]] = [{"type": "text", "text": instruction}]
-        if image_url:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_url},
-                }
+        try:
+            parsed = await self._responses_json(
+                messages=[system, {"role": "user", "content": instruction}],
+                output_type=_SearchWeightOutput,
+                pool=self.search_understanding_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+                max_output_tokens=self._settings.search_weight_max_output_tokens,
+                model=self._settings.search_weight_model,
             )
-        parsed = await self._responses_json(
-            messages=[system, {"role": "user", "content": content}],
-            output_type=_SearchParserOutput,
-            pool=self.search_understanding_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-            max_output_tokens=self._settings.search_parser_max_output_tokens,
-            model=self._settings.search_parser_model,
-        )
-        returned_types = [item.embedding_type for item in parsed.dimension_queries]
-        if len(returned_types) != len(set(returned_types)) or set(returned_types) != set(
-            request.embedding_types
+        except ValidationError as exc:
+            raise DoubaoResponseError("weight resolver output is invalid") from exc
+
+        if set(parsed.weights) != set(requested_types):
+            raise DoubaoResponseError(
+                "weight resolver dimensions do not match required_embedding_types"
+            )
+        if any(
+            not math.isfinite(weight) or weight <= 0
+            for weight in parsed.weights.values()
         ):
             raise DoubaoResponseError(
-                "search parser dimensions do not match required_embedding_types"
+                "weight resolver weights must be positive finite numbers"
             )
-        total_weight = sum(item.weight for item in parsed.dimension_queries)
-        return ParsedQuery(
-            dimension_queries=[
-                DimensionQuery(
-                    embedding_type=item.embedding_type,
-                    query=item.query,
-                    weight=item.weight / total_weight,
-                    source=item.source,
-                )
-                for item in parsed.dimension_queries
-            ],
-        )
+        total_weight = sum(parsed.weights.values())
+        if not math.isfinite(total_weight) or total_weight <= 0:
+            raise DoubaoResponseError("weight resolver weight total must be positive")
+        return {
+            embedding_type: parsed.weights[embedding_type] / total_weight
+            for embedding_type in requested_types
+        }
 
     async def rerank_search_results(
         self,

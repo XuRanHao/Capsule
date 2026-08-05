@@ -72,7 +72,6 @@ class SearchRequest(BaseModel):
         min_length=1,
         max_length=len(EmbeddingType),
     )
-    precision_mode: bool = False
     fusion_method: FusionMethod = FusionMethod.WEIGHTED_RRF
     rerank: RerankMethod | bool = RerankMethod.OFF
     save_capsule: bool = False
@@ -156,7 +155,6 @@ class SearchQueryEcho(BaseModel):
     embedding_types: list[EmbeddingType] = Field(
         default_factory=lambda: [EmbeddingType.NATIVE_MULTIMODAL]
     )
-    precision_mode: bool = False
 
 
 class MatchedChannel(BaseModel):
@@ -232,7 +230,7 @@ class SearchResult(BaseModel):
 
 
 class SearchTimings(BaseModel):
-    parser_ms: float = 0
+    weight_resolution_ms: float = 0
     embedding_ms: float = 0
     recall_ms: float = 0
     fusion_ms: float = 0

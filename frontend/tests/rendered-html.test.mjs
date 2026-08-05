@@ -45,6 +45,10 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /目标素材类型/);
   assert.match(html, /Markdown 段落/);
   assert.match(html, /纯文本块/);
+  assert.match(html, /系统默认等权/);
+  assert.match(html, /检索文字明确表达倾向时自动解析权重/);
+  assert.match(html, /图片 \/ 视频本身不参与权重解析/);
+  assert.doesNotMatch(html, /精搜模式|普通模式|precision_mode/);
   const targetTypeInputs = [
     ...html.matchAll(/<input[^>]*name="target_asset_types"[^>]*>/g),
   ].map((match) => match[0]);
@@ -138,6 +142,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /source_contexts/);
   assert.match(page, /Weighted RRF/);
   assert.match(page, /normalized_weighted_similarity/);
+  assert.doesNotMatch(page, /precisionMode|precision_mode|精搜模式|普通模式/);
   assert.match(page, /\/api\/v1\/search-capsules/);
   assert.match(page, /\/api\/v1\/query-images/);
   assert.match(page, /cluster_run_id=/);

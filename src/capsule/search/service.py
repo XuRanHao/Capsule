@@ -70,13 +70,13 @@ class SearchService:
         reasons: list[str] = []
         image_url = await self._resolve_image(request)
 
-        parser_started = perf_counter()
-        parsed_query, parser_reasons = await self._query_parser.parse(
+        weight_resolution_started = perf_counter()
+        parsed_query, weight_resolution_reasons = await self._query_parser.parse(
             request,
             image_url=image_url,
         )
-        reasons.extend(parser_reasons)
-        parser_ms = _elapsed_ms(parser_started)
+        reasons.extend(weight_resolution_reasons)
+        weight_resolution_ms = _elapsed_ms(weight_resolution_started)
 
         embedding_started = perf_counter()
         plan = await self._query_embedding.embed(
@@ -190,7 +190,7 @@ class SearchService:
                 reasons.append("search completed but history persistence failed")
 
         timings = SearchTimings(
-            parser_ms=parser_ms,
+            weight_resolution_ms=weight_resolution_ms,
             embedding_ms=embedding_ms,
             recall_ms=recall_ms,
             fusion_ms=fusion_ms,
@@ -201,14 +201,14 @@ class SearchService:
         )
         logger.info(
             "search completed workspace_id=%s query_type=%s results=%d "
-            "channels=%d parser_ms=%.2f embedding_ms=%.2f recall_ms=%.2f "
+            "channels=%d weight_resolution_ms=%.2f embedding_ms=%.2f recall_ms=%.2f "
             "fusion_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f "
             "cluster_ms=%.2f total_ms=%.2f degraded=%s",
             request.workspace_id,
             request.query_type.value,
             len(results),
             len(recall.channels),
-            parser_ms,
+            weight_resolution_ms,
             embedding_ms,
             recall_ms,
             fusion_ms,
@@ -233,7 +233,6 @@ class SearchService:
                 query_image_url=request.query_image_url,
                 query_image_upload_id=request.query_image_upload_id,
                 embedding_types=request.embedding_types,
-                precision_mode=request.precision_mode,
             ),
             parsed_query=parsed_query,
             fusion_method=request.fusion_method,
