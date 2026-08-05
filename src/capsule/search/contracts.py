@@ -5,6 +5,7 @@ from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     ClusterSearchResult,
+    QueryEnhancement,
     RerankBatch,
     SearchAssetRecord,
     SearchFilters,
@@ -22,12 +23,12 @@ class QueryEmbeddingClient(Protocol):
 
 
 class SearchUnderstandingClient(Protocol):
-    async def resolve_query_weights(
+    async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
-    ) -> Mapping[EmbeddingType, float]: ...
+    ) -> QueryEnhancement: ...
 
     async def rerank_search_results(
         self,

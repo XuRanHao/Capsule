@@ -901,7 +901,7 @@ fieldset legend,
   display: grid;
   margin-top: 13px;
   gap: 7px;
-  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .dimension-strip > div {
@@ -913,6 +913,13 @@ fieldset legend,
   gap: 3px;
 }
 
+.dimension-strip header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .dimension-strip span,
 .dimension-strip small {
   overflow: hidden;
@@ -922,7 +929,16 @@ fieldset legend,
   white-space: nowrap;
 }
 
+.dimension-strip p {
+  min-height: 34px;
+  margin: 5px 0;
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .dimension-strip b {
+  flex: none;
   font-family: var(--font-geist-mono), monospace;
   font-size: 14px;
 }

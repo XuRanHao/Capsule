@@ -9,7 +9,7 @@ path is implemented end to end:
 
 ```text
 text / image / image+text
-  -> user-selected dimensions and optional text Weight Resolver
+  -> user-selected dimensions and optional text Dimension Query Enhancer
   -> concurrent query embeddings
   -> 12-channel Milvus recall
   -> PostgreSQL filters
@@ -27,7 +27,7 @@ boundary; retrieval starts from persisted Assets and Embedding Records.
 ## Core decisions
 
 - Python 3.11+ and a single-process asynchronous runner.
-- Separate concurrency pools for Asset understanding, search Weight Resolver,
+- Separate concurrency pools for Asset understanding, search Dimension Query Enhancer,
   native embedding, text embedding, capsule naming, file parsing, and FFmpeg.
 - Enrichment overlaps native embedding with Asset understanding, then runs the
   independent description and Feature embedding channels concurrently.
@@ -119,11 +119,11 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    cp .env.example .env
    ```
 
-   Model workloads are configured independently: `CAPSULE_SEARCH_WEIGHT_MODEL`
-   controls text Weight Resolver calls, `CAPSULE_UNDERSTANDING_MODEL` controls asset and
-   cluster understanding, and `CAPSULE_EMBEDDING_MODEL` controls the shared
-   multimodal embedding space. Changing the embedding model requires rebuilding
-   its indexes; changing only the Weight Resolver model does not.
+   Model workloads are configured independently: `CAPSULE_SEARCH_QUERY_MODEL`
+   controls text Dimension Query Enhancer calls, `CAPSULE_UNDERSTANDING_MODEL`
+   controls asset and cluster understanding, and `CAPSULE_EMBEDDING_MODEL` controls
+   the shared multimodal embedding space. Changing the embedding model requires
+   rebuilding its indexes; changing only the Query Enhancer model does not.
 
 2. Start local infrastructure.
 
@@ -246,7 +246,8 @@ continues to use its Linux FFmpeg instead.
    Open `http://localhost:3000`. The page supports text, uploaded image,
    image URL, and combined image-text queries. It exposes target asset and
    dimension selection, both fusion algorithms, optional reranking, all documented
-   filters, resolved dimension weights, channel evidence, source folding, and Search Capsules.
+   filters, enhanced dimension queries and weights, channel evidence, source folding,
+   and Search Capsules.
 
    Search accepts text, image, and combined image-text queries:
 
@@ -294,7 +295,7 @@ continues to use its Linux FFmpeg instead.
 
 ```text
 query
-  -> user-selected dimensions and optional text Weight Resolver
+  -> user-selected dimensions and optional text Dimension Query Enhancer
   -> bounded concurrent query embeddings
   -> concurrent Milvus recall scoped by workspace and Asset metadata
   -> PostgreSQL-authoritative hydration, indexed-status and revision validation
@@ -307,14 +308,16 @@ query
 
 The available embedding routes are `native_multimodal`, `asset_description`,
 and all ten Asset Feature dimensions. Requests default to `native_multimodal`
-only and may explicitly select multiple routes with `embedding_types`. Selected
-routes are equal-weighted unless a multi-route text or image-text query explicitly
-expresses a dimension preference. In that case, the text-only Weight Resolver
-returns normalized weights for exactly the user-selected dimensions; images and
-videos are never sent to it. The backend determines each route's query source and
-the model cannot add, remove, or rewrite routes. Pure-image queries and queries
-without an explicit preference remain equal-weighted. Any failed route is removed,
-surviving weights are renormalized, and the response reports `degraded=true`.
+only and may explicitly select multiple routes with `embedding_types`.
+Multi-route text and image-text queries use a text-only Dimension Query Enhancer
+to produce a focused query for each selected route and normalized route weights;
+images and videos are never sent to it. The enhancer reorganizes each query around
+its target dimension, retaining other information only when it provides useful
+context or a meaningful cross-dimension relationship. It must not invent facts or
+add/remove routes. Queries without an explicit dimension preference remain
+equal-weighted; explicit textual preferences may adjust weights.
+Pure-image queries skip enhancement and remain equal-weighted. Any failed route is
+removed, surviving weights are renormalized, and the response reports `degraded=true`.
 
 Search dimensions are validated against the target `filters.asset_type` values.
 `visual_style` and `color_composition` are available only for images and video

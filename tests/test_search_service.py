@@ -340,7 +340,8 @@ async def test_search_api_returns_the_service_response() -> None:
     assert payload["query"]["query_type"] == "image"
     assert payload["query"]["embedding_types"] == ["native_multimodal"]
     assert "precision_mode" not in payload["query"]
-    assert "weight_resolution_ms" in payload["timings"]
+    assert "query_enhancement_ms" in payload["timings"]
+    assert "weight_resolution_ms" not in payload["timings"]
     assert "parser_ms" not in payload["timings"]
     assert payload["total"] == 2
     assert payload["asset_total"] == 2

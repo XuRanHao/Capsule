@@ -133,6 +133,13 @@ class DimensionQuery(BaseModel):
     source: QueryDimensionSource = QueryDimensionSource.TEXT
 
 
+class QueryEnhancement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=12)
+    weights: dict[EmbeddingType, float] = Field(min_length=1, max_length=12)
+
+
 class ParsedQuery(BaseModel):
     dimension_queries: list[DimensionQuery] = Field(min_length=1, max_length=12)
 
@@ -230,7 +237,7 @@ class SearchResult(BaseModel):
 
 
 class SearchTimings(BaseModel):
-    weight_resolution_ms: float = 0
+    query_enhancement_ms: float = 0
     embedding_ms: float = 0
     recall_ms: float = 0
     fusion_ms: float = 0

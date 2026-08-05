@@ -10,18 +10,48 @@ from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
-from capsule.search.models import RerankBatch, SearchRequest
+from capsule.search.models import QueryEnhancement, RerankBatch, SearchRequest
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-class _SearchWeightOutput(BaseModel):
+class _SearchQueryOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=12)
     weights: dict[EmbeddingType, StrictFloat | StrictInt] = Field(
         min_length=1,
         max_length=12,
     )
+
+
+_EMBEDDING_TYPE_GUIDANCE: dict[EmbeddingType, str] = {
+    EmbeddingType.NATIVE_MULTIMODAL: (
+        "原始内容：聚焦原查询中可见或可读的主体、动作、场景、关系和内容约束，"
+        "形成对素材本身的整体内容表达"
+    ),
+    EmbeddingType.ASSET_DESCRIPTION: (
+        "素材完整描述：基于原查询已有信息，组织成对目标素材整体内容的客观完整描述"
+    ),
+    EmbeddingType.SUBJECT_CONTENT: "主体内容：突出人物、物体、动作及主体之间的关系",
+    EmbeddingType.SCENE_THEME: "场景主题：突出地点、环境、时段、事件和主题语境",
+    EmbeddingType.VISUAL_STYLE: (
+        "视觉风格：突出媒介类型、艺术流派、材质、摄影或渲染风格"
+    ),
+    EmbeddingType.COLOR_COMPOSITION: (
+        "色彩构图：突出颜色、光影、明暗、视角、景别和画面布局"
+    ),
+    EmbeddingType.MOOD_ATMOSPHERE: "情绪氛围：突出情感、气氛和感官基调",
+    EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY: (
+        "人物状态与心理：突出人物可观察的表情、姿态、行为和明确心理状态"
+    ),
+    EmbeddingType.ASSET_USAGE: "素材用途：突出用户明确提到的使用场景、载体和任务目的",
+    EmbeddingType.TARGET_AUDIENCE: "目标受众：突出用户明确提到的受众群体和适用人群",
+    EmbeddingType.PROVENANCE: "来源：突出用户明确提供的出处、来源和生成方式线索",
+    EmbeddingType.RIGHTS_VERSION_AUTHORSHIP: (
+        "权利版本作者：突出用户明确提供的作者、版本、授权和版权线索"
+    ),
+}
 
 
 class DoubaoConfigurationError(RuntimeError):
@@ -157,32 +187,51 @@ class DoubaoClient:
                 timeout_seconds=self._settings.understanding_timeout_seconds,
             )
 
-    async def resolve_query_weights(
+    async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
-    ) -> dict[EmbeddingType, float]:
-        """Resolve text-expressed route preferences into normalized weights."""
+    ) -> QueryEnhancement:
+        """Enhance selected text routes and resolve normalized route weights."""
         requested_types = list(embedding_types)
         if not requested_types or len(requested_types) != len(set(requested_types)):
             raise DoubaoResponseError(
                 "embedding_types must be non-empty and contain no duplicates"
             )
+        dimension_guidance = {
+            item.value: _EMBEDDING_TYPE_GUIDANCE[item] for item in requested_types
+        }
         system = {
             "role": "system",
             "content": (
-                "你是素材检索维度权重解析器。只根据用户文本中明确表达的维度倾向分配"
-                "权重。只输出 JSON，根节点只能包含 weights；weights 必须是对象，键必须"
-                "且只能是 required_embedding_types 中列出的全部维度，不能增加、删除或"
-                "重复维度。每个值必须是大于 0 的有限数字，总和应为 1。出现“重点、主要、"
-                "更看重、其次、优先、侧重、为主”等表达时拉开权重；不要改写查询，不要"
-                "输出 query、source、embedding_type 列表或解释。"
+                "你是素材检索维度 Query Enhancer。只输出 JSON，根节点必须且只能包含"
+                " queries 和 weights。queries、weights 都必须是对象，二者的键必须且只能"
+                "是 required_embedding_types 列出的全部维度，不能增加、删除或重复维度。"
+                "queries 的每个值必须是非空字符串：根据 dimension_guidance 将 query_text"
+                "重组为适合该维度向量检索的查询，以目标维度为中心提高该维度信息密度。"
+                "其他信息由你判断其是否有助于理解目标维度；只保留必要上下文，允许保留"
+                "能说明目标维度的跨维度关联，不要机械地按词或维度删除。原文没有直接"
+                "说明目标维度时，也要基于原查询做保守的维度化表达，不能因缺少直接线索"
+                "而输出空查询。"
+                "绝不虚构原文没有的人物、物体、场景、颜色、风格、情绪、用途、来源、"
+                "作者、版权或其他具体事实，不得编造补全。"
+                "dimension_guidance 仅用于说明关注范围，不能把其中的类别示例或枚举词"
+                "复制进 query；query 中的每一项具体语义都必须能在 query_text 中找到依据。"
+                "维度偏好和权重控制意图应体现在 weights 中，不应原样混入 queries；应自然"
+                "保留实际检索语义以及否定、排除、范围等内容约束。native_multimodal 要"
+                "围绕原始可见或可读内容及其关系组织整体表达；asset_description 要形成"
+                "完整客观描述，但都只能使用原查询已有信息。"
+                "weights 的每个值必须是大于 0 的有限数字，总和应为 1；没有"
+                "明确维度倾向时必须等权，出现“重点、主要、更看重、其次、优先、侧重、"
+                "为主”等倾向时才按 query_text 拉开权重。不要输出 source、embedding_type"
+                "列表、解释或 Markdown。"
             ),
         }
         instruction = json.dumps(
             {
                 "required_embedding_types": [item.value for item in requested_types],
+                "dimension_guidance": dimension_guidance,
                 "query_text": query_text,
             },
             ensure_ascii=False,
@@ -190,33 +239,47 @@ class DoubaoClient:
         try:
             parsed = await self._responses_json(
                 messages=[system, {"role": "user", "content": instruction}],
-                output_type=_SearchWeightOutput,
+                output_type=_SearchQueryOutput,
                 pool=self.search_understanding_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
-                max_output_tokens=self._settings.search_weight_max_output_tokens,
-                model=self._settings.search_weight_model,
+                max_output_tokens=self._settings.search_query_max_output_tokens,
+                model=self._settings.search_query_model,
             )
         except ValidationError as exc:
-            raise DoubaoResponseError("weight resolver output is invalid") from exc
+            raise DoubaoResponseError("query enhancer output is invalid") from exc
 
-        if set(parsed.weights) != set(requested_types):
+        requested_type_set = set(requested_types)
+        if set(parsed.queries) != requested_type_set:
             raise DoubaoResponseError(
-                "weight resolver dimensions do not match required_embedding_types"
+                "query enhancer query dimensions do not match required_embedding_types"
+            )
+        queries = {
+            embedding_type: parsed.queries[embedding_type].strip()
+            for embedding_type in requested_types
+        }
+        if any(not query for query in queries.values()):
+            raise DoubaoResponseError("query enhancer queries must be non-empty")
+        if set(parsed.weights) != requested_type_set:
+            raise DoubaoResponseError(
+                "query enhancer weight dimensions do not match required_embedding_types"
             )
         if any(
             not math.isfinite(weight) or weight <= 0
             for weight in parsed.weights.values()
         ):
             raise DoubaoResponseError(
-                "weight resolver weights must be positive finite numbers"
+                "query enhancer weights must be positive finite numbers"
             )
         total_weight = sum(parsed.weights.values())
         if not math.isfinite(total_weight) or total_weight <= 0:
-            raise DoubaoResponseError("weight resolver weight total must be positive")
-        return {
-            embedding_type: parsed.weights[embedding_type] / total_weight
-            for embedding_type in requested_types
-        }
+            raise DoubaoResponseError("query enhancer weight total must be positive")
+        return QueryEnhancement(
+            queries=queries,
+            weights={
+                embedding_type: parsed.weights[embedding_type] / total_weight
+                for embedding_type in requested_types
+            },
+        )
 
     async def rerank_search_results(
         self,

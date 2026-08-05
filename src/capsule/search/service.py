@@ -70,13 +70,13 @@ class SearchService:
         reasons: list[str] = []
         image_url = await self._resolve_image(request)
 
-        weight_resolution_started = perf_counter()
-        parsed_query, weight_resolution_reasons = await self._query_parser.parse(
+        query_enhancement_started = perf_counter()
+        parsed_query, query_enhancement_reasons = await self._query_parser.parse(
             request,
             image_url=image_url,
         )
-        reasons.extend(weight_resolution_reasons)
-        weight_resolution_ms = _elapsed_ms(weight_resolution_started)
+        reasons.extend(query_enhancement_reasons)
+        query_enhancement_ms = _elapsed_ms(query_enhancement_started)
 
         embedding_started = perf_counter()
         plan = await self._query_embedding.embed(
@@ -190,7 +190,7 @@ class SearchService:
                 reasons.append("search completed but history persistence failed")
 
         timings = SearchTimings(
-            weight_resolution_ms=weight_resolution_ms,
+            query_enhancement_ms=query_enhancement_ms,
             embedding_ms=embedding_ms,
             recall_ms=recall_ms,
             fusion_ms=fusion_ms,
@@ -201,14 +201,14 @@ class SearchService:
         )
         logger.info(
             "search completed workspace_id=%s query_type=%s results=%d "
-            "channels=%d weight_resolution_ms=%.2f embedding_ms=%.2f recall_ms=%.2f "
+            "channels=%d query_enhancement_ms=%.2f embedding_ms=%.2f recall_ms=%.2f "
             "fusion_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f "
             "cluster_ms=%.2f total_ms=%.2f degraded=%s",
             request.workspace_id,
             request.query_type.value,
             len(results),
             len(recall.channels),
-            weight_resolution_ms,
+            query_enhancement_ms,
             embedding_ms,
             recall_ms,
             fusion_ms,

@@ -12,6 +12,7 @@ from capsule.search.models import (
     FusedHit,
     FusionMethod,
     QueryDimensionSource,
+    QueryEnhancement,
     QueryType,
     QueryVector,
     RerankBatch,
@@ -68,16 +69,22 @@ def test_normalized_weighted_similarity_is_selectable() -> None:
 
 class FakeUnderstandingClient:
     def __init__(self) -> None:
-        self.weight_calls = 0
+        self.enhancement_calls = 0
 
-    async def resolve_query_weights(
+    async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
-    ) -> Mapping[EmbeddingType, float]:
-        self.weight_calls += 1
-        return {embedding_type: 1 for embedding_type in embedding_types}
+    ) -> QueryEnhancement:
+        self.enhancement_calls += 1
+        return QueryEnhancement(
+            queries={
+                embedding_type: f"{embedding_type.value}:{query_text}"
+                for embedding_type in embedding_types
+            },
+            weights={embedding_type: 1 for embedding_type in embedding_types},
+        )
 
     async def rerank_search_results(
         self,
@@ -122,29 +129,35 @@ async def test_image_query_uses_equal_weight_selected_routes_without_model() -> 
         math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries
     )
     assert all(item.source is QueryDimensionSource.IMAGE for item in parsed.dimension_queries)
-    assert client.weight_calls == 0
+    assert client.enhancement_calls == 0
 
 
-class WeightedTextUnderstandingClient:
-    async def resolve_query_weights(
+class TextQueryEnhancementClient:
+    async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
-    ) -> Mapping[EmbeddingType, float]:
+    ) -> QueryEnhancement:
         assert query_text == "重点看动画风格，原始内容其次"
         assert list(embedding_types) == [
             EmbeddingType.NATIVE_MULTIMODAL,
             EmbeddingType.VISUAL_STYLE,
         ]
-        return {
-            EmbeddingType.NATIVE_MULTIMODAL: 2,
-            EmbeddingType.VISUAL_STYLE: 8,
-        }
+        return QueryEnhancement(
+            queries={
+                EmbeddingType.NATIVE_MULTIMODAL: "蓝紫色黄昏动画场景",
+                EmbeddingType.VISUAL_STYLE: "蓝紫色调的动画电影视觉风格",
+            },
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: 2,
+                EmbeddingType.VISUAL_STYLE: 8,
+            },
+        )
 
 
 @pytest.mark.parametrize("query_type", [QueryType.TEXT, QueryType.IMAGE_TEXT])
-async def test_text_bearing_queries_resolve_explicit_intent_weights(
+async def test_text_bearing_queries_are_enhanced_with_intent_weights(
     query_type: QueryType,
 ) -> None:
     image_url = (
@@ -161,14 +174,17 @@ async def test_text_bearing_queries_resolve_explicit_intent_weights(
         ],
     )
 
-    parsed, reasons = await QueryParser(WeightedTextUnderstandingClient()).parse(
+    parsed, reasons = await QueryParser(TextQueryEnhancementClient()).parse(
         request,
         image_url=image_url,
     )
 
     assert reasons == ()
     assert [item.weight for item in parsed.dimension_queries] == [0.2, 0.8]
-    assert all(item.query == request.query_text for item in parsed.dimension_queries)
+    assert [item.query for item in parsed.dimension_queries] == [
+        "蓝紫色黄昏动画场景",
+        "蓝紫色调的动画电影视觉风格",
+    ]
     expected_sources = (
         [QueryDimensionSource.JOINT, QueryDimensionSource.TEXT]
         if query_type is QueryType.IMAGE_TEXT
@@ -177,7 +193,7 @@ async def test_text_bearing_queries_resolve_explicit_intent_weights(
     assert [item.source for item in parsed.dimension_queries] == expected_sources
 
 
-async def test_text_without_weight_intent_uses_equal_weights_without_model_call() -> None:
+async def test_text_multidimension_always_uses_query_enhancer() -> None:
     client = FakeUnderstandingClient()
     request = SearchRequest(
         workspace_id="workspace_demo",
@@ -197,10 +213,14 @@ async def test_text_without_weight_intent_uses_equal_weights_without_model_call(
         EmbeddingType.VISUAL_STYLE,
     ]
     assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
-    assert client.weight_calls == 0
+    assert [item.query for item in parsed.dimension_queries] == [
+        "native_multimodal:蓝紫色黄昏动画场景，主要人物在中央",
+        "visual_style:蓝紫色黄昏动画场景，主要人物在中央",
+    ]
+    assert client.enhancement_calls == 1
 
 
-async def test_native_only_skips_weight_resolver() -> None:
+async def test_native_only_skips_query_enhancer() -> None:
     client = FakeUnderstandingClient()
     request = SearchRequest(
         workspace_id="workspace_demo",
@@ -215,20 +235,65 @@ async def test_native_only_skips_weight_resolver() -> None:
     assert [item.embedding_type for item in parsed.dimension_queries] == [
         EmbeddingType.NATIVE_MULTIMODAL
     ]
-    assert client.weight_calls == 0
+    assert client.enhancement_calls == 0
 
 
-class InvalidWeightClient:
-    async def resolve_query_weights(
+class StaticEnhancementClient:
+    def __init__(self, enhancement: QueryEnhancement) -> None:
+        self.enhancement = enhancement
+
+    async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
-    ) -> Mapping[EmbeddingType, float]:
-        return {EmbeddingType.NATIVE_MULTIMODAL: 1.0}
+    ) -> QueryEnhancement:
+        return self.enhancement
 
 
-async def test_invalid_resolved_weights_fall_back_to_equal_weights() -> None:
+@pytest.mark.parametrize(
+    "enhancement",
+    [
+        QueryEnhancement(
+            queries={EmbeddingType.NATIVE_MULTIMODAL: "内容查询"},
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: 0.5,
+                EmbeddingType.VISUAL_STYLE: 0.5,
+            },
+        ),
+        QueryEnhancement(
+            queries={
+                EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
+                EmbeddingType.VISUAL_STYLE: "   ",
+            },
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: 0.5,
+                EmbeddingType.VISUAL_STYLE: 0.5,
+            },
+        ),
+        QueryEnhancement(
+            queries={
+                EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
+                EmbeddingType.VISUAL_STYLE: "风格查询",
+            },
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: float("nan"),
+                EmbeddingType.VISUAL_STYLE: 0.5,
+            },
+        ),
+        QueryEnhancement(
+            queries={
+                EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
+                EmbeddingType.VISUAL_STYLE: "风格查询",
+            },
+            weights={EmbeddingType.NATIVE_MULTIMODAL: 1.0},
+        ),
+    ],
+    ids=["query-keys", "empty-query", "bad-weight", "weight-keys"],
+)
+async def test_invalid_enhancement_falls_back_to_original_query_and_equal_weights(
+    enhancement: QueryEnhancement,
+) -> None:
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=QueryType.TEXT,
@@ -239,13 +304,17 @@ async def test_invalid_resolved_weights_fall_back_to_equal_weights() -> None:
         ],
     )
 
-    parsed, reasons = await QueryParser(InvalidWeightClient()).parse(
+    parsed, reasons = await QueryParser(StaticEnhancementClient(enhancement)).parse(
         request,
         image_url=None,
     )
 
     assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
-    assert reasons == ("query weight resolution fallback used",)
+    assert [item.query for item in parsed.dimension_queries] == [
+        request.query_text,
+        request.query_text,
+    ]
+    assert reasons == ("query enhancement fallback used",)
 
 
 async def test_seed_reranker_reorders_only_hydrated_candidates() -> None:

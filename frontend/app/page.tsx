@@ -105,7 +105,10 @@ type SearchResponse = {
   cluster_total: number;
   degraded: boolean;
   degraded_reasons: string[];
-  timings: { total_ms: number };
+  timings: {
+    query_enhancement_ms: number;
+    total_ms: number;
+  };
   assets: SearchResult[];
   clusters: ClusterSearchResult[];
   results: SearchResult[];
@@ -373,7 +376,7 @@ const DEMO_RESPONSE: SearchResponse = {
     dimension_queries: [
       {
         embedding_type: "asset_description",
-        query: "蓝紫色黄昏动画场景",
+        query: "蓝紫色黄昏时分的动画场景，呈现完整画面内容与环境氛围",
         weight: 0.35,
         source: "text",
       },
@@ -385,13 +388,13 @@ const DEMO_RESPONSE: SearchResponse = {
       },
       {
         embedding_type: "subject_content",
-        query: "蓝紫色黄昏动画场景",
+        query: "黄昏场景中的人物、环境与主体内容",
         weight: 0.15,
         source: "text",
       },
       {
         embedding_type: "visual_style",
-        query: "蓝紫色黄昏动画场景",
+        query: "蓝紫色调的动画电影视觉风格",
         weight: 0.15,
         source: "text",
       },
@@ -407,7 +410,7 @@ const DEMO_RESPONSE: SearchResponse = {
   cluster_total: DEMO_CLUSTERS.length,
   degraded: false,
   degraded_reasons: [],
-  timings: { total_ms: 286 },
+  timings: { query_enhancement_ms: 74, total_ms: 286 },
   assets: DEMO_RESULTS,
   clusters: DEMO_CLUSTERS,
   results: DEMO_RESULTS,
@@ -433,7 +436,7 @@ const EMPTY_RESPONSE: SearchResponse = {
   cluster_total: 0,
   degraded: false,
   degraded_reasons: [],
-  timings: { total_ms: 0 },
+  timings: { query_enhancement_ms: 0, total_ms: 0 },
   assets: [],
   clusters: [],
   results: [],
@@ -662,12 +665,15 @@ function QueryPlan({ parsed }: { parsed: ParsedQuery | null }) {
       <div className="dimension-strip">
         {parsed.dimension_queries.map((dimension) => (
           <div key={dimension.embedding_type}>
-            <span>
-              {CHANNEL_LABELS[dimension.embedding_type] ??
-                dimension.embedding_type}
-            </span>
-            <b>{Math.round(dimension.weight * 100)}%</b>
-            <small>{dimension.source}</small>
+            <header>
+              <span>
+                {CHANNEL_LABELS[dimension.embedding_type] ??
+                  dimension.embedding_type}
+              </span>
+              <b>{Math.round(dimension.weight * 100)}%</b>
+            </header>
+            <p>{dimension.query}</p>
+            <small>source · {dimension.source}</small>
           </div>
         ))}
       </div>
@@ -1125,8 +1131,8 @@ export default function Home() {
                   })}
                 </div>
                 <p>
-                  系统默认等权；仅在多维且检索文字明确表达倾向时自动解析权重，
-                  图片 / 视频本身不参与权重解析。
+                  文本多维检索会按已选维度生成针对性 Query；文本中的倾向可影响权重。
+                  图片 / 视频内容不参与权重解析，source 由后端根据输入类型决定。
                 </p>
               </details>
 
@@ -1271,6 +1277,9 @@ export default function Home() {
               <div className="results-meta">
                 <span>
                   {Math.round(response.timings.total_ms)} ms
+                </span>
+                <span>
+                  Query 增强 {Math.round(response.timings.query_enhancement_ms)} ms
                 </span>
                 <span>
                   {response.fusion_method === "weighted_rrf"

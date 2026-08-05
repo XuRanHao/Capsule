@@ -104,6 +104,7 @@ class QueryEmbeddingService:
         image_url: str | None,
         operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
     ) -> tuple[QueryVector, str | None]:
+        operation_key: tuple[str, ...]
         if dimension.source is QueryDimensionSource.IMAGE:
             if image_url is None:
                 raise QueryEmbeddingError("image route requires a resolved image URL")

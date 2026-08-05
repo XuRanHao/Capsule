@@ -56,6 +56,10 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
             }
         else:
             content = {
+                "queries": {
+                    "native_multimodal": "重点看视觉风格，内容其次",
+                    "visual_style": "视觉风格",
+                },
                 "weights": {
                     "native_multimodal": 0.25,
                     "visual_style": 0.75,
@@ -77,7 +81,7 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
     )
     try:
         await client.understand_asset([{"role": "user", "content": "分析测试素材"}])
-        await client.resolve_query_weights(
+        await client.enhance_search_query(
             query_text="重点看视觉风格，内容其次",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
@@ -92,7 +96,7 @@ async def test_asset_and_search_understanding_use_independent_pools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_output() -> None:
+async def test_query_enhancer_uses_responses_api_with_bounded_non_thinking_output() -> None:
     captured: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -103,6 +107,10 @@ async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_outp
             json={
                 "output_text": json.dumps(
                     {
+                        "queries": {
+                            "native_multimodal": "蓝色湖泊",
+                            "visual_style": "清透的自然摄影风格",
+                        },
                         "weights": {
                             "native_multimodal": 0.2,
                             "visual_style": 0.6,
@@ -116,7 +124,7 @@ async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_outp
     client = DoubaoClient(
         Settings(
             ark_api_key=SecretStr("test-key"),
-            search_weight_max_output_tokens=192,
+            search_query_max_output_tokens=400,
         )
     )
     await client.close()
@@ -125,8 +133,8 @@ async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_outp
         transport=httpx.MockTransport(handler),
     )
     try:
-        weights = await client.resolve_query_weights(
-            query_text="重点看视觉风格，原始内容其次",
+        enhancement = await client.enhance_search_query(
+            query_text="蓝色湖泊，重点看清透自然摄影风格，原始内容其次",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
                 EmbeddingType.VISUAL_STYLE,
@@ -137,15 +145,31 @@ async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_outp
 
     assert captured["thinking"] == {"type": "disabled"}
     assert captured["model"] == "doubao-seed-2-0-mini-260428"
-    assert captured["max_output_tokens"] == 192
+    assert captured["max_output_tokens"] == 400
     assert captured["text"] == {"format": {"type": "json_object"}}
-    assert "根节点只能包含 weights" in str(captured["input"])
+    assert "根节点必须且只能包含 queries 和 weights" in str(captured["input"])
     assert '"required_embedding_types": ["native_multimodal", "visual_style"]' in str(
         captured["input"]
     )
-    assert "重点看视觉风格，原始内容其次" in str(captured["input"])
+    assert "原始内容" in str(captured["input"])
+    assert "媒介类型、艺术流派" in str(captured["input"])
+    assert "不能把其中的类别示例或枚举词复制进 query" in str(captured["input"])
+    assert "以目标维度为中心提高该维度信息密度" in str(captured["input"])
+    assert "只保留必要上下文" in str(captured["input"])
+    assert "允许保留能说明目标维度的跨维度关联" in str(captured["input"])
+    assert "不要机械地按词或维度删除" in str(captured["input"])
+    assert "保守的维度化表达" in str(captured["input"])
+    assert "权重控制意图应体现在 weights 中" in str(captured["input"])
+    assert '"scene_theme"' not in str(captured["input"])
+    assert "蓝色湖泊，重点看清透自然摄影风格，原始内容其次" in str(
+        captured["input"]
+    )
     assert "input_image" not in str(captured["input"])
-    assert weights == pytest.approx(
+    assert enhancement.queries == {
+        EmbeddingType.NATIVE_MULTIMODAL: "蓝色湖泊",
+        EmbeddingType.VISUAL_STYLE: "清透的自然摄影风格",
+    }
+    assert enhancement.weights == pytest.approx(
         {
             EmbeddingType.NATIVE_MULTIMODAL: 0.25,
             EmbeddingType.VISUAL_STYLE: 0.75,
@@ -157,15 +181,42 @@ async def test_weight_resolver_uses_responses_api_with_bounded_non_thinking_outp
 @pytest.mark.parametrize(
     "content",
     [
-        {"weights": {"native_multimodal": 1.0}, "query": "不应出现"},
-        {"weights": {"native_multimodal": 0.5, "scene_theme": 0.5}},
-        {"weights": {"native_multimodal": 0.0, "visual_style": 1.0}},
-        {"weights": {"native_multimodal": float("inf"), "visual_style": 1.0}},
-        {"weights": {"native_multimodal": True, "visual_style": 1.0}},
-        {"weights": {"native_multimodal": "0.5", "visual_style": 0.5}},
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": 0.5, "visual_style": 0.5},
+            "source": "不应出现",
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "scene_theme": "场景"},
+            "weights": {"native_multimodal": 0.5, "visual_style": 0.5},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": 0.5, "scene_theme": 0.5},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "   "},
+            "weights": {"native_multimodal": 0.5, "visual_style": 0.5},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": 0.0, "visual_style": 1.0},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": float("inf"), "visual_style": 1.0},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": True, "visual_style": 1.0},
+        },
+        {
+            "queries": {"native_multimodal": "原查询", "visual_style": "风格"},
+            "weights": {"native_multimodal": "0.5", "visual_style": 0.5},
+        },
     ],
 )
-async def test_weight_resolver_rejects_invalid_output(content: object) -> None:
+async def test_query_enhancer_rejects_invalid_output(content: object) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/responses"
         return httpx.Response(200, json={"output_text": json.dumps(content)})
@@ -178,7 +229,7 @@ async def test_weight_resolver_rejects_invalid_output(content: object) -> None:
     )
     try:
         with pytest.raises(DoubaoResponseError):
-            await client.resolve_query_weights(
+            await client.enhance_search_query(
                 query_text="重点看视觉风格",
                 embedding_types=[
                     EmbeddingType.NATIVE_MULTIMODAL,

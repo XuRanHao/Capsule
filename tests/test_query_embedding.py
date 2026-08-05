@@ -1,11 +1,20 @@
 import asyncio
 import math
+from collections.abc import Sequence
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
-from capsule.search.models import QueryType, SearchRequest
+from capsule.search.models import (
+    QueryEnhancement,
+    QueryType,
+    SearchFilters,
+    SearchRequest,
+    VectorSearchHit,
+)
 from capsule.search.query_embedding import QueryEmbeddingService
+from capsule.search.query_parser import QueryParser
+from capsule.search.recall import MultiChannelRecall
 
 
 class FakeEmbeddingClient:
@@ -149,6 +158,89 @@ async def test_image_text_embeddings_run_concurrently() -> None:
     )
 
     assert client.max_observed == 2
+
+
+class DistinctQueryEnhancementClient:
+    async def enhance_search_query(
+        self,
+        *,
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> QueryEnhancement:
+        return QueryEnhancement(
+            queries={
+                EmbeddingType.VISUAL_STYLE: "动画视觉风格",
+                EmbeddingType.COLOR_COMPOSITION: "蓝紫色调与黄昏光影",
+            },
+            weights={
+                EmbeddingType.VISUAL_STYLE: 0.6,
+                EmbeddingType.COLOR_COMPOSITION: 0.4,
+            },
+        )
+
+
+class ProjectionEmbeddingClient(FakeEmbeddingClient):
+    async def embed_text(self, text: str) -> EmbeddingResult:
+        self.calls.append(f"text:{text}")
+        vectors = {
+            "动画视觉风格": [1.0, 0.0, 0.0],
+            "蓝紫色调与黄昏光影": [0.0, 1.0, 0.0],
+        }
+        return EmbeddingResult(vector=vectors[text], model="fake")
+
+
+class ProjectionRecallRepository:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[float]]] = []
+
+    async def search(
+        self,
+        *,
+        vector: list[float],
+        workspace_id: str,
+        embedding_type: str,
+        filters: SearchFilters,
+        limit: int,
+    ) -> Sequence[VectorSearchHit]:
+        self.calls.append((embedding_type, vector))
+        return []
+
+
+async def test_enhanced_queries_flow_to_independent_embedding_and_recall_routes() -> None:
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="蓝紫色黄昏动画场景",
+        embedding_types=[
+            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.COLOR_COMPOSITION,
+        ],
+    )
+    parsed, reasons = await QueryParser(DistinctQueryEnhancementClient()).parse(
+        request,
+        image_url=None,
+    )
+    client = ProjectionEmbeddingClient()
+
+    plan = await QueryEmbeddingService(client, settings()).embed(request, parsed)
+    recall_repository = ProjectionRecallRepository()
+    await MultiChannelRecall(recall_repository, settings()).search(
+        plan=plan,
+        workspace_id=request.workspace_id,
+        filters=request.filters,
+        top_k=request.top_k,
+    )
+
+    assert reasons == ()
+    assert client.calls == [
+        "text:动画视觉风格",
+        "text:蓝紫色调与黄昏光影",
+    ]
+    assert [vector.weight for vector in plan.vectors] == [0.6, 0.4]
+    assert recall_repository.calls == [
+        ("visual_style", [1.0, 0.0, 0.0]),
+        ("color_composition", [0.0, 1.0, 0.0]),
+    ]
 
 
 async def test_image_query_reuses_image_vector_for_selected_semantic_channels() -> None:
