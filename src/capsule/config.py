@@ -148,7 +148,7 @@ class Settings(BaseSettings):
         le=1.0,
     )
     cluster_incremental_assignment_threshold: float = Field(
-        default=0.92,
+        default=0.88,
         ge=-1.0,
         le=1.0,
     )

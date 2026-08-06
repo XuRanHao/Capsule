@@ -1,7 +1,9 @@
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from capsule.api.app import create_app
 from capsule.config import Settings
@@ -92,7 +94,7 @@ def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
     import_root = tmp_path / "imports"
     import_root.mkdir()
     image_path = import_root / "image.jpg"
-    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    Image.new("RGB", (1200, 800), "#e05b3f").save(image_path, quality=95)
     repository = FakeAssetRepository(image_path)
     app = create_app(
         settings=Settings(import_root=import_root),
@@ -108,16 +110,28 @@ def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
         payload = response.json()
         assert payload["total"] == 1
         assert payload["items"][0]["asset_name"] == "测试图片"
-        assert payload["items"][0]["preview_url"].endswith(
-            "/api/v1/assets/asset_image/preview?workspace_id=workspace_test"
+        assert payload["items"][0]["preview_url"] == (
+            "/api/v1/assets/asset_image/thumbnail?workspace_id=workspace_test"
+        )
+        assert payload["items"][0]["content_url"] == (
+            "/api/v1/assets/asset_image/content?workspace_id=workspace_test"
         )
 
         preview = client.get(
             "/api/v1/assets/asset_image/preview",
             params={"workspace_id": "workspace_test"},
         )
+        thumbnail = client.get(
+            "/api/v1/assets/asset_image/thumbnail",
+            params={"workspace_id": "workspace_test"},
+        )
         assert preview.status_code == 200
         assert preview.content == image_path.read_bytes()
+        assert thumbnail.status_code == 200
+        assert thumbnail.headers["content-type"] == "image/jpeg"
+        assert thumbnail.headers["cache-control"] == "public, max-age=86400, immutable"
+        with Image.open(BytesIO(thumbnail.content)) as rendered:
+            assert max(rendered.size) == 480
 
 
 def test_library_clear_requires_explicit_confirmation(tmp_path: Path) -> None:

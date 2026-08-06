@@ -218,6 +218,27 @@ class AssetRepository:
             job.current_stage = PipelineStage.PARSING.value
             job.started_at = datetime.now(UTC)
 
+    async def mark_import_upload_activity(
+        self,
+        *,
+        job_id: str,
+        workspace_id: str,
+    ) -> None:
+        async with self._database.session() as session, session.begin():
+            job = await session.scalar(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.job_id == job_id,
+                    ProcessingJob.workspace_id == workspace_id,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            if job.status != JobStatus.QUEUED.value:
+                raise ValueError(f"processing job cannot accept uploads from status {job.status}")
+            job.updated_at = datetime.now(UTC)
+
     async def get_or_create_source_file(
         self,
         *,
@@ -649,13 +670,13 @@ class AssetRepository:
                 raise ValueError(f"processing job does not exist: {job_id}")
             if job.failed_count == 0:
                 job.status = JobStatus.COMPLETED.value
-                job.current_stage = PipelineStage.ASSET_STORED.value
+                job.current_stage = PipelineStage.COMPLETED.value
             elif job.completed_count == 0:
                 job.status = JobStatus.FAILED.value
                 job.current_stage = PipelineStage.FAILED.value
             else:
                 job.status = JobStatus.PARTIAL_FAILED.value
-                job.current_stage = PipelineStage.ASSET_STORED.value
+                job.current_stage = PipelineStage.COMPLETED.value
             job.completed_at = datetime.now(UTC)
 
     async def fail_job(self, *, job_id: str, error: str) -> None:
@@ -710,6 +731,18 @@ class AssetRepository:
                 .limit(limit)
             )
             return [_processing_job_record(job) for job in rows]
+
+    async def clear_jobs(self, *, workspace_id: str) -> int:
+        """Remove every processing-job record owned by one workspace."""
+        async with self._database.session() as session, session.begin():
+            deleted_ids = list(
+                await session.scalars(
+                    delete(ProcessingJob)
+                    .where(ProcessingJob.workspace_id == workspace_id)
+                    .returning(ProcessingJob.job_id)
+                )
+            )
+            return len(deleted_ids)
 
     async def list_asset_views(
         self,
@@ -1772,6 +1805,28 @@ class CurrentClusterRepository:
                 for_update=True,
             )
             cluster.mode = parsed_mode.value
+            await session.flush()
+            await session.refresh(cluster)
+            return _current_cluster_record(cluster)
+
+    async def set_name(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        name: str,
+    ) -> CurrentClusterRecord:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("current cluster name cannot be empty")
+        async with self._database.session() as session, session.begin():
+            cluster = await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                for_update=True,
+            )
+            cluster.name = normalized_name
             await session.flush()
             await session.refresh(cluster)
             return _current_cluster_record(cluster)

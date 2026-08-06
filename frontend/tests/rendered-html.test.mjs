@@ -138,7 +138,7 @@ test("cluster workspace keeps history and exposes current resident controls", as
 });
 
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage, api] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage, api, worker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -150,6 +150,7 @@ test("removes all disposable starter-preview references", async () => {
     readFile(new URL("../app/clusters/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/capsules/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/v1\/search/);
@@ -192,11 +193,19 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /current_cluster_not_found/);
   assert.match(clustersPage, /\/api\/v1\/clusters\/assets\/status\?/);
   assert.match(clustersPage, /refreshClusterDimension/);
+  assert.match(clustersPage, /RUN_POLL_INTERVAL_MS/);
+  assert.match(clustersPage, /完成后会自动展示结果/);
+  assert.match(clustersPage, /当前维度已有全量重聚类任务/);
   assert.doesNotMatch(clustersPage, /setInterval\(/);
   assert.match(clustersPage, /assetStatus\?\.items/);
   assert.match(api, /type ClusterAssetStatus =/);
   assert.match(api, /baseline_sample_count: number \| null/);
   assert.match(api, /class ApiRequestError extends Error/);
+  assert.doesNotMatch(api, /http:\/\/localhost:8010/);
+  assert.doesNotMatch(clustersPage, /http:\/\/localhost:8010/);
+  assert.match(worker, /url\.pathname\.startsWith\("\/api\/"\)/);
+  assert.match(worker, /127\.0\.0\.1/);
+  assert.match(worker, /proxyRequest\.duplex = "half"/);
   assert.match(clustersPage, /setMinSamples\] = useState\("3"\)/);
   assert.match(clustersPage, /开放常驻/);
   assert.match(clustersPage, /手动管理/);

@@ -505,7 +505,19 @@ class NewAssetClusterStatusResponse(BaseModel):
 class CurrentClusterPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: ClusterMode
+    mode: ClusterMode | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=1024)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def require_change(self) -> "CurrentClusterPatch":
+        if self.mode is None and self.name is None:
+            raise ValueError("mode or name is required")
+        return self
 
 
 AssetId = Annotated[str, Field(min_length=1, max_length=64)]

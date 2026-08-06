@@ -47,6 +47,11 @@ class ImportJobStarted(BaseModel):
     file_count: int
 
 
+class ImportJobsCleared(BaseModel):
+    deleted_count: int
+    cancelled_count: int
+
+
 def _import_service(request: Request) -> BrowserImportService:
     service = getattr(request.app.state, "import_service", None)
     if service is None:
@@ -101,6 +106,21 @@ async def list_import_jobs(
         limit=max(1, min(limit, 200)),
     )
     return ProcessingJobListResponse(items=items)
+
+
+@router.delete("/import-jobs", response_model=ImportJobsCleared)
+async def clear_import_jobs(
+    request: Request,
+    workspace_id: str,
+) -> ImportJobsCleared:
+    cancelled_count = await _import_service(request).cancel_active_jobs(
+        workspace_id=workspace_id
+    )
+    deleted_count = await _asset_repository(request).clear_jobs(workspace_id=workspace_id)
+    return ImportJobsCleared(
+        deleted_count=deleted_count,
+        cancelled_count=cancelled_count,
+    )
 
 
 @router.post(

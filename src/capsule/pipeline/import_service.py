@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol
 from uuid import uuid4
 
 from fastapi import UploadFile
@@ -469,6 +469,7 @@ class BrowserImportService:
         self._understanding_service = understanding_service
         self._embedding_service = embedding_service
         self._incremental_cluster_processor = incremental_cluster_processor
+        self._active_executions: dict[str, tuple[str, asyncio.Task[Any]]] = {}
 
     async def create_job(self, *, workspace_id: str) -> BrowserImportJob:
         root = self._settings.import_root.expanduser().resolve()
@@ -501,12 +502,17 @@ class BrowserImportService:
         if not staged_path.is_dir():
             raise ImportSubmissionError("import staging directory is unavailable")
         try:
-            return await asyncio.to_thread(
+            size_bytes = await asyncio.to_thread(
                 _copy_upload_atomically,
                 file.file,
                 target,
                 self._settings.import_file_max_bytes,
             )
+            await self._repository.mark_import_upload_activity(
+                job_id=job_id,
+                workspace_id=workspace_id,
+            )
+            return size_bytes
         except ImportFileTooLargeError:
             raise
         except OSError as exc:
@@ -541,6 +547,9 @@ class BrowserImportService:
         workspace_id: str,
     ) -> PipelineRunResult | None:
         enrichment_pipeline: AssetEnrichmentPipeline | None = None
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_executions[completion.job_id] = (workspace_id, current_task)
         try:
             if self._understanding_service is not None and self._embedding_service is not None:
                 enrichment_pipeline = AssetEnrichmentPipeline(
@@ -578,12 +587,32 @@ class BrowserImportService:
             )
             await enrichment_pipeline.finish()
             return result
+        except asyncio.CancelledError:
+            if enrichment_pipeline is not None:
+                await enrichment_pipeline.abort()
+            return None
         except Exception as exc:
             if enrichment_pipeline is not None:
                 await enrichment_pipeline.abort()
             message = str(exc) or type(exc).__name__
             await self._repository.fail_job(job_id=completion.job_id, error=message)
             return None
+        finally:
+            active = self._active_executions.get(completion.job_id)
+            if active is not None and active[1] is current_task:
+                self._active_executions.pop(completion.job_id, None)
+
+    async def cancel_active_jobs(self, *, workspace_id: str) -> int:
+        tasks = [
+            task
+            for active_workspace_id, task in self._active_executions.values()
+            if active_workspace_id == workspace_id and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
 
     def _job_staging_path(self, input_path: str) -> Path:
         root = self._settings.import_root.expanduser().resolve()

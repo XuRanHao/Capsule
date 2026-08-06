@@ -1,10 +1,13 @@
 import asyncio
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlencode, urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
 from capsule.config import Settings
@@ -136,6 +139,49 @@ async def get_asset_preview(
     return await _serve_uri(request, uri=uri, media_type=media_type)
 
 
+@router.get("/{asset_id}/thumbnail", name="get_asset_thumbnail")
+async def get_asset_thumbnail(
+    asset_id: str,
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> Response:
+    target = await _media_target(request, asset_id=asset_id, workspace_id=workspace_id)
+    uri = target.preview_uri
+    if uri is None and target.asset_type == "image":
+        uri = target.derived_file_uri or target.source_storage_uri
+    if uri is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "asset_thumbnail_not_found", "message": "asset has no thumbnail"},
+        )
+
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return await _serve_uri(request, uri=uri, media_type=None)
+
+    settings = cast(Settings, request.app.state.settings)
+    path = await asyncio.to_thread(
+        _validated_local_path,
+        settings,
+        unquote(parsed.path),
+    )
+    stat = await asyncio.to_thread(path.stat)
+    try:
+        content = await asyncio.to_thread(
+            _render_local_thumbnail,
+            str(path),
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+    except (OSError, UnidentifiedImageError):
+        return FileResponse(path)
+    return Response(
+        content=content,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
+
+
 @router.get("/{asset_id}/content", name="get_asset_content")
 async def get_asset_content(
     asset_id: str,
@@ -228,17 +274,37 @@ def _validated_local_path(settings: Settings, raw_path: str) -> Path:
     return path
 
 
+@lru_cache(maxsize=256)
+def _render_local_thumbnail(
+    path_value: str,
+    _modified_at_ns: int,
+    _source_size: int,
+) -> bytes:
+    with Image.open(path_value) as source:
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((480, 480), Image.Resampling.LANCZOS)
+        if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            flattened = Image.new("RGB", rgba.size, "white")
+            flattened.paste(rgba, mask=rgba.getchannel("A"))
+            image = flattened
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=76, optimize=True, progressive=True)
+        return output.getvalue()
+
+
 def _with_media_urls(request: Request, item: AssetViewRecord) -> AssetViewRecord:
     query = {"workspace_id": item.workspace_id}
-    content_url = str(
-        request.url_for("get_asset_content", asset_id=item.asset_id).include_query_params(**query)
+    query_string = urlencode(query)
+    content_url = (
+        f"{request.url_for('get_asset_content', asset_id=item.asset_id).path}"
+        f"?{query_string}"
     )
     preview_url = (
-        str(
-            request.url_for("get_asset_preview", asset_id=item.asset_id).include_query_params(
-                **query
-            )
-        )
+        f"{request.url_for('get_asset_thumbnail', asset_id=item.asset_id).path}"
+        f"?{query_string}"
         if item.asset_type.value in {"image", "video_segment"}
         else None
     )

@@ -22,6 +22,7 @@ class FakeAssetRepository:
         self.import_root: Path | None = None
         self.status = "queued"
         self.started_count: int | None = None
+        self.upload_activity_count = 0
 
     async def create_pending_import_job(self, **values: object) -> str:
         self.import_root = values["import_root"]  # type: ignore[assignment]
@@ -49,6 +50,11 @@ class FakeAssetRepository:
         assert job_id == "job_import_test"
         self.status = "running"
         self.started_count = total_count
+
+    async def mark_import_upload_activity(self, *, job_id: str, workspace_id: str) -> None:
+        assert job_id == "job_import_test"
+        assert workspace_id == "workspace_import_test"
+        self.upload_activity_count += 1
 
     async def fail_job(self, **_: object) -> None:
         raise AssertionError("import should not fail")
@@ -96,6 +102,7 @@ async def test_browser_import_uploads_each_file_before_assetization(tmp_path: Pa
 
     assert (job.staged_path / "references/notes/note.md").read_bytes() == b"# Retried version"
     assert repository.started_count == 1
+    assert repository.upload_activity_count == 2
     assert runner.calls == [
         {
             "input_path": job.staged_path,
@@ -103,6 +110,42 @@ async def test_browser_import_uploads_each_file_before_assetization(tmp_path: Pa
             "job_id": "job_import_test",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_browser_import_can_cancel_an_active_execution(tmp_path: Path) -> None:
+    repository = FakeAssetRepository()
+    started = asyncio.Event()
+
+    class BlockingRunner:
+        async def run(self, *_: object, **__: object) -> SimpleNamespace:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled execution must not resume")
+
+    service = BrowserImportService(
+        settings=Settings(import_root=tmp_path / "imports"),
+        repository=repository,  # type: ignore[arg-type]
+        runner=BlockingRunner(),  # type: ignore[arg-type]
+    )
+    execution = asyncio.create_task(
+        service.execute(
+            completion=ImportCompletion(
+                job_id="job_import_test",
+                staged_path=tmp_path,
+                file_count=1,
+            ),
+            workspace_id="workspace_import_test",
+        )
+    )
+    await started.wait()
+
+    cancelled_count = await service.cancel_active_jobs(
+        workspace_id="workspace_import_test"
+    )
+
+    assert cancelled_count == 1
+    assert await execution is None
 
 
 @pytest.mark.asyncio

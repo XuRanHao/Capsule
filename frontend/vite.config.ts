@@ -44,9 +44,23 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: {
+      allowedHosts: [".trycloudflare.com"],
+      ...(isCodexSeatbeltSandbox
+        ? { watch: { useFsEvents: false, usePolling: true } }
+        : {}),
+      // Keep browser requests on the same origin. This makes local use and a
+      // temporary HTTPS tunnel behave identically while computation remains
+      // on the local API process.
+      proxy: {
+        "/api": {
+          target: "http://127.0.0.1:8010",
+        },
+        "/health": {
+          target: "http://127.0.0.1:8010",
+        },
+      },
+    },
     plugins: [
       vinext(),
       sites(),

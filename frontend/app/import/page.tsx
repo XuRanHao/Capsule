@@ -12,6 +12,15 @@ type QueuedFile = {
   size: number;
 };
 
+type ImportPhase = "creating" | "uploading" | "starting";
+
+type UploadProgress = {
+  completed: number;
+  loadedBytes: number;
+  totalBytes: number;
+  currentName: string;
+};
+
 const folderInputProps = {
   webkitdirectory: "",
   directory: "",
@@ -77,8 +86,58 @@ function formatBytes(bytes: number) {
 }
 
 function endpoint(path: string) {
-  const base = process.env.NEXT_PUBLIC_CAPSULE_API_BASE_URL || "http://localhost:8010";
+  const base = process.env.NEXT_PUBLIC_CAPSULE_API_BASE_URL ?? "";
   return `${base.replace(/\/$/, "")}${path}`;
+}
+
+function uploadFile(
+  {
+    jobId,
+    workspaceId,
+    item,
+    onProgress,
+  }: {
+    jobId: string;
+    workspaceId: string;
+    item: QueuedFile;
+    onProgress: (loadedBytes: number) => void;
+  },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.set("workspace_id", workspaceId);
+    form.set("relative_path", item.path);
+    form.set("file", item.file, item.name);
+
+    const request = new XMLHttpRequest();
+    request.open(
+      "POST",
+      endpoint(`/api/v1/import-jobs/${encodeURIComponent(jobId)}/files`),
+    );
+    request.upload.onprogress = (event) => {
+      onProgress(Math.min(event.loaded, item.size));
+    };
+    request.onerror = () => reject(new Error(`上传 ${item.name} 时网络中断`));
+    request.onabort = () => reject(new Error(`上传 ${item.name} 已取消`));
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        onProgress(item.size);
+        resolve();
+        return;
+      }
+      let message = `上传 ${item.name} 失败`;
+      try {
+        const body = JSON.parse(request.responseText) as {
+          detail?: { message?: string };
+        };
+        message = body.detail?.message || message;
+      } catch {
+        // Keep the file-specific fallback when the proxy returns a non-JSON error.
+      }
+      reject(new Error(message));
+    };
+    request.send(form);
+  });
 }
 
 export default function ImportPage() {
@@ -89,7 +148,8 @@ export default function ImportPage() {
   const [dragging, setDragging] = useState(false);
   const [starting, setStarting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [importPhase, setImportPhase] = useState<ImportPhase | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
 
   const counts = useMemo(
     () => ({
@@ -137,7 +197,8 @@ export default function ImportPage() {
     if (!files.length) return;
     setStarting(true);
     setImportError(null);
-    setUploadProgress(0);
+    setImportPhase("creating");
+    setUploadProgress(null);
     try {
       const workspaceId = "workspace_demo";
       const created = await fetch(endpoint("/api/v1/import-jobs"), {
@@ -151,35 +212,58 @@ export default function ImportPage() {
       }
       const { job_id: jobId } = (await created.json()) as { job_id: string };
 
-      for (const [index, item] of files.entries()) {
-        const form = new FormData();
-        form.set("workspace_id", workspaceId);
-        form.set("relative_path", item.path);
-        form.set("file", item.file, item.name);
+      setImportPhase("uploading");
+      const loadedByPath = new Map<string, number>();
+      let completed = 0;
+      let nextIndex = 0;
+      const publishProgress = (item: QueuedFile, loadedBytes: number) => {
+        loadedByPath.set(item.path, loadedBytes);
+        setUploadProgress({
+          completed,
+          loadedBytes: Array.from(loadedByPath.values()).reduce(
+            (total, loaded) => total + loaded,
+            0,
+          ),
+          totalBytes: counts.bytes,
+          currentName: item.name,
+        });
+      };
+      const uploadItem = async (item: QueuedFile) => {
         let lastError: Error | null = null;
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
-            const uploaded = await fetch(
-              endpoint(`/api/v1/import-jobs/${encodeURIComponent(jobId)}/files`),
-              { method: "POST", body: form },
-            );
-            if (!uploaded.ok) {
-              const body = await uploaded.json().catch(() => null);
-              throw new Error(body?.detail?.message || `上传 ${item.name} 失败`);
-            }
+            await uploadFile({
+              jobId,
+              workspaceId,
+              item,
+              onProgress: (loadedBytes) => publishProgress(item, loadedBytes),
+            });
             lastError = null;
             break;
           } catch (error) {
             lastError = error instanceof Error ? error : new Error(`上传 ${item.name} 失败`);
+            publishProgress(item, 0);
             if (attempt < 2) {
               await new Promise((resolve) => window.setTimeout(resolve, 600 * (attempt + 1)));
             }
           }
         }
         if (lastError) throw lastError;
-        setUploadProgress(index + 1);
-      }
+        completed += 1;
+        publishProgress(item, item.size);
+      };
+      const uploadWorker = async () => {
+        while (nextIndex < files.length) {
+          const item = files[nextIndex];
+          nextIndex += 1;
+          await uploadItem(item);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(4, files.length) }, () => uploadWorker()),
+      );
 
+      setImportPhase("starting");
       const started = await fetch(
         endpoint(`/api/v1/import-jobs/${encodeURIComponent(jobId)}/complete`),
         {
@@ -197,6 +281,7 @@ export default function ImportPage() {
       setImportError(error instanceof Error ? error.message : "创建导入任务失败");
     } finally {
       setStarting(false);
+      setImportPhase(null);
       setUploadProgress(null);
     }
   };
@@ -354,14 +439,24 @@ export default function ImportPage() {
           <small>WORKSPACE</small>
           <strong>workspace_demo</strong>
           <span>
-            {uploadProgress === null
-              ? `${files.length} 个 Source File 将进入处理队列`
-              : `正在上传 ${uploadProgress}/${files.length}`}
+            {importPhase === "creating"
+              ? "正在创建导入任务"
+              : importPhase === "starting"
+                ? "上传完成，正在启动处理任务"
+                : importPhase === "uploading" && uploadProgress
+                  ? `正在上传 ${uploadProgress.completed}/${files.length} · ${Math.round((uploadProgress.loadedBytes / Math.max(1, uploadProgress.totalBytes)) * 100)}% · ${uploadProgress.currentName}`
+                  : `${files.length} 个 Source File 将进入处理队列`}
           </span>
           {importError && <span className="import-error">{importError}</span>}
         </div>
         <button disabled={!files.length || starting} onClick={startImport}>
-          {starting ? "正在创建任务…" : "开始处理"}
+          {importPhase === "creating"
+            ? "正在创建任务…"
+            : importPhase === "uploading"
+              ? "正在上传…"
+              : importPhase === "starting"
+                ? "正在启动处理…"
+                : "开始处理"}
           <b>↗</b>
         </button>
       </div>

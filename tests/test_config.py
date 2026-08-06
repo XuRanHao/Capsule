@@ -84,10 +84,10 @@ def test_video_keyframe_size_cannot_diverge_from_media_writer_contract() -> None
         Settings(video_keyframe_size=256)
 
 
-def test_incremental_cluster_defaults_are_conservative() -> None:
+def test_incremental_cluster_defaults_balance_recall_and_precision() -> None:
     settings = Settings()
 
-    assert settings.cluster_incremental_assignment_threshold == 0.92
+    assert settings.cluster_incremental_assignment_threshold == 0.88
     assert settings.cluster_bootstrap_minimum_count == 50
     assert settings.cluster_bootstrap_concurrency == 1
     assert "cluster_recluster_ratio_threshold" not in Settings.model_fields

@@ -116,8 +116,8 @@ class FullClusterRunner(Protocol):
 class IncrementalAssignmentThresholds:
     """Cosine thresholds for the two algorithm-addressable cluster modes."""
 
-    resident_open: float = 0.92
-    dynamic: float = 0.92
+    resident_open: float = 0.88
+    dynamic: float = 0.88
 
     def __post_init__(self) -> None:
         for field_name, value in (

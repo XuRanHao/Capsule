@@ -190,6 +190,17 @@ class FakeCurrentClusterRepository:
         self.cluster = self.cluster.model_copy(update={"mode": mode})
         return self.cluster
 
+    async def set_name(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        name: str,
+    ) -> CurrentClusterRecord:
+        await self.get_cluster(cluster_id=cluster_id, workspace_id=workspace_id)
+        self.cluster = self.cluster.model_copy(update={"name": name})
+        return self.cluster
+
     async def attach_members(
         self,
         *,
@@ -320,6 +331,11 @@ async def test_current_cluster_api_supports_resident_membership_workflow() -> No
                 params={"workspace_id": "workspace_current_test"},
                 json={"mode": "resident_open"},
             )
+            renamed = await client.patch(
+                "/api/v1/clusters/cluster_current_test",
+                params={"workspace_id": "workspace_current_test"},
+                json={"name": "  新的簇名  "},
+            )
             attached = await client.post(
                 "/api/v1/clusters/cluster_current_test/members:attach",
                 params={"workspace_id": "workspace_current_test"},
@@ -349,6 +365,8 @@ async def test_current_cluster_api_supports_resident_membership_workflow() -> No
     assert listed.json()["items"][0]["mode"] == "dynamic"
     assert patched.status_code == 200
     assert patched.json()["mode"] == "resident_open"
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "新的簇名"
     assert attached.json() == {
         "cluster_id": "cluster_current_test",
         "asset_ids": ["asset_1", "asset_2"],

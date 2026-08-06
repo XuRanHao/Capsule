@@ -66,6 +66,8 @@ export default function TasksPage() {
   const [jobs, setJobs] = useState<ProcessingJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [clearMessage, setClearMessage] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -94,6 +96,38 @@ export default function TasksPage() {
     }
   }, []);
 
+  const clearJobs = async () => {
+    if (
+      !window.confirm(
+        "强制清空全部处理任务？正在上传或运行的任务会立即停止，但已生成的素材与聚类结果不会删除。",
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    setClearMessage(null);
+    try {
+      const result = await apiFetch<{
+        deleted_count: number;
+        cancelled_count: number;
+      }>(`/api/v1/import-jobs?workspace_id=${WORKSPACE_ID}`, {
+        method: "DELETE",
+      });
+      setClearMessage(
+        result.cancelled_count
+          ? `已停止 ${result.cancelled_count} 个运行任务，并清空 ${result.deleted_count} 条任务记录。`
+          : `已清空 ${result.deleted_count} 个处理任务。`,
+      );
+      await load();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "清空任务失败",
+      );
+    } finally {
+      setClearing(false);
+    }
+  };
+
   useEffect(() => {
     const initial = window.setTimeout(() => void load(), 0);
     const polling = window.setInterval(() => void load(), 2000);
@@ -104,8 +138,10 @@ export default function TasksPage() {
   }, [load]);
 
   const selected = jobs.find((job) => job.job_id === selectedId) ?? jobs[0];
-  const currentStage = selected
-    ? PIPELINE_STAGES.indexOf(selected.current_stage)
+  const effectiveStage =
+    selected?.status === "completed" ? "completed" : selected?.current_stage;
+  const currentStage = effectiveStage
+    ? PIPELINE_STAGES.indexOf(effectiveStage)
     : -1;
   const elapsed = useMemo(() => {
     if (!selected) return "—";
@@ -124,11 +160,21 @@ export default function TasksPage() {
       title="每一步，都看得见。"
       description="实时读取导入 Job，展示解析、理解、Embedding 和 Milvus 入库阶段。"
       actions={
-        <Link className="primary-action button-link" href="/import">
-          新建导入
-        </Link>
+        <>
+          <button
+            className="secondary-action"
+            disabled={clearing || jobs.length === 0}
+            onClick={() => void clearJobs()}
+          >
+            {clearing ? "正在清空…" : "清空处理任务"}
+          </button>
+          <Link className="primary-action button-link" href="/import">
+            新建导入
+          </Link>
+        </>
       }
     >
+      {clearMessage && <div className="task-clear-message">{clearMessage}</div>}
       {error && (
         <div className="asset-empty">
           <strong>无法读取任务</strong>
@@ -194,7 +240,7 @@ export default function TasksPage() {
               {PIPELINE_STAGES.map((stage, index) => {
                 const completed =
                   selected.status === "completed" || index < currentStage;
-                const active = index === currentStage;
+                const active = selected.status === "running" && index === currentStage;
                 const duration =
                   stage === "completed"
                     ? elapsedMilliseconds(selected)
@@ -212,7 +258,9 @@ export default function TasksPage() {
                       {active && selected.status === "running"
                         ? "计时中…"
                         : completed
-                          ? formatDuration(duration)
+                          ? duration == null
+                            ? "已跳过"
+                            : formatDuration(duration)
                           : "等待"}
                     </small>
                   </div>
@@ -234,7 +282,7 @@ export default function TasksPage() {
               <article>
                 <small>STAGE</small>
                 <strong>{currentStage + 1}</strong>
-                <span>{STAGE_LABELS[selected.current_stage]}</span>
+                <span>{STAGE_LABELS[effectiveStage || selected.current_stage]}</span>
               </article>
               <article>
                 <small>ERRORS</small>
@@ -258,7 +306,9 @@ export default function TasksPage() {
                 <div>
                   <span className="eyebrow">CURRENT STAGE</span>
                   <h3>
-                    {STAGE_LABELS[selected.current_stage] || selected.current_stage}
+                    {STAGE_LABELS[effectiveStage || selected.current_stage] ||
+                      effectiveStage ||
+                      selected.current_stage}
                   </h3>
                 </div>
                 <span className="live-pulse">
@@ -277,17 +327,19 @@ export default function TasksPage() {
                 </p>
                 <p className="console-active">
                   <span>STAGE</span>
-                  {STAGE_LABELS[selected.current_stage] || selected.current_stage}
+                  {STAGE_LABELS[effectiveStage || selected.current_stage] ||
+                    effectiveStage ||
+                    selected.current_stage}
                 </p>
                 <p>
                   <span>DURATION</span>
                   {selected.status === "running"
                     ? "计时中…"
                     : formatDuration(
-                        selected.current_stage === "completed"
+                        effectiveStage === "completed"
                           ? elapsedMilliseconds(selected)
                           : selected.stage_durations_ms?.[
-                              selected.current_stage
+                              effectiveStage || selected.current_stage
                             ],
                       )}
                 </p>

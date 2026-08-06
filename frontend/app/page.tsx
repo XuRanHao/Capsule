@@ -138,7 +138,7 @@ type CapsuleDetail = CapsuleSummary & {
 };
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8010";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 const QUERY_TYPES: Array<{ value: QueryType; label: string; marker: string }> = [
   { value: "text", label: "文字", marker: "T" },
@@ -454,7 +454,7 @@ function getPreviewUrl(
   const base = apiBaseUrl.replace(/\/$/, "");
   return `${base}/api/v1/assets/${encodeURIComponent(
     result.asset_id,
-  )}/preview?workspace_id=${encodeURIComponent(workspaceId)}`;
+  )}/thumbnail?workspace_id=${encodeURIComponent(workspaceId)}`;
 }
 
 function locatorTime(locator: Record<string, unknown>) {

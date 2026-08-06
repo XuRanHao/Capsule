@@ -63,6 +63,8 @@ const GROUP_COLORS = [
 const GRAPH_MIN_SCALE = 0.35;
 const GRAPH_MAX_SCALE = 2.4;
 const GRAPH_MEMBER_LIMIT = 32;
+const RUN_POLL_INTERVAL_MS = 1_000;
+const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
 
 const CURRENT_CLUSTER_MODES: Array<{
   value: CurrentClusterMode;
@@ -103,6 +105,27 @@ function clusterAssetStatusLabel(status: ClusterAssetStatusItem["status"]) {
 function parseAssetIds(value: string) {
   return [...new Set(value.split(/[\s,，]+/).map((item) => item.trim()))].filter(
     Boolean,
+  );
+}
+
+function CurrentMemberThumbnail({ assetId }: { assetId: string }) {
+  const [failed, setFailed] = useState(false);
+  const previewUrl = `/api/v1/assets/${encodeURIComponent(assetId)}/thumbnail?workspace_id=${encodeURIComponent(WORKSPACE_ID)}`;
+
+  return (
+    <span className="current-member-thumbnail">
+      {failed ? (
+        <small>NO PREVIEW</small>
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={previewUrl}
+          alt={`${assetId} 缩略图`}
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      )}
+    </span>
   );
 }
 
@@ -170,6 +193,10 @@ function runOptionLabel(run: ClusterRun) {
   const minSamples = runParameter(run.parameters.min_samples);
   const minClusterSize = runParameter(run.parameters.min_cluster_size);
   return `${feature} · ${run.status} · ${run.sample_count} 条 · PCA ${pca} / MS ${minSamples} / MCS ${minClusterSize}`;
+}
+
+function isActiveRun(run: ClusterRun | undefined) {
+  return Boolean(run && ACTIVE_RUN_STATUSES.has(run.status));
 }
 
 function placeMemberNodes(
@@ -466,6 +493,7 @@ export default function ClustersPage() {
   const [assetIdsInput, setAssetIdsInput] = useState("");
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
   const [running, setRunning] = useState(false);
+  const [runNotice, setRunNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const currentClusterRequestRef = useRef(0);
   const assetStatusRequestRef = useRef(0);
@@ -655,6 +683,78 @@ export default function ClustersPage() {
   const selectedRun =
     runs.find((run) => run.cluster_run_id === selectedRunId) ?? runs[0];
 
+  const activeRunForDimension = runs.find(
+    (run) => run.embedding_type === embeddingType && isActiveRun(run),
+  );
+
+  useEffect(() => {
+    if (!isActiveRun(selectedRun)) return;
+
+    let cancelled = false;
+    let pollTimer: number | undefined;
+
+    const pollRun = async () => {
+      try {
+        const run = await apiFetch<ClusterRun>(
+          `/api/v1/cluster-runs/${encodeURIComponent(selectedRun.cluster_run_id)}?workspace_id=${WORKSPACE_ID}`,
+        );
+        if (cancelled) return;
+
+        setRuns((current) => {
+          const exists = current.some(
+            (item) => item.cluster_run_id === run.cluster_run_id,
+          );
+          return exists
+            ? current.map((item) =>
+                item.cluster_run_id === run.cluster_run_id ? run : item,
+              )
+            : [run, ...current];
+        });
+
+        if (isActiveRun(run)) {
+          setRunNotice(
+            run.status === "pending"
+              ? "全量重聚类已提交，等待开始计算…"
+              : "全量重聚类正在计算，完成后会自动展示结果…",
+          );
+          pollTimer = window.setTimeout(pollRun, RUN_POLL_INTERVAL_MS);
+          return;
+        }
+
+        if (run.status === "completed") {
+          setRunNotice(
+            `全量重聚类完成：${run.cluster_count ?? 0} 个簇，${run.noise_count ?? 0} 个噪声样本。`,
+          );
+          setError(null);
+        } else if (run.status === "insufficient_data") {
+          setRunNotice("全量重聚类完成，但当前维度样本不足，未生成簇。");
+        } else if (run.status === "failed") {
+          const reason =
+            typeof run.preprocessing.error === "string"
+              ? `：${run.preprocessing.error}`
+              : "";
+          setRunNotice(null);
+          setError(`全量重聚类失败${reason}`);
+        }
+        await refreshClusterDimension();
+      } catch (requestError) {
+        if (cancelled) return;
+        setError(
+          requestError instanceof Error
+            ? `聚类状态刷新失败：${requestError.message}`
+            : "聚类状态刷新失败",
+        );
+        pollTimer = window.setTimeout(pollRun, RUN_POLL_INTERVAL_MS);
+      }
+    };
+
+    pollTimer = window.setTimeout(pollRun, RUN_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer);
+    };
+  }, [refreshClusterDimension, selectedRun]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       if (
@@ -744,8 +844,14 @@ export default function ClustersPage() {
   }, [selectedCapsule?.cluster_capsule_id]);
 
   const createRun = async () => {
+    if (activeRunForDimension) {
+      setSelectedRunId(activeRunForDimension.cluster_run_id);
+      setRunNotice("当前维度已有全量重聚类任务，正在等待它完成…");
+      return;
+    }
     setRunning(true);
     setError(null);
+    setRunNotice("正在提交全量重聚类任务…");
     try {
       const parsedPcaDimension = parseIntegerParameter(
         "PCA Dimension",
@@ -779,8 +885,19 @@ export default function ClustersPage() {
         },
       );
       setSelectedRunId(submitted.cluster_run_id);
-      await Promise.all([loadRuns(), loadAssetStatus()]);
+      const submittedRun = await apiFetch<ClusterRun>(
+        `/api/v1/cluster-runs/${encodeURIComponent(submitted.cluster_run_id)}?workspace_id=${WORKSPACE_ID}`,
+      );
+      setRuns((current) => [
+        submittedRun,
+        ...current.filter(
+          (run) => run.cluster_run_id !== submittedRun.cluster_run_id,
+        ),
+      ]);
+      setRunNotice("全量重聚类已提交，完成后会自动展示结果…");
+      await loadAssetStatus();
     } catch (requestError) {
+      setRunNotice(null);
       setError(
         requestError instanceof Error
           ? requestError.message
@@ -791,22 +908,33 @@ export default function ClustersPage() {
     }
   };
 
-  const updateName = async (value: string) => {
-    if (!selectedCapsule || !value.trim()) return;
-    const updated = await apiFetch<ClusterCapsule>(
-      `/api/v1/cluster-capsules/${selectedCapsule.cluster_capsule_id}?workspace_id=${WORKSPACE_ID}`,
-      {
-        method: "PATCH",
-        body: JSON.stringify({ name: value.trim() }),
-      },
-    );
-    setCapsules((current) =>
-      current.map((capsule) =>
-        capsule.cluster_capsule_id === updated.cluster_capsule_id
-          ? updated
-          : capsule,
-      ),
-    );
+  const renameCurrentCluster = async (value: string) => {
+    if (!selectedCurrentCluster || !value.trim()) return;
+    setCurrentMutation("rename");
+    setCurrentError(null);
+    setCurrentNotice(null);
+    try {
+      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const updated = await apiFetch<CurrentCluster>(
+        `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}?${params}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ name: value.trim() }),
+        },
+      );
+      setCurrentClusters((current) =>
+        current.map((cluster) =>
+          cluster.cluster_id === updated.cluster_id ? updated : cluster,
+        ),
+      );
+      setCurrentNotice(`已重命名为 ${updated.name}`);
+    } catch (requestError) {
+      setCurrentError(
+        requestError instanceof Error ? requestError.message : "簇重命名失败",
+      );
+    } finally {
+      setCurrentMutation("");
+    }
   };
 
   const updateCurrentMode = async (mode: CurrentClusterMode) => {
@@ -986,11 +1114,15 @@ export default function ClustersPage() {
       actions={
         <button
           className="primary-action"
-          disabled={running}
+          disabled={running || Boolean(activeRunForDimension)}
           title="只有点击此按钮，才会对当前维度执行全量重聚类"
           onClick={createRun}
         >
-          {running ? "正在启动全量重聚类…" : "＋ 全量重聚类当前维度"}
+          {running
+            ? "正在提交全量重聚类…"
+            : activeRunForDimension
+              ? "正在全量重聚类…"
+              : "＋ 全量重聚类当前维度"}
         </button>
       }
     >
@@ -1000,7 +1132,16 @@ export default function ClustersPage() {
             Feature Type
             <select
               value={embeddingType}
-              onChange={(event) => setEmbeddingType(event.target.value)}
+              onChange={(event) => {
+                const nextEmbeddingType = event.target.value;
+                setEmbeddingType(nextEmbeddingType);
+                setSelectedRunId(
+                  runs.find(
+                    (run) => run.embedding_type === nextEmbeddingType,
+                  )?.cluster_run_id || "",
+                );
+                setRunNotice(null);
+              }}
             >
               {FEATURE_TYPES.map((item) => (
                 <option value={item.value} key={item.value}>
@@ -1095,8 +1236,13 @@ export default function ClustersPage() {
             <StatusBadge status={selectedRun?.status || "pending"} />
           </span>
         </div>
-        <p className="full-recluster-note">
-          历史 Cluster Run 仅供查看；只有点击“全量重聚类当前维度”才会重新计算全部动态样本。
+        <p
+          className={`full-recluster-note ${runNotice ? "active" : ""}`}
+          role={runNotice ? "status" : undefined}
+          aria-live="polite"
+        >
+          {runNotice ||
+            "历史 Cluster Run 仅供查看；只有点击“全量重聚类当前维度”才会重新计算全部动态样本。"}
         </p>
       </section>
 
@@ -1271,7 +1417,22 @@ export default function ClustersPage() {
                       {selectedCurrentCluster.description || "暂无簇描述"}
                     </p>
                   </div>
-                  <strong>{currentMembers.length} MEMBERS</strong>
+                  <div className="current-cluster-heading-actions">
+                    <strong>{currentMembers.length} MEMBERS</strong>
+                    <button
+                      type="button"
+                      disabled={Boolean(currentMutation)}
+                      onClick={() => {
+                        const name = window.prompt(
+                          "输入新的簇名称",
+                          selectedCurrentCluster.name,
+                        );
+                        if (name) void renameCurrentCluster(name);
+                      }}
+                    >
+                      {currentMutation === "rename" ? "重命名中…" : "重命名"}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="cluster-mode-controls" role="group" aria-label="簇模式">
@@ -1330,6 +1491,7 @@ export default function ClustersPage() {
 
                 <div className="current-member-table">
                   <div className="current-member-row current-member-head">
+                    <span>缩略图</span>
                     <span>Asset ID</span>
                     <span>来源</span>
                     <span>归类分数</span>
@@ -1340,6 +1502,7 @@ export default function ClustersPage() {
                   )}
                   {currentMembers.map((member) => (
                     <div className="current-member-row" key={member.asset_id}>
+                      <CurrentMemberThumbnail assetId={member.asset_id} />
                       <strong title={member.asset_id}>{member.asset_id}</strong>
                       <span>{member.source}</span>
                       <span>
@@ -1424,9 +1587,11 @@ export default function ClustersPage() {
             layout={graphLayout}
             selectedCapsuleId={selectedCapsule?.cluster_capsule_id || ""}
             emptyMessage={
-              selectedRun?.status === "running"
+              isActiveRun(selectedRun)
                 ? "正在计算聚类…"
-                : "选择 Embedding Type 并创建第一个 Run"
+                : selectedRun
+                  ? "本次聚类未生成语义分组"
+                  : "选择 Embedding Type 并创建第一个 Run"
             }
             onSelect={setSelectedCapsuleId}
           />
@@ -1521,17 +1686,6 @@ export default function ClustersPage() {
             </div>
             <div>
               <StatusBadge status="completed" />
-              <button
-                onClick={() => {
-                  const name = window.prompt(
-                    "输入新的 Cluster 名称",
-                    selectedCapsule.effective_name,
-                  );
-                  if (name) void updateName(name);
-                }}
-              >
-                用户改名
-              </button>
             </div>
           </header>
           <div className="cluster-member-summary">
@@ -1557,28 +1711,10 @@ export default function ClustersPage() {
                     : `MEMBER ${index + 1}`}
                 </span>
                 <strong>{asset.asset_name || asset.file_name}</strong>
+                <small className="representative-asset-id" title={asset.asset_id}>
+                  {asset.asset_id}
+                </small>
               </article>
-            ))}
-          </div>
-          <div className="member-table">
-            <div className="data-row member-row data-head">
-              <span>成员</span>
-              <span>类型</span>
-              <span>Membership Probability</span>
-              <span>来源</span>
-            </div>
-            {selectedMembers.map((asset) => (
-              <div className="data-row member-row" key={asset.asset_id}>
-                <strong>{asset.asset_name || asset.file_name}</strong>
-                <span>{asset.asset_type}</span>
-                <span className="membership-meter">
-                  <i
-                    style={{ width: `${asset.membership_probability * 100}%` }}
-                  />
-                  <b>{asset.membership_probability.toFixed(2)}</b>
-                </span>
-                <span>{asset.relative_path}</span>
-              </div>
             ))}
           </div>
         </section>

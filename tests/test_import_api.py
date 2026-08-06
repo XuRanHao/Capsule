@@ -15,6 +15,7 @@ class FakeImportService:
         self.uploads: list[dict[str, object]] = []
         self.completions: list[dict[str, object]] = []
         self.executions: list[dict[str, object]] = []
+        self.cancelled_workspaces: list[str] = []
 
     async def create_job(self, *, workspace_id: str) -> BrowserImportJob:
         self.created_workspaces.append(workspace_id)
@@ -35,8 +36,19 @@ class FakeImportService:
     async def execute(self, **values: object) -> None:
         self.executions.append(values)
 
+    async def cancel_active_jobs(self, *, workspace_id: str) -> int:
+        self.cancelled_workspaces.append(workspace_id)
+        return 1
+
 
 class FakeAssetRepository:
+    def __init__(self) -> None:
+        self.cleared_workspaces: list[str] = []
+
+    async def clear_jobs(self, *, workspace_id: str) -> int:
+        self.cleared_workspaces.append(workspace_id)
+        return 4
+
     async def get_job(self, *, job_id: str, workspace_id: str) -> ProcessingJobRecord:
         assert job_id == "job_api_import"
         assert workspace_id == "workspace_import_api"
@@ -104,3 +116,27 @@ async def test_import_api_creates_then_uploads_then_starts_one_job() -> None:
     assert import_service.executions[0]["workspace_id"] == "workspace_import_api"
     assert job.status_code == 200
     assert job.json()["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_import_api_cancels_active_jobs_then_clears_every_job() -> None:
+    repository = FakeAssetRepository()
+    import_service = FakeImportService()
+    app = create_app(
+        settings=Settings(),
+        import_service=import_service,  # type: ignore[arg-type]
+        asset_repository=repository,  # type: ignore[arg-type]
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.delete(
+                "/api/v1/import-jobs",
+                params={"workspace_id": "workspace_import_api"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted_count": 4, "cancelled_count": 1}
+    assert repository.cleared_workspaces == ["workspace_import_api"]
+    assert import_service.cancelled_workspaces == ["workspace_import_api"]

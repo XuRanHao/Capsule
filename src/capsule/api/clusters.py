@@ -2,6 +2,7 @@
 
 import logging
 from typing import Protocol, cast
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -105,6 +106,14 @@ class CurrentClusterRepositoryProtocol(Protocol):
         cluster_id: str,
         workspace_id: str,
         mode: ClusterMode,
+    ) -> CurrentClusterRecord: ...
+
+    async def set_name(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        name: str,
     ) -> CurrentClusterRecord: ...
 
     async def attach_members(
@@ -270,12 +279,24 @@ async def patch_current_cluster(
     request: Request,
     workspace_id: str = Query(min_length=1, max_length=64),
 ) -> CurrentClusterRecord:
+    repository = _current_cluster_repository(request)
     try:
-        return await _current_cluster_repository(request).set_mode(
-            cluster_id=cluster_id,
-            workspace_id=workspace_id,
-            mode=payload.mode,
-        )
+        updated: CurrentClusterRecord | None = None
+        if payload.mode is not None:
+            updated = await repository.set_mode(
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                mode=payload.mode,
+            )
+        if payload.name is not None:
+            updated = await repository.set_name(
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                name=payload.name,
+            )
+        if updated is None:  # pragma: no cover - guarded by request validation
+            raise ValueError("current cluster patch is empty")
+        return updated
     except ValueError as exc:
         raise _current_cluster_not_found(cluster_id) from exc
 
@@ -454,14 +475,14 @@ async def list_cluster_members(
                 "message": str(exc),
             },
         ) from exc
-    base_url = str(request.base_url).rstrip("/")
+    query_string = urlencode({"workspace_id": workspace_id})
     return ClusterMemberListResponse(
         items=[
             member.model_copy(
                 update={
                     "preview_url": (
-                        f"{base_url}/api/v1/assets/{member.asset_id}/preview"
-                        f"?workspace_id={workspace_id}"
+                        f"{request.url_for('get_asset_thumbnail', asset_id=member.asset_id).path}"
+                        f"?{query_string}"
                     )
                     if member.asset_type.value in {"image", "video_segment"}
                     else None
