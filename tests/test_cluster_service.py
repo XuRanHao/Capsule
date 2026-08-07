@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,13 +18,14 @@ from capsule.db.repositories import (
 from capsule.enums import ClusterInternalVariance, ClusterRunStatus, EmbeddingType
 from capsule.pipeline import cluster_service as cluster_service_module
 from capsule.pipeline.cluster_service import ClusterService
-from capsule.pipeline.clustering import ClusterResult, HdbscanParameters
+from capsule.pipeline.clustering import ClusterResult, HdbscanParameters, dataset_hash
 from capsule.schemas import ClusterCapsuleWrite, ClusterSummary
 
 
 class FakeEmbeddingRepository:
     def __init__(self, assets_by_type: Mapping[EmbeddingType, list[ClusterEmbeddingAsset]]) -> None:
         self.assets_by_type = assets_by_type
+        self.calls: list[EmbeddingType] = []
 
     async def list_indexed_cluster_embeddings(
         self,
@@ -31,7 +33,19 @@ class FakeEmbeddingRepository:
         embedding_type: str,
         **_: object,
     ) -> list[ClusterEmbeddingAsset]:
-        return list(self.assets_by_type.get(EmbeddingType(embedding_type), []))
+        requested_type = EmbeddingType(embedding_type)
+        self.calls.append(requested_type)
+        indexed = self.assets_by_type.get(requested_type)
+        if indexed is not None:
+            return list(indexed)
+        if requested_type is EmbeddingType.NATIVE_MULTIMODAL:
+            # Most pre-existing unit scenarios model a single channel.  Give
+            # them a same-Asset native channel so their expectations remain
+            # focused on the clustering behavior rather than fixture plumbing.
+            for source_type, source_assets in self.assets_by_type.items():
+                if source_type is not EmbeddingType.NATIVE_MULTIMODAL:
+                    return [replace(asset) for asset in source_assets]
+        return []
 
 
 class FakeClusterRepository:
@@ -86,12 +100,14 @@ class FakeVectorStore:
     def __init__(self, vectors: Mapping[str, list[float]]) -> None:
         self.vectors = vectors
         self.ensure_calls = 0
+        self.fetch_calls: list[list[str]] = []
 
     async def ensure_collection(self) -> bool:
         self.ensure_calls += 1
         return False
 
     async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]:
+        self.fetch_calls.append(list(embedding_ids))
         return {
             embedding_id: self.vectors[embedding_id]
             for embedding_id in embedding_ids
@@ -134,8 +150,15 @@ class ConcurrentSummaryClient(FakeSummaryClient):
 
 @pytest.mark.asyncio
 async def test_cluster_service_runs_each_requested_embedding_type_independently() -> None:
-    embedding_types = [EmbeddingType.NATIVE_MULTIMODAL, EmbeddingType.VISUAL_STYLE]
-    assets_by_type = {embedding_type: _assets(embedding_type) for embedding_type in embedding_types}
+    visual_assets = _assets(EmbeddingType.VISUAL_STYLE)
+    native_assets = [
+        replace(asset, embedding_id=f"emb_{EmbeddingType.NATIVE_MULTIMODAL.value}_{index}")
+        for index, asset in enumerate(visual_assets)
+    ]
+    assets_by_type = {
+        EmbeddingType.NATIVE_MULTIMODAL: native_assets,
+        EmbeddingType.VISUAL_STYLE: visual_assets,
+    }
     vectors = {
         asset.embedding_id: _vector(index)
         for assets in assets_by_type.values()
@@ -306,6 +329,139 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     assert run["parameters"]["min_samples"] == 3
     assert run["parameters"]["cluster_selection_epsilon"] == 0.5
     assert len(next(iter(repository.memberships.values()))) == 12
+
+
+@pytest.mark.asyncio
+async def test_dimension_clustering_fuses_native_vectors_and_excludes_missing_native() -> None:
+    dimension_type = EmbeddingType.VISUAL_STYLE
+    dimension_assets = _assets(dimension_type, count=4)
+    native_assets = [
+        replace(asset, embedding_id=f"native_{index}")
+        for index, asset in enumerate(dimension_assets)
+    ]
+    vectors = {
+        asset.embedding_id: [1.0, float(index + 1)]
+        for index, asset in enumerate(dimension_assets)
+    }
+    vectors.update(
+        {
+            native_assets[index].embedding_id: [float(index + 1), 1.0]
+            for index in range(3)
+        }
+    )
+    repository = FakeClusterRepository()
+    service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=FakeEmbeddingRepository(
+            {
+                dimension_type: dimension_assets,
+                EmbeddingType.NATIVE_MULTIMODAL: native_assets,
+            }
+        ),  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        vector_store=FakeVectorStore(vectors),
+        model_client=FakeSummaryClient(),
+    )
+
+    result = await service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=dimension_type,
+        native_content_weight=0.25,
+    )
+
+    run = next(iter(repository.runs.values()))
+    assert result.status == ClusterRunStatus.COMPLETED
+    assert result.vector_count == 3
+    assert result.missing_vector_count == 1
+    assert run["embedding_ids"] == [asset.embedding_id for asset in dimension_assets[:3]]
+    assert run["preprocessing"]["vector_fusion"] == {
+        "mode": "l2_normalized_weighted_average",
+        "requested_native_content_weight": 0.25,
+        "effective_native_content_weight": 0.25,
+        "native_content_weight": 0.25,
+        "dimension_weight": 0.75,
+        "components": ["native_multimodal", "visual_style"],
+    }
+    assert run["dataset_hash"] != dataset_hash(run["embedding_ids"])
+
+
+@pytest.mark.asyncio
+async def test_dimension_clustering_fetches_only_nonzero_weight_components() -> None:
+    dimension_type = EmbeddingType.VISUAL_STYLE
+    dimension_assets = _assets(dimension_type, count=3)
+    native_assets = [
+        replace(asset, embedding_id=f"native_{index}")
+        for index, asset in enumerate(dimension_assets)
+    ]
+
+    zero_weight_repository = FakeEmbeddingRepository({dimension_type: dimension_assets})
+    zero_weight_store = FakeVectorStore(
+        {
+            asset.embedding_id: [1.0, float(index + 1)]
+            for index, asset in enumerate(dimension_assets)
+        }
+    )
+    zero_weight_service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=zero_weight_repository,  # type: ignore[arg-type]
+        cluster_repository=FakeClusterRepository(),  # type: ignore[arg-type]
+        vector_store=zero_weight_store,
+        model_client=FakeSummaryClient(),
+    )
+
+    zero_weight_result = await zero_weight_service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=dimension_type,
+        native_content_weight=0.0,
+    )
+
+    assert zero_weight_result.vector_count == 3
+    assert zero_weight_repository.calls == [dimension_type]
+    assert set(zero_weight_store.fetch_calls[0]) == {
+        asset.embedding_id for asset in dimension_assets
+    }
+
+    native_weight_store = FakeVectorStore(
+        {asset.embedding_id: [float(index + 1), 1.0] for index, asset in enumerate(native_assets)}
+    )
+    native_weight_service = ClusterService(
+        settings=Settings(
+            ark_api_key=SecretStr("test-key"),
+            embedding_model="test-embedding",
+            embedding_dimension=2,
+            milvus_collection="cluster-test",
+        ),
+        embedding_repository=FakeEmbeddingRepository(
+            {
+                dimension_type: dimension_assets,
+                EmbeddingType.NATIVE_MULTIMODAL: native_assets,
+            }
+        ),  # type: ignore[arg-type]
+        cluster_repository=FakeClusterRepository(),  # type: ignore[arg-type]
+        vector_store=native_weight_store,
+        model_client=FakeSummaryClient(),
+    )
+
+    native_weight_result = await native_weight_service.run(
+        workspace_id="workspace_cluster_service",
+        embedding_type=dimension_type,
+        native_content_weight=1.0,
+    )
+
+    assert native_weight_result.vector_count == 3
+    assert set(native_weight_store.fetch_calls[0]) == {
+        asset.embedding_id for asset in native_assets
+    }
 
 
 @pytest.mark.asyncio

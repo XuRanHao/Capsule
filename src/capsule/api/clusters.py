@@ -41,6 +41,15 @@ class ClusterRunCreate(BaseModel):
 
     workspace_id: str = Field(min_length=1, max_length=64)
     embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL
+    native_content_weight: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Influence of the native multimodal embedding when clustering a feature dimension. "
+            "The selected dimension receives 1 - native_content_weight."
+        ),
+    )
     pca_dimension: int = Field(default=8, ge=2, le=1024)
     min_samples: int = Field(default=3, ge=1, le=10_000)
     min_cluster_size: int = Field(default=3, ge=2, le=10_000)
@@ -393,6 +402,24 @@ async def submit_cluster_run(
             embedding_type=payload.embedding_type.value,
             preprocessing={
                 "trigger": "user",
+                "vector_fusion": {
+                    "requested_native_content_weight": payload.native_content_weight,
+                    "effective_native_content_weight": (
+                        1.0
+                        if payload.embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+                        else payload.native_content_weight
+                    ),
+                    "native_content_weight": (
+                        1.0
+                        if payload.embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+                        else payload.native_content_weight
+                    ),
+                    "dimension_weight": (
+                        0.0
+                        if payload.embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+                        else 1.0 - payload.native_content_weight
+                    ),
+                },
                 "requested_pca_dimension": payload.pca_dimension,
                 "parameter_selection": (
                     "user_defined_selection_optimized"
@@ -420,6 +447,7 @@ async def submit_cluster_run(
         min_samples=payload.min_samples,
         min_cluster_size=payload.min_cluster_size,
         optimize_parameters=payload.optimize_parameters,
+        native_content_weight=payload.native_content_weight,
     )
     return ClusterRunSubmission(cluster_run_id=cluster_run_id)
 
@@ -564,6 +592,7 @@ async def _execute_cluster_run(
     min_samples: int,
     min_cluster_size: int,
     optimize_parameters: bool,
+    native_content_weight: float,
 ) -> None:
     await service.run(
         workspace_id=workspace_id,
@@ -573,6 +602,7 @@ async def _execute_cluster_run(
         min_samples=min_samples,
         min_cluster_size=min_cluster_size,
         optimize_parameters=optimize_parameters,
+        native_content_weight=native_content_weight,
     )
 
 

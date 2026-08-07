@@ -126,6 +126,8 @@ test("cluster workspace keeps history and exposes current resident controls", as
   assert.match(html, /Cluster Run/);
   assert.match(html, /正在读取当前簇/);
   assert.match(html, /全量重聚类当前维度/);
+  assert.match(html, /原始内容权重/);
+  assert.match(html, /原始内容模式无需融合/);
   assert.match(html, /只有点击/);
   assert.match(html, /首次达到/);
   assert.match(html, /只增量归簇/);
@@ -216,6 +218,10 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /RUN_POLL_INTERVAL_MS/);
   assert.match(clustersPage, /完成后会自动展示结果/);
   assert.match(clustersPage, /当前维度已有全量重聚类任务/);
+  assert.match(clustersPage, /native_content_weight/);
+  assert.match(clustersPage, /parseNativeContentWeight/);
+  assert.match(clustersPage, /当前维度权重/);
+  assert.match(clustersPage, /原始内容模式无需融合/);
   assert.doesNotMatch(clustersPage, /setInterval\(/);
   assert.match(clustersPage, /assetStatus\?\.items/);
   assert.match(clustersPage, /representative-asset-link/);

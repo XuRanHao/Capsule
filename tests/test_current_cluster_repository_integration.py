@@ -136,6 +136,10 @@ async def test_current_clusters_preserve_residents_and_honor_manual_membership()
             ("cluster_current_resident", ClusterMode.RESIDENT_OPEN),
             ("cluster_current_dynamic_2", ClusterMode.DYNAMIC),
         }
+        assert {item.cluster_id: item.native_content_weight for item in current} == {
+            "cluster_current_resident": 0.25,
+            "cluster_current_dynamic_2": 0.75,
+        }
         assert await repository.list_resident_asset_ids(
             workspace_id=workspace_id,
             embedding_type="visual_style",
@@ -225,7 +229,11 @@ async def _seed_cluster_data(database: Database, *, workspace_id: str) -> None:
                     ],
                     dataset_hash=str(run_number) * 64,
                     sample_count=4,
-                    preprocessing={},
+                    preprocessing={
+                        "vector_fusion": {
+                            "native_content_weight": 0.25 if run_number == 1 else 0.75,
+                        }
+                    },
                     parameters={},
                     cluster_count=1,
                     noise_count=0,

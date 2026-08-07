@@ -43,6 +43,10 @@ from capsule.pipeline.clustering import (
     merge_semantically_overlapping_clusters,
     select_cluster_representatives,
 )
+from capsule.pipeline.vector_fusion import (
+    fuse_native_dimension_vectors,
+    validate_native_content_weight,
+)
 from capsule.schemas import ClusterCapsuleWrite, ClusterRepresentativeWrite, ClusterSummary
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,7 @@ class ClusterSummaryClient(Protocol):
 class _LoadedClusterVector:
     asset: ClusterEmbeddingAsset
     vector: list[float]
+    native_embedding_id: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -118,6 +123,7 @@ class ClusterService:
         min_samples: int = 3,
         min_cluster_size: int = 3,
         optimize_parameters: bool = False,
+        native_content_weight: float = 0.5,
         trigger: str = "user",
     ) -> EmbeddingTypeClusterResult:
         """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
@@ -129,6 +135,7 @@ class ClusterService:
             min_samples=min_samples,
             min_cluster_size=min_cluster_size,
             optimize_parameters=optimize_parameters,
+            native_content_weight=native_content_weight,
             trigger=trigger,
         )
 
@@ -142,6 +149,7 @@ class ClusterService:
         min_samples: int,
         min_cluster_size: int,
         optimize_parameters: bool,
+        native_content_weight: float,
         trigger: str,
     ) -> EmbeddingTypeClusterResult:
         assets: list[ClusterEmbeddingAsset] = []
@@ -156,6 +164,12 @@ class ClusterService:
             merged_member_min_cosine_threshold=(
                 self._settings.cluster_merge_member_min_cosine_threshold
             ),
+        )
+        requested_native_content_weight = validate_native_content_weight(native_content_weight)
+        effective_native_content_weight = (
+            1.0
+            if embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+            else requested_native_content_weight
         )
         try:
             assets = await self._embedding_repository.list_indexed_cluster_embeddings(
@@ -174,11 +188,34 @@ class ClusterService:
                 else set()
             )
             assets = [asset for asset in assets if asset.asset_id not in resident_asset_ids]
-            loaded = await self._load_vectors(assets)
+            native_assets_by_id: dict[str, ClusterEmbeddingAsset] = {}
+            if (
+                embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+                and effective_native_content_weight > 0.0
+            ):
+                native_assets = await self._embedding_repository.list_indexed_cluster_embeddings(
+                    workspace_id=workspace_id,
+                    embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
+                    model_name=self._settings.embedding_model,
+                    dimension=self._settings.embedding_dimension,
+                    milvus_collection=self._settings.milvus_collection,
+                )
+                native_assets_by_id = {asset.asset_id: asset for asset in native_assets}
+            loaded = await self._load_vectors(
+                assets,
+                native_assets_by_id=native_assets_by_id,
+                embedding_type=embedding_type,
+                native_content_weight=effective_native_content_weight,
+            )
             preprocessing = {
                 "trigger": trigger,
                 "normalization": "l2",
                 "post_pca_normalization": "l2",
+                "vector_fusion": _vector_fusion_metadata(
+                    embedding_type=embedding_type,
+                    requested_native_content_weight=requested_native_content_weight,
+                    native_content_weight=effective_native_content_weight,
+                ),
                 "requested_pca_dimension": pca_dimension,
                 "parameter_selection": (
                     "user_defined_selection_optimized" if optimize_parameters else "user_defined"
@@ -188,12 +225,19 @@ class ClusterService:
                 "resident_excluded_count": len(resident_asset_ids),
             }
             embedding_ids = [item.asset.embedding_id for item in loaded]
+            run_dataset_hash = dataset_hash(
+                _dataset_hash_inputs(
+                    loaded,
+                    embedding_type=embedding_type,
+                    native_content_weight=effective_native_content_weight,
+                )
+            )
             if run_id is None:
                 run_id = await self._cluster_repository.create_run(
                     workspace_id=workspace_id,
                     embedding_type=embedding_type.value,
                     embedding_ids=embedding_ids,
-                    dataset_hash=dataset_hash(embedding_ids),
+                    dataset_hash=run_dataset_hash,
                     preprocessing=preprocessing,
                     parameters={
                         "min_cluster_size": min_cluster_size,
@@ -210,7 +254,7 @@ class ClusterService:
                     workspace_id=workspace_id,
                     embedding_type=embedding_type.value,
                     embedding_ids=embedding_ids,
-                    dataset_hash=dataset_hash(embedding_ids),
+                    dataset_hash=run_dataset_hash,
                     preprocessing=preprocessing,
                     parameters={
                         "min_cluster_size": min_cluster_size,
@@ -406,16 +450,78 @@ class ClusterService:
     async def _load_vectors(
         self,
         assets: list[ClusterEmbeddingAsset],
+        *,
+        native_assets_by_id: Mapping[str, ClusterEmbeddingAsset],
+        embedding_type: EmbeddingType,
+        native_content_weight: float,
     ) -> list[_LoadedClusterVector]:
         if not assets:
             return []
         await self._vector_store.ensure_collection()
-        vectors = await self._vector_store.fetch_vectors([asset.embedding_id for asset in assets])
-        return [
-            _LoadedClusterVector(asset=asset, vector=vectors[asset.embedding_id])
-            for asset in assets
-            if asset.embedding_id in vectors
-        ]
+        native_only = embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+        dimension_weight = 1.0 - native_content_weight
+        vector_ids: set[str] = set()
+        if native_only or dimension_weight > 0.0:
+            vector_ids.update(asset.embedding_id for asset in assets)
+        if not native_only and native_content_weight > 0.0:
+            vector_ids.update(
+                native_assets_by_id[asset.asset_id].embedding_id
+                for asset in assets
+                if asset.asset_id in native_assets_by_id
+            )
+        vectors = await self._vector_store.fetch_vectors(sorted(vector_ids))
+        loaded: list[_LoadedClusterVector] = []
+        for asset in assets:
+            if native_only:
+                dimension_vector = vectors.get(asset.embedding_id)
+                if dimension_vector is None:
+                    continue
+                loaded.append(
+                    _LoadedClusterVector(
+                        asset=asset,
+                        vector=dimension_vector,
+                        native_embedding_id=asset.embedding_id,
+                    )
+                )
+                continue
+            dimension_vector = (
+                vectors.get(asset.embedding_id) if dimension_weight > 0.0 else None
+            )
+            if dimension_weight > 0.0 and dimension_vector is None:
+                continue
+            native_asset = (
+                native_assets_by_id.get(asset.asset_id)
+                if native_content_weight > 0.0
+                else None
+            )
+            native_vector = (
+                vectors.get(native_asset.embedding_id) if native_asset is not None else None
+            )
+            if native_content_weight > 0.0 and native_vector is None:
+                continue
+            try:
+                fused = fuse_native_dimension_vectors(
+                    native_vector=native_vector,
+                    dimension_vector=dimension_vector,
+                    native_content_weight=native_content_weight,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "skipping asset with incompatible fusion vectors asset=%s: %s",
+                    asset.asset_id,
+                    exc,
+                )
+                continue
+            loaded.append(
+                _LoadedClusterVector(
+                    asset=asset,
+                    vector=fused,
+                    native_embedding_id=(
+                        native_asset.embedding_id if native_asset is not None else None
+                    ),
+                )
+            )
+        return loaded
 
     async def _summarize_and_store_capsules(
         self,
@@ -626,4 +732,51 @@ def _semantic_merge_metadata(
             }
             for decision in result.decisions
         ],
+    }
+
+
+def _dataset_hash_inputs(
+    loaded: Sequence[_LoadedClusterVector],
+    *,
+    embedding_type: EmbeddingType,
+    native_content_weight: float,
+) -> list[str]:
+    """Return selected eligibility and actual vector inputs for a fusion hash."""
+    selected_inputs = [f"selected:{item.asset.embedding_id}" for item in loaded]
+    if embedding_type is EmbeddingType.NATIVE_MULTIMODAL:
+        return [*selected_inputs, "native_content_weight:1"]
+    inputs = [*selected_inputs, f"native_content_weight:{native_content_weight:.12g}"]
+    if native_content_weight < 1.0:
+        inputs.extend(f"dimension:{item.asset.embedding_id}" for item in loaded)
+    if native_content_weight > 0.0:
+        inputs.extend(
+            f"native:{item.native_embedding_id}"
+            for item in loaded
+            if item.native_embedding_id is not None
+        )
+    return inputs
+
+
+def _vector_fusion_metadata(
+    *,
+    embedding_type: EmbeddingType,
+    requested_native_content_weight: float,
+    native_content_weight: float,
+) -> dict[str, Any]:
+    if embedding_type is EmbeddingType.NATIVE_MULTIMODAL:
+        return {
+            "mode": "native_only",
+            "requested_native_content_weight": requested_native_content_weight,
+            "effective_native_content_weight": 1.0,
+            "native_content_weight": 1.0,
+            "dimension_weight": 0.0,
+            "components": [EmbeddingType.NATIVE_MULTIMODAL.value],
+        }
+    return {
+        "mode": "l2_normalized_weighted_average",
+        "requested_native_content_weight": requested_native_content_weight,
+        "effective_native_content_weight": native_content_weight,
+        "native_content_weight": native_content_weight,
+        "dimension_weight": 1.0 - native_content_weight,
+        "components": [EmbeddingType.NATIVE_MULTIMODAL.value, embedding_type.value],
     }

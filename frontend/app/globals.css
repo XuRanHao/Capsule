@@ -3714,6 +3714,7 @@ blockquote p {
   grid-template-columns:
     minmax(180px, 1fr)
     minmax(220px, 1.2fr)
+    minmax(154px, 0.7fr)
     repeat(3, minmax(104px, 0.55fr));
 }
 
@@ -3753,6 +3754,19 @@ blockquote p {
 .run-selector input[type="number"]:hover,
 .run-selector input[type="number"]:focus {
   border-color: var(--ink);
+}
+
+.native-content-weight-control small {
+  max-width: 180px;
+  color: var(--muted-ink);
+  font-size: 6px;
+  line-height: 1.35;
+  text-transform: none;
+}
+
+.native-content-weight-control input:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .run-parameters small {

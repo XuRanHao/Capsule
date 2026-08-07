@@ -181,6 +181,14 @@ function parseIntegerParameter(
   return parsed;
 }
 
+function parseNativeContentWeight(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    throw new Error("原始内容权重必须是 0 到 1 之间的数值");
+  }
+  return parsed;
+}
+
 function runParameter(value: unknown) {
   return typeof value === "number" ? value : "—";
 }
@@ -482,6 +490,7 @@ export default function ClustersPage() {
   const [embeddingType, setEmbeddingType] = useState<string>(
     FEATURE_TYPES[0].value,
   );
+  const [nativeContentWeight, setNativeContentWeight] = useState("0.5");
   const [pcaDimension, setPcaDimension] = useState("8");
   const [minSamples, setMinSamples] = useState("3");
   const [minClusterSize, setMinClusterSize] = useState("3");
@@ -887,6 +896,10 @@ export default function ClustersPage() {
         2,
         1024,
       );
+      const parsedNativeContentWeight =
+        embeddingType === "native_multimodal"
+          ? 1
+          : parseNativeContentWeight(nativeContentWeight);
       const parsedMinSamples = parseIntegerParameter(
         "Min Samples",
         minSamples,
@@ -906,6 +919,7 @@ export default function ClustersPage() {
           body: JSON.stringify({
             workspace_id: workspaceId,
             embedding_type: embeddingType,
+            native_content_weight: parsedNativeContentWeight,
             pca_dimension: parsedPcaDimension,
             min_samples: parsedMinSamples,
             min_cluster_size: parsedMinClusterSize,
@@ -1213,6 +1227,29 @@ export default function ClustersPage() {
                 </option>
               ))}
             </select>
+          </label>
+          <label className="native-content-weight-control">
+            原始内容权重
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              value={
+                embeddingType === "native_multimodal" ? "1" : nativeContentWeight
+              }
+              disabled={embeddingType === "native_multimodal"}
+              onChange={(event) => setNativeContentWeight(event.target.value)}
+              aria-describedby="native-content-weight-help"
+            />
+            <small id="native-content-weight-help">
+              {embeddingType === "native_multimodal"
+                ? "原始内容模式无需融合，仅使用原始内容（100%）。"
+                : `当前维度权重：${(
+                    (1 - Math.min(1, Math.max(0, Number(nativeContentWeight) || 0))) *
+                    100
+                  ).toFixed(0)}%`}
+            </small>
           </label>
           <label>
             PCA Dimension

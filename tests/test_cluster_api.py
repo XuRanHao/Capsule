@@ -144,6 +144,12 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
     assert submitted.status_code == 202
     assert submitted.json() == {"cluster_run_id": "run_api_test", "status": "pending"}
     assert repository.run.preprocessing["requested_pca_dimension"] == 8
+    assert repository.run.preprocessing["vector_fusion"] == {
+        "requested_native_content_weight": 0.5,
+        "effective_native_content_weight": 1.0,
+        "native_content_weight": 1.0,
+        "dimension_weight": 0.0,
+    }
     assert repository.run.parameters["min_samples"] == 3
     assert repository.run.parameters["min_cluster_size"] == 3
     assert service.calls == [
@@ -155,6 +161,7 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "min_samples": 3,
             "min_cluster_size": 3,
             "optimize_parameters": False,
+            "native_content_weight": 0.5,
         }
     ]
     assert polled.json()["status"] == "completed"
@@ -187,11 +194,18 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
                     "min_samples": 2,
                     "min_cluster_size": 5,
                     "optimize_parameters": True,
+                    "native_content_weight": 0.25,
                 },
             )
 
     assert response.status_code == 202
     assert repository.run.preprocessing["requested_pca_dimension"] == 12
+    assert repository.run.preprocessing["vector_fusion"] == {
+        "requested_native_content_weight": 0.25,
+        "effective_native_content_weight": 0.25,
+        "native_content_weight": 0.25,
+        "dimension_weight": 0.75,
+    }
     assert repository.run.parameters["min_samples"] == 2
     assert repository.run.parameters["min_cluster_size"] == 5
     assert service.calls == [
@@ -203,5 +217,35 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
             "min_samples": 2,
             "min_cluster_size": 5,
             "optimize_parameters": True,
+            "native_content_weight": 0.25,
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_content_weight", [0.0, 1.0])
+async def test_cluster_api_accepts_fusion_weight_endpoints(native_content_weight: float) -> None:
+    repository = FakeClusterRepository()
+    service = FakeClusterService(repository)
+    app = create_app(
+        settings=Settings(),
+        cluster_service=service,  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/cluster-runs",
+                json={
+                    "workspace_id": "workspace_api_test",
+                    "embedding_type": "visual_style",
+                    "native_content_weight": native_content_weight,
+                },
+            )
+
+    assert response.status_code == 202
+    assert service.calls[0]["native_content_weight"] == native_content_weight

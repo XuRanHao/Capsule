@@ -19,6 +19,7 @@ from typing import Protocol
 from capsule.config import Settings
 from capsule.db.repositories import ClusterBootstrapState
 from capsule.enums import ClusterMemberSource, ClusterMode, EmbeddingType
+from capsule.pipeline.vector_fusion import fuse_native_dimension_vectors
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ class IncrementalClusterCandidate(Protocol):
 
     @property
     def representative_asset_id(self) -> str | None: ...
+
+    @property
+    def native_content_weight(self) -> float: ...
 
 
 class IncrementalEmbedding(Protocol):
@@ -255,51 +259,82 @@ class IncrementalClusterService:
                 if candidate.representative_asset_id is not None
             )
         )
-        embedding_assets = await self._repository.list_indexed_asset_embeddings(
+        all_asset_ids = (*requested_asset_ids, *representative_asset_ids)
+        dimension_embeddings = await self._repository.list_indexed_asset_embeddings(
             workspace_id=workspace_id,
             embedding_type=embedding_type_value,
-            asset_ids=(*requested_asset_ids, *representative_asset_ids),
+            asset_ids=all_asset_ids,
         )
-        embedding_id_by_asset = {item.asset_id: item.embedding_id for item in embedding_assets}
-        target_embedding_ids = {
-            asset_id: embedding_id_by_asset[asset_id]
-            for asset_id in requested_asset_ids
-            if asset_id in embedding_id_by_asset
-        }
-        missing_embedding_assets = {
-            asset_id for asset_id in requested_asset_ids if asset_id not in target_embedding_ids
+        dimension_embedding_id_by_asset = {
+            item.asset_id: item.embedding_id for item in dimension_embeddings
         }
 
-        requested_embedding_ids = tuple(dict.fromkeys(embedding_id_by_asset.values()))
+        native_only = embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+        candidate_weights = {
+            _candidate_native_content_weight(candidate, native_only=native_only)
+            for candidate in candidates
+        }
+        need_native_vectors = not native_only and any(weight > 0.0 for weight in candidate_weights)
+        native_embedding_id_by_asset = dimension_embedding_id_by_asset
+        if need_native_vectors:
+            native_embeddings = await self._repository.list_indexed_asset_embeddings(
+                workspace_id=workspace_id,
+                embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
+                asset_ids=all_asset_ids,
+            )
+            native_embedding_id_by_asset = {
+                item.asset_id: item.embedding_id for item in native_embeddings
+            }
+
+        requested_embedding_ids = set(dimension_embedding_id_by_asset.values())
+        if need_native_vectors:
+            requested_embedding_ids.update(native_embedding_id_by_asset.values())
         vectors: dict[str, list[float]] = {}
         if requested_embedding_ids:
             await self._vector_store.ensure_collection()
-            vectors = await self._vector_store.fetch_vectors(requested_embedding_ids)
+            vectors = await self._vector_store.fetch_vectors(sorted(requested_embedding_ids))
 
-        target_vectors = {
-            asset_id: vectors[embedding_id]
-            for asset_id, embedding_id in target_embedding_ids.items()
-            if embedding_id in vectors and _valid_vector(vectors[embedding_id])
-        }
-        missing_vector_assets = missing_embedding_assets | {
-            asset_id for asset_id in target_embedding_ids if asset_id not in target_vectors
+        weights_to_build = candidate_weights or {0.0}
+        vectors_by_asset_and_weight: dict[tuple[str, float], list[float]] = {}
+        for asset_id in all_asset_ids:
+            for native_content_weight in weights_to_build:
+                vector = _fused_asset_vector(
+                    asset_id=asset_id,
+                    embedding_type=embedding_type,
+                    native_content_weight=native_content_weight,
+                    dimension_embedding_id_by_asset=dimension_embedding_id_by_asset,
+                    native_embedding_id_by_asset=native_embedding_id_by_asset,
+                    vectors=vectors,
+                )
+                if vector is not None:
+                    vectors_by_asset_and_weight[(asset_id, native_content_weight)] = vector
+
+        missing_vector_assets = {
+            asset_id
+            for asset_id in requested_asset_ids
+            if not any(
+                (asset_id, native_content_weight) in vectors_by_asset_and_weight
+                for native_content_weight in weights_to_build
+            )
         }
         usable_candidates = [
             candidate
             for candidate in candidates
-            if (
-                candidate.representative_asset_id in embedding_id_by_asset
-                and embedding_id_by_asset[candidate.representative_asset_id] in vectors
-                and _valid_vector(
-                    vectors[embedding_id_by_asset[candidate.representative_asset_id]]
-                )
+            if candidate.representative_asset_id is not None
+            and (
+                candidate.representative_asset_id,
+                _candidate_native_content_weight(candidate, native_only=native_only),
             )
+            in vectors_by_asset_and_weight
         ]
+        target_asset_ids = tuple(
+            asset_id for asset_id in requested_asset_ids if asset_id not in missing_vector_assets
+        )
         excluded_pairs = await self._repository.list_excluded_pairs(
             workspace_id=workspace_id,
             embedding_type=embedding_type_value,
             cluster_ids=tuple(candidate.cluster_id for candidate in usable_candidates),
-            asset_ids=tuple(target_vectors),
+            asset_ids=target_asset_ids,
         )
         thresholds = self._thresholds_by_embedding_type.get(
             embedding_type_value,
@@ -307,16 +342,12 @@ class IncrementalClusterService:
         )
 
         planned: list[IncrementalClusterAssignment] = []
-        for asset_id in requested_asset_ids:
-            target_vector = target_vectors.get(asset_id)
-            if target_vector is None:
-                continue
+        for asset_id in target_asset_ids:
             assignment = _select_assignment(
                 asset_id=asset_id,
-                vector=target_vector,
                 candidates=usable_candidates,
-                embedding_id_by_asset=embedding_id_by_asset,
-                vectors=vectors,
+                vectors_by_asset_and_weight=vectors_by_asset_and_weight,
+                native_only=native_only,
                 excluded_pairs=excluded_pairs,
                 thresholds=thresholds,
             )
@@ -479,10 +510,9 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float | 
 def _select_assignment(
     *,
     asset_id: str,
-    vector: Sequence[float],
     candidates: Sequence[IncrementalClusterCandidate],
-    embedding_id_by_asset: Mapping[str, str],
-    vectors: Mapping[str, list[float]],
+    vectors_by_asset_and_weight: Mapping[tuple[str, float], list[float]],
+    native_only: bool,
     excluded_pairs: Set[tuple[str, str]],
     thresholds: IncrementalAssignmentThresholds,
 ) -> IncrementalClusterAssignment | None:
@@ -496,11 +526,17 @@ def _select_assignment(
             representative_id = candidate.representative_asset_id
             if representative_id is None:
                 continue
-            embedding_id = embedding_id_by_asset.get(representative_id)
-            representative_vector = vectors.get(embedding_id) if embedding_id else None
-            if representative_vector is None:
+            native_content_weight = _candidate_native_content_weight(
+                candidate,
+                native_only=native_only,
+            )
+            target_vector = vectors_by_asset_and_weight.get((asset_id, native_content_weight))
+            representative_vector = vectors_by_asset_and_weight.get(
+                (representative_id, native_content_weight)
+            )
+            if target_vector is None or representative_vector is None:
                 continue
-            score = cosine_similarity(vector, representative_vector)
+            score = cosine_similarity(target_vector, representative_vector)
             if score is None or score < thresholds.for_mode(mode):
                 continue
             assignment = IncrementalClusterAssignment(
@@ -535,3 +571,60 @@ def _valid_vector(vector: Sequence[float]) -> bool:
     return bool(vector) and all(math.isfinite(value) for value in vector) and any(
         value != 0.0 for value in vector
     )
+
+
+def _candidate_native_content_weight(
+    candidate: IncrementalClusterCandidate,
+    *,
+    native_only: bool,
+) -> float:
+    """Return the persisted fusion setting, keeping legacy runs dimension-only."""
+    if native_only:
+        return 1.0
+    value = getattr(candidate, "native_content_weight", 0.0)
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return weight if math.isfinite(weight) and 0.0 <= weight <= 1.0 else 0.0
+
+
+def _fused_asset_vector(
+    *,
+    asset_id: str,
+    embedding_type: EmbeddingType,
+    native_content_weight: float,
+    dimension_embedding_id_by_asset: Mapping[str, str],
+    native_embedding_id_by_asset: Mapping[str, str],
+    vectors: Mapping[str, list[float]],
+) -> list[float] | None:
+    """Build one Asset representation compatible with a candidate's full run."""
+    dimension_embedding_id = dimension_embedding_id_by_asset.get(asset_id)
+    if dimension_embedding_id is None:
+        return None
+    dimension_vector = vectors.get(dimension_embedding_id)
+    if embedding_type is EmbeddingType.NATIVE_MULTIMODAL:
+        if dimension_vector is not None and _valid_vector(dimension_vector):
+            return dimension_vector
+        return None
+
+    native_vector: Sequence[float] | None = None
+    if native_content_weight > 0.0:
+        native_embedding_id = native_embedding_id_by_asset.get(asset_id)
+        native_vector = vectors.get(native_embedding_id) if native_embedding_id else None
+    if native_content_weight < 1.0 and (
+        dimension_vector is None or not _valid_vector(dimension_vector)
+    ):
+        return None
+    if native_content_weight > 0.0 and (native_vector is None or not _valid_vector(native_vector)):
+        return None
+    try:
+        return fuse_native_dimension_vectors(
+            native_vector=native_vector,
+            dimension_vector=dimension_vector,
+            native_content_weight=native_content_weight,
+        )
+    except ValueError:
+        return None

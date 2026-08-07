@@ -22,6 +22,7 @@ class FakeCluster:
     cluster_id: str
     mode: ClusterMode
     representative_asset_id: str | None
+    native_content_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -36,10 +37,15 @@ class FakeRepository:
         *,
         clusters: Sequence[FakeCluster],
         embeddings: Sequence[FakeEmbedding],
+        embeddings_by_type: Mapping[str, Sequence[FakeEmbedding]] | None = None,
         excluded_pairs: set[tuple[str, str]] | None = None,
     ) -> None:
         self.clusters = list(clusters)
         self.embeddings = list(embeddings)
+        self.embeddings_by_type = {
+            embedding_type: list(items)
+            for embedding_type, items in (embeddings_by_type or {}).items()
+        }
         self.excluded_pairs = excluded_pairs or set()
         self.list_cluster_calls: list[dict[str, object]] = []
         self.embedding_calls: list[dict[str, object]] = []
@@ -78,7 +84,8 @@ class FakeRepository:
             }
         )
         selected_ids = set(asset_ids)
-        return [item for item in self.embeddings if item.asset_id in selected_ids]
+        available = self.embeddings_by_type.get(embedding_type, self.embeddings)
+        return [item for item in available if item.asset_id in selected_ids]
 
     async def list_excluded_pairs(
         self,
@@ -349,6 +356,121 @@ async def test_embedding_type_specific_threshold_is_used_for_one_dimension() -> 
     assert repository.list_cluster_calls[0]["embedding_type"] == "mood_atmosphere"
     assert repository.embedding_calls[0]["embedding_type"] == "mood_atmosphere"
     assert repository.exclusion_calls[0]["embedding_type"] == "mood_atmosphere"
+
+
+@pytest.mark.asyncio
+async def test_candidate_fusion_weight_changes_incremental_assignment() -> None:
+    dimension_embeddings = [
+        FakeEmbedding("new_asset", "dimension_new"),
+        FakeEmbedding("representative", "dimension_rep"),
+    ]
+    native_embeddings = [
+        FakeEmbedding("new_asset", "native_new"),
+        FakeEmbedding("representative", "native_rep"),
+    ]
+
+    async def assign_for_weight(weight: float):
+        repository = FakeRepository(
+            clusters=[
+                FakeCluster(
+                    "dynamic",
+                    ClusterMode.DYNAMIC,
+                    "representative",
+                    native_content_weight=weight,
+                )
+            ],
+            embeddings=dimension_embeddings,
+            embeddings_by_type={
+                EmbeddingType.VISUAL_STYLE.value: dimension_embeddings,
+                EmbeddingType.NATIVE_MULTIMODAL.value: native_embeddings,
+            },
+        )
+        service = IncrementalClusterService(
+            repository=repository,
+            vector_store=FakeVectorStore(
+                {
+                    "dimension_new": [0.0, 1.0],
+                    "dimension_rep": [1.0, 0.0],
+                    "native_new": [1.0, 0.0],
+                    "native_rep": [1.0, 0.0],
+                }
+            ),
+            default_thresholds=IncrementalAssignmentThresholds(0.9, 0.9),
+        )
+        return await service.assign_assets(
+            workspace_id="workspace_a",
+            embedding_type=EmbeddingType.VISUAL_STYLE,
+            asset_ids=["new_asset"],
+        )
+
+    legacy = await assign_for_weight(0.0)
+    native_only = await assign_for_weight(1.0)
+
+    assert legacy.assignments == ()
+    assert legacy.pending_asset_ids == ("new_asset",)
+    assert native_only.assignments[0].cluster_id == "dynamic"
+
+
+@pytest.mark.asyncio
+async def test_legacy_candidate_defaults_to_dimension_only_without_native_embedding() -> None:
+    repository = FakeRepository(
+        clusters=[FakeCluster("dynamic", ClusterMode.DYNAMIC, "representative")],
+        embeddings=[
+            FakeEmbedding("new_asset", "dimension_new"),
+            FakeEmbedding("representative", "dimension_rep"),
+        ],
+        embeddings_by_type={
+            EmbeddingType.SUBJECT_CONTENT.value: [
+                FakeEmbedding("new_asset", "dimension_new"),
+                FakeEmbedding("representative", "dimension_rep"),
+            ],
+            EmbeddingType.NATIVE_MULTIMODAL.value: [],
+        },
+    )
+    service = IncrementalClusterService(
+        repository=repository,
+        vector_store=FakeVectorStore({"dimension_new": [1.0, 0.0], "dimension_rep": [1.0, 0.0]}),
+    )
+
+    result = await service.assign_assets(
+        workspace_id="workspace_a",
+        embedding_type=EmbeddingType.SUBJECT_CONTENT,
+        asset_ids=["new_asset"],
+    )
+
+    assert result.assignments[0].cluster_id == "dynamic"
+    assert [call["embedding_type"] for call in repository.embedding_calls] == ["subject_content"]
+
+
+@pytest.mark.asyncio
+async def test_native_multimodal_assignment_fetches_only_native_embeddings_once() -> None:
+    repository = FakeRepository(
+        clusters=[
+            FakeCluster(
+                "dynamic",
+                ClusterMode.DYNAMIC,
+                "representative",
+                native_content_weight=0.0,
+            )
+        ],
+        embeddings=[
+            FakeEmbedding("new_asset", "native_new"),
+            FakeEmbedding("representative", "native_rep"),
+        ],
+    )
+    service = IncrementalClusterService(
+        repository=repository,
+        vector_store=FakeVectorStore({"native_new": [1.0, 0.0], "native_rep": [1.0, 0.0]}),
+    )
+
+    result = await service.assign_assets(
+        workspace_id="workspace_a",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        asset_ids=["new_asset"],
+    )
+
+    assert result.assignments[0].cluster_id == "dynamic"
+    assert [call["embedding_type"] for call in repository.embedding_calls] == ["native_multimodal"]
 
 
 def _bootstrap_state(

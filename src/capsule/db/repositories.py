@@ -1,5 +1,6 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1617,6 +1618,12 @@ class CurrentClusterRecord:
     source_run_id: str | None
     created_at: datetime
     updated_at: datetime
+    # The effective native-content contribution persisted with the full run
+    # that created this cluster.  It is internal runtime metadata used by
+    # incremental assignment; API response schemas intentionally omit it.
+    # Legacy/manual clusters have no source-run fusion metadata and therefore
+    # retain the pre-fusion, selected-dimension-only behavior.
+    native_content_weight: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1713,9 +1720,16 @@ class CurrentClusterRepository:
         embedding_type: str,
         modes: Sequence[ClusterMode] | None = None,
     ) -> list[CurrentClusterRecord]:
-        statement = select(CurrentCluster).where(
-            CurrentCluster.workspace_id == workspace_id,
-            CurrentCluster.embedding_type == embedding_type,
+        statement = (
+            select(CurrentCluster, ClusterRun.preprocessing)
+            .outerjoin(
+                ClusterRun,
+                ClusterRun.cluster_run_id == CurrentCluster.source_run_id,
+            )
+            .where(
+                CurrentCluster.workspace_id == workspace_id,
+                CurrentCluster.embedding_type == embedding_type,
+            )
         )
         if modes is not None:
             mode_values = [ClusterMode(mode).value for mode in modes]
@@ -1724,8 +1738,14 @@ class CurrentClusterRepository:
             statement = statement.where(CurrentCluster.mode.in_(mode_values))
         statement = statement.order_by(CurrentCluster.created_at, CurrentCluster.cluster_id)
         async with self._database.session() as session:
-            rows = await session.scalars(statement)
-            return [_current_cluster_record(cluster) for cluster in rows]
+            rows = (await session.execute(statement)).all()
+            return [
+                _current_cluster_record(
+                    cluster,
+                    native_content_weight=_native_content_weight_from_preprocessing(preprocessing),
+                )
+                for cluster, preprocessing in rows
+            ]
 
     async def get_cluster_bootstrap_state(
         self,
@@ -2786,7 +2806,11 @@ async def _latest_eligible_cluster_assets(
     return list(selected.values())
 
 
-def _current_cluster_record(cluster: CurrentCluster) -> CurrentClusterRecord:
+def _current_cluster_record(
+    cluster: CurrentCluster,
+    *,
+    native_content_weight: float = 0.0,
+) -> CurrentClusterRecord:
     return CurrentClusterRecord(
         cluster_id=cluster.cluster_id,
         workspace_id=cluster.workspace_id,
@@ -2798,7 +2822,27 @@ def _current_cluster_record(cluster: CurrentCluster) -> CurrentClusterRecord:
         source_run_id=cluster.source_run_id,
         created_at=cluster.created_at,
         updated_at=cluster.updated_at,
+        native_content_weight=native_content_weight,
     )
+
+
+def _native_content_weight_from_preprocessing(preprocessing: Any) -> float:
+    """Extract a run's fusion weight without changing legacy-cluster behavior."""
+    if not isinstance(preprocessing, dict):
+        return 0.0
+    fusion = preprocessing.get("vector_fusion")
+    value = (
+        fusion.get("native_content_weight")
+        if isinstance(fusion, dict)
+        else preprocessing.get("native_content_weight")
+    )
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return weight if math.isfinite(weight) and 0.0 <= weight <= 1.0 else 0.0
 
 
 def _current_cluster_member_record(
