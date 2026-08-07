@@ -1,10 +1,13 @@
 import asyncio
+import mimetypes
+import re
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, cast
 from urllib.parse import unquote, urlencode, urlparse
 
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -19,6 +22,7 @@ from capsule.storage.object_storage import ObjectStorage
 router = APIRouter(prefix="/api/v1/assets", tags=["assets"])
 
 _LIBRARY_CLEAR_CONFIRMATION = "CLEAR ALL DATA"
+_SINGLE_BYTE_RANGE = re.compile(r"^bytes=\d*-\d*$")
 
 
 class LibraryClearRequest(BaseModel):
@@ -156,6 +160,22 @@ async def get_asset_thumbnail(
         )
 
     parsed = urlparse(uri)
+    if parsed.scheme == "s3":
+        storage = _object_storage(request)
+        source_content = await storage.download_uri(uri)
+        try:
+            content = await asyncio.to_thread(_render_thumbnail_content, source_content)
+        except (OSError, UnidentifiedImageError):
+            return Response(
+                content=source_content,
+                media_type=_guessed_media_type(uri, fallback="application/octet-stream"),
+                headers={"Cache-Control": "public, max-age=86400, immutable"},
+            )
+        return Response(
+            content=content,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400, immutable"},
+        )
     if parsed.scheme != "file":
         return await _serve_uri(request, uri=uri, media_type=None)
 
@@ -234,16 +254,39 @@ async def _serve_uri(
         )
         return FileResponse(path, media_type=media_type)
     if parsed.scheme == "s3":
-        storage = getattr(request.app.state, "object_storage", None)
-        if not isinstance(storage, ObjectStorage):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "object_storage_not_ready",
-                    "message": "object storage is not ready",
-                },
-            )
-        return RedirectResponse(await storage.presigned_get_uri(uri))
+        storage = _object_storage(request)
+        byte_range = request.headers.get("range")
+        if byte_range is not None and not _SINGLE_BYTE_RANGE.fullmatch(byte_range):
+            return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+        try:
+            payload = await storage.download_uri_response(uri, byte_range=byte_range)
+        except ClientError as exc:
+            response_status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+            if response_status == status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE:
+                return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+            raise
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400, immutable",
+        }
+        if payload.content_range:
+            headers["Content-Range"] = payload.content_range
+        if payload.etag:
+            headers["ETag"] = payload.etag
+        return Response(
+            content=payload.content,
+            status_code=(
+                status.HTTP_206_PARTIAL_CONTENT
+                if payload.content_range
+                else status.HTTP_200_OK
+            ),
+            media_type=(
+                media_type
+                or payload.content_type
+                or _guessed_media_type(uri, fallback="application/octet-stream")
+            ),
+            headers=headers,
+        )
     if parsed.scheme in {"http", "https"}:
         return RedirectResponse(uri)
     raise HTTPException(
@@ -274,13 +317,35 @@ def _validated_local_path(settings: Settings, raw_path: str) -> Path:
     return path
 
 
+def _object_storage(request: Request) -> ObjectStorage:
+    storage = getattr(request.app.state, "object_storage", None)
+    if not isinstance(storage, ObjectStorage):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "object_storage_not_ready",
+                "message": "object storage is not ready",
+            },
+        )
+    return storage
+
+
+def _guessed_media_type(uri: str, *, fallback: str) -> str:
+    return mimetypes.guess_type(urlparse(uri).path)[0] or fallback
+
+
 @lru_cache(maxsize=256)
 def _render_local_thumbnail(
     path_value: str,
     _modified_at_ns: int,
     _source_size: int,
 ) -> bytes:
-    with Image.open(path_value) as source:
+    with open(path_value, "rb") as source:
+        return _render_thumbnail_content(source.read())
+
+
+def _render_thumbnail_content(content: bytes) -> bytes:
+    with Image.open(BytesIO(content)) as source:
         image = ImageOps.exif_transpose(source)
         image.thumbnail((480, 480), Image.Resampling.LANCZOS)
         if image.mode in {"RGBA", "LA"} or "transparency" in image.info:

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -15,6 +16,7 @@ from capsule.schemas import (
     AssetViewRecord,
     LibraryClearResult,
 )
+from capsule.storage.object_storage import ObjectDownload, ObjectStorage
 
 
 class FakeAssetRepository:
@@ -88,6 +90,19 @@ class FakeLibraryClearService:
             vectors_deleted=2,
             objects_deleted=4,
             staging_paths_deleted=1,
+        )
+
+
+class FakeVideoAssetRepository(FakeAssetRepository):
+    async def get_asset_media(self, **_: object) -> AssetMediaTarget:
+        return AssetMediaTarget(
+            asset_id="asset_video",
+            workspace_id="workspace_test",
+            asset_type=AssetType.VIDEO_SEGMENT.value,
+            source_storage_uri="s3://capsule/source/video.mp4",
+            source_mime_type="video/mp4",
+            preview_uri="s3://capsule/derived/preview.jpg",
+            derived_file_uri="s3://capsule/derived/segment.mp4",
         )
 
 def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
@@ -195,3 +210,54 @@ def test_document_image_preview_uses_derived_media_root(tmp_path: Path) -> None:
     assert content.status_code == 200
     assert preview.content == image_path.read_bytes()
     assert content.content == image_path.read_bytes()
+
+
+def test_s3_video_media_is_proxied_with_thumbnail_and_range_support(tmp_path: Path) -> None:
+    import_root = tmp_path / "imports"
+    import_root.mkdir()
+    placeholder = import_root / "placeholder.jpg"
+    Image.new("RGB", (640, 360), "#a9a69d").save(placeholder)
+    thumbnail_source = BytesIO()
+    Image.new("RGB", (1280, 720), "#e05b3f").save(thumbnail_source, format="JPEG")
+    settings = Settings(import_root=import_root)
+    storage = ObjectStorage(settings)
+    storage.download_uri = AsyncMock(return_value=thumbnail_source.getvalue())  # type: ignore[method-assign]
+    storage.download_uri_response = AsyncMock(  # type: ignore[method-assign]
+        return_value=ObjectDownload(
+            content=b"video-range",
+            content_type="video/mp4",
+            content_range="bytes 0-10/1024",
+            etag='"video-etag"',
+        )
+    )
+    app = create_app(
+        settings=settings,
+        asset_repository=FakeVideoAssetRepository(placeholder),  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        app.state.object_storage = storage
+        thumbnail = client.get(
+            "/api/v1/assets/asset_video/thumbnail",
+            params={"workspace_id": "workspace_test"},
+        )
+        content = client.get(
+            "/api/v1/assets/asset_video/content",
+            params={"workspace_id": "workspace_test"},
+            headers={"Range": "bytes=0-10"},
+        )
+
+    assert thumbnail.status_code == 200
+    assert thumbnail.headers["content-type"] == "image/jpeg"
+    assert thumbnail.headers["cache-control"] == "public, max-age=86400, immutable"
+    with Image.open(BytesIO(thumbnail.content)) as rendered:
+        assert max(rendered.size) == 480
+    assert content.status_code == 206
+    assert content.content == b"video-range"
+    assert content.headers["content-type"] == "video/mp4"
+    assert content.headers["content-range"] == "bytes 0-10/1024"
+    assert content.headers["accept-ranges"] == "bytes"
+    storage.download_uri_response.assert_awaited_once_with(
+        "s3://capsule/derived/segment.mp4",
+        byte_range="bytes=0-10",
+    )

@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -7,6 +8,16 @@ import boto3
 from botocore.client import BaseClient
 
 from capsule.config import Settings
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectDownload:
+    """One object-storage response, including HTTP range metadata."""
+
+    content: bytes
+    content_type: str | None
+    content_range: str | None
+    etag: str | None
 
 
 class ObjectStorage:
@@ -99,11 +110,41 @@ class ObjectStorage:
         )
 
     async def download_uri(self, uri: str) -> bytes:
+        return (await self.download_uri_response(uri)).content
+
+    async def download_uri_response(
+        self,
+        uri: str,
+        *,
+        byte_range: str | None = None,
+    ) -> ObjectDownload:
         parsed = urlparse(uri)
         if parsed.scheme != "s3" or parsed.netloc != self._bucket or not parsed.path.lstrip("/"):
             raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
 
-        return await self.download_object(unquote(parsed.path.lstrip("/")))
+        object_key = unquote(parsed.path.lstrip("/"))
+
+        def download() -> ObjectDownload:
+            kwargs: dict[str, str] = {
+                "Bucket": self._bucket,
+                "Key": object_key,
+            }
+            if byte_range is not None:
+                kwargs["Range"] = byte_range
+            response = self._client.get_object(**kwargs)
+            body = response["Body"]
+            try:
+                content = bytes(body.read())
+            finally:
+                body.close()
+            return ObjectDownload(
+                content=content,
+                content_type=response.get("ContentType"),
+                content_range=response.get("ContentRange"),
+                etag=response.get("ETag"),
+            )
+
+        return await asyncio.to_thread(download)
 
     async def download_object(self, object_key: str) -> bytes:
         """Download one object by key without exposing a private storage URL."""
