@@ -532,7 +532,15 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "以下输出结构约束优先于其他格式描述。只返回一个符合 JSON Schema 的 JSON 对象，"
             "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
             "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
-            "的对象；value 最多五个关键词，evidence 最多一条，无证据时使用 null 和空数组。"
+            "的对象；value 最多五条短语，按表现力和区分度从高到低排列，使用中文分号连接。"
+            "每条短语必须采用“主体 + 当前维度信息”的结构，两部分之间只用一个空格分隔："
+            "先写属性实际归属的具体主体，"
+            "再写该主体在当前维度中的事实。例如 color_composition 应写“桌子 红色；星空 深蓝”，"
+            "不得只写“红色；深蓝”，也不得写无法对应到具体主体的关键词堆。主体必须来自素材"
+            "中可见、可读或有可靠上下文证据的对象，不得虚构；同一主体可以跨 Feature 重复作为"
+            "属性锚点，但后半部分只能写当前维度信息，不得混入其他维度。对于用途、受众、来源、"
+            "权利等素材级维度，使用“素材 + 维度事实”。evidence 最多一条，无证据时使用 null "
+            "和空数组。"
             "unknown 表示维度适用但证据不足，not_applicable 表示当前 Asset 不适用该维度；"
             "这两种状态的 value 必须为 null。人物状态维度在没有清晰可见或明确描述的人物、"
             "拟人角色时必须使用 not_applicable，禁止用场景、物体或怪物状态代替人物状态。"
@@ -543,7 +551,7 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "唯一例外是 asset_usage：它除了通用字段外还必须返回 description 和 source_path。"
             "source_path 必须逐字复制输入 metadata.context.source_path；description 必须明确"
             "说明该完整相对路径及其对应用途。目录语义能确认用途时 status 使用 metadata，"
-            "value 只写用途语义，不得写绝对路径。"
+            "value 按上述格式写“素材 + 规范化用途语义”，不得写绝对路径。"
             "下面的手工示例只说明结构，禁止照抄；实际值必须根据输入素材重新判断。"
             f"JSON 结构示例：{example}"
         ),
@@ -551,12 +559,14 @@ def _asset_understanding_schema_message() -> dict[str, str]:
 
 
 def _asset_understanding_json_example() -> dict[str, object]:
-    observed: dict[str, object] = {
-        "value": "关键词一；关键词二",
-        "status": "observed",
-        "confidence": 0.9,
-        "evidence": ["输入中可核验的简短证据"],
-    }
+    def observed(value: str) -> dict[str, object]:
+        return {
+            "value": value,
+            "status": "observed",
+            "confidence": 0.9,
+            "evidence": ["输入中可核验的简短证据"],
+        }
+
     unknown: dict[str, object] = {
         "value": None,
         "status": "unknown",
@@ -570,7 +580,7 @@ def _asset_understanding_json_example() -> dict[str, object]:
         "evidence": [],
     }
     asset_usage: dict[str, object] = {
-        "value": "海报制作",
+        "value": "素材 海报制作",
         "status": "metadata",
         "confidence": 0.95,
         "evidence": ["相对文件路径：海报/素材/example.png"],
@@ -584,11 +594,11 @@ def _asset_understanding_json_example() -> dict[str, object]:
         "asset_name": "基于素材生成的简洁名称",
         "asset_description": "基于素材生成的客观完整描述",
         "features": {
-            "subject_content": observed,
-            "scene_theme": observed,
-            "visual_style": observed,
-            "color_composition": observed,
-            "mood_atmosphere": observed,
+            "subject_content": observed("女孩 手持雨伞；小狗 跟随女孩"),
+            "scene_theme": observed("女孩 雨夜街道；远处 城市天际线"),
+            "visual_style": observed("人物 写实摄影；背景 电影感光影"),
+            "color_composition": observed("桌子 红色；星空 深蓝"),
+            "mood_atmosphere": observed("人物 轻松愉悦；街道 安静神秘"),
             "character_state_or_psychology": not_applicable,
             "asset_usage": asset_usage,
             "target_audience": unknown,

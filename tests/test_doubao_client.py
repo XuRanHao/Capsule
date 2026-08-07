@@ -346,6 +346,9 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
     first_input = calls[0]["input"]
     assert isinstance(first_input, list)
     assert "features 必须是对象，不能是数组" in str(first_input[0])
+    assert "主体 + 当前维度信息" in str(first_input[0])
+    assert "桌子 红色；星空 深蓝" in str(first_input[0])
+    assert "不得只写“红色；深蓝”" in str(first_input[0])
     assert "not_applicable" in str(first_input[0])
     assert "没有清晰可见或明确描述的人物" in str(first_input[0])
     assert "有效语义必须自然融入描述" in str(first_input[0])

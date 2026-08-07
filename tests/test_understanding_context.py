@@ -169,6 +169,10 @@ async def test_video_understanding_uses_keyframe_data_uris() -> None:
     content = messages[1]["content"]
     image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
 
+    assert "0 到 5 条最具表现力和区分度" in messages[0]["content"]
+    assert "主体 + 当前维度信息" in messages[0]["content"]
+    assert "桌子 红色；星空 深蓝" in messages[0]["content"]
+
     assert reader.uris == [
         "s3://capsule/video/keyframes/01.jpg",
         "s3://capsule/video/keyframes/02.jpg",

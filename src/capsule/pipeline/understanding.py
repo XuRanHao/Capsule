@@ -184,9 +184,15 @@ class AssetUnderstandingService:
             "role": "system",
             "content": (
                 "你是多模态 Asset 特征提取器，只描述当前 Asset；上下文仅用于消歧。"
-                "十个 Feature 彼此独立，不跨维度重复或推导。asset_name 不超过 20 字；"
+                "十个 Feature 彼此独立。主体词可以跨维度复用以锚定属性，但维度信息不得"
+                "跨维度重复、混写或推导。asset_name 不超过 20 字；"
                 "asset_description 用 40 到 120 字客观描述可检索内容。每个 Feature 的 value "
-                "只含该维度 0 到 5 个中文关键词，以分号连接；evidence 最多一条且不超过 40 字。"
+                "只含该维度 0 到 5 条最具表现力和区分度的中文短语，按重要性排序并以分号连接。"
+                "每条必须是“主体 + 当前维度信息”，两部分之间只用一个空格分隔：先写属性实际"
+                "归属的具体主体，再写当前维度事实；例如 color_composition 写“桌子 红色；"
+                "星空 深蓝”，不得只写“红色；深蓝”。"
+                "主体必须来自素材或可靠上下文，不得虚构；用途、受众、来源、权利等素材级维度"
+                "使用“素材 + 维度事实”。evidence 最多一条且不超过 40 字。"
                 f"{_DESCRIPTION_CONTEXT_RULES}"
                 "维度边界：subject_content=主体与动作；scene_theme=场景题材；"
                 "visual_style=表现技法；color_composition=色彩构图；"
@@ -201,7 +207,8 @@ class AssetUnderstandingService:
                 "场景叙事或画面情绪推断不存在的人物，也不得把物体或场景状态写成人物状态。"
                 "asset_usage 必须优先使用 metadata.context.source_path 和 file_tree_context："
                 "当目录名能表达海报、宣传、封面、广告、预告、参考等用途时，status 使用 "
-                "metadata，value 只写规范化用途语义；description 必须自然说明完整相对路径"
+                "metadata，value 按上述格式写“素材 + 规范化用途语义”；description 必须自然"
+                "说明完整相对路径"
                 "及其对应用途，source_path 必须原样返回该相对路径。不得返回本地绝对路径。"
                 "无证据不得虚构。只输出约定 JSON，不要 Markdown。"
             ),

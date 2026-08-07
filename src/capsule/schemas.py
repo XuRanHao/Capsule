@@ -237,7 +237,8 @@ class StoredFileResult(BaseModel):
 class FeatureValue(BaseModel):
     value: str | None = Field(
         description=(
-            "该维度内最多五个互不重复的名词、形容词或短语，使用中文分号连接；无法确定时为 null"
+            "该维度内最多五条互不重复的“主体 + 维度信息”短语，两部分以一个空格分隔，"
+            "按表现力和区分度排序并使用中文分号连接；无法确定时为 null"
         )
     )
     status: FeatureStatus
