@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DemoShell, { AssetThumb, StatusBadge } from "../components/DemoShell";
 import {
   type AssetRecord,
@@ -8,10 +8,13 @@ import {
   type ClusterRun,
   type SearchCapsule,
   CREATED_BY,
-  WORKSPACE_ID,
   apiFetch,
   loadAssets,
 } from "../lib/api";
+import {
+  useWorkspaceSelection,
+  WorkspaceSelect,
+} from "../lib/workspaces";
 
 type CapsuleKind = "cluster" | "search";
 type CapsuleFilter = "all" | "favorite";
@@ -20,7 +23,22 @@ type LiveCapsule =
   | { kind: "search"; id: string; search: SearchCapsule }
   | { kind: "cluster"; id: string; cluster: ClusterCapsule };
 
+function inWorkspace<T extends { workspace_id: string }>(
+  items: T[],
+  workspaceId: string,
+) {
+  return items.filter((item) => item.workspace_id === workspaceId);
+}
+
 export default function CapsulesPage() {
+  const {
+    workspaceId,
+    workspaces,
+    ready: workspaceReady,
+    loading: workspacesLoading,
+    error: workspaceError,
+    setWorkspaceId,
+  } = useWorkspaceSelection();
   const [kind, setKind] = useState<CapsuleKind>("search");
   const [filter, setFilter] = useState<CapsuleFilter>("all");
   const [records, setRecords] = useState<LiveCapsule[]>([]);
@@ -28,30 +46,76 @@ export default function CapsulesPage() {
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const listRequestRef = useRef(0);
+  const assetRequestRef = useRef(0);
+  const favoriteRequestRef = useRef(0);
+  const workspaceIdRef = useRef(workspaceId);
+
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId;
+  }, [workspaceId]);
+
+  const changeWorkspace = useCallback(
+    (nextWorkspaceId: string) => {
+      workspaceIdRef.current = nextWorkspaceId;
+      listRequestRef.current += 1;
+      assetRequestRef.current += 1;
+      favoriteRequestRef.current += 1;
+      setRecords([]);
+      setSelectedId("");
+      setAssets([]);
+      setError(null);
+      setLoading(true);
+      setWorkspaceId(nextWorkspaceId);
+    },
+    [setWorkspaceId],
+  );
 
   const load = useCallback(async () => {
+    if (!workspaceReady || !workspaceId) return;
+    const requestId = ++listRequestRef.current;
+    const requestWorkspaceId = workspaceId;
     setLoading(true);
     try {
       const [searchPayload, runPayload] = await Promise.all([
         apiFetch<{ items: SearchCapsule[] }>(
-          `/api/v1/search-capsules?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+          `/api/v1/search-capsules?workspace_id=${encodeURIComponent(requestWorkspaceId)}&created_by=${encodeURIComponent(CREATED_BY)}`,
         ),
         apiFetch<{ items: ClusterRun[] }>(
-          `/api/v1/cluster-runs?workspace_id=${WORKSPACE_ID}&limit=100`,
+          `/api/v1/cluster-runs?workspace_id=${encodeURIComponent(requestWorkspaceId)}&limit=100`,
         ),
       ]);
-      const completedRuns = runPayload.items.filter(
+      if (
+        requestId !== listRequestRef.current ||
+        workspaceIdRef.current !== requestWorkspaceId
+      ) {
+        return;
+      }
+      const searchItems = inWorkspace(
+        searchPayload.items,
+        requestWorkspaceId,
+      );
+      const completedRuns = inWorkspace(
+        runPayload.items,
+        requestWorkspaceId,
+      ).filter(
         (run) => run.status === "completed",
       );
       const clusterPayloads = await Promise.all(
         completedRuns.map((run) =>
           apiFetch<{ items: ClusterCapsule[] }>(
-            `/api/v1/cluster-runs/${run.cluster_run_id}/capsules?workspace_id=${WORKSPACE_ID}`,
+            `/api/v1/cluster-runs/${encodeURIComponent(run.cluster_run_id)}/capsules?workspace_id=${encodeURIComponent(requestWorkspaceId)}`,
           ),
         ),
       );
+      if (
+        requestId !== listRequestRef.current ||
+        workspaceIdRef.current !== requestWorkspaceId
+      ) {
+        return;
+      }
       const next: LiveCapsule[] = [
-        ...searchPayload.items.map(
+        ...searchItems.map(
           (search): LiveCapsule => ({
             kind: "search",
             id: search.capsule_id,
@@ -59,7 +123,7 @@ export default function CapsulesPage() {
           }),
         ),
         ...clusterPayloads.flatMap((payload) =>
-          payload.items.map(
+          inWorkspace(payload.items, requestWorkspaceId).map(
             (cluster): LiveCapsule => ({
               kind: "cluster",
               id: cluster.cluster_capsule_id,
@@ -72,24 +136,44 @@ export default function CapsulesPage() {
       setSelectedId((current) =>
         current && next.some((record) => record.id === current)
           ? current
-          : next.find((record) => record.kind === kind)?.id || "",
+          : "",
       );
       setError(null);
     } catch (requestError) {
+      if (
+        requestId !== listRequestRef.current ||
+        workspaceIdRef.current !== requestWorkspaceId
+      ) {
+        return;
+      }
       setError(
         requestError instanceof Error
           ? requestError.message
           : "Capsule 加载失败",
       );
     } finally {
-      setLoading(false);
+      if (
+        requestId === listRequestRef.current &&
+        workspaceIdRef.current === requestWorkspaceId
+      ) {
+        setLoading(false);
+      }
     }
-  }, [kind]);
+  }, [workspaceId, workspaceReady]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => void load(), 0);
+    listRequestRef.current += 1;
+    assetRequestRef.current += 1;
+    favoriteRequestRef.current += 1;
+    const timer = window.setTimeout(() => {
+      setRecords([]);
+      setSelectedId("");
+      setAssets([]);
+      setError(null);
+      if (workspaceReady) void load();
+    }, 0);
     return () => window.clearTimeout(timer);
-  }, [load]);
+  }, [load, workspaceId, workspaceReady]);
 
   const visible = useMemo(
     () =>
@@ -107,9 +191,11 @@ export default function CapsulesPage() {
     visible[0];
 
   useEffect(() => {
+    const requestId = ++assetRequestRef.current;
+    const requestWorkspaceId = workspaceId;
     const timer = window.setTimeout(() => {
-      if (!selected) {
-        setAssets([]);
+      setAssets([]);
+      if (!selected || !workspaceReady || !requestWorkspaceId) {
         return;
       }
       const loadSelectedAssets = async () => {
@@ -118,31 +204,60 @@ export default function CapsulesPage() {
           assetIds = selected.cluster.representative_asset_ids;
         } else {
           const detail = await apiFetch<{
+            workspace_id: string;
             latest_snapshot: {
               results: Array<{ asset_id: string }>;
             };
           }>(
-            `/api/v1/search-capsules/${selected.search.capsule_id}?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+            `/api/v1/search-capsules/${encodeURIComponent(selected.search.capsule_id)}?workspace_id=${encodeURIComponent(requestWorkspaceId)}&created_by=${encodeURIComponent(CREATED_BY)}`,
           );
+          if (
+            detail.workspace_id !== requestWorkspaceId ||
+            requestId !== assetRequestRef.current ||
+            workspaceIdRef.current !== requestWorkspaceId
+          ) {
+            return;
+          }
           assetIds = detail.latest_snapshot.results.map(
             (item) => item.asset_id,
           );
         }
         if (!assetIds.length) {
-          setAssets([]);
+          if (
+            requestId === assetRequestRef.current &&
+            workspaceIdRef.current === requestWorkspaceId
+          ) {
+            setAssets([]);
+          }
           return;
         }
         const params = new URLSearchParams({
-          workspace_id: WORKSPACE_ID,
+          workspace_id: requestWorkspaceId,
           limit: "100",
         });
         assetIds.forEach((assetId) => params.append("asset_id", assetId));
-        setAssets((await loadAssets(params)).items);
+        const payload = await loadAssets(params);
+        if (
+          requestId === assetRequestRef.current &&
+          workspaceIdRef.current === requestWorkspaceId
+        ) {
+          setAssets(inWorkspace(payload.items, requestWorkspaceId));
+        }
       };
-      void loadSelectedAssets().catch(() => setAssets([]));
+      void loadSelectedAssets().catch(() => {
+        if (
+          requestId === assetRequestRef.current &&
+          workspaceIdRef.current === requestWorkspaceId
+        ) {
+          setAssets([]);
+        }
+      });
     }, 0);
-    return () => window.clearTimeout(timer);
-  }, [selected]);
+    return () => {
+      window.clearTimeout(timer);
+      assetRequestRef.current += 1;
+    };
+  }, [selected, workspaceId, workspaceReady]);
 
   const switchKind = (nextKind: CapsuleKind) => {
     setKind(nextKind);
@@ -151,8 +266,10 @@ export default function CapsulesPage() {
 
   const toggleFavorite = async () => {
     if (!selected || selected.kind !== "search") return;
-    await apiFetch(
-      `/api/v1/search-capsules/${selected.search.capsule_id}?workspace_id=${WORKSPACE_ID}&created_by=${CREATED_BY}`,
+    const requestWorkspaceId = workspaceId;
+    const requestId = ++favoriteRequestRef.current;
+    const updated = await apiFetch<SearchCapsule>(
+      `/api/v1/search-capsules/${encodeURIComponent(selected.search.capsule_id)}?workspace_id=${encodeURIComponent(requestWorkspaceId)}&created_by=${encodeURIComponent(CREATED_BY)}`,
       {
         method: "PATCH",
         body: JSON.stringify({
@@ -160,6 +277,13 @@ export default function CapsulesPage() {
         }),
       },
     );
+    if (
+      requestId !== favoriteRequestRef.current ||
+      workspaceIdRef.current !== requestWorkspaceId ||
+      updated.workspace_id !== requestWorkspaceId
+    ) {
+      return;
+    }
     await load();
   };
 
@@ -177,11 +301,23 @@ export default function CapsulesPage() {
   return (
     <DemoShell
       active="capsules"
+      workspaceControl={
+        <WorkspaceSelect
+          workspaceId={workspaceId}
+          workspaces={workspaces}
+          loading={workspacesLoading}
+          onChange={changeWorkspace}
+        />
+      }
       eyebrow="CAPSULE LIBRARY / LIVE"
       title="把一次发现，变成可复用的入口。"
       description="统一读取真实 Cluster Capsule 和 Search Capsule，并展示其关联 Asset。"
       actions={
-        <button className="secondary-action" onClick={() => void load()}>
+        <button
+          className="secondary-action"
+          disabled={!workspaceReady}
+          onClick={() => void load()}
+        >
           刷新
         </button>
       }
@@ -220,18 +356,18 @@ export default function CapsulesPage() {
           </div>
         </header>
 
-        {error && (
+        {(workspaceError || error) && (
           <div className="asset-empty">
             <strong>无法加载 Capsule</strong>
-            <span>{error}</span>
+            <span>{workspaceError || error}</span>
           </div>
         )}
-        {!error && loading && (
+        {!workspaceError && !error && (!workspaceReady || loading) && (
           <div className="asset-empty">
             <strong>正在读取 Capsule…</strong>
           </div>
         )}
-        {!error && !loading && (
+        {!workspaceError && !error && workspaceReady && !loading && (
           <div className="capsule-layout">
             <aside className="capsule-list">
               {visible.map((record) => {

@@ -38,7 +38,7 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /CAPSULE/);
   assert.match(html, /搜到你记得的/);
   assert.match(html, /个人多模态素材库/);
-  assert.match(html, /实时服务/);
+  assert.match(html, /Workspace Demo/);
   assert.match(html, /默认检索原始内容/);
   assert.match(html, /检索维度/);
   assert.match(html, /原始内容/);
@@ -138,7 +138,7 @@ test("cluster workspace keeps history and exposes current resident controls", as
 });
 
 test("workspace-aware pages render a shared workspace switcher", async () => {
-  for (const pathname of ["/tasks", "/assets", "/clusters"]) {
+  for (const pathname of ["/tasks", "/assets", "/clusters", "/search", "/capsules"]) {
     const response = await render(pathname);
     assert.equal(response.status, 200);
     assert.match(await response.text(), /aria-label="切换工作空间"/);
@@ -175,6 +175,12 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /target="_blank"/);
   assert.match(page, /rel="noopener noreferrer"/);
   assert.match(page, /ProductTopbar/);
+  assert.match(page, /useWorkspaceSelection/);
+  assert.match(page, /WorkspaceSelect/);
+  assert.match(page, /workspaceReady/);
+  assert.match(page, /AbortController/);
+  assert.match(page, /requestWorkspaceId/);
+  assert.doesNotMatch(page, /useState\("workspace_demo"\)/);
   assert.match(shell, /ProductTopbar/);
   assert.match(shell, /product-nav-compact/);
   assert.doesNotMatch(shell, /demo-sidebar/);
@@ -225,6 +231,15 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /手动管理/);
   assert.match(clustersPage, /簇内成员由用户手动管理/);
   assert.match(capsulesPage, /Search Capsule/);
+  assert.match(capsulesPage, /useWorkspaceSelection/);
+  assert.match(capsulesPage, /WorkspaceSelect/);
+  assert.match(capsulesPage, /workspaceReady/);
+  assert.match(capsulesPage, /listRequestRef/);
+  assert.match(capsulesPage, /assetRequestRef/);
+  assert.match(capsulesPage, /favoriteRequestRef/);
+  assert.match(capsulesPage, /requestWorkspaceId/);
+  assert.match(capsulesPage, /inWorkspace/);
+  assert.doesNotMatch(capsulesPage, /WORKSPACE_ID|workspace_demo/);
   assert.match(layout, /Capsule · 个人多模态素材工作台/);
   assert.doesNotMatch(
     `${page}\n${layout}\n${packageJson}\n${shell}\n${importPage}\n${tasksPage}\n${assetsPage}\n${detailPage}\n${clustersPage}\n${capsulesPage}`,

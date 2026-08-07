@@ -1,7 +1,16 @@
 "use client";
 
-import { FormEvent, KeyboardEvent, useMemo, useState } from "react";
+import {
+  FormEvent,
+  KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { ProductTopbar } from "./components/DemoShell";
+import { endpoint } from "./lib/api";
+import { useWorkspaceSelection, WorkspaceSelect } from "./lib/workspaces";
 
 type QueryType = "text" | "image" | "image_text";
 type AssetType = "image" | "video_segment" | "markdown_block" | "text_block";
@@ -136,9 +145,6 @@ type CapsuleDetail = CapsuleSummary & {
   };
   executions: string[];
 };
-
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 const QUERY_TYPES: Array<{ value: QueryType; label: string; marker: string }> = [
   { value: "text", label: "文字", marker: "T" },
@@ -444,17 +450,15 @@ const EMPTY_RESPONSE: SearchResponse = {
 
 function getPreviewUrl(
   result: SearchResult,
-  apiBaseUrl: string,
   workspaceId: string,
 ) {
   if (result.preview_uri && /^(https?:|data:image\/)/.test(result.preview_uri)) {
     return result.preview_uri;
   }
   if (result.asset_type !== "image") return null;
-  const base = apiBaseUrl.replace(/\/$/, "");
-  return `${base}/api/v1/assets/${encodeURIComponent(
+  return endpoint(`/api/v1/assets/${encodeURIComponent(
     result.asset_id,
-  )}/thumbnail?workspace_id=${encodeURIComponent(workspaceId)}`;
+  )}/thumbnail?workspace_id=${encodeURIComponent(workspaceId)}`);
 }
 
 function locatorTime(locator: Record<string, unknown>) {
@@ -474,17 +478,15 @@ function SearchResultCard({
   result,
   index,
   fusionMethod,
-  apiBaseUrl,
   workspaceId,
 }: {
   result: SearchResult;
   index: number;
   fusionMethod: FusionMethod;
-  apiBaseUrl: string;
   workspaceId: string;
 }) {
   const [imageFailed, setImageFailed] = useState(false);
-  const previewUrl = getPreviewUrl(result, apiBaseUrl, workspaceId);
+  const previewUrl = getPreviewUrl(result, workspaceId);
   const startTime = locatorTime(result.source_locator);
   const context = result.source_contexts.find((item) => item.text)?.text;
   const foldedCount = result.folded_asset_ids?.length ?? 1;
@@ -689,9 +691,14 @@ export default function Home() {
   const [queryText, setQueryText] = useState("蓝紫色黄昏动画场景");
   const [queryImageUrl, setQueryImageUrl] = useState("");
   const [queryImageFile, setQueryImageFile] = useState<File | null>(null);
-  const [workspaceId, setWorkspaceId] = useState("workspace_demo");
+  const {
+    workspaceId,
+    workspaces,
+    loading: workspacesLoading,
+    ready: workspaceReady,
+    setWorkspaceId,
+  } = useWorkspaceSelection();
   const [createdBy, setCreatedBy] = useState("user_demo");
-  const [apiBaseUrl, setApiBaseUrl] = useState(API_BASE_URL);
   const [assetTypes, setAssetTypes] = useState<AssetType[]>([
     "image",
     "video_segment",
@@ -719,12 +726,64 @@ export default function Home() {
     useState<CapsuleDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const workspaceIdRef = useRef(workspaceId);
+  const requestControllersRef = useRef(new Set<AbortController>());
+
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId;
+    for (const controller of requestControllersRef.current) {
+      controller.abort();
+    }
+    requestControllersRef.current.clear();
+  }, [workspaceId]);
+
+  useEffect(
+    () => () => {
+      for (const controller of requestControllersRef.current) {
+        controller.abort();
+      }
+    },
+    [],
+  );
+
+  const startWorkspaceRequest = () => {
+    const controller = new AbortController();
+    requestControllersRef.current.add(controller);
+    return controller;
+  };
+
+  const finishWorkspaceRequest = (controller: AbortController) => {
+    requestControllersRef.current.delete(controller);
+  };
+
+  const isCurrentWorkspace = (requestWorkspaceId: string) =>
+    workspaceIdRef.current === requestWorkspaceId;
+
+  const handleWorkspaceChange = (nextWorkspaceId: string) => {
+    if (!nextWorkspaceId || nextWorkspaceId === workspaceIdRef.current) return;
+    // Update the ref synchronously so a response that resolves during the
+    // React state transition cannot paint data from the previous workspace.
+    workspaceIdRef.current = nextWorkspaceId;
+    for (const controller of requestControllersRef.current) {
+      controller.abort();
+    }
+    requestControllersRef.current.clear();
+    setResponse(EMPTY_RESPONSE);
+    setCapsules([]);
+    setSelectedCapsule(null);
+    setError(null);
+    setLoading(false);
+    setResultSet("assets");
+    setViewMode("live");
+    setWorkspaceId(nextWorkspaceId);
+  };
 
   const imageQueryEnabled =
     queryType === "image" || queryType === "image_text";
   const textQueryEnabled = queryType === "text" || queryType === "image_text";
 
   const validationMessage = useMemo(() => {
+    if (!workspaceReady) return "正在加载工作空间";
     if (!workspaceId.trim()) return "请填写 Workspace ID";
     if (assetTypes.length === 0) return "请至少选择一种目标素材类型";
     if (embeddingTypes.length === 0) return "请至少选择一个检索维度";
@@ -746,10 +805,8 @@ export default function Home() {
     queryText,
     textQueryEnabled,
     workspaceId,
+    workspaceReady,
   ]);
-
-  const endpoint = (path: string) =>
-    `${apiBaseUrl.replace(/\/$/, "")}${path}`;
 
   const readError = async (apiResponse: Response) => {
     const payload = (await apiResponse.json().catch(() => null)) as
@@ -762,14 +819,18 @@ export default function Home() {
     return detail || `请求失败（${apiResponse.status}）`;
   };
 
-  const uploadImage = async () => {
+  const uploadImage = async (
+    requestWorkspaceId: string,
+    signal: AbortSignal,
+  ) => {
     if (!queryImageFile) return null;
     const form = new FormData();
-    form.set("workspace_id", workspaceId.trim());
+    form.set("workspace_id", requestWorkspaceId);
     form.set("file", queryImageFile);
     const uploadResponse = await fetch(endpoint("/api/v1/query-images"), {
       method: "POST",
       body: form,
+      signal,
     });
     if (!uploadResponse.ok) throw new Error(await readError(uploadResponse));
     return (await uploadResponse.json()) as { upload_id: string };
@@ -781,15 +842,20 @@ export default function Home() {
       setError(validationMessage);
       return;
     }
+    const requestWorkspaceId = workspaceId.trim();
+    const controller = startWorkspaceRequest();
     setLoading(true);
     setError(null);
     try {
-      const upload = imageQueryEnabled ? await uploadImage() : null;
+      const upload = imageQueryEnabled
+        ? await uploadImage(requestWorkspaceId, controller.signal)
+        : null;
       const apiResponse = await fetch(endpoint("/api/v1/search"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
-          workspace_id: workspaceId.trim(),
+          workspace_id: requestWorkspaceId,
           created_by: createdBy.trim(),
           query_type: queryType,
           query_text: textQueryEnabled ? queryText.trim() : null,
@@ -820,128 +886,186 @@ export default function Home() {
         }),
       });
       if (!apiResponse.ok) throw new Error(await readError(apiResponse));
-      setResponse((await apiResponse.json()) as SearchResponse);
-      setResultSet("assets");
-      setViewMode("live");
+      const nextResponse = (await apiResponse.json()) as SearchResponse;
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setResponse(nextResponse);
+        setResultSet("assets");
+        setViewMode("live");
+      }
     } catch (requestError) {
-      setError(
-        requestError instanceof Error
-          ? requestError.message
-          : "无法连接搜索服务，请检查 API 地址。",
-      );
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "无法连接搜索服务，请检查 API 地址。",
+        );
+      }
     } finally {
-      setLoading(false);
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
   };
 
-  const loadCapsules = async () => {
+  const loadCapsules = async (
+    requestWorkspaceId = workspaceId,
+    requestCreatedBy = createdBy,
+  ) => {
+    const controller = startWorkspaceRequest();
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams({
-        workspace_id: workspaceId,
-        created_by: createdBy,
+        workspace_id: requestWorkspaceId,
+        created_by: requestCreatedBy,
       });
       const apiResponse = await fetch(
         endpoint(`/api/v1/search-capsules?${params}`),
+        { signal: controller.signal },
       );
       if (!apiResponse.ok) throw new Error(await readError(apiResponse));
       const payload = (await apiResponse.json()) as {
         items: CapsuleSummary[];
       };
-      setCapsules(payload.items);
-      setViewMode("live");
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setCapsules(payload.items);
+        setViewMode("live");
+      }
     } catch (requestError) {
-      setError(
-        requestError instanceof Error
-          ? requestError.message
-          : "Search Capsule 加载失败",
-      );
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "Search Capsule 加载失败",
+        );
+      }
     } finally {
-      setLoading(false);
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
   };
 
   const openCapsule = async (capsuleId: string) => {
+    const requestWorkspaceId = workspaceId;
+    const requestCreatedBy = createdBy;
+    const controller = startWorkspaceRequest();
     setLoading(true);
     try {
       const params = new URLSearchParams({
-        workspace_id: workspaceId,
-        created_by: createdBy,
+        workspace_id: requestWorkspaceId,
+        created_by: requestCreatedBy,
       });
       const apiResponse = await fetch(
         endpoint(`/api/v1/search-capsules/${capsuleId}?${params}`),
+        { signal: controller.signal },
       );
       if (!apiResponse.ok) throw new Error(await readError(apiResponse));
-      setSelectedCapsule((await apiResponse.json()) as CapsuleDetail);
+      const capsule = (await apiResponse.json()) as CapsuleDetail;
+      if (isCurrentWorkspace(requestWorkspaceId)) setSelectedCapsule(capsule);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "打开失败");
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(requestError instanceof Error ? requestError.message : "打开失败");
+      }
     } finally {
-      setLoading(false);
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
   };
 
   const refreshCapsule = async (capsuleId: string) => {
+    const requestWorkspaceId = workspaceId;
+    const requestCreatedBy = createdBy;
+    const controller = startWorkspaceRequest();
     setLoading(true);
     try {
       const params = new URLSearchParams({
-        workspace_id: workspaceId,
-        created_by: createdBy,
+        workspace_id: requestWorkspaceId,
+        created_by: requestCreatedBy,
       });
       const apiResponse = await fetch(
         endpoint(`/api/v1/search-capsules/${capsuleId}/refresh?${params}`),
-        { method: "POST" },
+        { method: "POST", signal: controller.signal },
       );
       if (!apiResponse.ok) throw new Error(await readError(apiResponse));
-      setResponse((await apiResponse.json()) as SearchResponse);
-      setResultSet("assets");
-      setActiveView("search");
-      setViewMode("live");
+      const nextResponse = (await apiResponse.json()) as SearchResponse;
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setResponse(nextResponse);
+        setResultSet("assets");
+        setActiveView("search");
+        setViewMode("live");
+      }
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "刷新失败");
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(requestError instanceof Error ? requestError.message : "刷新失败");
+      }
     } finally {
-      setLoading(false);
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
   };
 
   const toggleFavorite = async (capsule: CapsuleSummary) => {
+    const requestWorkspaceId = workspaceId;
+    const requestCreatedBy = createdBy;
+    const controller = startWorkspaceRequest();
     const params = new URLSearchParams({
-      workspace_id: workspaceId,
-      created_by: createdBy,
+      workspace_id: requestWorkspaceId,
+      created_by: requestCreatedBy,
     });
-    const apiResponse = await fetch(
-      endpoint(`/api/v1/search-capsules/${capsule.capsule_id}?${params}`),
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_favorite: !capsule.is_favorite }),
-      },
-    );
-    if (!apiResponse.ok) {
-      setError(await readError(apiResponse));
-      return;
+    setLoading(true);
+    try {
+      const apiResponse = await fetch(
+        endpoint(`/api/v1/search-capsules/${capsule.capsule_id}?${params}`),
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_favorite: !capsule.is_favorite }),
+          signal: controller.signal,
+        },
+      );
+      if (!apiResponse.ok) throw new Error(await readError(apiResponse));
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        await loadCapsules(requestWorkspaceId, requestCreatedBy);
+      }
+    } catch (requestError) {
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(requestError instanceof Error ? requestError.message : "更新失败");
+      }
+    } finally {
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
-    await loadCapsules();
   };
 
   const deleteCapsule = async (capsuleId: string) => {
     if (!window.confirm("确认删除这个 Search Capsule？历史快照也会一并删除。")) {
       return;
     }
+    const requestWorkspaceId = workspaceId;
+    const requestCreatedBy = createdBy;
+    const controller = startWorkspaceRequest();
     const params = new URLSearchParams({
-      workspace_id: workspaceId,
-      created_by: createdBy,
+      workspace_id: requestWorkspaceId,
+      created_by: requestCreatedBy,
     });
-    const apiResponse = await fetch(
-      endpoint(`/api/v1/search-capsules/${capsuleId}?${params}`),
-      { method: "DELETE" },
-    );
-    if (!apiResponse.ok) {
-      setError(await readError(apiResponse));
-      return;
+    setLoading(true);
+    try {
+      const apiResponse = await fetch(
+        endpoint(`/api/v1/search-capsules/${capsuleId}?${params}`),
+        { method: "DELETE", signal: controller.signal },
+      );
+      if (!apiResponse.ok) throw new Error(await readError(apiResponse));
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setSelectedCapsule(null);
+        await loadCapsules(requestWorkspaceId, requestCreatedBy);
+      }
+    } catch (requestError) {
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(requestError instanceof Error ? requestError.message : "删除失败");
+      }
+    } finally {
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) setLoading(false);
     }
-    setSelectedCapsule(null);
-    await loadCapsules();
   };
 
   const handleQueryKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -983,8 +1107,15 @@ export default function Home() {
       <ProductTopbar
         active="search"
         connection={viewMode}
-        status={viewMode === "live" ? "实时服务" : "演示数据"}
-        workspace={workspaceId || "未选择 Workspace"}
+        status="Workspace Demo"
+        workspaceControl={
+          <WorkspaceSelect
+            workspaceId={workspaceId}
+            workspaces={workspaces}
+            loading={workspacesLoading}
+            onChange={handleWorkspaceChange}
+          />
+        }
       />
 
       {activeView === "search" ? (
@@ -1245,7 +1376,8 @@ export default function Home() {
                 Workspace ID
                 <input
                   value={workspaceId}
-                  onChange={(event) => setWorkspaceId(event.target.value)}
+                  readOnly
+                  aria-label="当前 Workspace ID"
                 />
               </label>
               <label>
@@ -1253,13 +1385,6 @@ export default function Home() {
                 <input
                   value={createdBy}
                   onChange={(event) => setCreatedBy(event.target.value)}
-                />
-              </label>
-              <label>
-                Search API
-                <input
-                  value={apiBaseUrl}
-                  onChange={(event) => setApiBaseUrl(event.target.value)}
                 />
               </label>
             </details>
@@ -1331,7 +1456,6 @@ export default function Home() {
                     result={result}
                     index={index}
                     fusionMethod={response.fusion_method}
-                    apiBaseUrl={apiBaseUrl}
                     workspaceId={workspaceId}
                     key={result.asset_id}
                   />
@@ -1453,7 +1577,6 @@ export default function Home() {
                           result={result}
                           index={index}
                           fusionMethod={selectedCapsule.fusion_method}
-                          apiBaseUrl={apiBaseUrl}
                           workspaceId={workspaceId}
                           key={`${selectedCapsule.capsule_id}-${result.asset_id}`}
                         />
