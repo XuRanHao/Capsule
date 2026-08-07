@@ -345,22 +345,13 @@ def build_cluster_summary_messages(
     }
     if embedding_type in _PATH_AWARE_EMBEDDING_TYPES:
         payload["member_source_context"] = cluster_source_context(member_source_paths)
-    description_length_instruction = (
-        "使用中文 50 到 90 字"
-        if embedding_type in _PATH_AWARE_EMBEDDING_TYPES
-        else "使用中文 50 到 150 字"
-    )
     path_instruction = (
         f"当前维度为 {embedding_type}。member_source_context 来自该簇全部成员的真实相对"
-        "路径。description 必须明确写出 semantic_path_terms 中与当前维度证据一致的项目名"
-        "或角色名及对应成员数量，但不要在模型 description 中复述完整 relative_path 或"
-        "file_name；系统会在保存前确定性追加代表文件与相对路径，避免超过长度上限。name "
-        "必须优先保留上述有语义的项目名或角色名，再概括当前维度，例如“古小玲少女立绘”"
-        "或“古小玲角色立绘制作”；如果只有部分成员属于该实体，使用“古小玲及其他……”等"
-        "不误导的表达。哈希、纯数字、日期文件名不得进入 name。路径只能作为当前维度事实"
-        "的补充证据，不得据此混入其他维度；directory_counts 中未进入 semantic_path_terms "
-        "的“参考、测试、png、小说编辑”等通用目录词不得进入 name，完整路径中的上层目录"
-        "也不得被误判为当前资产的角色身份。"
+        "路径。只有 semantic_path_terms 在多个成员中重复出现且与当前维度直接相关时，才可"
+        "把最具代表性的一个语义实体写入 name 或 common_features。成员数量、完整相对路径、"
+        "文件名、目录统计和代表文件不得写入 description；这些属于证据元数据，不属于簇的"
+        "语义描述。哈希、纯数字、日期文件名和“参考、测试、png、小说编辑”等通用目录词"
+        "不得进入任何生成字段，完整路径中的上层目录不得被误判为角色或项目身份。"
         if embedding_type in _PATH_AWARE_EMBEDDING_TYPES
         else ""
     )
@@ -368,23 +359,31 @@ def build_cluster_summary_messages(
         {
             "role": "system",
             "content": (
-                "你正在总结一个通过单一 Feature 向量维度聚类发现的个人资产组。"
-                "embedding_type 和 dimension_policy 是不可跨越的语义边界；所有输出字段只能"
-                "使用 representative_assets 中当前维度的证据，不得混入主体、场景、风格、颜色、"
-                "情绪、媒介、用途、受众、来源或版权等其他维度信息。严格按以下顺序完成："
-                "第一步，先写 description，只概括 description_focus 指定的共同特征，并说明"
-                f"该维度内的必要差异；{description_length_instruction}。第二步，再从已经写好的 "
-                "description 中提炼 name；name 不得增加 description 中没有的信息，只保留 "
-                "title_focus 指定的关键词，简洁、可区分，不添加“图像、图片、素材、作品、"
-                "集合、类别”等泛化尾词。"
-                "name 不得堆叠近义词、同义词或只有措辞差异的词组；同一概念只保留一个最准确"
-                f"的短语。{path_instruction}"
-                "keywords 和 common_features 也必须严格属于当前维度。description_must_exclude "
-                "和 title_must_exclude 中列出的内容禁止出现在对应字段。只返回合法 JSON，并按"
-                "“先描述、后标题”的字段顺序输出："
-                '{"description":"...","name":"...","keywords":["..."],'
-                '"common_features":["..."],"internal_variance":"low|medium|high"}。'
-                "keywords 必须有 3 到 8 个。"
+                "你正在总结一个由单一 Feature 向量维度聚类得到的资产簇。你的任务不是为这个"
+                "簇撰写完整介绍，而是尽可能准确、完整且简洁地提取簇内成员共同具备的当前维度"
+                "特征。embedding_type 和 dimension_policy 是不可跨越的语义边界；所有输出只能"
+                "使用 representative_assets 中与当前维度直接相关的证据，不得混入其他维度，"
+                "不得根据常识、文件名称或孤立成员的特殊表现补充推测。"
+                "第一步生成 common_features：只提取 description_focus 指定的当前维度共同特征；"
+                "优先保留在多个代表资产中重复出现或语义一致的特征；membership_probability "
+                "越高且 distance_to_medoid 越低，证据权重越高；只在单个边缘成员出现的特征不得"
+                "作为共同特征。每项只表达一个独立事实，尽量采用“主体 + 当前维度信息”的短语"
+                "结构，按证据支持度和区分度排列；相近、同义或包含关系的特征合并。在证据允许"
+                "范围内尽可能完整提取，但不得为了增加数量而拆分、改写、推测或凑数；如果只能"
+                "确认一个共同特征，就只输出一个。common_features 必须有 1 到 8 项。"
+                "第二步生成 description：只能概括 common_features 已出现的内容，使用 30 到 80 "
+                "个中文字符，以能够覆盖共同特征的最短自然表达为准；不得为了字数、文采或完整"
+                "介绍而增加信息，不写背景、用途、成因、价值、推测或成员差异，不逐一介绍代表"
+                "资产，避免“本簇包含”“这一组素材主要展现”等空泛开场。成员差异只通过 "
+                "internal_variance 表达。"
+                "第三步生成 name：只能从 common_features 和 description 中提炼最有区分度的 "
+                "1 到 2 个共同特征，不得增加新信息，不添加“图像、图片、素材、作品、集合、"
+                "类别、分组”等泛化词，不得堆叠近义词。"
+                f"{path_instruction}"
+                "description_must_exclude 和 title_must_exclude 中列出的内容禁止出现在对应字段。"
+                "只返回合法 JSON，不要输出 keywords，也不要输出其他字段："
+                '{"description":"...","name":"...","common_features":["..."],'
+                '"internal_variance":"low|medium|high"}。'
             ),
         },
         {
@@ -488,98 +487,14 @@ def ensure_path_aware_cluster_summary(
     *,
     embedding_type: str,
 ) -> ClusterSummary:
-    """Guarantee path-aware dimensions persist source identity and file evidence."""
+    """Preserve only a shared semantic path entity in the generated name."""
     if embedding_type not in _PATH_AWARE_EMBEDDING_TYPES:
         return summary
     context = cluster_source_context(source_paths)
-    description = _ensure_cluster_path_description(summary.description, context)
     name = _ensure_cluster_path_name(summary.name, context)
-    if name == summary.name and description == summary.description:
+    if name == summary.name:
         return summary
-    return summary.model_copy(update={"name": name, "description": description})
-
-
-def ensure_asset_usage_cluster_path_description(
-    description: str,
-    source_paths: Sequence[str],
-    *,
-    max_length: int = 150,
-) -> str:
-    """Guarantee the persisted usage Capsule visibly names its path evidence."""
-    return _ensure_cluster_path_description(
-        description,
-        cluster_source_context(source_paths),
-        max_length=max_length,
-    )
-
-
-def _ensure_cluster_path_description(
-    description: str,
-    context: dict[str, object],
-    *,
-    max_length: int = 150,
-) -> str:
-    raw_directories = context["directory_counts"]
-    directories = (
-        [item for item in raw_directories if isinstance(item, dict)]
-        if isinstance(raw_directories, list)
-        else []
-    )
-    raw_terms = context["semantic_path_terms"]
-    semantic_terms = (
-        [item for item in raw_terms if isinstance(item, dict)]
-        if isinstance(raw_terms, list)
-        else []
-    )
-    raw_files = context["representative_files"]
-    representative_files = (
-        [item for item in raw_files if isinstance(item, dict)]
-        if isinstance(raw_files, list)
-        else []
-    )
-    if not representative_files:
-        return description
-
-    primary_term = str(semantic_terms[0].get("term", "")) if semantic_terms else ""
-    primary_count = int(semantic_terms[0].get("member_count", 0)) if semantic_terms else 0
-    primary_directory = str(directories[0].get("directory", "")) if directories else ""
-    representative = _representative_file_for_context(
-        representative_files,
-        term=primary_term,
-        directory=primary_directory,
-    )
-    representative_path = str(representative.get("relative_path", ""))
-    file_name = str(representative.get("file_name", ""))
-    if representative_path in description and file_name in description:
-        return description
-    directory = _source_directory(representative_path)
-    if primary_term:
-        prefix = (
-            f"路径实体「{primary_term}」出现在{primary_count}项成员中；代表文件"
-            f"「{file_name}」位于相对路径「{representative_path}」。"
-        )
-    elif directories:
-        directory_count = int(directories[0].get("member_count", 0))
-        prefix = (
-            f"成员中{directory_count}项来自「{directory}」；代表文件「{file_name}」"
-            f"位于相对路径「{representative_path}」。"
-        )
-    else:
-        prefix = f"代表文件「{file_name}」位于相对路径「{representative_path}」。"
-    prefix_budget = max(40, max_length - 50)
-    if len(prefix) > prefix_budget:
-        identity = f"路径实体「{primary_term}」覆盖{primary_count}项；" if primary_term else ""
-        prefix = f"{identity}相对目录「{directory}」，代表文件「{file_name}」。"
-    if len(prefix) > prefix_budget:
-        file_budget = max(12, prefix_budget - len(directory) - 25)
-        prefix = (
-            f"相对目录「{_abbreviate(directory, 30)}」，"
-            f"代表文件「{_abbreviate(file_name, file_budget)}」。"
-        )
-    remaining = max_length - len(prefix)
-    if remaining <= 0:
-        return _abbreviate(prefix, max_length)
-    return f"{prefix}{_truncate_complete_sentence(description, remaining)}".rstrip()
+    return summary.model_copy(update={"name": name})
 
 
 def _ensure_cluster_path_name(name: str, context: dict[str, object]) -> str:
@@ -600,25 +515,6 @@ def _ensure_cluster_path_name(name: str, context: dict[str, object]) -> str:
     if primary_count < member_count:
         return f"{primary_term}及其他{name}"
     return f"{primary_term}{name}"
-
-
-def _representative_file_for_context(
-    representative_files: list[dict[str, object]],
-    *,
-    term: str,
-    directory: str,
-) -> dict[str, object]:
-    if term:
-        for representative in representative_files:
-            path = str(representative.get("relative_path", ""))
-            if term in PurePosixPath(path).parent.parts:
-                return representative
-    if directory:
-        for representative in representative_files:
-            path = str(representative.get("relative_path", ""))
-            if _source_directory(path) == directory:
-                return representative
-    return representative_files[0]
 
 
 def _semantic_path_terms(parts: Sequence[str]) -> list[str]:
@@ -650,38 +546,6 @@ def _is_human_readable_file_name(file_name: str) -> bool:
     if re.fullmatch(r"[\d_\-. √]+", stem):
         return False
     return bool(re.search(r"[\u3400-\u9fffA-Za-z]", stem))
-
-
-def _abbreviate(value: str, max_length: int) -> str:
-    if len(value) <= max_length:
-        return value
-    if max_length <= 1:
-        return "…"
-    head_length = (max_length - 1) // 2
-    tail_length = max_length - head_length - 1
-    return f"{value[:head_length]}…{value[-tail_length:]}"
-
-
-def _truncate_complete_sentence(value: str, max_length: int) -> str:
-    if len(value) <= max_length:
-        if value.endswith(("。", "！", "？", "!", "?")):
-            return value
-        if len(value) < max_length:
-            return f"{value.rstrip('，、；：,;: ')}。"
-        return f"{value[: max_length - 1].rstrip('，、；：,;: ')}。"
-    if max_length <= 1:
-        return "。"
-    candidate = value[: max_length - 1].rstrip("，、；：,;: ")
-    boundaries = {
-        mark: candidate.rfind(mark) for mark in ("。", "！", "？", "!", "?", "；", ";", "，", ",")
-    }
-    boundary_mark, last_boundary = max(boundaries.items(), key=lambda item: item[1])
-    if last_boundary >= max_length // 2:
-        complete_clause = candidate[: last_boundary + 1]
-        if boundary_mark in {"；", ";", "，", ","}:
-            complete_clause = f"{complete_clause[:-1]}。"
-        return complete_clause
-    return f"{candidate}。"
 
 
 def _normalized_source_path(raw_path: str) -> str | None:

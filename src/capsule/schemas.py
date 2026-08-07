@@ -372,9 +372,8 @@ class EmbeddingResult(BaseModel):
 
 class ClusterSummary(BaseModel):
     name: str = Field(min_length=1, max_length=1024)
-    description: str = Field(min_length=50, max_length=150)
-    keywords: list[str] = Field(min_length=3, max_length=8)
-    common_features: list[str] = Field(default_factory=list, max_length=8)
+    description: str = Field(min_length=30, max_length=80)
+    common_features: list[str] = Field(min_length=1, max_length=8)
     internal_variance: ClusterInternalVariance
 
 

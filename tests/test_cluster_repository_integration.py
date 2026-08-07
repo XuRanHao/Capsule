@@ -170,7 +170,6 @@ def _capsule_write(*, workspace_id: str, name: str, description: str) -> Cluster
         summary=ClusterSummary(
             name=name,
             description=description,
-            keywords=["霓虹", "夜景", "赛博朋克"],
             common_features=["蓝紫色冷光", "城市夜景"],
             internal_variance=ClusterInternalVariance.LOW,
         ),
@@ -203,7 +202,4 @@ def _capsule_write(*, workspace_id: str, name: str, description: str) -> Cluster
 
 
 def _description(name: str) -> str:
-    return (
-        f"{name} 这一组素材以蓝紫色霓虹光影和城市夜景为主要共同特征，"
-        "画面多使用冷色调反射与高对比照明，整体呈现稳定的电影感视觉风格。"
-    )
+    return f"{name}共同呈现蓝紫色冷光、低饱和度和高明暗对比，整体视觉特征保持稳定。"

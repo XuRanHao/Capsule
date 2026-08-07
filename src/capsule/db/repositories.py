@@ -2591,7 +2591,7 @@ class ClusterRepository:
                     effective_name=values.summary.name,
                     model_generated_description=values.summary.description,
                     effective_description=values.summary.description,
-                    keywords=values.summary.keywords,
+                    keywords=[],
                     common_features=values.summary.common_features,
                     internal_variance=values.summary.internal_variance.value,
                     member_count=values.member_count,
@@ -2609,7 +2609,7 @@ class ClusterRepository:
                 capsule.effective_description = (
                     capsule.user_override_description or values.summary.description
                 )
-                capsule.keywords = values.summary.keywords
+                capsule.keywords = []
                 capsule.common_features = values.summary.common_features
                 capsule.internal_variance = values.summary.internal_variance.value
                 capsule.member_count = values.member_count

@@ -185,8 +185,7 @@ class DoubaoClient:
                 timeout_seconds=self._settings.understanding_timeout_seconds,
             )
         except ValidationError as exc:
-            # Responses can be valid JSON but still violate the persisted Capsule
-            # contract (most often a description shorter than 50 Chinese chars).
+            # Responses can be valid JSON but still violate the concise Capsule contract.
             # Retry once with the original representatives intact and explicit errors.
             validation_errors = json.dumps(
                 exc.errors(include_url=False),
@@ -197,8 +196,9 @@ class DoubaoClient:
                 "role": "user",
                 "content": (
                     "上一份输出未通过结构校验。请仅基于前述代表资产重新输出完整合法 JSON，"
-                    "不要解释或使用 Markdown。description 必须是 50 到 150 个中文字符；"
-                    "keywords 必须为 3 到 8 项；internal_variance 只能为 low、medium 或 high。"
+                    "不要解释或使用 Markdown。description 必须是 30 到 80 个中文字符；"
+                    "common_features 必须有 1 到 8 项；不要输出 keywords；"
+                    "internal_variance 只能为 low、medium 或 high。"
                     f"校验错误：{validation_errors}"
                 ),
             }

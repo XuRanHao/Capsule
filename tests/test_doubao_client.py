@@ -399,10 +399,7 @@ async def test_embed_multimodal_requests_configured_dimension() -> None:
 @pytest.mark.asyncio
 async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> None:
     captured: dict[str, object] = {}
-    description = (
-        "这一组素材以夜间城市中的蓝紫色霓虹光影为主，人物和街道在冷色调反射中呈现出"
-        "稳定的赛博朋克电影感，少量镜头的构图变化不影响整体风格判断。"
-    )
+    description = "共同呈现蓝紫色冷光、低饱和度和高明暗对比，整体色彩关系保持稳定。"
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/responses"
@@ -420,7 +417,6 @@ async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> 
                                     {
                                         "name": "蓝紫色霓虹夜景",
                                         "description": description,
-                                        "keywords": ["霓虹", "夜景", "赛博朋克"],
                                         "common_features": ["蓝紫色冷光", "城市夜景"],
                                         "internal_variance": "low",
                                     },
@@ -459,10 +455,7 @@ async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> 
 @pytest.mark.asyncio
 async def test_summarize_cluster_retries_once_when_response_violates_contract() -> None:
     calls: list[dict[str, object]] = []
-    valid_description = (
-        "这一组素材围绕蓝紫色霓虹夜景展开，冷色光线、城市建筑和夜间反射共同形成"
-        "稳定的电影化视觉风格，代表资产之间仅在画面主体与构图细节上存在轻微变化。"
-    )
+    valid_description = "共同呈现蓝紫色冷光、低饱和度和高明暗对比，整体色彩关系保持稳定。"
 
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -475,7 +468,6 @@ async def test_summarize_cluster_retries_once_when_response_violates_contract() 
                     {
                         "name": "蓝紫色霓虹夜景",
                         "description": description,
-                        "keywords": ["霓虹", "夜景", "冷色"],
                         "common_features": ["蓝紫色光线"],
                         "internal_variance": "low",
                     },
@@ -503,3 +495,5 @@ async def test_summarize_cluster_retries_once_when_response_violates_contract() 
     assert summary.description == valid_description
     assert len(calls) == 2
     assert "上一份输出未通过结构校验" in str(calls[1]["input"])
+    assert "description 必须是 30 到 80 个中文字符" in str(calls[1]["input"])
+    assert "不要输出 keywords" in str(calls[1]["input"])

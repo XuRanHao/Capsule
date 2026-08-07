@@ -7,7 +7,6 @@ from capsule.pipeline.cluster_summary import (
     asset_usage_path_context,
     build_cluster_summary_messages,
     cluster_source_context,
-    ensure_asset_usage_cluster_path_description,
     ensure_path_aware_cluster_summary,
 )
 from capsule.schemas import ClusterSummary
@@ -103,10 +102,11 @@ def test_color_composition_summary_is_restricted_to_its_feature_dimension() -> N
     }
     assert policy["title_focus"].startswith("只提炼颜色")
     assert {"海报", "插画", "动漫", "主题", "场景", "宣传"} <= set(policy["title_must_exclude"])
-    assert prompt.index('"description"') < prompt.index('"name"')
-    assert "先写 description" in prompt
-    assert "再从已经写好的 description" in prompt
-    assert "同一概念只保留一个最准确" in prompt
+    assert "尽可能准确、完整且简洁" in prompt
+    assert "成员差异只通过 internal_variance 表达" in prompt
+    assert "30 到 80" in prompt
+    assert "不要输出 keywords" in prompt
+    assert "说明该维度内的必要差异" not in prompt
 
 
 def test_description_channels_only_receive_their_permitted_text_evidence() -> None:
@@ -149,7 +149,7 @@ def test_description_channels_only_receive_their_permitted_text_evidence() -> No
     assert "current_dimension_feature" not in description_evidence
 
 
-def test_asset_usage_summary_receives_and_guarantees_relative_path_context() -> None:
+def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
     source_paths = [
         "海报/素材/20251216-143446.png",
         "海报/素材/20251216-143450.png",
@@ -195,15 +195,9 @@ def test_asset_usage_summary_receives_and_guarantees_relative_path_context() -> 
     }
     assert evidence["source_relative_path"] == "海报/素材/20251216-143446.png"
     assert evidence["source_file_name"] == "20251216-143446.png"
-    assert "必须明确写出" in messages[0]["content"]
-
-    description = ensure_asset_usage_cluster_path_description(
-        "本组资产主要用于宣传海报的视觉设计和制作，可服务于推广物料的统一交付。",
-        source_paths,
+    assert "成员数量、完整相对路径、文件名、目录统计和代表文件不得写入 description" in (
+        messages[0]["content"]
     )
-    assert "2项来自「海报/素材」" in description
-    assert "海报/素材/20251216-143446.png" in description
-    assert len(description) <= 150
 
 
 def test_subject_content_summary_preserves_named_path_entity_and_file_evidence() -> None:
@@ -247,15 +241,11 @@ def test_subject_content_summary_preserves_named_path_entity_and_file_evidence()
     }
     assert evidence["source_relative_path"] == source_paths[0]
     assert evidence["source_file_name"] == "2√.png"
-    assert "项目名或角色名" in messages[0]["content"]
+    assert "最具代表性的一个语义实体" in messages[0]["content"]
 
     summary = ClusterSummary(
         name="二次元少女立绘",
-        description=(
-            "本组资产的核心主体均为二次元动漫少女，多呈现人物立绘内容，在服饰、发型和"
-            "姿态等具体表现上存在一定差异。"
-        ),
-        keywords=["二次元", "少女", "立绘"],
+        description="共同呈现二次元少女角色立绘，人物主体和立绘形式在代表资产中保持一致。",
         common_features=["少女角色"],
         internal_variance=ClusterInternalVariance.MEDIUM,
     )
@@ -266,10 +256,8 @@ def test_subject_content_summary_preserves_named_path_entity_and_file_evidence()
     )
 
     assert enriched.name == "古小玲及其他二次元少女立绘"
-    assert "「古小玲」出现在2项成员中" in enriched.description
-    assert "代表文件「2√.png」" in enriched.description
-    assert source_paths[0] in enriched.description
-    assert len(enriched.description) <= 150
+    assert enriched.description == summary.description
+    assert source_paths[0] not in enriched.description
 
 
 def test_path_entity_does_not_duplicate_an_existing_subject_name() -> None:
@@ -281,11 +269,7 @@ def test_path_entity_does_not_duplicate_an_existing_subject_name() -> None:
     ]
     summary = ClusterSummary(
         name="男性汪叹之立绘",
-        description=(
-            "本组资产的核心主体均为男性角色汪叹之，呈现形式均为人物立绘，局部服饰和"
-            "视角存在轻微差异，其中既有正面视图，也包含背面和半身视图等补充内容。"
-        ),
-        keywords=["汪叹之", "男性", "立绘"],
+        description="共同呈现男性角色汪叹之立绘，人物身份与立绘形式在代表资产中保持稳定一致。",
         common_features=["男性角色"],
         internal_variance=ClusterInternalVariance.LOW,
     )
@@ -297,7 +281,7 @@ def test_path_entity_does_not_duplicate_an_existing_subject_name() -> None:
     )
 
     assert enriched.name == "男性汪叹之立绘"
-    assert "「汪叹之」出现在4项成员中" in enriched.description
+    assert enriched.description == summary.description
 
 
 def test_generic_path_folders_do_not_become_title_entities() -> None:
@@ -313,7 +297,7 @@ def test_generic_path_folders_do_not_become_title_entities() -> None:
     assert context["semantic_path_terms"] == []
 
 
-def test_long_file_path_is_compacted_without_cutting_the_description_mid_path() -> None:
+def test_long_file_path_is_not_injected_into_cluster_description() -> None:
     long_name = (
         "MoriMai_httpss.mj.runPIXbomaA8kc_An_anime-style_digital_illus_"
         "59b7f9ba-6677-40d3-8479-acc48a9b26ff_3.png"
@@ -324,11 +308,7 @@ def test_long_file_path_is_compacted_without_cutting_the_description_mid_path() 
     ]
     summary = ClusterSummary(
         name="动画角色参考",
-        description=(
-            "本组资产主要用于动画角色设计参考，成员具有相似的人物呈现方式，可为角色造型"
-            "和视觉设定环节提供素材依据"
-        ),
-        keywords=["动画", "角色", "参考"],
+        description="共同用于动画角色设计参考，角色造型和视觉设定用途在代表资产中保持一致。",
         common_features=["角色设计"],
         internal_variance=ClusterInternalVariance.LOW,
     )
@@ -339,7 +319,5 @@ def test_long_file_path_is_compacted_without_cutting_the_description_mid_path() 
         embedding_type="asset_usage",
     )
 
-    assert "相对目录「第一集/小说编辑/测试」" in enriched.description
-    assert "代表文件「" in enriched.description
-    assert enriched.description.endswith("。")
-    assert len(enriched.description) <= 150
+    assert enriched.description == summary.description
+    assert long_name not in enriched.description

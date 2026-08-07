@@ -107,11 +107,7 @@ class FakeSummaryClient:
         self.prompts.append(list(messages))
         return ClusterSummary(
             name="测试聚类",
-            description=(
-                "这一组测试资产在向量空间中具有稳定的共同特征，代表资产显示出相近的内容和"
-                "视觉表现，少量边缘样本不影响该组的整体判断。"
-            ),
-            keywords=["测试", "聚类", "代表资产"],
+            description="代表资产在当前向量维度中保持稳定一致，核心共同特征为向量语义相近。",
             common_features=["向量相近"],
             internal_variance=ClusterInternalVariance.LOW,
         )
@@ -235,7 +231,7 @@ async def test_cluster_service_records_insufficient_type_without_model_call() ->
 
 
 @pytest.mark.asyncio
-async def test_asset_usage_capsules_persist_member_path_context() -> None:
+async def test_asset_usage_capsules_keep_path_context_out_of_description() -> None:
     embedding_type = EmbeddingType.ASSET_USAGE
     assets = _assets(embedding_type)
     repository = FakeClusterRepository()
@@ -262,8 +258,9 @@ async def test_asset_usage_capsules_persist_member_path_context() -> None:
 
     assert result.status == ClusterRunStatus.COMPLETED
     assert repository.capsules
-    assert all("海报/素材/" in capsule.summary.description for capsule in repository.capsules)
+    assert all("海报/素材/" not in capsule.summary.description for capsule in repository.capsules)
     for messages in summary_client.prompts:
+        assert "不得写入 description" in str(messages[0]["content"])
         payload = json.loads(str(messages[1]["content"]))
         assert payload["member_source_context"]["directory_counts"]
         assert payload["member_source_context"]["representative_files"]
