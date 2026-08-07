@@ -25,9 +25,9 @@ import {
   type CurrentCluster,
   type CurrentClusterMember,
   type CurrentClusterMode,
-  WORKSPACE_ID,
   apiFetch,
 } from "../lib/api";
+import { useWorkspaceSelection, WorkspaceSelect } from "../lib/workspaces";
 
 const FEATURE_TYPES = [
   { value: "native_multimodal", label: "原始内容" },
@@ -109,9 +109,15 @@ function parseAssetIds(value: string) {
   );
 }
 
-function CurrentMemberThumbnail({ assetId }: { assetId: string }) {
+function CurrentMemberThumbnail({
+  assetId,
+  workspaceId,
+}: {
+  assetId: string;
+  workspaceId: string;
+}) {
   const [failed, setFailed] = useState(false);
-  const previewUrl = `/api/v1/assets/${encodeURIComponent(assetId)}/thumbnail?workspace_id=${encodeURIComponent(WORKSPACE_ID)}`;
+  const previewUrl = `/api/v1/assets/${encodeURIComponent(assetId)}/thumbnail?workspace_id=${encodeURIComponent(workspaceId)}`;
 
   return (
     <span className="current-member-thumbnail">
@@ -464,6 +470,13 @@ function ClusterKnowledgeGraph({
 }
 
 export default function ClustersPage() {
+  const {
+    workspaceId,
+    workspaces,
+    ready: workspaceReady,
+    loading: workspacesLoading,
+    setWorkspaceId,
+  } = useWorkspaceSelection();
   const [runs, setRuns] = useState<ClusterRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [embeddingType, setEmbeddingType] = useState<string>(
@@ -496,6 +509,7 @@ export default function ClustersPage() {
   const [running, setRunning] = useState(false);
   const [runNotice, setRunNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const runRequestRef = useRef(0);
   const currentClusterRequestRef = useRef(0);
   const assetStatusRequestRef = useRef(0);
   const currentMemberRequestRef = useRef(0);
@@ -518,10 +532,13 @@ export default function ClustersPage() {
   const deepLinkOpenedRef = useRef(false);
 
   const loadRuns = useCallback(async () => {
+    if (!workspaceReady) return;
+    const requestId = ++runRequestRef.current;
     try {
       const payload = await apiFetch<{ items: ClusterRun[] }>(
-        `/api/v1/cluster-runs?workspace_id=${WORKSPACE_ID}&limit=100`,
+        `/api/v1/cluster-runs?workspace_id=${encodeURIComponent(workspaceId)}&limit=100`,
       );
+      if (requestId !== runRequestRef.current) return;
       setRuns(payload.items);
       setSelectedRunId((current) => {
         const deepLinkedRunId = deepLinkTargetRef.current.clusterRunId;
@@ -539,11 +556,12 @@ export default function ClustersPage() {
       });
       setError(null);
     } catch (requestError) {
+      if (requestId !== runRequestRef.current) return;
       setError(
         requestError instanceof Error ? requestError.message : "聚类记录加载失败",
       );
     }
-  }, []);
+  }, [workspaceId, workspaceReady]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void loadRuns(), 0);
@@ -551,11 +569,12 @@ export default function ClustersPage() {
   }, [loadRuns]);
 
   const loadCurrentClusters = useCallback(async () => {
+    if (!workspaceReady) return;
     const requestId = ++currentClusterRequestRef.current;
     setCurrentLoading(true);
     try {
       const params = new URLSearchParams({
-        workspace_id: WORKSPACE_ID,
+        workspace_id: workspaceId,
         embedding_type: embeddingType,
       });
       const payload = await apiFetch<{ items: CurrentCluster[] }>(
@@ -583,14 +602,15 @@ export default function ClustersPage() {
         setCurrentLoading(false);
       }
     }
-  }, [embeddingType]);
+  }, [embeddingType, workspaceId, workspaceReady]);
 
   const loadAssetStatus = useCallback(async () => {
+    if (!workspaceReady) return;
     const requestId = ++assetStatusRequestRef.current;
     setAssetStatusLoading(true);
     try {
       const params = new URLSearchParams({
-        workspace_id: WORKSPACE_ID,
+        workspace_id: workspaceId,
         embedding_type: embeddingType,
       });
       const payload = await apiFetch<ClusterAssetStatus>(
@@ -612,7 +632,7 @@ export default function ClustersPage() {
         setAssetStatusLoading(false);
       }
     }
-  }, [embeddingType]);
+  }, [embeddingType, workspaceId, workspaceReady]);
 
   const refreshClusterDimension = useCallback(async () => {
     await Promise.all([loadCurrentClusters(), loadAssetStatus()]);
@@ -650,7 +670,7 @@ export default function ClustersPage() {
       return;
     }
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       const payload = await apiFetch<{ items: CurrentClusterMember[] }>(
         `/api/v1/clusters/${encodeURIComponent(activeCurrentClusterId)}/members?${params}`,
       );
@@ -674,7 +694,7 @@ export default function ClustersPage() {
         requestError instanceof Error ? requestError.message : "簇成员加载失败",
       );
     }
-  }, [activeCurrentClusterId, loadCurrentClusters]);
+  }, [activeCurrentClusterId, loadCurrentClusters, workspaceId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadCurrentMembers(), 0);
@@ -697,7 +717,7 @@ export default function ClustersPage() {
     const pollRun = async () => {
       try {
         const run = await apiFetch<ClusterRun>(
-          `/api/v1/cluster-runs/${encodeURIComponent(selectedRun.cluster_run_id)}?workspace_id=${WORKSPACE_ID}`,
+          `/api/v1/cluster-runs/${encodeURIComponent(selectedRun.cluster_run_id)}?workspace_id=${encodeURIComponent(workspaceId)}`,
         );
         if (cancelled) return;
 
@@ -754,9 +774,10 @@ export default function ClustersPage() {
       cancelled = true;
       if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     };
-  }, [refreshClusterDimension, selectedRun]);
+  }, [refreshClusterDimension, selectedRun, workspaceId]);
 
   useEffect(() => {
+    let cancelled = false;
     const timer = window.setTimeout(() => {
       if (
         !selectedRun ||
@@ -767,9 +788,10 @@ export default function ClustersPage() {
         return;
       }
       void apiFetch<{ items: ClusterCapsule[] }>(
-        `/api/v1/cluster-runs/${selectedRun.cluster_run_id}/capsules?workspace_id=${WORKSPACE_ID}`,
+        `/api/v1/cluster-runs/${selectedRun.cluster_run_id}/capsules?workspace_id=${encodeURIComponent(workspaceId)}`,
       )
         .then(async (payload) => {
+          if (cancelled) return;
           setCapsules(payload.items);
           setSelectedCapsuleId((current) => {
             const deepLinkedCapsuleId =
@@ -793,23 +815,28 @@ export default function ClustersPage() {
           const entries = await Promise.all(
             payload.items.map(async (capsule) => {
               const members = await apiFetch<{ items: ClusterMember[] }>(
-                `/api/v1/cluster-capsules/${capsule.cluster_capsule_id}/members?workspace_id=${WORKSPACE_ID}`,
+                `/api/v1/cluster-capsules/${capsule.cluster_capsule_id}/members?workspace_id=${encodeURIComponent(workspaceId)}`,
               );
               return [capsule.cluster_capsule_id, members.items] as const;
             }),
           );
+          if (cancelled) return;
           setMembersByCapsule(Object.fromEntries(entries));
         })
-        .catch((requestError: unknown) =>
+        .catch((requestError: unknown) => {
+          if (cancelled) return;
           setError(
             requestError instanceof Error
               ? requestError.message
               : "Cluster Capsule 加载失败",
-          ),
-        );
+          );
+        });
     }, 0);
-    return () => window.clearTimeout(timer);
-  }, [selectedRun]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [selectedRun, workspaceId]);
 
   const selectedCapsule =
     capsules.find(
@@ -877,7 +904,7 @@ export default function ClustersPage() {
         {
           method: "POST",
           body: JSON.stringify({
-            workspace_id: WORKSPACE_ID,
+            workspace_id: workspaceId,
             embedding_type: embeddingType,
             pca_dimension: parsedPcaDimension,
             min_samples: parsedMinSamples,
@@ -887,7 +914,7 @@ export default function ClustersPage() {
       );
       setSelectedRunId(submitted.cluster_run_id);
       const submittedRun = await apiFetch<ClusterRun>(
-        `/api/v1/cluster-runs/${encodeURIComponent(submitted.cluster_run_id)}?workspace_id=${WORKSPACE_ID}`,
+        `/api/v1/cluster-runs/${encodeURIComponent(submitted.cluster_run_id)}?workspace_id=${encodeURIComponent(workspaceId)}`,
       );
       setRuns((current) => [
         submittedRun,
@@ -915,7 +942,7 @@ export default function ClustersPage() {
     setCurrentError(null);
     setCurrentNotice(null);
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       const updated = await apiFetch<CurrentCluster>(
         `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}?${params}`,
         {
@@ -944,7 +971,7 @@ export default function ClustersPage() {
     setCurrentError(null);
     setCurrentNotice(null);
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       const updated = await apiFetch<CurrentCluster>(
         `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}?${params}`,
         {
@@ -978,7 +1005,7 @@ export default function ClustersPage() {
     setCurrentError(null);
     setCurrentNotice(null);
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
         `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members:attach?${params}`,
         {
@@ -1004,7 +1031,7 @@ export default function ClustersPage() {
     setCurrentError(null);
     setCurrentNotice(null);
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
         `/api/v1/clusters/${encodeURIComponent(selectedCurrentCluster.cluster_id)}/members:detach?${params}`,
         {
@@ -1038,7 +1065,7 @@ export default function ClustersPage() {
     setCurrentError(null);
     setCurrentNotice(null);
     try {
-      const params = new URLSearchParams({ workspace_id: WORKSPACE_ID });
+      const params = new URLSearchParams({ workspace_id: workspaceId });
       await apiFetch<{ cluster_id: string; asset_ids: string[] }>(
         `/api/v1/clusters/${encodeURIComponent(targetCluster.cluster_id)}/members:attach?${params}`,
         {
@@ -1109,6 +1136,28 @@ export default function ClustersPage() {
   return (
     <DemoShell
       active="clusters"
+      workspaceControl={
+        <WorkspaceSelect
+          workspaceId={workspaceId}
+          workspaces={workspaces}
+          loading={workspacesLoading}
+          onChange={(nextWorkspaceId) => {
+            runRequestRef.current += 1;
+            currentClusterRequestRef.current += 1;
+            assetStatusRequestRef.current += 1;
+            currentMemberRequestRef.current += 1;
+            setRuns([]);
+            setSelectedRunId("");
+            setCapsules([]);
+            setMembersByCapsule({});
+            setCurrentClusters([]);
+            setCurrentMembers([]);
+            setAssetStatus(null);
+            setError(null);
+            setWorkspaceId(nextWorkspaceId);
+          }}
+        />
+      }
       eyebrow="CLUSTER LAB / LIVE"
       title="从相似中，看见结构。"
       description="首次达到样本阈值会自动初始化；之后新增 Asset 只做增量归簇，全量重聚类由用户手动启动。"
@@ -1503,7 +1552,10 @@ export default function ClustersPage() {
                   )}
                   {currentMembers.map((member) => (
                     <div className="current-member-row" key={member.asset_id}>
-                      <CurrentMemberThumbnail assetId={member.asset_id} />
+                      <CurrentMemberThumbnail
+                        assetId={member.asset_id}
+                        workspaceId={workspaceId}
+                      />
                       <strong title={member.asset_id}>{member.asset_id}</strong>
                       <span>{member.source}</span>
                       <span>

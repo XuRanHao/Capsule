@@ -9,9 +9,9 @@ import DemoShell, {
 } from "../../components/DemoShell";
 import {
   type AssetRecord,
-  WORKSPACE_ID,
   apiFetch,
 } from "../../lib/api";
+import { useWorkspaceSelection, WorkspaceSelect } from "../../lib/workspaces";
 
 const FEATURE_LABELS: Record<string, string> = {
   subject_content: "主体内容",
@@ -27,17 +27,27 @@ const FEATURE_LABELS: Record<string, string> = {
 };
 
 export default function AssetDetailPage() {
+  const {
+    workspaceId,
+    workspaces,
+    ready: workspaceReady,
+    loading: workspacesLoading,
+    setWorkspaceId,
+  } = useWorkspaceSelection();
   const pathname = usePathname();
   const assetId = pathname.split("/").filter(Boolean).at(-1);
   const [asset, setAsset] = useState<AssetRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!assetId) return;
+    if (!assetId || !workspaceReady) return;
     void apiFetch<AssetRecord>(
-      `/api/v1/assets/${encodeURIComponent(assetId)}?workspace_id=${WORKSPACE_ID}`,
+      `/api/v1/assets/${encodeURIComponent(assetId)}?workspace_id=${encodeURIComponent(workspaceId)}`,
     )
-      .then(setAsset)
+      .then((loadedAsset) => {
+        setAsset(loadedAsset);
+        setError(null);
+      })
       .catch((requestError: unknown) =>
         setError(
           requestError instanceof Error
@@ -45,12 +55,22 @@ export default function AssetDetailPage() {
             : "Asset 加载失败",
         ),
       );
-  }, [assetId]);
+  }, [assetId, workspaceId, workspaceReady]);
 
-  if (!asset) {
+  const workspaceControl = (
+    <WorkspaceSelect
+      workspaceId={workspaceId}
+      workspaces={workspaces}
+      loading={workspacesLoading}
+      onChange={setWorkspaceId}
+    />
+  );
+
+  if (!asset || asset.workspace_id !== workspaceId) {
     return (
       <DemoShell
         active="assets"
+        workspaceControl={workspaceControl}
         eyebrow="ASSET DETAIL / LIVE"
         title={error ? "无法打开 Asset" : "正在读取 Asset…"}
         description={error || assetId || ""}
@@ -96,6 +116,7 @@ export default function AssetDetailPage() {
   return (
     <DemoShell
       active="assets"
+      workspaceControl={workspaceControl}
       eyebrow="ASSET DETAIL / LIVE"
       title={asset.asset_name || asset.file_name}
       description={`${asset.asset_id} · ${locator || "whole_file"}`}

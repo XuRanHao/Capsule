@@ -199,6 +199,26 @@ class ObjectStorage:
 
         return await asyncio.to_thread(delete)
 
+    async def delete_object_keys(self, object_keys: Iterable[str]) -> int:
+        """Delete caller-owned keys without broad bucket traversal."""
+        keys = [str(key) for key in object_keys if str(key)]
+        if not keys:
+            return 0
+
+        def delete() -> int:
+            for start in range(0, len(keys), 1_000):
+                batch = keys[start : start + 1_000]
+                response = self._client.delete_objects(
+                    Bucket=self._bucket,
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+                )
+                errors = response.get("Errors") or []
+                if errors:
+                    raise RuntimeError("could not delete workspace object-storage records")
+            return len(keys)
+
+        return await asyncio.to_thread(delete)
+
     async def delete_all_objects(self) -> int:
         """Delete every object in Capsule's configured, dedicated bucket."""
 

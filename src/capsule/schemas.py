@@ -191,6 +191,31 @@ class AssetListResponse(BaseModel):
     offset: int
 
 
+class WorkspaceRecord(BaseModel):
+    workspace_id: str
+    name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceListResponse(BaseModel):
+    items: list[WorkspaceRecord] = Field(default_factory=list)
+
+
+class WorkspaceDeleteResult(BaseModel):
+    workspace_id: str
+    workspace_deleted: bool
+    assets_deleted: int
+    source_files_deleted: int
+    embeddings_deleted: int
+    jobs_deleted: int
+    vectors_deleted: int
+    objects_deleted: int
+    staging_paths_deleted: int
+    cancelled_jobs: int = 0
+    cleanup_warnings: list[str] = Field(default_factory=list)
+
+
 class LibraryClearResult(BaseModel):
     workspaces_deleted: int
     assets_deleted: int

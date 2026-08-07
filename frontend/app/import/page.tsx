@@ -1,8 +1,12 @@
 "use client";
 
-import { DragEvent, useMemo, useRef, useState } from "react";
+import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import DemoShell from "../components/DemoShell";
+import {
+  CURRENT_WORKSPACE_STORAGE_KEY,
+  type WorkspaceRecord,
+} from "../lib/workspaces";
 
 type QueuedFile = {
   file: File;
@@ -20,6 +24,8 @@ type UploadProgress = {
   totalBytes: number;
   currentName: string;
 };
+
+type WorkspaceMode = "existing" | "new";
 
 const folderInputProps = {
   webkitdirectory: "",
@@ -90,6 +96,14 @@ function endpoint(path: string) {
   return `${base.replace(/\/$/, "")}${path}`;
 }
 
+async function responseError(response: Response, fallback: string) {
+  const body = (await response.json().catch(() => null)) as
+    | { detail?: string | { message?: string } }
+    | null;
+  if (typeof body?.detail === "string") return body.detail;
+  return body?.detail?.message || fallback;
+}
+
 function uploadFile(
   {
     jobId,
@@ -150,6 +164,95 @@ export default function ImportPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [importPhase, setImportPhase] = useState<ImportPhase | null>(null);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("existing");
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [loadingWorkspaces, setLoadingWorkspaces] = useState(true);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadWorkspaces = async () => {
+      setLoadingWorkspaces(true);
+      setWorkspaceError(null);
+      try {
+        const response = await fetch(endpoint("/api/v1/workspaces"));
+        if (!response.ok) {
+          throw new Error(await responseError(response, "读取工作空间失败"));
+        }
+        const payload = (await response.json()) as { items: WorkspaceRecord[] };
+        if (cancelled) return;
+        const items = payload.items ?? [];
+        setWorkspaces(items);
+        if (!items.length) {
+          setWorkspaceMode("new");
+          return;
+        }
+        const remembered = window.localStorage.getItem(CURRENT_WORKSPACE_STORAGE_KEY);
+        setSelectedWorkspaceId(
+          items.some((workspace) => workspace.workspace_id === remembered)
+            ? remembered ?? items[0].workspace_id
+            : items[0].workspace_id,
+        );
+      } catch (error) {
+        if (!cancelled) {
+          setWorkspaceError(
+            error instanceof Error ? error.message : "读取工作空间失败",
+          );
+        }
+      } finally {
+        if (!cancelled) setLoadingWorkspaces(false);
+      }
+    };
+    void loadWorkspaces();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const activeWorkspace = workspaces.find(
+    (workspace) => workspace.workspace_id === selectedWorkspaceId,
+  );
+
+  const chooseWorkspace = (workspaceId: string) => {
+    setSelectedWorkspaceId(workspaceId);
+    window.localStorage.setItem(CURRENT_WORKSPACE_STORAGE_KEY, workspaceId);
+  };
+
+  const resolveWorkspaceId = async () => {
+    if (workspaceMode === "existing") {
+      if (!selectedWorkspaceId) throw new Error("请选择要导入的工作空间");
+      window.localStorage.setItem(
+        CURRENT_WORKSPACE_STORAGE_KEY,
+        selectedWorkspaceId,
+      );
+      return selectedWorkspaceId;
+    }
+
+    const name = newWorkspaceName.trim();
+    if (!name) throw new Error("请填写新工作空间名称");
+    const response = await fetch(endpoint("/api/v1/workspaces"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!response.ok) {
+      throw new Error(await responseError(response, "创建工作空间失败"));
+    }
+    const workspace = (await response.json()) as WorkspaceRecord;
+    setWorkspaces((current) => [
+      workspace,
+      ...current.filter((item) => item.workspace_id !== workspace.workspace_id),
+    ]);
+    setSelectedWorkspaceId(workspace.workspace_id);
+    setWorkspaceMode("existing");
+    window.localStorage.setItem(
+      CURRENT_WORKSPACE_STORAGE_KEY,
+      workspace.workspace_id,
+    );
+    return workspace.workspace_id;
+  };
 
   const counts = useMemo(
     () => ({
@@ -200,7 +303,7 @@ export default function ImportPage() {
     setImportPhase("creating");
     setUploadProgress(null);
     try {
-      const workspaceId = "workspace_demo";
+      const workspaceId = await resolveWorkspaceId();
       const created = await fetch(endpoint("/api/v1/import-jobs"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -208,7 +311,11 @@ export default function ImportPage() {
       });
       if (!created.ok) {
         const body = await created.json().catch(() => null);
-        throw new Error(body?.detail?.message || "创建导入任务失败");
+        throw new Error(
+          typeof body?.detail === "string"
+            ? body.detail
+            : body?.detail?.message || "创建导入任务失败",
+        );
       }
       const { job_id: jobId } = (await created.json()) as { job_id: string };
 
@@ -320,6 +427,92 @@ export default function ImportPage() {
           <span>场景切分</span>
         </div>
       </div>
+
+      <section className="import-workspace-target" aria-label="选择导入工作空间">
+        <header>
+          <div>
+            <span className="eyebrow">IMPORT DESTINATION</span>
+            <h2>选择资产导入位置</h2>
+          </div>
+          <p>资产、处理任务和后续聚类都会归属于这里选择的工作空间。</p>
+        </header>
+        <div className="workspace-mode-switch" role="radiogroup">
+          <label className={workspaceMode === "existing" ? "selected" : ""}>
+            <input
+              type="radio"
+              name="workspace-mode"
+              value="existing"
+              checked={workspaceMode === "existing"}
+              disabled={!workspaces.length && !loadingWorkspaces}
+              onChange={() => setWorkspaceMode("existing")}
+            />
+            <span>
+              <strong>将资产导入已有的工作空间</strong>
+              <small>继续补充已有素材库</small>
+            </span>
+          </label>
+          <label className={workspaceMode === "new" ? "selected" : ""}>
+            <input
+              type="radio"
+              name="workspace-mode"
+              value="new"
+              checked={workspaceMode === "new"}
+              onChange={() => setWorkspaceMode("new")}
+            />
+            <span>
+              <strong>创建新的工作空间</strong>
+              <small>为这批素材建立独立空间</small>
+            </span>
+          </label>
+        </div>
+        <div className="workspace-target-fields">
+          {workspaceMode === "existing" ? (
+            <label>
+              <span>已有工作空间</span>
+              <select
+                value={selectedWorkspaceId}
+                disabled={loadingWorkspaces || !workspaces.length || starting}
+                onChange={(event) => chooseWorkspace(event.target.value)}
+              >
+                {loadingWorkspaces && <option value="">正在读取…</option>}
+                {!loadingWorkspaces && !workspaces.length && (
+                  <option value="">暂无工作空间</option>
+                )}
+                {workspaces.map((workspace) => (
+                  <option value={workspace.workspace_id} key={workspace.workspace_id}>
+                    {workspace.name} · {workspace.workspace_id}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            <label>
+              <span>新工作空间名称</span>
+              <input
+                value={newWorkspaceName}
+                disabled={starting}
+                maxLength={255}
+                placeholder="例如：2026 秋季 campaign"
+                onChange={(event) => setNewWorkspaceName(event.target.value)}
+              />
+            </label>
+          )}
+          <div className="workspace-target-summary">
+            <small>{workspaceMode === "existing" ? "当前目标" : "创建后导入"}</small>
+            <strong>
+              {workspaceMode === "existing"
+                ? activeWorkspace?.name || "尚未选择"
+                : newWorkspaceName.trim() || "等待填写名称"}
+            </strong>
+            <span>
+              {workspaceMode === "existing"
+                ? activeWorkspace?.workspace_id || "—"
+                : "Workspace ID 将自动生成"}
+            </span>
+          </div>
+        </div>
+        {workspaceError && <p className="workspace-load-error">{workspaceError}</p>}
+      </section>
 
       <div className="import-workspace">
         <div
@@ -437,7 +630,11 @@ export default function ImportPage() {
       <div className="import-submit-bar">
         <div>
           <small>WORKSPACE</small>
-          <strong>workspace_demo</strong>
+          <strong>
+            {workspaceMode === "existing"
+              ? activeWorkspace?.name || selectedWorkspaceId || "未选择工作空间"
+              : newWorkspaceName.trim() || "待创建工作空间"}
+          </strong>
           <span>
             {importPhase === "creating"
               ? "正在创建导入任务"
@@ -449,7 +646,16 @@ export default function ImportPage() {
           </span>
           {importError && <span className="import-error">{importError}</span>}
         </div>
-        <button disabled={!files.length || starting} onClick={startImport}>
+        <button
+          disabled={
+            !files.length ||
+            starting ||
+            loadingWorkspaces ||
+            (workspaceMode === "existing" && !selectedWorkspaceId) ||
+            (workspaceMode === "new" && !newWorkspaceName.trim())
+          }
+          onClick={startImport}
+        >
           {importPhase === "creating"
             ? "正在创建任务…"
             : importPhase === "uploading"

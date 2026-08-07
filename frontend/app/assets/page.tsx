@@ -1,14 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DemoShell, { AssetThumb, StatusBadge } from "../components/DemoShell";
 import {
   type AssetRecord,
-  WORKSPACE_ID,
   apiFetch,
   loadAssets,
 } from "../lib/api";
+import { useWorkspaceSelection, WorkspaceSelect } from "../lib/workspaces";
 
 type AssetFilter = AssetRecord["asset_type"] | "all";
 
@@ -30,6 +30,14 @@ function featureValues(asset: AssetRecord) {
 }
 
 export default function AssetsPage() {
+  const {
+    workspaceId,
+    workspaces,
+    ready: workspaceReady,
+    loading: workspacesLoading,
+    setWorkspaceId,
+    refreshWorkspaces,
+  } = useWorkspaceSelection();
   const [view, setView] = useState<"grid" | "list">("grid");
   const [type, setType] = useState<AssetFilter>("all");
   const [status, setStatus] = useState("all");
@@ -40,31 +48,36 @@ export default function AssetsPage() {
   const [error, setError] = useState<string | null>(null);
   const [clearNotice, setClearNotice] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const loadRequestRef = useRef(0);
 
   const load = useCallback(async () => {
+    if (!workspaceReady) return;
+    const requestId = ++loadRequestRef.current;
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams({
-        workspace_id: WORKSPACE_ID,
+        workspace_id: workspaceId,
         limit: "500",
       });
       if (type !== "all") params.set("asset_type", type);
       if (status !== "all") params.set("processing_status", status);
       if (query.trim()) params.set("query", query.trim());
       const result = await loadAssets(params);
+      if (requestId !== loadRequestRef.current) return;
       setAssets(result.items);
       setTotal(result.total);
     } catch (requestError) {
+      if (requestId !== loadRequestRef.current) return;
       setError(
         requestError instanceof Error
           ? requestError.message
           : "Asset 加载失败",
       );
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestRef.current) setLoading(false);
     }
-  }, [query, status, type]);
+  }, [query, status, type, workspaceId, workspaceReady]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 180);
@@ -80,9 +93,9 @@ export default function AssetsPage() {
     [assets],
   );
 
-  const clearLibrary = async () => {
+  const deleteWorkspace = async () => {
     const confirmed = window.confirm(
-      "确定清空全部数据吗？\n\n将永久删除所有工作区的 Asset、来源文件、处理任务、向量、媒体文件和导入暂存文件。此操作不可恢复。",
+      `确定删除当前工作空间「${workspaceId}」吗？\n\n将永久删除该工作空间的 Asset、来源文件、处理任务、向量和媒体文件。其他工作空间不会受影响，此操作不可恢复。`,
     );
     if (!confirmed) return;
 
@@ -91,25 +104,30 @@ export default function AssetsPage() {
     setClearNotice(null);
     try {
       const result = await apiFetch<{
+        workspace_id: string;
+        workspace_deleted: boolean;
         assets_deleted: number;
         source_files_deleted: number;
+        embeddings_deleted: number;
+        jobs_deleted: number;
         vectors_deleted: number;
         objects_deleted: number;
+        staging_paths_deleted: number;
+        cancelled_jobs: number;
         cleanup_warnings: string[];
-      }>("/api/v1/assets/clear-all", {
-        method: "POST",
-        body: JSON.stringify({
-          confirmation: "CLEAR ALL DATA",
-        }),
-      });
+      }>(
+        `/api/v1/workspaces/${encodeURIComponent(workspaceId)}?confirmation=${encodeURIComponent(workspaceId)}`,
+        { method: "DELETE" },
+      );
       setAssets([]);
       setTotal(0);
       setClearNotice(
-        `已清空全部数据：${result.assets_deleted} 个 Asset、${result.source_files_deleted} 个来源文件、${result.vectors_deleted} 条向量与 ${result.objects_deleted} 个媒体文件。${result.cleanup_warnings.length ? ` ${result.cleanup_warnings.join("；")}` : ""}`,
+        `已删除工作空间 ${result.workspace_id}：${result.assets_deleted} 个 Asset、${result.source_files_deleted} 个来源文件、${result.jobs_deleted} 个任务、${result.vectors_deleted} 条向量与 ${result.objects_deleted} 个媒体文件。${result.cleanup_warnings.length ? ` ${result.cleanup_warnings.join("；")}` : ""}`,
       );
+      await refreshWorkspaces();
     } catch (requestError) {
       setError(
-        requestError instanceof Error ? requestError.message : "清空资产库失败",
+        requestError instanceof Error ? requestError.message : "工作空间删除失败",
       );
     } finally {
       setClearing(false);
@@ -119,6 +137,21 @@ export default function AssetsPage() {
   return (
     <DemoShell
       active="assets"
+      workspaceControl={
+        <WorkspaceSelect
+          workspaceId={workspaceId}
+          workspaces={workspaces}
+          loading={workspacesLoading}
+          onChange={(nextWorkspaceId) => {
+            loadRequestRef.current += 1;
+            setAssets([]);
+            setTotal(0);
+            setLoading(true);
+            setClearNotice(null);
+            setWorkspaceId(nextWorkspaceId);
+          }}
+        />
+      }
       eyebrow="ASSET LIBRARY / LIVE"
       title="所有素材，都有语义。"
       description="这里直接读取 PostgreSQL 中的真实 Asset，并通过后端安全地加载本地图片和视频预览。"
@@ -127,8 +160,8 @@ export default function AssetsPage() {
           <Link className="primary-action button-link" href="/import">
             ＋ 导入素材
           </Link>
-          <button className="danger-action" disabled={clearing} onClick={clearLibrary}>
-            {clearing ? "正在清空…" : "清空全部数据"}
+          <button className="danger-action" disabled={clearing} onClick={deleteWorkspace}>
+            {clearing ? "正在删除…" : "删除当前工作空间"}
           </button>
         </>
       }
@@ -199,7 +232,7 @@ export default function AssetsPage() {
         <span>
           SHOWING <strong>{assets.length}</strong> OF {total}
         </span>
-        <span>WORKSPACE · {WORKSPACE_ID}</span>
+        <span>WORKSPACE · {workspaceId}</span>
       </div>
 
       {error && (
@@ -213,7 +246,7 @@ export default function AssetsPage() {
       )}
       {clearNotice && (
         <div className="asset-cleared-notice">
-          <strong>工作区已清空</strong>
+          <strong>工作空间已删除</strong>
           <span>{clearNotice}</span>
         </div>
       )}

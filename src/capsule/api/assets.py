@@ -11,24 +11,15 @@ from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field
 
 from capsule.config import Settings
-from capsule.db.repositories import AssetMediaTarget, AssetRepository, LibraryClearBusyError
-from capsule.pipeline.workspace_clear import LibraryClearService
-from capsule.schemas import AssetListResponse, AssetViewRecord, LibraryClearResult
+from capsule.db.repositories import AssetMediaTarget, AssetRepository
+from capsule.schemas import AssetListResponse, AssetViewRecord
 from capsule.storage.object_storage import ObjectStorage
 
 router = APIRouter(prefix="/api/v1/assets", tags=["assets"])
 
-_LIBRARY_CLEAR_CONFIRMATION = "CLEAR ALL DATA"
 _SINGLE_BYTE_RANGE = re.compile(r"^bytes=\d*-\d*$")
-
-
-class LibraryClearRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    confirmation: str = Field(min_length=1, max_length=64)
 
 
 def _repository(request: Request) -> AssetRepository:
@@ -39,19 +30,6 @@ def _repository(request: Request) -> AssetRepository:
             detail={"code": "asset_repository_not_ready", "message": "asset storage is not ready"},
         )
     return cast(AssetRepository, repository)
-
-
-def _library_clear_service(request: Request) -> LibraryClearService:
-    service = getattr(request.app.state, "library_clear_service", None)
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "library_clear_not_ready",
-                "message": "asset library cleanup is not ready",
-            },
-        )
-    return cast(LibraryClearService, service)
 
 
 @router.get("", response_model=AssetListResponse)
@@ -83,27 +61,16 @@ async def list_assets(
     )
 
 
-@router.post("/clear-all", response_model=LibraryClearResult)
-async def clear_library(
-    payload: LibraryClearRequest,
-    request: Request,
-) -> LibraryClearResult:
-    """Irreversibly clear all Asset-library data across every workspace."""
-    if payload.confirmation != _LIBRARY_CLEAR_CONFIRMATION:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "code": "library_clear_confirmation_required",
-                "message": "an explicit library-clear confirmation is required",
-            },
-        )
-    try:
-        return await _library_clear_service(request).clear_all()
-    except LibraryClearBusyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "library_has_active_jobs", "message": str(exc)},
-        ) from exc
+@router.post("/clear-all")
+async def clear_library() -> None:
+    """Retired: broad multi-workspace deletion is intentionally unavailable."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "code": "library_clear_retired",
+            "message": "delete one current workspace through /api/v1/workspaces/{workspace_id}",
+        },
+    )
 
 
 @router.get("/{asset_id}", response_model=AssetViewRecord)

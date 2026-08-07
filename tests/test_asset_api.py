@@ -149,7 +149,7 @@ def test_asset_list_and_local_preview_are_available(tmp_path: Path) -> None:
             assert max(rendered.size) == 480
 
 
-def test_library_clear_requires_explicit_confirmation(tmp_path: Path) -> None:
+def test_library_clear_endpoint_is_permanently_retired(tmp_path: Path) -> None:
     import_root = tmp_path / "imports"
     import_root.mkdir()
     image_path = import_root / "image.jpg"
@@ -162,21 +162,13 @@ def test_library_clear_requires_explicit_confirmation(tmp_path: Path) -> None:
     )
 
     with TestClient(app) as client:
-        rejected = client.post(
+        retired = client.post(
             "/api/v1/assets/clear-all",
-            json={"confirmation": "clear"},
+            json={"confirmation": "CLEAR ALL DATA"},
         )
-        assert rejected.status_code == 422
-
-        cleared = client.post(
-            "/api/v1/assets/clear-all",
-            json={
-                "confirmation": "CLEAR ALL DATA",
-            },
-        )
-        assert cleared.status_code == 200
-        assert cleared.json()["assets_deleted"] == 3
-        assert clear_service.clear_calls == 1
+        assert retired.status_code == 410
+        assert retired.json()["detail"]["code"] == "library_clear_retired"
+        assert clear_service.clear_calls == 0
 
 
 def test_document_image_preview_uses_derived_media_root(tmp_path: Path) -> None:

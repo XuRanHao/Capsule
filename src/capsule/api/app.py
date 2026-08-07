@@ -10,6 +10,7 @@ from capsule.api.capsules import router as capsules_router
 from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
+from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
 from capsule.db.repositories import (
     AssetRepository,
@@ -31,6 +32,7 @@ from capsule.pipeline.incremental_clustering import (
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.pipeline.workspace_clear import LibraryClearService
+from capsule.pipeline.workspace_management import WorkspaceService
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.query_parser import QueryParser
@@ -53,6 +55,7 @@ def create_app(
     import_service: BrowserImportService | None = None,
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
+    workspace_service: WorkspaceService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -67,6 +70,7 @@ def create_app(
             or import_service is not None
             or asset_repository is not None
             or library_clear_service is not None
+            or workspace_service is not None
         ):
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
@@ -76,6 +80,7 @@ def create_app(
             app.state.import_service = import_service
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
+            app.state.workspace_service = workspace_service
             yield
             return
 
@@ -101,6 +106,12 @@ def create_app(
         app.state.current_cluster_repository = current_cluster_repo
         app.state.asset_repository = asset_repo
         app.state.library_clear_service = LibraryClearService(
+            settings=resolved_settings,
+            repository=asset_repo,
+            vector_store=vectors,
+            object_storage=storage,
+        )
+        app.state.workspace_service = WorkspaceService(
             settings=resolved_settings,
             repository=asset_repo,
             vector_store=vectors,
@@ -220,6 +231,7 @@ def create_app(
     application.include_router(capsules_router)
     application.include_router(cluster_runs_router)
     application.include_router(imports_router)
+    application.include_router(workspaces_router)
 
     @application.get("/health")
     async def health() -> dict[str, str | bool]:

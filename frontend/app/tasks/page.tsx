@@ -1,13 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DemoShell, { StatusBadge } from "../components/DemoShell";
 import {
   type ProcessingJob,
-  WORKSPACE_ID,
   apiFetch,
 } from "../lib/api";
+import { useWorkspaceSelection, WorkspaceSelect } from "../lib/workspaces";
 
 const PIPELINE_STAGES = [
   "discovering",
@@ -63,17 +63,28 @@ function formatDuration(durationMs: number | null | undefined) {
 }
 
 export default function TasksPage() {
+  const {
+    workspaceId,
+    workspaces,
+    ready: workspaceReady,
+    loading: workspacesLoading,
+    setWorkspaceId,
+  } = useWorkspaceSelection();
   const [jobs, setJobs] = useState<ProcessingJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clearMessage, setClearMessage] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const loadRequestRef = useRef(0);
 
   const load = useCallback(async () => {
+    if (!workspaceReady) return;
+    const requestId = ++loadRequestRef.current;
     try {
       const payload = await apiFetch<{ items: ProcessingJob[] }>(
-        `/api/v1/import-jobs?workspace_id=${WORKSPACE_ID}&limit=100`,
+        `/api/v1/import-jobs?workspace_id=${encodeURIComponent(workspaceId)}&limit=100`,
       );
+      if (requestId !== loadRequestRef.current) return;
       setJobs(payload.items);
       const requested =
         typeof window !== "undefined"
@@ -90,11 +101,12 @@ export default function TasksPage() {
       });
       setError(null);
     } catch (requestError) {
+      if (requestId !== loadRequestRef.current) return;
       setError(
         requestError instanceof Error ? requestError.message : "任务加载失败",
       );
     }
-  }, []);
+  }, [workspaceId, workspaceReady]);
 
   const clearJobs = async () => {
     if (
@@ -110,7 +122,7 @@ export default function TasksPage() {
       const result = await apiFetch<{
         deleted_count: number;
         cancelled_count: number;
-      }>(`/api/v1/import-jobs?workspace_id=${WORKSPACE_ID}`, {
+      }>(`/api/v1/import-jobs?workspace_id=${encodeURIComponent(workspaceId)}`, {
         method: "DELETE",
       });
       setClearMessage(
@@ -156,6 +168,20 @@ export default function TasksPage() {
   return (
     <DemoShell
       active="tasks"
+      workspaceControl={
+        <WorkspaceSelect
+          workspaceId={workspaceId}
+          workspaces={workspaces}
+          loading={workspacesLoading}
+          onChange={(nextWorkspaceId) => {
+            loadRequestRef.current += 1;
+            setJobs([]);
+            setSelectedId(null);
+            setClearMessage(null);
+            setWorkspaceId(nextWorkspaceId);
+          }}
+        />
+      }
       eyebrow="PROCESSING / LIVE"
       title="每一步，都看得见。"
       description="实时读取导入 Job，展示解析、理解、Embedding 和 Milvus 入库阶段。"

@@ -161,6 +161,28 @@ summary:focus-visible {
   text-transform: none;
 }
 
+.workspace-switcher {
+  display: inline-flex;
+  margin-left: 10px;
+}
+
+.workspace-switcher select {
+  max-width: 220px;
+  padding: 8px 34px 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  outline: none;
+  background: var(--paper);
+  color: var(--ink);
+  font: 500 11px/1.2 var(--font-geist-mono), monospace;
+  text-transform: none;
+}
+
+.workspace-switcher select:focus-visible {
+  border-color: var(--orange);
+  box-shadow: 0 0 0 3px rgb(242 100 63 / 14%);
+}
+
 .connection-dot {
   width: 7px;
   height: 7px;
@@ -2145,6 +2167,140 @@ blockquote p {
   font-size: 27px;
   font-weight: 500;
   letter-spacing: -0.06em;
+}
+
+.import-workspace-target {
+  display: grid;
+  margin-bottom: 18px;
+  padding: 21px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+  gap: 17px;
+}
+
+.import-workspace-target > header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.import-workspace-target h2 {
+  margin: 5px 0 0;
+  font-size: 19px;
+  letter-spacing: -0.04em;
+}
+
+.import-workspace-target > header p {
+  max-width: 430px;
+  margin: 0;
+  color: var(--muted-ink);
+  font-size: 9px;
+  line-height: 1.6;
+  text-align: right;
+}
+
+.workspace-mode-switch {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.workspace-mode-switch label {
+  display: flex;
+  align-items: center;
+  padding: 14px 15px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f7f4ee;
+  cursor: pointer;
+  gap: 11px;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease;
+}
+
+.workspace-mode-switch label.selected {
+  border-color: var(--violet);
+  background: color-mix(in srgb, var(--violet), var(--card) 94%);
+}
+
+.workspace-mode-switch input {
+  accent-color: var(--violet);
+}
+
+.workspace-mode-switch span {
+  display: grid;
+  gap: 3px;
+}
+
+.workspace-mode-switch strong {
+  font-size: 10px;
+}
+
+.workspace-mode-switch small,
+.workspace-target-fields label > span,
+.workspace-target-summary small,
+.workspace-target-summary span {
+  color: var(--muted-ink);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+}
+
+.workspace-target-fields {
+  display: grid;
+  align-items: stretch;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) 250px;
+}
+
+.workspace-target-fields label {
+  display: grid;
+  gap: 6px;
+}
+
+.workspace-target-fields select,
+.workspace-target-fields input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  background: #fffdfa;
+  color: var(--ink);
+  font: inherit;
+  font-size: 10px;
+}
+
+.workspace-target-fields select:focus,
+.workspace-target-fields input:focus {
+  border-color: var(--violet);
+  box-shadow: 0 0 0 3px rgb(98 88 232 / 8%);
+}
+
+.workspace-target-summary {
+  display: grid;
+  align-content: center;
+  padding: 10px 13px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--card);
+  gap: 3px;
+}
+
+.workspace-target-summary strong {
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-load-error {
+  margin: -5px 0 0;
+  color: #a33c26;
+  font-size: 9px;
 }
 
 .import-workspace {
@@ -5246,11 +5402,21 @@ blockquote p {
   }
 
   .import-workspace,
+  .workspace-target-fields,
   .task-layout,
   .asset-detail-hero,
   .asset-detail-grid,
   .capsule-browser {
     grid-template-columns: 1fr;
+  }
+
+  .import-workspace-target > header {
+    display: grid;
+  }
+
+  .import-workspace-target > header p {
+    max-width: none;
+    text-align: left;
   }
 
   .task-list {
@@ -5367,6 +5533,10 @@ blockquote p {
 
   .import-overview {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .workspace-mode-switch {
+    grid-template-columns: 1fr;
   }
 
   .import-overview > div:nth-child(2) {

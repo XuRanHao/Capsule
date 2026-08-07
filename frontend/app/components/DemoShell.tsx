@@ -54,11 +54,13 @@ export function ProductTopbar({
   connection = "live",
   status = "Workspace Demo",
   workspace = "workspace_demo",
+  workspaceControl,
 }: {
   active: DemoSection;
   connection?: "live" | "demo";
   status?: string;
   workspace?: string;
+  workspaceControl?: ReactNode;
 }) {
   return (
     <header className="topbar product-topbar">
@@ -73,7 +75,7 @@ export function ProductTopbar({
       <div className="topbar-meta">
         <span className={`connection-dot ${connection}`} />
         <span>{status}</span>
-        <b>{workspace}</b>
+        {workspaceControl ?? <b>{workspace}</b>}
       </div>
     </header>
   );
@@ -85,6 +87,7 @@ export default function DemoShell({
   title,
   description,
   actions,
+  workspaceControl,
   children,
 }: {
   active: DemoSection;
@@ -92,11 +95,12 @@ export default function DemoShell({
   title: string;
   description: string;
   actions?: ReactNode;
+  workspaceControl?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <main className="demo-app-shell">
-      <ProductTopbar active={active} />
+      <ProductTopbar active={active} workspaceControl={workspaceControl} />
       <div className="demo-layout">
         <section className="demo-main">
           <header className="demo-page-header">

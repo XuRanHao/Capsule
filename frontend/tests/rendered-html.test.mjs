@@ -99,7 +99,7 @@ test("cluster selector renders every searchable embedding dimension", async () =
   const html = await response.text();
   const optionValues = [...html.matchAll(/<option[^>]*\bvalue="([^"]+)"/g)]
     .map((match) => match[1])
-    .filter(Boolean);
+    .filter((value) => value && value !== "workspace_demo");
 
   assert.deepEqual(optionValues, [
     "native_multimodal",
@@ -137,6 +137,14 @@ test("cluster workspace keeps history and exposes current resident controls", as
   assert.match(html, /手动管理/);
 });
 
+test("workspace-aware pages render a shared workspace switcher", async () => {
+  for (const pathname of ["/tasks", "/assets", "/clusters"]) {
+    const response = await render(pathname);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /aria-label="切换工作空间"/);
+  }
+});
+
 test("removes all disposable starter-preview references", async () => {
   const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage, api, worker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -171,6 +179,10 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(shell, /product-nav-compact/);
   assert.doesNotMatch(shell, /demo-sidebar/);
   assert.match(importPage, /选择文件夹/);
+  assert.match(importPage, /将资产导入已有的工作空间/);
+  assert.match(importPage, /创建新的工作空间/);
+  assert.match(importPage, /\/api\/v1\/workspaces/);
+  assert.match(importPage, /workspaceId = await resolveWorkspaceId/);
   assert.match(tasksPage, /失败记录/);
   assert.match(assetsPage, /source_file/);
   assert.match(detailPage, /source_contexts/);

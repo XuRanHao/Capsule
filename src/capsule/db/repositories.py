@@ -22,6 +22,7 @@ from capsule.db.models import (
     EmbeddingRecord,
     ModelCallLog,
     ProcessingJob,
+    QueryImageUpload,
     SourceFile,
     Workspace,
 )
@@ -59,6 +60,7 @@ from capsule.schemas import (
     DiscoveredFile,
     ProcessingJobRecord,
     StoredFileResult,
+    WorkspaceRecord,
 )
 
 
@@ -100,9 +102,145 @@ class LibraryClearSnapshot:
     job_count: int
 
 
+@dataclass(slots=True, frozen=True)
+class WorkspaceDeleteSnapshot:
+    workspace_id: str
+    asset_count: int
+    source_file_count: int
+    embedding_count: int
+    job_count: int
+    storage_uris: tuple[str, ...]
+    object_keys: tuple[str, ...]
+    staging_paths: tuple[str, ...]
+
+
 class AssetRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
+
+    async def list_workspaces(self) -> list[WorkspaceRecord]:
+        async with self._database.session() as session:
+            rows = list(await session.scalars(select(Workspace).order_by(Workspace.created_at)))
+        return [
+            WorkspaceRecord(
+                workspace_id=row.workspace_id,
+                name=row.name,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
+
+    async def create_workspace(
+        self,
+        *,
+        name: str,
+        workspace_id: str | None = None,
+    ) -> WorkspaceRecord:
+        async with self._database.session() as session, session.begin():
+            workspace = Workspace(name=name)
+            if workspace_id is not None:
+                workspace.workspace_id = workspace_id
+            session.add(workspace)
+            await session.flush()
+            await session.refresh(workspace)
+            return WorkspaceRecord(
+                workspace_id=workspace.workspace_id,
+                name=workspace.name,
+                created_at=workspace.created_at,
+                updated_at=workspace.updated_at,
+            )
+
+    async def delete_workspace_records(self, *, workspace_id: str) -> WorkspaceDeleteSnapshot:
+        """Delete exactly one workspace and collect its external cleanup targets."""
+        async with self._database.session() as session, session.begin():
+            workspace = await session.get(Workspace, workspace_id, with_for_update=True)
+            if workspace is None:
+                raise ValueError(f"workspace does not exist: {workspace_id}")
+
+            source_rows = list(
+                await session.execute(
+                    select(SourceFile.storage_uri).where(SourceFile.workspace_id == workspace_id)
+                )
+            )
+            asset_rows = list(
+                await session.execute(
+                    select(
+                        Asset.derived_file_uri,
+                        Asset.preview_uri,
+                        Asset.file_info,
+                        Asset.source_locator,
+                        Asset.source_contexts,
+                    ).where(Asset.workspace_id == workspace_id)
+                )
+            )
+            object_keys = tuple(
+                str(value)
+                for value in await session.scalars(
+                    select(QueryImageUpload.object_key).where(
+                        QueryImageUpload.workspace_id == workspace_id
+                    )
+                )
+            )
+            staging_paths = tuple(
+                str(value)
+                for value in await session.scalars(
+                    select(ProcessingJob.input_path).where(
+                        ProcessingJob.workspace_id == workspace_id
+                    )
+                )
+            )
+            storage_uris: set[str] = {
+                str(row.storage_uri) for row in source_rows if row.storage_uri
+            }
+            for row in asset_rows:
+                _collect_storage_uris(row.derived_file_uri, storage_uris)
+                _collect_storage_uris(row.preview_uri, storage_uris)
+                _collect_storage_uris(row.file_info, storage_uris)
+                _collect_storage_uris(row.source_locator, storage_uris)
+                _collect_storage_uris(row.source_contexts, storage_uris)
+
+            asset_count = int(
+                await session.scalar(
+                    select(func.count(Asset.asset_id)).where(Asset.workspace_id == workspace_id)
+                )
+                or 0
+            )
+            source_file_count = int(
+                await session.scalar(
+                    select(func.count(SourceFile.source_file_id)).where(
+                        SourceFile.workspace_id == workspace_id
+                    )
+                )
+                or 0
+            )
+            embedding_count = int(
+                await session.scalar(
+                    select(func.count(EmbeddingRecord.embedding_id)).where(
+                        EmbeddingRecord.workspace_id == workspace_id
+                    )
+                )
+                or 0
+            )
+            job_count = int(
+                await session.scalar(
+                    select(func.count(ProcessingJob.job_id)).where(
+                        ProcessingJob.workspace_id == workspace_id
+                    )
+                )
+                or 0
+            )
+            await session.delete(workspace)
+            return WorkspaceDeleteSnapshot(
+                workspace_id=workspace_id,
+                asset_count=asset_count,
+                source_file_count=source_file_count,
+                embedding_count=embedding_count,
+                job_count=job_count,
+                storage_uris=tuple(sorted(storage_uris)),
+                object_keys=object_keys,
+                staging_paths=staging_paths,
+            )
 
     async def create_job(
         self,
@@ -2931,3 +3069,18 @@ def _cluster_run_record(run: ClusterRun) -> ClusterRunRecord:
         started_at=run.started_at,
         completed_at=run.completed_at,
     )
+
+
+def _collect_storage_uris(value: Any, collected: set[str]) -> None:
+    """Collect only explicit storage URIs from nested persisted metadata."""
+    if isinstance(value, str):
+        if value.startswith(("s3://", "file://")):
+            collected.add(value)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_storage_uris(item, collected)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_storage_uris(item, collected)
