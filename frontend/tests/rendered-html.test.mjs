@@ -198,6 +198,8 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /当前维度已有全量重聚类任务/);
   assert.doesNotMatch(clustersPage, /setInterval\(/);
   assert.match(clustersPage, /assetStatus\?\.items/);
+  assert.match(clustersPage, /representative-asset-link/);
+  assert.match(clustersPage, /\/assets\/\$\{encodeURIComponent\(asset\.asset_id\)\}/);
   assert.match(api, /type ClusterAssetStatus =/);
   assert.match(api, /baseline_sample_count: number \| null/);
   assert.match(api, /class ApiRequestError extends Error/);

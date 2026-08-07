@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
@@ -1699,22 +1700,29 @@ export default function ClustersPage() {
           </div>
           <div className="representative-strip">
             {selectedMembers.map((asset, index) => (
-              <article key={asset.asset_id}>
-                <AssetThumb
-                  preview={asset.preview_url}
-                  name={asset.asset_name || asset.file_name}
-                  type={asset.asset_type}
-                />
-                <span>
-                  {asset.asset_id === selectedCapsule.medoid_asset_id
-                    ? "MEDOID"
-                    : `MEMBER ${index + 1}`}
-                </span>
-                <strong>{asset.asset_name || asset.file_name}</strong>
-                <small className="representative-asset-id" title={asset.asset_id}>
-                  {asset.asset_id}
-                </small>
-              </article>
+              <Link
+                className="representative-asset-link"
+                href={`/assets/${encodeURIComponent(asset.asset_id)}`}
+                aria-label={`打开 Asset 详情：${asset.asset_name || asset.file_name}`}
+                key={asset.asset_id}
+              >
+                <article>
+                  <AssetThumb
+                    preview={asset.preview_url}
+                    name={asset.asset_name || asset.file_name}
+                    type={asset.asset_type}
+                  />
+                  <span>
+                    {asset.asset_id === selectedCapsule.medoid_asset_id
+                      ? "MEDOID"
+                      : `MEMBER ${index + 1}`}
+                  </span>
+                  <strong>{asset.asset_name || asset.file_name}</strong>
+                  <small className="representative-asset-id" title={asset.asset_id}>
+                    {asset.asset_id}
+                  </small>
+                </article>
+              </Link>
             ))}
           </div>
         </section>
