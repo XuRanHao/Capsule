@@ -190,6 +190,8 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(importPage, /\/api\/v1\/workspaces/);
   assert.match(importPage, /workspaceId = await resolveWorkspaceId/);
   assert.match(tasksPage, /失败记录/);
+  assert.match(tasksPage, /最终存放/);
+  assert.match(tasksPage, /selected\.workspace_id/);
   assert.match(assetsPage, /source_file/);
   assert.match(detailPage, /source_contexts/);
   assert.match(detailPage, /asset-video-player/);

@@ -150,6 +150,11 @@ export default function TasksPage() {
   }, [load]);
 
   const selected = jobs.find((job) => job.job_id === selectedId) ?? jobs[0];
+  const selectedWorkspace = selected
+    ? workspaces.find(
+        (workspace) => workspace.workspace_id === selected.workspace_id,
+      )
+    : null;
   const effectiveStage =
     selected?.status === "completed" ? "completed" : selected?.current_stage;
   const currentStage = effectiveStage
@@ -236,6 +241,9 @@ export default function TasksPage() {
                 </div>
                 <strong>{job.input_path.split("/").at(-1)}</strong>
                 <span>{STAGE_LABELS[job.current_stage] || job.current_stage}</span>
+                <span className="task-workspace-label">
+                  最终存放 · {job.workspace_id}
+                </span>
                 <div className="task-progress">
                   <i style={{ width: `${progress(job)}%` }} />
                 </div>
@@ -261,6 +269,17 @@ export default function TasksPage() {
                 <strong>{elapsed}</strong>
               </div>
             </header>
+
+            <section className="task-workspace-destination">
+              <div>
+                <small>最终存放工作空间</small>
+                <strong>
+                  {selectedWorkspace?.name || selected.workspace_id}
+                </strong>
+                <span>该任务生成的 Assets、特征与聚类结果最终存放在此工作空间。</span>
+              </div>
+              <code>{selected.workspace_id}</code>
+            </section>
 
             <div className="pipeline-timeline">
               {PIPELINE_STAGES.map((stage, index) => {

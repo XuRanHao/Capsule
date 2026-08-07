@@ -2702,6 +2702,13 @@ blockquote p {
   font-size: 10px;
 }
 
+.task-list > button .task-workspace-label {
+  overflow: hidden;
+  color: #645cb8;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .task-progress {
   overflow: hidden;
   height: 3px;
@@ -2752,6 +2759,48 @@ blockquote p {
   font-family: var(--font-geist-mono), monospace;
   font-size: 26px;
   font-weight: 400;
+}
+
+.task-workspace-destination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border: 1px solid #cfc9f2;
+  border-radius: 11px;
+  background: #f1efff;
+  gap: 20px;
+}
+
+.task-workspace-destination > div {
+  display: grid;
+  gap: 5px;
+}
+
+.task-workspace-destination small,
+.task-workspace-destination code {
+  color: #645cb8;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+}
+
+.task-workspace-destination strong {
+  font-size: 15px;
+}
+
+.task-workspace-destination span {
+  color: var(--muted-ink);
+  font-size: 9px;
+}
+
+.task-workspace-destination code {
+  max-width: 45%;
+  overflow-wrap: anywhere;
+  padding: 7px 9px;
+  border: 1px solid rgb(100 92 184 / 22%);
+  border-radius: 6px;
+  background: rgb(255 255 255 / 65%);
+  text-align: right;
 }
 
 .status-badge {
@@ -5432,6 +5481,15 @@ blockquote p {
   .task-list > button {
     border-right: 1px solid var(--line);
     border-bottom: 0;
+  }
+
+  .task-workspace-destination {
+    display: grid;
+  }
+
+  .task-workspace-destination code {
+    max-width: none;
+    text-align: left;
   }
 
   .asset-detail-preview {
