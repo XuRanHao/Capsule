@@ -1,9 +1,9 @@
 import json
 
-from capsule.enums import ClusterInternalVariance, ClusterRepresentativeRole, EmbeddingType
+from capsule.enums import ClusterInternalVariance, EmbeddingType
 from capsule.pipeline.cluster_summary import (
     CLUSTER_SUMMARY_DIMENSION_POLICIES,
-    ClusterSummaryRepresentative,
+    ClusterSummaryAsset,
     asset_usage_path_context,
     build_cluster_summary_messages,
     cluster_source_context,
@@ -12,33 +12,21 @@ from capsule.pipeline.cluster_summary import (
 from capsule.schemas import ClusterSummary
 
 
-def test_cluster_summary_input_contains_only_selected_representative_assets() -> None:
+def test_cluster_summary_input_contains_every_asset_description_and_dimension() -> None:
     messages = build_cluster_summary_messages(
         embedding_type="visual_style",
         member_count=42,
         average_membership_probability=0.81,
-        representatives=[
-            ClusterSummaryRepresentative(
+        assets=[
+            ClusterSummaryAsset(
                 asset_id="asset_medoid",
-                role=ClusterRepresentativeRole.MEDOID,
-                asset_type="image",
-                asset_name="霓虹街道",
                 asset_description="蓝紫色霓虹灯下的夜间街道与人物。",
                 asset_features={"visual_style": {"effective_value": "赛博朋克"}},
-                file_tree_context=["inspiration", "night"],
-                membership_probability=0.98,
-                distance_to_medoid=0.0,
             ),
-            ClusterSummaryRepresentative(
+            ClusterSummaryAsset(
                 asset_id="asset_edge",
-                role=ClusterRepresentativeRole.EDGE,
-                asset_type="video_segment",
-                asset_name=None,
                 asset_description="夜景镜头缓慢推进，霓虹灯反射在湿润路面。",
                 asset_features={"visual_style": {"value": "写实电影感"}},
-                file_tree_context=["inspiration", "video"],
-                membership_probability=0.3,
-                distance_to_medoid=1.2,
             ),
         ],
     )
@@ -46,17 +34,21 @@ def test_cluster_summary_input_contains_only_selected_representative_assets() ->
     payload = json.loads(messages[1]["content"])
 
     assert payload["semantic_dimension"] == "视觉风格"
-    assert [item["asset_id"] for item in payload["representative_assets"]] == [
+    assert [item["asset_id"] for item in payload["cluster_assets"]] == [
         "asset_medoid",
         "asset_edge",
     ]
     assert "asset_discarded" not in messages[1]["content"]
-    assert payload["representative_assets"][0]["current_dimension_feature"] == "赛博朋克"
-    assert payload["representative_assets"][1]["current_dimension_feature"] == "写实电影感"
-    assert "asset_name" not in payload["representative_assets"][0]
-    assert "asset_description" not in payload["representative_assets"][0]
-    assert "asset_type" not in payload["representative_assets"][0]
-    assert "file_tree_context" not in payload["representative_assets"][0]
+    assert payload["cluster_assets"][0] == {
+        "asset_id": "asset_medoid",
+        "asset_description": "蓝紫色霓虹灯下的夜间街道与人物。",
+        "current_dimension_description": "赛博朋克",
+    }
+    assert payload["cluster_assets"][1]["asset_description"] == (
+        "夜景镜头缓慢推进，霓虹灯反射在湿润路面。"
+    )
+    assert payload["cluster_assets"][1]["current_dimension_description"] == "写实电影感"
+    assert "representative_assets" not in payload
 
 
 def test_cluster_summary_policies_cover_every_embedding_type() -> None:
@@ -70,56 +62,48 @@ def test_color_composition_summary_is_restricted_to_its_feature_dimension() -> N
         embedding_type="color_composition",
         member_count=6,
         average_membership_probability=0.97,
-        representatives=[
-            ClusterSummaryRepresentative(
+        assets=[
+            ClusterSummaryAsset(
                 asset_id="asset_color",
-                role=ClusterRepresentativeRole.MEDOID,
-                asset_type="image",
-                asset_name="暗黑动漫宣传海报",
                 asset_description="一张以动漫人物为主体的宣传海报。",
                 asset_features={
                     "subject_content": {"value": "动漫人物；宣传主题"},
                     "color_composition": {"value": "暗调；低饱和度；暖色点缀；强明暗对比"},
                 },
-                file_tree_context=["海报", "动漫"],
-                membership_probability=0.99,
-                distance_to_medoid=0.0,
             )
         ],
     )
 
     prompt = messages[0]["content"]
     payload = json.loads(messages[1]["content"])
-    representative = payload["representative_assets"][0]
+    cluster_asset = payload["cluster_assets"][0]
     policy = payload["dimension_policy"]
 
-    assert representative == {
+    assert cluster_asset == {
         "asset_id": "asset_color",
-        "role": "medoid",
-        "membership_probability": 0.99,
-        "distance_to_medoid": 0.0,
-        "current_dimension_feature": "暗调；低饱和度；暖色点缀；强明暗对比",
+        "asset_description": "一张以动漫人物为主体的宣传海报。",
+        "current_dimension_description": "暗调；低饱和度；暖色点缀；强明暗对比",
     }
-    assert policy["title_focus"].startswith("只提炼颜色")
-    assert {"海报", "插画", "动漫", "主题", "场景", "宣传"} <= set(policy["title_must_exclude"])
+    assert policy["title_focus"].startswith("最有区分度的色彩关系")
+    assert "视角、景别、画面布局、空间层次和视觉重心" in policy["description_focus"]
+    assert "description_must_exclude" not in policy
+    assert "title_must_exclude" not in policy
+    assert "description_must_exclude" not in prompt
+    assert "title_must_exclude" not in prompt
     assert "尽可能准确、完整且简洁" in prompt
-    assert "成员差异只通过 internal_variance 表达" in prompt
+    assert "共同定义当前任务的正向语义范围" in prompt
+    assert "成员差异通过 internal_variance 表达" in prompt
+    assert "common_features 必须有 1 到 3 项" in prompt
     assert "30 到 80" in prompt
     assert "不要输出 keywords" in prompt
     assert "说明该维度内的必要差异" not in prompt
 
 
 def test_description_channels_only_receive_their_permitted_text_evidence() -> None:
-    representative = ClusterSummaryRepresentative(
+    cluster_asset = ClusterSummaryAsset(
         asset_id="asset_text",
-        role=ClusterRepresentativeRole.MEDOID,
-        asset_type="image",
-        asset_name="文件名称",
         asset_description="蓝色海面上有一艘白色帆船。",
         asset_features={"subject_content": {"value": "帆船"}},
-        file_tree_context=["旅行", "参考"],
-        membership_probability=1.0,
-        distance_to_medoid=0.0,
     )
 
     native_payload = json.loads(
@@ -127,7 +111,7 @@ def test_description_channels_only_receive_their_permitted_text_evidence() -> No
             embedding_type="native_multimodal",
             member_count=1,
             average_membership_probability=1.0,
-            representatives=[representative],
+            assets=[cluster_asset],
         )[1]["content"]
     )
     description_payload = json.loads(
@@ -135,18 +119,18 @@ def test_description_channels_only_receive_their_permitted_text_evidence() -> No
             embedding_type="asset_description",
             member_count=1,
             average_membership_probability=1.0,
-            representatives=[representative],
+            assets=[cluster_asset],
         )[1]["content"]
     )
 
-    native_evidence = native_payload["representative_assets"][0]
-    description_evidence = description_payload["representative_assets"][0]
-    assert native_evidence["asset_name"] == "文件名称"
+    native_evidence = native_payload["cluster_assets"][0]
+    description_evidence = description_payload["cluster_assets"][0]
     assert native_evidence["asset_description"] == "蓝色海面上有一艘白色帆船。"
+    assert native_evidence["current_dimension_description"] == "蓝色海面上有一艘白色帆船。"
     assert description_evidence["asset_description"] == "蓝色海面上有一艘白色帆船。"
-    assert "asset_name" not in description_evidence
-    assert "file_tree_context" not in native_evidence
-    assert "current_dimension_feature" not in description_evidence
+    assert description_evidence["current_dimension_description"] == (
+        "蓝色海面上有一艘白色帆船。"
+    )
 
 
 def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
@@ -155,11 +139,8 @@ def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
         "海报/素材/20251216-143450.png",
         "海报/png/111.png",
     ]
-    representative = ClusterSummaryRepresentative(
+    cluster_asset = ClusterSummaryAsset(
         asset_id="asset_usage",
-        role=ClusterRepresentativeRole.MEDOID,
-        asset_type="image",
-        asset_name="海报视觉",
         asset_description="一张宣传海报。",
         asset_features={
             "asset_usage": {
@@ -171,9 +152,6 @@ def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
                 "source_path": "海报/素材/20251216-143446.png",
             }
         },
-        file_tree_context=["海报", "素材"],
-        membership_probability=1.0,
-        distance_to_medoid=0.0,
         source_relative_path="海报/素材/20251216-143446.png",
     )
 
@@ -181,12 +159,12 @@ def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
         embedding_type="asset_usage",
         member_count=3,
         average_membership_probability=0.95,
-        representatives=[representative],
+        assets=[cluster_asset],
         member_source_paths=source_paths,
     )
     payload = json.loads(messages[1]["content"])
     path_context = payload["member_source_context"]
-    evidence = payload["representative_assets"][0]
+    evidence = payload["cluster_assets"][0]
 
     assert path_context == asset_usage_path_context(source_paths)
     assert path_context["directory_counts"][0] == {
@@ -195,9 +173,7 @@ def test_asset_usage_summary_keeps_path_context_as_evidence_metadata() -> None:
     }
     assert evidence["source_relative_path"] == "海报/素材/20251216-143446.png"
     assert evidence["source_file_name"] == "20251216-143446.png"
-    assert "成员数量、完整相对路径、文件名、目录统计和代表文件不得写入 description" in (
-        messages[0]["content"]
-    )
+    assert "成员数量、完整路径、文件名和目录统计作为证据元数据保留" in messages[0]["content"]
 
 
 def test_subject_content_summary_preserves_named_path_entity_and_file_evidence() -> None:
@@ -211,16 +187,10 @@ def test_subject_content_summary_preserves_named_path_entity_and_file_evidence()
         "第一集/小说编辑/参考/bb1f3e2600aec859f35e971d107330ac.jpg",
         "第一集/小说编辑/参考/f9951fe08005132c82c7b6c57fcd6cd3.jpg",
     ]
-    representative = ClusterSummaryRepresentative(
+    cluster_asset = ClusterSummaryAsset(
         asset_id="asset_guxiaoling",
-        role=ClusterRepresentativeRole.MEDOID,
-        asset_type="image",
-        asset_name="双色马尾动漫女孩古小玲立绘",
         asset_description="一名二次元少女角色的立绘。",
         asset_features={"subject_content": {"value": "二次元少女角色立绘"}},
-        file_tree_context=["第一集", "古小玲", "古小玲"],
-        membership_probability=0.98,
-        distance_to_medoid=0.0,
         source_relative_path=source_paths[0],
     )
 
@@ -228,12 +198,12 @@ def test_subject_content_summary_preserves_named_path_entity_and_file_evidence()
         embedding_type="subject_content",
         member_count=len(source_paths),
         average_membership_probability=0.93,
-        representatives=[representative],
+        assets=[cluster_asset],
         member_source_paths=source_paths,
     )
     payload = json.loads(messages[1]["content"])
     context = payload["member_source_context"]
-    evidence = payload["representative_assets"][0]
+    evidence = payload["cluster_assets"][0]
 
     assert context["semantic_path_terms"][0] == {
         "term": "古小玲",
@@ -241,7 +211,7 @@ def test_subject_content_summary_preserves_named_path_entity_and_file_evidence()
     }
     assert evidence["source_relative_path"] == source_paths[0]
     assert evidence["source_file_name"] == "2√.png"
-    assert "最具代表性的一个语义实体" in messages[0]["content"]
+    assert "代表性语义实体" in messages[0]["content"]
 
     summary = ClusterSummary(
         name="二次元少女立绘",

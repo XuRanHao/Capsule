@@ -9,9 +9,13 @@ Docker application does not need to carry PyTorch or access macOS MPS.
 import asyncio
 import json
 import math
+import os
 import platform
 import shutil
+import signal
 import subprocess
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Protocol, cast
@@ -24,10 +28,65 @@ from sklearn.metrics import silhouette_score
 
 from capsule.enums import AssetType
 from capsule.schemas import AssetDraft, DiscoveredFile
+from capsule.video_output import VideoOutputMode
 
 
 class VideoToolingError(RuntimeError):
     """Raised when FFmpeg, decoding, or the visual embedding backend fails."""
+
+
+class VideoProcessingCancelledError(VideoToolingError):
+    """A host worker cancelled native video work and reaped its process group."""
+
+
+@dataclass(frozen=True, slots=True)
+class VideoAnalysisProgress:
+    """A real decoder or embedding advance; never a synthetic heartbeat."""
+
+    stage: str
+    decoded_frames: int = 0
+    decoded_time_ms: int = 0
+    duration_ms: int | None = None
+
+
+class VideoCancellationToken:
+    """Stop all registered FFmpeg process groups and wait for their exit."""
+
+    def __init__(self, *, terminate_grace_seconds: float = 3.0) -> None:
+        if terminate_grace_seconds <= 0:
+            raise ValueError("terminate_grace_seconds must be positive")
+        self._terminate_grace_seconds = terminate_grace_seconds
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen[bytes]] = set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise VideoProcessingCancelledError("video processing cancelled")
+
+    def register(self, process: subprocess.Popen[bytes]) -> Callable[[], None]:
+        with self._lock:
+            self._processes.add(process)
+            cancelled = self.cancelled
+        if cancelled:
+            _terminate_process_group(process, self._terminate_grace_seconds)
+
+        def unregister() -> None:
+            with self._lock:
+                self._processes.discard(process)
+
+        return unregister
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            processes = tuple(self._processes)
+        for process in processes:
+            _terminate_process_group(process, self._terminate_grace_seconds)
 
 
 class VisualEmbedder(Protocol):
@@ -41,6 +100,7 @@ class VisualEmbedder(Protocol):
 class VideoSegmentationConfig:
     """Adaptive content segmentation and representative-frame parameters."""
 
+    output_mode: VideoOutputMode = "logical"
     sample_interval_seconds: float = 0.5
     min_segment_seconds: float = 1.0
     distance_quantile: float = 0.75
@@ -178,21 +238,56 @@ class VideoParser:
             if resolve_video_tool(executable) is None
         ]
 
-    async def assetize(self, source_file: DiscoveredFile) -> list[AssetDraft]:
+    async def assetize(
+        self,
+        source_file: DiscoveredFile,
+        *,
+        progress_callback: Callable[[VideoAnalysisProgress], None] | None = None,
+        cancellation_token: VideoCancellationToken | None = None,
+    ) -> list[AssetDraft]:
         """Build logical video Segment drafts for later media persistence."""
         async with self._semaphore:
-            return await asyncio.to_thread(self.assetize_path, Path(source_file.path))
+            return await asyncio.to_thread(
+                self.assetize_path,
+                Path(source_file.path),
+                progress_callback=progress_callback,
+                cancellation_token=cancellation_token,
+            )
 
-    def assetize_path(self, source: Path) -> list[AssetDraft]:
+    def assetize_path(
+        self,
+        source: Path,
+        *,
+        progress_callback: Callable[[VideoAnalysisProgress], None] | None = None,
+        cancellation_token: VideoCancellationToken | None = None,
+    ) -> list[AssetDraft]:
         source = source.expanduser().resolve()
+        cancellation_token = cancellation_token or VideoCancellationToken()
+        cancellation_token.raise_if_cancelled()
+        _report_analysis_progress(progress_callback, "probing")
         _require_video_tools()
-        metadata = _probe_metadata(source)
+        metadata = _probe_metadata(source, cancellation_token=cancellation_token)
+        _report_analysis_progress(
+            progress_callback,
+            "decoding",
+            duration_ms=metadata.duration_ms,
+        )
         analysis = _analyze_video(
             source,
             metadata,
             self._config,
             self._get_embedder(),
             embedding_batch_size=self._mobileclip_batch_size,
+            progress_callback=progress_callback,
+            cancellation_token=cancellation_token,
+        )
+        cancellation_token.raise_if_cancelled()
+        _report_analysis_progress(
+            progress_callback,
+            "segmenting",
+            decoded_frames=len(analysis.candidates),
+            decoded_time_ms=metadata.duration_ms,
+            duration_ms=metadata.duration_ms,
         )
         atoms, distance_threshold = _content_atoms(analysis, metadata, self._config)
         ranges, merge_info = _merge_atoms(
@@ -209,6 +304,7 @@ class VideoParser:
 
         drafts: list[AssetDraft] = []
         for segment_index, item in enumerate(ranges):
+            cancellation_token.raise_if_cancelled()
             positions = _candidate_positions_for_range(
                 analysis.candidates,
                 item.start_ms,
@@ -224,10 +320,14 @@ class VideoParser:
                 analysis.embeddings[selected_positions],
                 self._config,
             )
-            keyframe_jpegs = [
-                _required_jpeg(candidate)
-                for candidate in representatives
-            ]
+            # Logical segments retain only the representative timestamps.  In
+            # particular, do not encode frame JPEG bytes that could later be
+            # rendered, uploaded, or sent to multimodal enrichment.
+            keyframe_jpegs = (
+                [_required_jpeg(candidate) for candidate in representatives]
+                if self._config.output_mode == "materialized"
+                else []
+            )
             drafts.append(
                 AssetDraft(
                     asset_type=AssetType.VIDEO_SEGMENT,
@@ -241,6 +341,7 @@ class VideoParser:
                         "atom_indices": [index + 1 for index in item.atom_indices],
                     },
                     file_info={
+                        "video_output_mode": self._config.output_mode,
                         "width": metadata.width,
                         "height": metadata.height,
                         "aspect_ratio": _aspect_ratio(metadata.width, metadata.height),
@@ -371,7 +472,11 @@ def _analyze_video(
     embedder: VisualEmbedder,
     *,
     embedding_batch_size: int,
+    progress_callback: Callable[[VideoAnalysisProgress], None] | None = None,
+    cancellation_token: VideoCancellationToken | None = None,
 ) -> _VideoAnalysis:
+    cancellation_token = cancellation_token or VideoCancellationToken()
+    cancellation_token.raise_if_cancelled()
     frame_size = config.keyframe_size
     activity_fps = config.activity_sample_fps
     filter_graph = (
@@ -403,9 +508,16 @@ def _analyze_video(
             "pipe:1",
         ]
     )
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    unregister_process = cancellation_token.register(process)
     if process.stdout is None or process.stderr is None:
-        process.kill()
+        _terminate_process_group(process, cancellation_token._terminate_grace_seconds)
+        unregister_process()
         raise VideoToolingError("FFmpeg did not expose its video analysis pipes")
 
     candidates: list[CandidateFrame] = []
@@ -421,6 +533,7 @@ def _analyze_video(
     def flush_embeddings() -> None:
         if not pending_frames:
             return
+        cancellation_token.raise_if_cancelled()
         embedded = np.asarray(embedder.embed(pending_frames), dtype=np.float32)
         if embedded.ndim != 2 or embedded.shape[0] != len(pending_frames):
             raise VideoToolingError("visual embedder must return one vector per sampled frame")
@@ -432,6 +545,7 @@ def _analyze_video(
 
     try:
         while True:
+            cancellation_token.raise_if_cancelled()
             payload = _read_exact(process.stdout, bytes_per_frame)
             if not payload:
                 break
@@ -455,6 +569,7 @@ def _analyze_video(
                     timestamp_ms,
                     keyframe,
                     jpeg_quality=config.keyframe_jpeg_quality,
+                    include_jpeg=config.output_mode == "materialized",
                 )
                 candidates.append(candidate)
                 pending_candidates.append(candidate)
@@ -464,6 +579,13 @@ def _analyze_video(
                     flush_embeddings()
                 next_sample_ms += max(1, round(config.sample_interval_seconds * 1000))
             frame_index += 1
+            _report_analysis_progress(
+                progress_callback,
+                "decoding",
+                decoded_frames=frame_index,
+                decoded_time_ms=timestamp_ms,
+                duration_ms=metadata.duration_ms,
+            )
         flush_embeddings()
         process.stdout.close()
         stderr = process.stderr.read()
@@ -473,8 +595,8 @@ def _analyze_video(
             raise VideoToolingError(message or f"FFmpeg could not decode video: {source}")
     finally:
         if process.poll() is None:
-            process.kill()
-            process.wait()
+            _terminate_process_group(process, cancellation_token._terminate_grace_seconds)
+        unregister_process()
         process.stdout.close()
         process.stderr.close()
     if not candidates or not embedding_batches:
@@ -750,7 +872,13 @@ def _rolling_max(values: np.ndarray, radius: int) -> np.ndarray:
     ])
 
 
-def _probe_metadata(source: Path) -> VideoMetadata:
+def _probe_metadata(
+    source: Path,
+    *,
+    cancellation_token: VideoCancellationToken | None = None,
+) -> VideoMetadata:
+    cancellation_token = cancellation_token or VideoCancellationToken()
+    cancellation_token.raise_if_cancelled()
     command = [
         str(_require_video_tool("ffprobe")),
         "-v",
@@ -765,11 +893,25 @@ def _probe_metadata(source: Path) -> VideoMetadata:
         "json",
         str(source),
     ]
-    result = subprocess.run(command, capture_output=True, check=False, text=True)
-    if result.returncode:
-        raise VideoToolingError(result.stderr.strip() or f"ffprobe failed for {source}")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    unregister_process = cancellation_token.register(process)
     try:
-        payload = json.loads(result.stdout)
+        stdout, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            _terminate_process_group(process, cancellation_token._terminate_grace_seconds)
+        unregister_process()
+    cancellation_token.raise_if_cancelled()
+    if process.returncode:
+        detail = stderr.decode(errors="replace").strip() or f"ffprobe failed for {source}"
+        raise VideoToolingError(detail)
+    try:
+        payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise VideoToolingError(f"ffprobe returned invalid metadata for {source}") from exc
     streams = payload.get("streams", [])
@@ -805,15 +947,19 @@ def _candidate_frame(
     frame: np.ndarray,
     *,
     jpeg_quality: int = 85,
+    include_jpeg: bool = True,
 ) -> CandidateFrame:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    encoded, payload = cv2.imencode(
-        ".jpg",
-        frame,
-        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
-    )
-    if not encoded:
-        raise VideoToolingError("OpenCV could not encode a sampled video keyframe")
+    jpeg_bytes: bytes | None = None
+    if include_jpeg:
+        encoded, payload = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+        )
+        if not encoded:
+            raise VideoToolingError("OpenCV could not encode a sampled video keyframe")
+        jpeg_bytes = payload.tobytes()
     return CandidateFrame(
         requested_ms=requested_ms,
         timestamp_ms=timestamp_ms,
@@ -821,7 +967,7 @@ def _candidate_frame(
         brightness=float(np.mean(gray)),
         contrast=float(np.std(gray)),
         sharpness=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
-        jpeg_bytes=payload.tobytes(),
+        jpeg_bytes=jpeg_bytes,
         thumbnail=np.asarray(cv2.resize(gray, (32, 32))),
     )
 
@@ -936,6 +1082,52 @@ def _string_or_none(value: object) -> str | None:
 
 def _aspect_ratio(width: int, height: int) -> float | None:
     return round(width / height, 6) if height else None
+
+
+def _report_analysis_progress(
+    callback: Callable[[VideoAnalysisProgress], None] | None,
+    stage: str,
+    *,
+    decoded_frames: int = 0,
+    decoded_time_ms: int = 0,
+    duration_ms: int | None = None,
+) -> None:
+    if callback is not None:
+        callback(
+            VideoAnalysisProgress(
+                stage=stage,
+                decoded_frames=decoded_frames,
+                decoded_time_ms=decoded_time_ms,
+                duration_ms=duration_ms,
+            )
+        )
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: float) -> None:
+    """Gracefully terminate a child group, then force-reap it if needed."""
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        else:  # pragma: no cover - Capsule video workers are POSIX hosts.
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        else:  # pragma: no cover - Capsule video workers are POSIX hosts.
+            process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def _require_video_tools() -> None:

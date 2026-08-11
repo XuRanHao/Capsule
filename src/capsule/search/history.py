@@ -16,7 +16,6 @@ from capsule.search.models import (
     FusionMethod,
     ParsedQuery,
     QueryType,
-    RerankMethod,
     SearchCapsuleDetail,
     SearchCapsuleListResponse,
     SearchCapsuleSummary,
@@ -59,7 +58,6 @@ class SearchHistoryRepository:
                     parsed_query=parsed_query.model_dump(mode="json"),
                     filters=request.filters.model_dump(mode="json"),
                     fusion_method=request.fusion_method.value,
-                    rerank_method=request.rerank_method.value,
                     search_engine_version=self._settings.search_engine_version,
                     embedding_model=self._settings.embedding_model,
                     is_favorite=request.save_capsule,
@@ -101,7 +99,6 @@ class SearchHistoryRepository:
                         result_rank=rank,
                         final_score=result.score,
                         component_scores={
-                            "rerank_score": result.rerank_score,
                             "channels": [
                                 item.model_dump(mode="json") for item in result.matched_channels
                             ],
@@ -222,7 +219,9 @@ class SearchHistoryRepository:
             )
             if latest is None:
                 raise SearchCapsuleNotFoundError(capsule_id)
-            request = SearchRequest.model_validate(latest.request_payload)
+            request_payload = dict(latest.request_payload)
+            request_payload.pop("rerank", None)
+            request = SearchRequest.model_validate(request_payload)
             return request.model_copy(
                 update={
                     "save_capsule": False,
@@ -304,7 +303,6 @@ class SearchHistoryRepository:
             query_text=capsule.query_text,
             query_image_uri=capsule.query_image_uri,
             fusion_method=FusionMethod(capsule.fusion_method),
-            rerank_method=RerankMethod(capsule.rerank_method),
             is_favorite=capsule.is_favorite,
             result_count=result_count,
             last_used_at=capsule.last_used_at,

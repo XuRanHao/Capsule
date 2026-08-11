@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   FormEvent,
   KeyboardEvent,
@@ -42,7 +43,7 @@ type ParsedQuery = {
 
 type MatchedChannel = {
   channel: string;
-  embedding_type: string;
+  embedding_type: string | null;
   rank: number;
   similarity: number;
   fusion_contribution: number;
@@ -72,7 +73,6 @@ type SearchResult = {
   matched_channels: MatchedChannel[];
   matched_feature: string | null;
   matched_reason: string | null;
-  rerank_score: number | null;
   group_kind: string | null;
   folded_asset_ids: string[];
   available: boolean;
@@ -105,7 +105,6 @@ type SearchResponse = {
   };
   parsed_query: ParsedQuery | null;
   fusion_method: FusionMethod;
-  rerank_method: "off" | "doubao_seed_2_lite";
   search_engine_version: string;
   execution_id: string | null;
   capsule_id: string | null;
@@ -123,13 +122,17 @@ type SearchResponse = {
   results: SearchResult[];
 };
 
+type SearchDimensionSuggestionResponse = {
+  embedding_types: EmbeddingType[];
+  weights: Record<EmbeddingType, number>;
+};
+
 type CapsuleSummary = {
   capsule_id: string;
   query_type: QueryType;
   query_text: string | null;
   query_image_uri: string | null;
   fusion_method: FusionMethod;
-  rerank_method: string;
   is_favorite: boolean;
   result_count: number;
   last_used_at: string;
@@ -248,7 +251,6 @@ const DEMO_RESULTS: SearchResult[] = [
     ],
     matched_feature: "日系动画电影感，柔和颗粒",
     matched_reason: "主体、色彩和动画电影质感同时命中",
-    rerank_score: 0.94,
     group_kind: null,
     folded_asset_ids: ["asset_demo_twilight_01"],
     available: true,
@@ -296,7 +298,6 @@ const DEMO_RESULTS: SearchResult[] = [
     ],
     matched_feature: "人物、马匹、金色田野",
     matched_reason: "命中人物尺度与安静的黄昏氛围",
-    rerank_score: 0.88,
     group_kind: "video_segments",
     folded_asset_ids: ["asset_demo_field_02", "asset_demo_field_03"],
     available: true,
@@ -335,7 +336,6 @@ const DEMO_RESULTS: SearchResult[] = [
     ],
     matched_feature: null,
     matched_reason: "文字描述命中蓝调时刻和长阴影",
-    rerank_score: null,
     group_kind: null,
     folded_asset_ids: ["asset_demo_notes_04"],
     available: true,
@@ -407,7 +407,6 @@ const DEMO_RESPONSE: SearchResponse = {
     ],
   },
   fusion_method: "weighted_rrf",
-  rerank_method: "doubao_seed_2_lite",
   search_engine_version: "search-v1",
   execution_id: "search_exec_demo",
   capsule_id: "search_capsule_demo",
@@ -433,7 +432,6 @@ const EMPTY_RESPONSE: SearchResponse = {
   },
   parsed_query: null,
   fusion_method: "weighted_rrf",
-  rerank_method: "doubao_seed_2_lite",
   search_engine_version: "search-v1",
   execution_id: null,
   capsule_id: null,
@@ -492,10 +490,12 @@ function SearchResultCard({
   const foldedCount = result.folded_asset_ids?.length ?? 1;
 
   return (
-    <article
+    <Link
+      aria-label={`打开 Asset 详情：${result.asset_name || result.asset_id}`}
       className={`result-card result-card-${index % 4} ${
         result.available ? "" : "result-unavailable"
       }`}
+      href={`/assets/${encodeURIComponent(result.asset_id)}`}
     >
       <div className="result-visual">
         {previewUrl && !imageFailed ? (
@@ -536,19 +536,6 @@ function SearchResultCard({
         {foldedCount > 1 && (
           <div className="folded-badge">已合并 {foldedCount} 个相邻片段</div>
         )}
-        {result.matched_reason && (
-          <div className="match-reason">
-            <span>为什么命中</span>
-            {result.matched_reason}
-          </div>
-        )}
-        {result.matched_feature && (
-          <div className="matched-feature">
-            <span>命中特征</span>
-            {result.matched_feature}
-          </div>
-        )}
-
         <div className="channel-list" aria-label="命中通道">
           {result.matched_channels.map((channel) => (
             <div
@@ -557,8 +544,9 @@ function SearchResultCard({
               title={`排名 ${channel.rank}，融合贡献 ${channel.fusion_contribution.toFixed(5)}`}
             >
               <span>
-                {CHANNEL_LABELS[channel.embedding_type] ??
-                  channel.embedding_type}
+                {channel.embedding_type
+                  ? CHANNEL_LABELS[channel.embedding_type] ?? channel.embedding_type
+                  : "本地文字"}
               </span>
               <strong>{channel.similarity.toFixed(3)}</strong>
             </div>
@@ -584,7 +572,7 @@ function SearchResultCard({
           </footer>
         )}
       </div>
-    </article>
+    </Link>
   );
 }
 
@@ -706,9 +694,11 @@ export default function Home() {
   const [embeddingTypes, setEmbeddingTypes] = useState<EmbeddingType[]>([
     "native_multimodal",
   ]);
+  const [dimensionWeights, setDimensionWeights] = useState<
+    Partial<Record<EmbeddingType, number>> | null
+  >(null);
   const [fusionMethod, setFusionMethod] =
     useState<FusionMethod>("weighted_rrf");
-  const [rerank, setRerank] = useState(false);
   const [saveCapsule, setSaveCapsule] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [sourceFileId, setSourceFileId] = useState("");
@@ -725,6 +715,7 @@ export default function Home() {
   const [selectedCapsule, setSelectedCapsule] =
     useState<CapsuleDetail | null>(null);
   const [loading, setLoading] = useState(false);
+  const [suggestingDimensions, setSuggestingDimensions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const workspaceIdRef = useRef(workspaceId);
   const requestControllersRef = useRef(new Set<AbortController>());
@@ -769,10 +760,12 @@ export default function Home() {
     }
     requestControllersRef.current.clear();
     setResponse(EMPTY_RESPONSE);
+    setDimensionWeights(null);
     setCapsules([]);
     setSelectedCapsule(null);
     setError(null);
     setLoading(false);
+    setSuggestingDimensions(false);
     setResultSet("assets");
     setViewMode("live");
     setWorkspaceId(nextWorkspaceId);
@@ -863,8 +856,8 @@ export default function Home() {
             imageQueryEnabled && !upload ? queryImageUrl.trim() : null,
           query_image_upload_id: upload?.upload_id ?? null,
           embedding_types: embeddingTypes,
+          dimension_weights: dimensionWeights,
           fusion_method: fusionMethod,
-          rerank: rerank ? "doubao_seed_2_lite" : "off",
           save_capsule: saveCapsule,
           filters: {
             project_id: projectId.trim() || null,
@@ -1081,6 +1074,7 @@ export default function Home() {
       : [...assetTypes, assetType];
     if (next.length === 0) return;
     setAssetTypes(next);
+    setDimensionWeights(null);
     setEmbeddingTypes((current) => {
       const compatible = current.filter((embeddingType) =>
         dimensionSupportsTargets(embeddingType, next),
@@ -1090,6 +1084,7 @@ export default function Home() {
   };
   const toggleEmbeddingType = (embeddingType: EmbeddingType) => {
     if (!dimensionSupportsTargets(embeddingType, assetTypes)) return;
+    setDimensionWeights(null);
     setEmbeddingTypes((current) => {
       if (current.includes(embeddingType)) {
         return current.length === 1
@@ -1098,6 +1093,81 @@ export default function Home() {
       }
       return [...current, embeddingType];
     });
+  };
+  const suggestDimensions = async () => {
+    if (!textQueryEnabled || !queryText.trim()) {
+      setError("智能选择需要先输入检索文字");
+      return;
+    }
+    const requestWorkspaceId = workspaceId.trim();
+    const controller = startWorkspaceRequest();
+    setSuggestingDimensions(true);
+    setError(null);
+    try {
+      const apiResponse = await fetch(
+        endpoint("/api/v1/search/dimensions/suggest"),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            query_text: queryText.trim(),
+            asset_types: assetTypes,
+          }),
+        },
+      );
+      if (!apiResponse.ok) throw new Error(await readError(apiResponse));
+      const suggestion =
+        (await apiResponse.json()) as SearchDimensionSuggestionResponse;
+      const selected = suggestion.embedding_types.filter((embeddingType) =>
+        dimensionSupportsTargets(embeddingType, assetTypes),
+      );
+      if (selected.length === 0 || selected.length > 4) {
+        throw new Error("模型返回的检索维度无效");
+      }
+      const selectedWeights = Object.fromEntries(
+        selected.map((embeddingType) => [
+          embeddingType,
+          suggestion.weights[embeddingType],
+        ]),
+      ) as Partial<Record<EmbeddingType, number>>;
+      const weightValues = Object.values(selectedWeights);
+      if (
+        weightValues.length !== selected.length ||
+        weightValues.some(
+          (weight) =>
+            typeof weight !== "number" ||
+            !Number.isFinite(weight) ||
+            weight <= 0,
+        )
+      ) {
+        throw new Error("模型返回的检索权重无效");
+      }
+      const totalWeight = weightValues.reduce((sum, weight) => sum + weight, 0);
+      const normalizedWeights = Object.fromEntries(
+        selected.map((embeddingType) => [
+          embeddingType,
+          (selectedWeights[embeddingType] ?? 0) / totalWeight,
+        ]),
+      ) as Partial<Record<EmbeddingType, number>>;
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setEmbeddingTypes([...new Set(selected)]);
+        setDimensionWeights(normalizedWeights);
+      }
+    } catch (requestError) {
+      if (isCurrentWorkspace(requestWorkspaceId) && !controller.signal.aborted) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "智能选择失败",
+        );
+      }
+    } finally {
+      finishWorkspaceRequest(controller);
+      if (isCurrentWorkspace(requestWorkspaceId)) {
+        setSuggestingDimensions(false);
+      }
+    }
   };
   const assetResults =
     response.assets.length > 0 ? response.assets : response.results;
@@ -1143,7 +1213,10 @@ export default function Home() {
                       type="radio"
                       name="query-type"
                       checked={queryType === item.value}
-                      onChange={() => setQueryType(item.value)}
+                      onChange={() => {
+                        setQueryType(item.value);
+                        setDimensionWeights(null);
+                      }}
                     />
                     <span>{item.marker}</span>
                     {item.label}
@@ -1156,7 +1229,10 @@ export default function Home() {
                   <span>你记得什么？</span>
                   <textarea
                     value={queryText}
-                    onChange={(event) => setQueryText(event.target.value)}
+                    onChange={(event) => {
+                      setQueryText(event.target.value);
+                      setDimensionWeights(null);
+                    }}
                     onKeyDown={handleQueryKeyDown}
                     placeholder="例如：保持构图，更像黄昏，排除文字水印…"
                     rows={4}
@@ -1223,6 +1299,24 @@ export default function Home() {
                   </span>
                   <b aria-hidden="true">⌄</b>
                 </summary>
+                <div className="dimension-smart-select">
+                  <button
+                    type="button"
+                    disabled={
+                      suggestingDimensions ||
+                      !textQueryEnabled ||
+                      !queryText.trim()
+                    }
+                    onClick={suggestDimensions}
+                  >
+                    {suggestingDimensions ? "判断中…" : "智能选择"}
+                  </button>
+                  <span>
+                    {dimensionWeights === null
+                      ? "自动选择并判断倾向，最多 4 个维度"
+                      : "已智能选择并分配近似权重"}
+                  </span>
+                </div>
                 <div className="dimension-options">
                   {SEARCH_DIMENSIONS.map((dimension) => {
                     const checked = embeddingTypes.includes(dimension.value);
@@ -1233,6 +1327,7 @@ export default function Home() {
                     const available = supportCount > 0;
                     const partiallyAvailable =
                       available && supportCount < assetTypes.length;
+                    const smartWeight = dimensionWeights?.[dimension.value];
                     return (
                       <label
                         key={dimension.value}
@@ -1253,6 +1348,8 @@ export default function Home() {
                         <code>
                           {!available
                             ? "当前类型不可用"
+                            : checked && smartWeight !== undefined
+                              ? `智能权重 ${Math.round(smartWeight * 100)}%`
                             : partiallyAvailable
                               ? "仅图片 / 视频"
                               : dimension.value}
@@ -1268,15 +1365,6 @@ export default function Home() {
               </details>
 
               <div className="search-options">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={rerank}
-                    onChange={(event) => setRerank(event.target.checked)}
-                  />
-                  <span />
-                  豆包重排
-                </label>
                 <label>
                   <input
                     type="checkbox"
@@ -1410,9 +1498,6 @@ export default function Home() {
                   {response.fusion_method === "weighted_rrf"
                     ? "Weighted RRF"
                     : "Normalized"}
-                </span>
-                <span>
-                  {response.rerank_method === "off" ? "未重排" : "Seed 重排"}
                 </span>
               </div>
             </div>

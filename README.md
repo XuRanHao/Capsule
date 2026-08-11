@@ -9,12 +9,12 @@ path is implemented end to end:
 
 ```text
 text / image / image+text
-  -> user-selected dimensions and optional text Dimension Query Enhancer
-  -> concurrent query embeddings
+  -> manual or text-model-assisted dimension selection
+  -> optional text Dimension Query Enhancer
+  -> fixed 0.3 original-content + 0.7 dimension query-vector fusion
   -> 12-channel Milvus recall
   -> PostgreSQL filters
   -> RRF or normalized-similarity fusion
-  -> optional Doubao rerank
   -> deduplication and source folding
   -> Search Capsule snapshot
 ```
@@ -154,6 +154,7 @@ To reset persisted PostgreSQL/Milvus/MinIO data, use
    capsule pipeline ./test-data --workspace workspace_demo --dry-run
    capsule pipeline ./test-data --workspace workspace_demo --execute
    capsule embed --workspace workspace_demo
+   capsule materialize-search-vectors --workspace workspace_demo
    ```
 
 The non-dry-run pipeline persists Markdown, plain-text, Word, PDF, image and video Assets
@@ -171,6 +172,12 @@ multimodal: Markdown uses the block text, images are sent inline as their
 original bytes, and video uses the derived playable MP4 inline as a Base64 Data
 URI. Repeat `--asset-id` to limit a batch; already indexed logical inputs are
 skipped unless `--force` is set.
+
+Raw model vectors remain in the canonical Milvus collection. Browser imports
+automatically materialize each non-native search vector as normalized
+`0.3 * native_multimodal + 0.7 * current_dimension` in a separate, rebuildable
+Milvus collection. Run `capsule materialize-search-vectors` after upgrading an
+existing workspace; it performs no model calls and does not overwrite raw vectors.
 
 ## Cluster lifecycle
 
@@ -191,30 +198,59 @@ Video visual features run only on the macOS host because Docker cannot access
 MPS. A single FFmpeg decode uses VideoToolbox on macOS and emits only 6 fps of
 224px analysis data instead of transferring every full-resolution frame into
 Python. It measures activity at 6 fps and samples a centered 224x224 frame every
-0.5 seconds for JPEG caching and MobileCLIP-S0 embeddings. Time-constrained
-content clustering derives a
+0.5 seconds for MobileCLIP-S0 embeddings. Time-constrained content clustering derives a
 per-video first-stage distance threshold from the adjacent-distance Q75. A
 second stage greedily merges content-compatible neighbors using adaptive
-duration and sustained activity-shift costs. The cached embeddings select up
-to three quality-filtered representative frames, so keyframes require no
-second extraction or MobileCLIP pass. Each final Segment is then rendered once
-as a playable MP4 while its selected cached 224x224 JPEGs become the cover and
-representative keyframes. The derived media is written to the configured private
-S3-compatible bucket; the Asset keeps the logical time range plus generic
-`derived_file_uri`, `preview_uri`, and video-specific `file_info.keyframes`.
-Both downstream video model paths read their durable private `s3://` objects
-from MinIO and send them inline to Ark as Base64 Data URIs: Understanding
-receives up to three representative JPEG keyframes, while native multimodal
-Embedding receives the rendered Segment MP4. Ark therefore does not need
-network access to the MinIO endpoint.
+duration and sustained activity-shift costs. The default
+`CAPSULE_VIDEO_OUTPUT_MODE=logical` persists only each final Segment's time
+range and representative-frame timestamp/quality metadata. It does not encode
+JPEGs, render MP4 clips, or touch MinIO. Segment Assets are still persisted to
+PostgreSQL and continue through Understanding, vector embedding, search-vector
+materialization, and clustering. Understanding and native multimodal embedding
+decode the recorded representative timestamps from the original video into
+memory and release those bytes after the model request. The original video is
+never copied; its `file://` source must be under `CAPSULE_IMPORT_ROOT` or one of
+`CAPSULE_VIDEO_SOURCE_ROOTS`.
+
+`CAPSULE_VIDEO_OUTPUT_MODE=materialized` is retained only for compatibility
+with the legacy playable-Segment contract. In that mode Capsule renders a
+playable MP4 plus representative JPEGs, uploads them to the private
+S3-compatible bucket, and keeps the legacy model-input path available.
 
 Run the command from a native Apple-silicon Python environment that has the
 Capsule dependencies plus PyTorch, Apple `ml-mobileclip`, FFmpeg and FFprobe:
 
 ```bash
+CAPSULE_VIDEO_SOURCE_ROOTS='["data/dev-fixtures"]' \
 uv run capsule mps-video data/dev-fixtures/nature/hiking-trip.mp4 \
   --workspace workspace_demo
 ```
+
+`mps-video` remains the synchronous compatibility command. For durable
+whole-video execution, first apply the current Alembic migrations, then run the
+PostgreSQL-backed scheduler and Redis Streams worker on the host:
+
+```bash
+uv run alembic upgrade head
+uv run capsule video-scheduler
+uv run capsule video-worker --worker-id mps-worker-1
+CAPSULE_VIDEO_SOURCE_ROOTS='["data/dev-fixtures"]' \
+  uv run capsule submit-video-task data/dev-fixtures/nature/hiking-trip.mp4 \
+  --workspace workspace_demo
+```
+
+PostgreSQL is authoritative for task state, attempts, leases and results;
+Redis Streams is only the delivery transport. The scheduler reconstructs
+missing queued/retry deliveries from PostgreSQL and republishes final failures
+to the DLQ. Workers ACK only after a fenced database outcome, separate worker
+heartbeats from actual FFmpeg/MobileCLIP progress, and terminate process groups
+when an attempt loses its lease or deadline. Derived object keys include the
+source generation so stale workers cannot overwrite the current generation.
+Use `--once` with `video-worker` or `video-scheduler` for service probes.
+Logical video tasks store source time ranges instead of derived MP4/JPEG files.
+Local sources outside `CAPSULE_IMPORT_ROOT` must be explicitly listed in
+`CAPSULE_VIDEO_SOURCE_ROOTS`; avoid granting broad roots such as the home or
+Downloads directory.
 
 The MobileCLIP-S0 checkpoint defaults to
 `data/models/mobileclip-s0/mobileclip_s0.pt` and can be changed with
@@ -261,7 +297,7 @@ continues to use its Linux FFmpeg instead.
 
    Open `http://localhost:3000`. The page supports text, uploaded image,
    image URL, and combined image-text queries. It exposes target asset and
-   dimension selection, both fusion algorithms, optional reranking, all documented
+   dimension selection, both fusion algorithms, all documented
    filters, enhanced dimension queries and weights, channel evidence, source folding,
    and Search Capsules.
 
@@ -276,7 +312,6 @@ continues to use its Linux FFmpeg instead.
        "query_text": "蓝紫色黄昏动画场景",
        "embedding_types": ["native_multimodal", "visual_style"],
        "fusion_method": "weighted_rrf",
-       "rerank": "doubao_seed_2_lite",
        "save_capsule": true,
        "filters": {"asset_type": ["image", "video_segment"]},
        "top_k": 20
@@ -312,12 +347,12 @@ continues to use its Linux FFmpeg instead.
 ```text
 query
   -> user-selected dimensions and optional text Dimension Query Enhancer
-  -> bounded concurrent query embeddings
+  -> native query vector plus dimension-focused query vectors
+  -> fixed normalized 0.3 native + 0.7 dimension fusion per non-native route
   -> concurrent Milvus recall scoped by workspace and Asset metadata
   -> PostgreSQL-authoritative hydration, indexed-status and revision validation
   -> PostgreSQL favorite / cluster filters and exact Asset field recheck
   -> weighted RRF or normalized weighted similarity
-  -> optional Seed-2-lite rerank of the top 30
   -> exact dedup, same-source cap and video / Markdown folding
   -> Search Capsule execution and immutable result snapshot
 ```
@@ -334,12 +369,20 @@ add/remove routes. Queries without an explicit dimension preference remain
 equal-weighted; explicit textual preferences may adjust weights.
 Pure-image queries skip enhancement and remain equal-weighted. Any failed route is
 removed, surviving weights are renormalized, and the response reports `degraded=true`.
+The fixed 0.3/0.7 vector composition is independent of those route weights: it is
+applied symmetrically to both Asset and Query vectors, while route weights are used
+only when combining results from multiple selected dimensions.
 
 Search dimensions are validated against the target `filters.asset_type` values.
 `visual_style` and `color_composition` are available only for images and video
 segments; Markdown and plain-text assets skip those channels during indexing.
 Mixed target-type searches use union semantics, so visual channels remain
 available but apply only to their image/video subset.
+
+The search UI can ask the text model to suggest one to four dimensions from the
+natural-language query and target Asset types. The same response provides approximate
+route weights. Users may still adjust the selected dimensions manually; doing so clears
+the suggestion and lets the normal Query Parser resolve weights again.
 
 Search filter names follow PostgreSQL columns. In particular, use
 `filters.model_name` for the Embedding model and `filters.file_type` for the

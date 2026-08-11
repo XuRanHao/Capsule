@@ -69,10 +69,12 @@ def test_search_query_environment_names_override_legacy_aliases(monkeypatch) -> 
 
 
 def test_video_adaptive_segmentation_defaults_replace_legacy_settings() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.assetization_version == "assetization-v6"
+    assert settings.ffmpeg_concurrency == 2
     assert settings.video_distance_quantile == 0.75
+    assert settings.video_output_mode == "logical"
     assert settings.video_activity_sample_fps == 6.0
     assert settings.video_keyframe_jpeg_quality == 85
     assert "video_scene_threshold" not in Settings.model_fields
@@ -82,6 +84,10 @@ def test_video_adaptive_segmentation_defaults_replace_legacy_settings() -> None:
 def test_video_keyframe_size_cannot_diverge_from_media_writer_contract() -> None:
     with pytest.raises(ValidationError):
         Settings(video_keyframe_size=256)
+
+
+def test_video_output_mode_can_preserve_materialized_segment_compatibility() -> None:
+    assert Settings(video_output_mode="materialized").video_output_mode == "materialized"
 
 
 def test_incremental_cluster_defaults_balance_recall_and_precision() -> None:

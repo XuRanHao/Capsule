@@ -40,9 +40,14 @@ class SearchResultBuilder:
                 continue
             current_by_channel: dict[str, ChannelMatch] = {}
             for match in sorted(hit.matched_channels, key=lambda item: item.rank):
+                if match.channel == "local_text" and match.embedding_type is None:
+                    current_by_channel.setdefault(match.channel, match)
+                    continue
                 if (
-                    match.embedding_id in asset.indexed_embedding_ids
+                    match.embedding_id is not None
+                    and match.embedding_id in asset.indexed_embedding_ids
                     and match.embedding_revision == asset.embedding_revision
+                    and match.embedding_type is not None
                     and embedding_channel_is_eligible(
                         embedding_type=match.embedding_type,
                         asset_features=asset.asset_features,
@@ -53,7 +58,7 @@ class SearchResultBuilder:
             current_channels = list(current_by_channel.values())
             if not current_channels:
                 logger.info(
-                    "Milvus candidate has no current indexed PostgreSQL embedding",
+                    "search candidate has no current PostgreSQL recall evidence",
                     extra={"asset_id": hit.asset_id, "workspace_id": workspace_id},
                 )
                 continue
@@ -78,10 +83,8 @@ class SearchResultBuilder:
         workspace_id: str,
         allowed_asset_types: tuple[str, ...],
         top_k: int,
-        rerank_items: Mapping[str, tuple[float, str]] | None = None,
     ) -> list[SearchResult]:
         candidates: list[SearchResult] = []
-        rerank_items = rerank_items or {}
         ranked_hits = self.validate_hits(
             ranked_hits=ranked_hits,
             assets=assets,
@@ -91,7 +94,7 @@ class SearchResultBuilder:
             asset = assets.get(hit.asset_id)
             if asset is None:
                 logger.info(
-                    "Milvus candidate was rejected by PostgreSQL hydration or filters",
+                    "search candidate was rejected by PostgreSQL hydration or filters",
                     extra={"asset_id": hit.asset_id, "workspace_id": workspace_id},
                 )
                 continue
@@ -119,7 +122,6 @@ class SearchResultBuilder:
                 hit.matched_channels,
                 key=lambda item: (-item.fusion_contribution, item.rank, item.channel),
             )
-            rerank_score, reason = rerank_items.get(asset.asset_id, (None, None))
             candidates.append(
                 SearchResult(
                     asset_id=asset.asset_id,
@@ -183,8 +185,7 @@ class SearchResultBuilder:
                         asset.asset_features,
                         ordered_channels,
                     ),
-                    matched_reason=reason or _default_reason(ordered_channels),
-                    rerank_score=rerank_score,
+                    matched_reason=_default_reason(ordered_channels),
                     folded_asset_ids=[asset.asset_id],
                     parent_asset_id=asset.parent_asset_id,
                     index_role=asset.index_role,
@@ -196,6 +197,80 @@ class SearchResultBuilder:
             same_source_limit=self._same_source_limit,
             top_k=top_k,
         )
+
+    @staticmethod
+    def expand_adjacent_children(
+        results: list[SearchResult],
+        *,
+        recalled_assets: Mapping[str, SearchAssetRecord],
+        sibling_assets: Mapping[str, SearchAssetRecord],
+        radius: int = 1,
+    ) -> list[SearchResult]:
+        """Attach nearby document children without changing recall ranking.
+
+        Only Markdown child Assets sharing the same parent are eligible. The
+        hit remains the representative result; its score and matched channels
+        are untouched while raw text and locators expand in source order.
+        """
+        if radius < 0:
+            raise ValueError("adjacent child radius cannot be negative")
+        siblings_by_parent: dict[str, list[SearchAssetRecord]] = {}
+        for sibling in sibling_assets.values():
+            if (
+                sibling.asset_type == AssetType.MARKDOWN_BLOCK.value
+                and sibling.index_role == "child"
+                and sibling.parent_asset_id is not None
+                and sibling.child_order is not None
+            ):
+                siblings_by_parent.setdefault(sibling.parent_asset_id, []).append(sibling)
+        for siblings in siblings_by_parent.values():
+            siblings.sort(key=lambda item: (item.child_order, item.asset_id))
+
+        for result in results:
+            if (
+                result.asset_type is not AssetType.MARKDOWN_BLOCK
+                or result.index_role != "child"
+                or result.parent_asset_id is None
+                or result.child_order is None
+            ):
+                continue
+            anchor_orders = {
+                asset.child_order
+                for asset_id in result.folded_asset_ids
+                if (asset := recalled_assets.get(asset_id)) is not None
+                and asset.parent_asset_id == result.parent_asset_id
+                and asset.child_order is not None
+            }
+            anchor_orders.add(result.child_order)
+            selected = [
+                sibling
+                for sibling in siblings_by_parent.get(result.parent_asset_id, [])
+                if sibling.child_order is not None
+                and any(abs(sibling.child_order - anchor) <= radius for anchor in anchor_orders)
+            ]
+            if not selected:
+                continue
+            result.folded_asset_ids = [sibling.asset_id for sibling in selected]
+            result.raw_content = _join_raw_content(selected)
+            result.source_contexts = []
+            representative = recalled_assets.get(result.asset_id)
+            result.source_locator = dict(
+                representative.source_locator
+                if representative is not None
+                else result.source_locator
+            )
+            representative_block_index = result.source_locator.get("block_index")
+            for sibling in selected:
+                result.source_contexts = _merge_contexts(
+                    result.source_contexts,
+                    sibling.source_contexts,
+                )
+                _expand_locator(result.source_locator, sibling.source_locator)
+            if representative_block_index is not None:
+                result.source_locator["block_index"] = representative_block_index
+            if len(selected) > 1:
+                result.group_kind = "markdown_blocks"
+        return results
 
 
 def _fold_and_limit(
@@ -310,6 +385,7 @@ def _expand_locator(target: dict[str, Any], incoming: Mapping[str, Any]) -> None
         ("start_time_ms", "end_time_ms"),
         ("start_seconds", "end_seconds"),
         ("start_time_seconds", "end_time_seconds"),
+        ("char_start", "char_end"),
         ("block_index", "block_index"),
     ):
         left_start = _number(target, start_key)
@@ -350,6 +426,15 @@ def _merge_contexts(
     return merged
 
 
+def _join_raw_content(assets: list[SearchAssetRecord]) -> str | None:
+    parts = [
+        asset.raw_content.strip()
+        for asset in assets
+        if asset.raw_content and asset.raw_content.strip()
+    ]
+    return "\n\n".join(parts) or None
+
+
 def _matched_feature(
     features: Mapping[str, Any],
     channels: list[ChannelMatch],
@@ -364,6 +449,8 @@ def _matched_feature(
         }
     }
     for channel in channels:
+        if channel.embedding_type is None:
+            continue
         key = feature_types.get(channel.embedding_type)
         if key is None:
             continue
@@ -376,5 +463,8 @@ def _matched_feature(
 def _default_reason(channels: list[ChannelMatch]) -> str | None:
     if not channels:
         return None
-    names = "、".join(item.embedding_type.value for item in channels[:3])
-    return f"命中检索维度：{names}"
+    names = "、".join(
+        "本地文字" if item.embedding_type is None else item.embedding_type.value
+        for item in channels[:3]
+    )
+    return f"命中召回通路：{names}"

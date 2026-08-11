@@ -490,7 +490,7 @@ export default function ClustersPage() {
   const [embeddingType, setEmbeddingType] = useState<string>(
     FEATURE_TYPES[0].value,
   );
-  const [nativeContentWeight, setNativeContentWeight] = useState("0.5");
+  const [nativeContentWeight, setNativeContentWeight] = useState("0.3");
   const [pcaDimension, setPcaDimension] = useState("8");
   const [minSamples, setMinSamples] = useState("3");
   const [minClusterSize, setMinClusterSize] = useState("3");

@@ -197,6 +197,7 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     class Embedding:
         def __init__(self) -> None:
             self.types: list[EmbeddingType] = []
+            self.materialize_calls: list[dict[str, object]] = []
 
         async def run(
             self,
@@ -229,6 +230,10 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
                 )
                 for embedding_type in embedding_types
             ]
+
+        async def materialize_search_vectors(self, **values: object) -> SimpleNamespace:
+            self.materialize_calls.append(values)
+            raise AssertionError("import enrichment must not materialize search vectors")
 
     repository = Repository()
     embedding = Embedding()
@@ -265,16 +270,114 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         PipelineStage.INDEXING,
     ]
     assert embedding.types == list(EmbeddingType)
+    assert embedding.materialize_calls == []
     assert result.completed_asset_count == 1
     assert result.partial_failed_asset_count == 1
-    assert repository.final_errors[0]["stage"] == "understanding"
+    assert repository.final_errors == [
+        {
+            "asset_id": "asset_b",
+            "stage": "understanding",
+            "error": "understanding failed",
+        }
+    ]
     assert repository.durations["understanding"] == 120.0
     assert repository.durations["feature_ready"] == 5.0
     assert repository.durations["embedding"] > 0
     assert repository.durations["indexing"] > 0
-    assert repository.durations["embedding"] / repository.durations["indexing"] == pytest.approx(10)
+    assert repository.durations["embedding"] / repository.durations[
+        "indexing"
+    ] == pytest.approx(10)
     assert [embedding_type for embedding_type, _ in processor.calls] == list(EmbeddingType)
     assert all(asset_ids == ["asset_a", "asset_b"] for _, asset_ids in processor.calls)
+
+
+@pytest.mark.asyncio
+async def test_raw_embedding_success_does_not_invoke_search_vector_materialization() -> None:
+    class Repository:
+        def __init__(self) -> None:
+            self.final_errors: list[dict[str, str]] = []
+
+        async def begin_asset_enrichment(self, **_: object) -> None:
+            return None
+
+        async def set_job_stage(self, **_: object) -> None:
+            return None
+
+        async def add_job_stage_durations(self, **_: object) -> None:
+            return None
+
+        async def finalize_enrichment(
+            self,
+            *,
+            errors: list[dict[str, str]],
+            **_: object,
+        ) -> None:
+            self.final_errors = errors
+
+    class Understanding:
+        async def run(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                errors=[],
+                understanding_duration_ms=1.0,
+                feature_ready_duration_ms=1.0,
+            )
+
+    class Embedding:
+        def __init__(self) -> None:
+            self.raw_completed = False
+            self.materialize_called = False
+
+        async def run(
+            self,
+            *,
+            embedding_type: EmbeddingType,
+            **_: object,
+        ) -> SimpleNamespace:
+            assert embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+            self.raw_completed = True
+            return SimpleNamespace(
+                embedding_type=embedding_type.value,
+                errors=[],
+                embedding_duration_ms=1.0,
+                indexing_duration_ms=1.0,
+            )
+
+        async def run_many(
+            self,
+            *,
+            embedding_types: list[EmbeddingType],
+            **_: object,
+        ) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    embedding_type=embedding_type.value,
+                    errors=[],
+                    embedding_duration_ms=1.0,
+                    indexing_duration_ms=1.0,
+                )
+                for embedding_type in embedding_types
+            ]
+
+        async def materialize_search_vectors(self, **_: object) -> SimpleNamespace:
+            self.materialize_called = True
+            raise AssertionError("import enrichment must not materialize search vectors")
+
+    repository = Repository()
+    embedding = Embedding()
+    result = await enrich_assets(
+        job_id="job_test",
+        workspace_id="workspace_test",
+        asset_ids=["asset_a"],
+        repository=repository,  # type: ignore[arg-type]
+        understanding_service=Understanding(),  # type: ignore[arg-type]
+        embedding_service=embedding,  # type: ignore[arg-type]
+    )
+
+    assert embedding.raw_completed is True
+    assert embedding.materialize_called is False
+    assert result.completed_asset_count == 1
+    assert result.partial_failed_asset_count == 0
+    assert repository.final_errors == []
 
 
 @pytest.mark.asyncio
@@ -382,6 +485,10 @@ async def test_browser_import_enriches_asset_before_runner_finishes(tmp_path: Pa
                 for embedding_type in embedding_types
             ]
 
+        async def materialize_search_vectors(self, **_: object) -> SimpleNamespace:
+            events.append("search_vectors_materialized")
+            raise AssertionError("import enrichment must not materialize search vectors")
+
     repository = Repository()
     service = BrowserImportService(
         settings=Settings(
@@ -407,6 +514,7 @@ async def test_browser_import_enriches_asset_before_runner_finishes(tmp_path: Pa
     assert result is not None
     assert events.index("understanding_started") < events.index("runner_finished")
     assert events.index("text_embedding_started") < events.index("job_finalized")
+    assert "search_vectors_materialized" not in events
     assert repository.final_asset_ids == ["asset_a"]
     assert repository.failures == []
 

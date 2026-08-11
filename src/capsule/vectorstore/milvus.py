@@ -8,6 +8,7 @@ from typing import Any
 from pymilvus import DataType, MilvusClient
 
 from capsule.config import Settings
+from capsule.enums import EmbeddingType
 from capsule.search.models import SearchFilters, VectorSearchHit
 
 
@@ -32,23 +33,40 @@ class MilvusVectorStore:
         token = settings.milvus_token.get_secret_value() if settings.milvus_token else ""
         self._client = client or MilvusClient(uri=settings.milvus_uri, token=token)
         self._collection = settings.milvus_collection
+        self._fused_search_collection = settings.milvus_fused_search_collection
         self._dimension = settings.embedding_dimension
         self._batch_size = settings.milvus_batch_size
         self._search_ef = settings.search_hnsw_ef
 
     async def ensure_collection(self) -> bool:
-        """Create and load the frozen Seed-1.6 collection when it is missing.
+        """Create and load the raw and fused-search collections when missing.
 
-        Returns ``True`` when a collection was created and ``False`` when the
-        existing collection already matched the configured vector dimension.
+        Returns ``True`` when either collection was created and ``False`` when
+        both existing collections matched the configured vector dimension.
         """
 
-        return await asyncio.to_thread(self._ensure_collection_sync)
+        return await asyncio.to_thread(self._ensure_collections_sync)
 
-    def _ensure_collection_sync(self) -> bool:
-        if self._client.has_collection(collection_name=self._collection):
+    def _ensure_collections_sync(self) -> bool:
+        raw_created = self._ensure_collection_sync(
+            self._collection,
+            collection_description="Capsule raw multimodal asset embeddings",
+        )
+        fused_created = self._ensure_collection_sync(
+            self._fused_search_collection,
+            collection_description="Capsule fused dimension-search embeddings",
+        )
+        return raw_created or fused_created
+
+    def _ensure_collection_sync(
+        self,
+        collection_name: str,
+        *,
+        collection_description: str,
+    ) -> bool:
+        if self._client.has_collection(collection_name=collection_name):
             description = self._client.describe_collection(
-                collection_name=self._collection,
+                collection_name=collection_name,
             )
             fields = description.get("fields") or []
             field_names = {
@@ -73,17 +91,20 @@ class MilvusVectorStore:
             missing_fields = required_fields - field_names
             if missing_fields:
                 stats = self._client.get_collection_stats(
-                    collection_name=self._collection,
+                    collection_name=collection_name,
                 )
                 row_count = int((stats or {}).get("row_count") or 0)
                 if row_count:
                     raise ValueError(
-                        f"Milvus collection {self._collection!r} misses fields "
+                        f"Milvus collection {collection_name!r} misses fields "
                         f"{sorted(missing_fields)} and contains {row_count} rows; "
                         "migrate it before starting search"
                     )
-                self._client.drop_collection(collection_name=self._collection)
-                return self._ensure_collection_sync()
+                self._client.drop_collection(collection_name=collection_name)
+                return self._ensure_collection_sync(
+                    collection_name,
+                    collection_description=collection_description,
+                )
             vector_field = next(
                 (
                     field
@@ -95,16 +116,16 @@ class MilvusVectorStore:
             configured_dimension = _field_dimension(vector_field)
             if configured_dimension is not None and configured_dimension != self._dimension:
                 raise ValueError(
-                    f"Milvus collection {self._collection!r} has dimension "
+                    f"Milvus collection {collection_name!r} has dimension "
                     f"{configured_dimension}, expected {self._dimension}"
                 )
-            self._client.load_collection(collection_name=self._collection)
+            self._client.load_collection(collection_name=collection_name)
             return False
 
         schema = MilvusClient.create_schema(
             auto_id=False,
             enable_dynamic_field=False,
-            description="Capsule multimodal asset embeddings",
+            description=collection_description,
         )
         schema.add_field(
             field_name="embedding_id",
@@ -174,11 +195,11 @@ class MilvusVectorStore:
             params={"M": 16, "efConstruction": 200},
         )
         self._client.create_collection(
-            collection_name=self._collection,
+            collection_name=collection_name,
             schema=schema,
             index_params=index_params,
         )
-        self._client.load_collection(collection_name=self._collection)
+        self._client.load_collection(collection_name=collection_name)
         return True
 
     def validate_vector(self, vector: list[float]) -> None:
@@ -190,12 +211,33 @@ class MilvusVectorStore:
             raise ValueError("vector must not be all zeros")
 
     def upsert(self, records: list[VectorRecord]) -> None:
+        """Persist model-produced raw vectors in the canonical collection."""
+        self._upsert_collection(self._collection, records)
+
+    def upsert_fused(self, records: list[VectorRecord]) -> None:
+        """Persist derived search vectors keyed by their dimension embedding IDs."""
+        if any(
+            record.embedding_type == EmbeddingType.NATIVE_MULTIMODAL.value
+            for record in records
+        ):
+            raise ValueError("native_multimodal vectors belong in the raw collection")
+        self._upsert_collection(self._fused_search_collection, records)
+        if records:
+            # Search follows lazy materialization in the same request.  Flush this
+            # derived batch once so ANN recall never races its own preceding write.
+            self._client.flush(collection_name=self._fused_search_collection)
+
+    def _upsert_collection(
+        self,
+        collection_name: str,
+        records: list[VectorRecord],
+    ) -> None:
         for record in records:
             self.validate_vector(record.vector)
         for start in range(0, len(records), self._batch_size):
             batch = records[start : start + self._batch_size]
             self._client.upsert(
-                collection_name=self._collection,
+                collection_name=collection_name,
                 data=[
                     {
                         "embedding_id": record.embedding_id,
@@ -216,8 +258,12 @@ class MilvusVectorStore:
             )
 
     async def aupsert(self, records: list[VectorRecord]) -> None:
-        """Write vectors without blocking callers that process many Assets."""
+        """Write raw vectors without blocking callers that process many Assets."""
         await asyncio.to_thread(self.upsert, records)
+
+    async def aupsert_fused(self, records: list[VectorRecord]) -> None:
+        """Write fused search vectors without blocking the event loop."""
+        await asyncio.to_thread(self.upsert_fused, records)
 
     async def search(
         self,
@@ -235,9 +281,14 @@ class MilvusVectorStore:
             embedding_type=embedding_type,
             filters=filters,
         )
+        collection_name = (
+            self._collection
+            if embedding_type == EmbeddingType.NATIVE_MULTIMODAL.value
+            else self._fused_search_collection
+        )
         raw = await asyncio.to_thread(
             self._client.search,
-            collection_name=self._collection,
+            collection_name=collection_name,
             data=[vector],
             anns_field="vector",
             filter=expression,
@@ -259,33 +310,41 @@ class MilvusVectorStore:
             return {}
         return await asyncio.to_thread(self._fetch_vectors_sync, list(embedding_ids))
 
+    async def fetch_fused_vector_ids(self, embedding_ids: Sequence[str]) -> set[str]:
+        """Return current derived-search IDs already visible in the fused collection."""
+        if not embedding_ids:
+            return set()
+        return await asyncio.to_thread(
+            self._fetch_vector_ids_sync,
+            self._fused_search_collection,
+            list(embedding_ids),
+        )
+
     async def delete_workspace(self, workspace_id: str) -> int:
         """Remove every vector belonging to one cleared workspace."""
         return await asyncio.to_thread(self._delete_workspace_sync, workspace_id)
 
     def _delete_workspace_sync(self, workspace_id: str) -> int:
-        response = self._client.delete(
-            collection_name=self._collection,
-            filter=f"workspace_id == {json.dumps(workspace_id)}",
+        expression = f"workspace_id == {json.dumps(workspace_id)}"
+        return sum(
+            self._delete_sync(collection_name, expression)
+            for collection_name in self._managed_collections
         )
-        if not isinstance(response, dict):
-            return 0
-        value = response.get("delete_count", response.get("delete_cnt", 0))
-        if not isinstance(value, (int, float, str)):
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
 
     async def delete_all(self) -> int:
-        """Remove all Capsule vectors from the configured collection."""
+        """Remove all Capsule vectors from both managed collections."""
         return await asyncio.to_thread(self._delete_all_sync)
 
     def _delete_all_sync(self) -> int:
+        return sum(
+            self._delete_sync(collection_name, 'embedding_id != ""')
+            for collection_name in self._managed_collections
+        )
+
+    def _delete_sync(self, collection_name: str, expression: str) -> int:
         response = self._client.delete(
-            collection_name=self._collection,
-            filter='embedding_id != ""',
+            collection_name=collection_name,
+            filter=expression,
         )
         if not isinstance(response, dict):
             return 0
@@ -296,6 +355,10 @@ class MilvusVectorStore:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @property
+    def _managed_collections(self) -> tuple[str, str]:
+        return (self._collection, self._fused_search_collection)
 
     def _fetch_vectors_sync(self, embedding_ids: list[str]) -> dict[str, list[float]]:
         vectors: dict[str, list[float]] = {}
@@ -307,6 +370,7 @@ class MilvusVectorStore:
                 filter=f"embedding_id in [{encoded_ids}]",
                 output_fields=["embedding_id", "vector"],
                 limit=len(batch),
+                consistency_level="Strong",
             )
             for row in rows:
                 if not isinstance(row, dict):
@@ -322,6 +386,30 @@ class MilvusVectorStore:
                     continue
                 vectors[embedding_id] = parsed
         return vectors
+
+    def _fetch_vector_ids_sync(
+        self,
+        collection_name: str,
+        embedding_ids: list[str],
+    ) -> set[str]:
+        visible: set[str] = set()
+        for start in range(0, len(embedding_ids), self._batch_size):
+            batch = embedding_ids[start : start + self._batch_size]
+            encoded_ids = ", ".join(json.dumps(item) for item in batch)
+            rows = self._client.query(
+                collection_name=collection_name,
+                filter=f"embedding_id in [{encoded_ids}]",
+                output_fields=["embedding_id"],
+                limit=len(batch),
+                consistency_level="Strong",
+            )
+            visible.update(
+                embedding_id
+                for row in rows
+                if isinstance(row, dict)
+                and isinstance((embedding_id := row.get("embedding_id")), str)
+            )
+        return visible
 
     @staticmethod
     def build_filter_expression(

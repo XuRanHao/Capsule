@@ -1,15 +1,15 @@
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     ClusterSearchResult,
     QueryEnhancement,
-    RerankBatch,
     SearchAssetRecord,
+    SearchDimensionSuggestionResponse,
     SearchFilters,
-    SearchRequest,
+    TextSearchHit,
     VectorSearchHit,
 )
 
@@ -23,20 +23,19 @@ class QueryEmbeddingClient(Protocol):
 
 
 class SearchUnderstandingClient(Protocol):
+    async def select_search_dimensions(
+        self,
+        *,
+        query_text: str,
+        asset_types: Sequence[AssetType],
+    ) -> SearchDimensionSuggestionResponse: ...
+
     async def enhance_search_query(
         self,
         *,
         query_text: str,
         embedding_types: Sequence[EmbeddingType],
     ) -> QueryEnhancement: ...
-
-    async def rerank_search_results(
-        self,
-        request: SearchRequest,
-        *,
-        image_url: str | None,
-        candidates: Sequence[Mapping[str, object]],
-    ) -> RerankBatch: ...
 
 
 class QueryImageResolver(Protocol):
@@ -60,6 +59,15 @@ class VectorSearchRepository(Protocol):
     ) -> Sequence[VectorSearchHit]: ...
 
 
+class SearchVectorIndexPreparer(Protocol):
+    async def ensure_search_vectors(
+        self,
+        *,
+        workspace_id: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, str]: ...
+
+
 class AssetSearchRepository(Protocol):
     async def get_by_ids(
         self,
@@ -71,6 +79,24 @@ class AssetSearchRepository(Protocol):
         filters: SearchFilters | None = None,
     ) -> Mapping[str, SearchAssetRecord]: ...
 
+    async def get_children_by_parent_ids(
+        self,
+        *,
+        workspace_id: str,
+        parent_asset_ids: Sequence[str],
+    ) -> Mapping[str, SearchAssetRecord]: ...
+
+
+class TextSearchRepository(Protocol):
+    async def search_text(
+        self,
+        *,
+        workspace_id: str,
+        query_text: str,
+        filters: SearchFilters,
+        created_by: str,
+        limit: int,
+    ) -> Sequence[TextSearchHit]: ...
 
 class ClusterSearchRepository(Protocol):
     async def search_by_assets(

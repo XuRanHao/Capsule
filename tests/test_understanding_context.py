@@ -11,6 +11,7 @@ from capsule.pipeline.understanding import (
     AssetUnderstandingService,
     _asset_context_payload,
     _attach_asset_usage_path_context,
+    _usage_hint_from_path,
 )
 from capsule.schemas import AssetUnderstanding
 
@@ -124,6 +125,16 @@ def test_asset_usage_path_is_persisted_as_metadata_evidence() -> None:
     assert usage.evidence == ["相对文件路径：海报/素材/20251216-143446.png"]
 
 
+def test_generic_storage_path_does_not_create_usage_semantics() -> None:
+    assert (
+        _usage_hint_from_path(
+            source_path="测试素材2（打乱素材集合）/黄.png",
+            file_tree_context=["测试素材2（打乱素材集合）"],
+        )
+        is None
+    )
+
+
 async def test_video_understanding_uses_keyframe_data_uris() -> None:
     class Reader:
         def __init__(self) -> None:
@@ -170,7 +181,13 @@ async def test_video_understanding_uses_keyframe_data_uris() -> None:
     image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
 
     assert "0 到 5 条最具表现力和区分度" in messages[0]["content"]
-    assert "主体 + 当前维度信息" in messages[0]["content"]
+    assert "每个 Feature 围绕自己的正向语义范围组织事实" in messages[0]["content"]
+    assert "整幅内容可辨识的叙事语境" in messages[0]["content"]
+    assert "角色三视图、产品白底陈列或孤立元素展示" in messages[0]["content"]
+    assert "缺少整体场景语境的主体陈列或孤立元素不适用" in messages[0]["content"]
+    assert "可核验的光线、色彩、空间、天气、动作、声音和叙事表现" in messages[0]["content"]
+    assert "人物内心、动机或性格只有在素材明确呈现时" in messages[0]["content"]
+    assert "来源平台、数据集或采集渠道" in messages[0]["content"]
     assert "桌子 红色；星空 深蓝" in messages[0]["content"]
 
     assert reader.uris == [
@@ -181,6 +198,63 @@ async def test_video_understanding_uses_keyframe_data_uris() -> None:
         "data:image/jpeg;base64,MDEuanBn",
         "data:image/jpeg;base64,MDIuanBn",
     ]
+
+
+async def test_logical_video_understanding_extracts_frames_without_persistent_files() -> None:
+    class FrameExtractor:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def extract(self, request) -> list[bytes]:
+            self.requests.append(request)
+            return [b"\xff\xd8frame-one", b"\xff\xd8frame-two"]
+
+    asset = EmbeddingAsset(
+        asset_id="asset_logical_video",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="source_video",
+        asset_type=AssetType.VIDEO_SEGMENT.value,
+        file_type=".mp4",
+        content_hash="e" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        raw_content=None,
+        asset_description=None,
+        asset_features={},
+        derived_file_uri=None,
+        source_storage_uri="file:///library/original.mp4",
+        source_mime_type="video/mp4",
+        file_info={
+            "video_output_mode": "logical",
+            "representative_frames": [
+                {"timestamp_ms": 12_000},
+                {"timestamp_ms": 16_000},
+            ],
+        },
+        source_locator={"start_ms": 10_000, "end_ms": 20_000},
+    )
+    extractor = FrameExtractor()
+    service = AssetUnderstandingService(
+        settings=Settings(),
+        embedding_repository=None,  # type: ignore[arg-type]
+        asset_repository=None,  # type: ignore[arg-type]
+        model_client=None,  # type: ignore[arg-type]
+        video_frame_extractor=extractor,
+    )
+
+    messages = await service._messages(asset)
+    content = messages[1]["content"]
+    image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+
+    assert image_urls == [
+        "data:image/jpeg;base64,/9hmcmFtZS1vbmU=",
+        "data:image/jpeg;base64,/9hmcmFtZS10d28=",
+    ]
+    assert len(extractor.requests) == 1
+    request = extractor.requests[0]
+    assert request.source_uri == "file:///library/original.mp4"
+    assert request.timestamps_ms == (12_000, 16_000)
 
 
 async def test_document_image_understanding_uses_materialised_image(tmp_path: Path) -> None:

@@ -4,8 +4,15 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from PIL import Image, UnidentifiedImageError
 
-from capsule.search.models import QueryImageUploadResponse, SearchRequest, SearchResponse
+from capsule.search.models import (
+    QueryImageUploadResponse,
+    SearchDimensionSuggestionRequest,
+    SearchDimensionSuggestionResponse,
+    SearchRequest,
+    SearchResponse,
+)
 from capsule.search.query_embedding import QueryEmbeddingError
+from capsule.search.query_parser import DimensionSelectionError
 from capsule.search.service import SearchService, SearchUnavailableError
 from capsule.search.uploads import QueryImageService
 
@@ -49,6 +56,27 @@ async def search_assets(payload: SearchRequest, request: Request) -> SearchRespo
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "search_unavailable", "message": str(exc)},
+        ) from exc
+
+
+@router.post(
+    "/search/dimensions/suggest",
+    response_model=SearchDimensionSuggestionResponse,
+)
+async def suggest_search_dimensions(
+    payload: SearchDimensionSuggestionRequest,
+    request: Request,
+) -> SearchDimensionSuggestionResponse:
+    service = get_search_service(request)
+    try:
+        return await service.suggest_dimensions(payload)
+    except DimensionSelectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "dimension_selection_failed",
+                "message": str(exc),
+            },
         ) from exc
 
 

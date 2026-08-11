@@ -1,5 +1,6 @@
+import math
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -15,6 +16,7 @@ from capsule.enums import (
     NewAssetClusterStatus,
     ProcessingStatus,
 )
+from capsule.features import FEATURE_DIMENSION_SCOPES
 
 
 class SourceContext(BaseModel):
@@ -65,6 +67,19 @@ class AssetDraft(BaseModel):
         if self.index_role != AssetIndexRole.CHILD and self.child_order is not None:
             raise ValueError("child_order is only valid for child assets")
         return self
+
+
+class AssetPlayback(BaseModel):
+    """Browser playback contract for derived clips and legacy logical ranges."""
+
+    mode: Literal["derived_clip", "source_range", "transcoded_stream"]
+    url: str
+    fallback_url: str | None = None
+    mime_type: str
+    start_ms: int | None = Field(default=None, ge=0)
+    end_ms: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0)
+    browser_compatible: bool
 
 
 class AssetCreate(BaseModel):
@@ -128,6 +143,7 @@ class AssetRecord(BaseModel):
     raw_content: str | None = None
     derived_file_uri: str | None = None
     preview_uri: str | None = None
+    playback: AssetPlayback | None = None
     processing_status: ProcessingStatus
     feature_revision: int = 1
     embedding_revision: int = 1
@@ -178,6 +194,12 @@ class AssetViewRecord(BaseModel):
     error_message: str | None = None
     preview_url: str | None = None
     content_url: str | None = None
+    playback: AssetPlayback | None = None
+    # API-only routing inputs. They are populated by repositories but never
+    # serialized, keeping storage URIs out of public asset views.
+    source_storage_uri: str | None = Field(default=None, exclude=True)
+    derived_file_uri: str | None = Field(default=None, exclude=True)
+    preview_uri: str | None = Field(default=None, exclude=True)
     source_file: AssetSourceRecord
     embeddings: list[AssetEmbeddingState] = Field(default_factory=list)
     created_at: datetime
@@ -237,7 +259,7 @@ class StoredFileResult(BaseModel):
 class FeatureValue(BaseModel):
     value: str | None = Field(
         description=(
-            "该维度内最多五条互不重复的“主体 + 维度信息”短语，两部分以一个空格分隔，"
+            "当前维度内最多五条互不重复的事实短语，表达结构由维度语义决定，"
             "按表现力和区分度排序并使用中文分号连接；无法确定时为 null"
         )
     )
@@ -258,6 +280,7 @@ class FeatureValue(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
+        normalized.setdefault("value", None)
         raw_value = normalized.get("value")
         if isinstance(raw_value, list):
             terms = [
@@ -280,6 +303,18 @@ class FeatureValue(BaseModel):
             ][:1]
         elif evidence is None:
             normalized["evidence"] = []
+        raw_confidence = normalized.get("confidence", 0.0)
+        try:
+            confidence = (
+                float(raw_confidence)
+                if not isinstance(raw_confidence, bool)
+                else 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            confidence = 0.0
+        if not math.isfinite(confidence):
+            confidence = 0.0
+        normalized["confidence"] = min(1.0, max(0.0, confidence))
         valid_statuses = {status.value for status in FeatureStatus}
         if normalized.get("status") not in valid_statuses:
             normalized["status"] = (
@@ -311,22 +346,40 @@ class AssetUsageFeatureValue(FeatureValue):
 
 
 class AssetFeatures(BaseModel):
-    subject_content: FeatureValue
-    scene_theme: FeatureValue
-    visual_style: FeatureValue
-    color_composition: FeatureValue
-    mood_atmosphere: FeatureValue
-    character_state_or_psychology: FeatureValue
-    asset_usage: AssetUsageFeatureValue
-    target_audience: FeatureValue
-    provenance: FeatureValue
-    rights_version_authorship: FeatureValue
+    subject_content: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT]
+    )
+    scene_theme: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME]
+    )
+    visual_style: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_STYLE]
+    )
+    color_composition: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.COLOR_COMPOSITION]
+    )
+    mood_atmosphere: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE]
+    )
+    character_state_or_psychology: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY]
+    )
+    asset_usage: AssetUsageFeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.ASSET_USAGE]
+    )
+    target_audience: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.TARGET_AUDIENCE]
+    )
+    provenance: FeatureValue = Field(description=FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE])
+    rights_version_authorship: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.RIGHTS_VERSION_AUTHORSHIP]
+    )
 
     @model_validator(mode="before")
     @classmethod
     def fill_omitted_model_fields(cls, value: Any) -> Any:
         if isinstance(value, list):
-            raise ValueError("features must be an object, not a list")
+            value = cls._object_from_feature_list(value)
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
@@ -340,6 +393,61 @@ class AssetFeatures(BaseModel):
                     "evidence": [],
                 },
             )
+        return normalized
+
+    @classmethod
+    def _object_from_feature_list(cls, value: list[Any]) -> dict[str, Any]:
+        identifier_fields = ("key", "name", "embedding_type")
+        valid_feature_names = set(cls.model_fields)
+        normalized: dict[str, Any] = {}
+        if not value:
+            raise ValueError(
+                "features must be an object or a non-empty unambiguous keyed feature array"
+            )
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "features must be an object or an unambiguous keyed feature array; "
+                    f"item {index} is not an object"
+                )
+            identifiers: list[str] = []
+            for identifier_field in identifier_fields:
+                if identifier_field not in item:
+                    continue
+                identifier = item[identifier_field]
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise ValueError(
+                        "features must be an object or an unambiguous keyed feature array; "
+                        f"item {index} has an invalid {identifier_field}"
+                    )
+                identifiers.append(identifier.strip())
+            if not identifiers:
+                raise ValueError(
+                    "features must be an object or an unambiguous keyed feature array; "
+                    f"item {index} has no key, name, or embedding_type"
+                )
+            feature_names = set(identifiers)
+            if len(feature_names) != 1:
+                raise ValueError(
+                    "features must be an object or an unambiguous keyed feature array; "
+                    f"item {index} has conflicting identifiers"
+                )
+            feature_name = feature_names.pop()
+            if feature_name not in valid_feature_names:
+                raise ValueError(
+                    "features must be an object or an unambiguous keyed feature array; "
+                    f"item {index} identifies unknown feature {feature_name!r}"
+                )
+            if feature_name in normalized:
+                raise ValueError(
+                    "features must be an object or an unambiguous keyed feature array; "
+                    f"feature {feature_name!r} appears more than once"
+                )
+            normalized[feature_name] = {
+                key: item_value
+                for key, item_value in item.items()
+                if key not in identifier_fields
+            }
         return normalized
 
 
@@ -373,7 +481,7 @@ class EmbeddingResult(BaseModel):
 class ClusterSummary(BaseModel):
     name: str = Field(min_length=1, max_length=1024)
     description: str = Field(min_length=30, max_length=80)
-    common_features: list[str] = Field(min_length=1, max_length=8)
+    common_features: list[str] = Field(min_length=1, max_length=3)
     internal_variance: ClusterInternalVariance
 
 

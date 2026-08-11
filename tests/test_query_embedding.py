@@ -2,6 +2,8 @@ import asyncio
 import math
 from collections.abc import Sequence
 
+import pytest
+
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
@@ -58,6 +60,16 @@ class ConcurrentEmbeddingClient(FakeEmbeddingClient):
         return EmbeddingResult(vector=[1.0, 1.0, 0.0], model="fake")
 
 
+class OrthogonalMultimodalClient(FakeEmbeddingClient):
+    async def embed_text(self, text: str) -> EmbeddingResult:
+        self.calls.append(f"text:{text}")
+        return EmbeddingResult(vector=[0.0, 1.0, 0.0], model="fake")
+
+    async def embed_image_text(self, image_url: str, text: str) -> EmbeddingResult:
+        self.calls.append(f"image_text:{image_url}:{text}")
+        return EmbeddingResult(vector=[1.0, 0.0, 0.0], model="fake")
+
+
 def settings() -> Settings:
     return Settings(
         embedding_dimension=3,
@@ -86,7 +98,7 @@ async def test_text_query_defaults_to_native_content_only() -> None:
 
 
 async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None:
-    client = FakeEmbeddingClient()
+    client = OrthogonalMultimodalClient()
     service = QueryEmbeddingService(client, settings())
 
     plan = await service.embed(
@@ -119,6 +131,11 @@ async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None
         "image_text:https://example.com/query.png:更像黄昏",
         "text:更像黄昏",
     ]
+    assert plan.vectors[0].vector == [1.0, 0.0, 0.0]
+    for vector in plan.vectors[1:]:
+        assert vector.vector == pytest.approx(
+            [0.3939193, 0.91914503, 0.0],
+        )
 
 
 async def test_image_text_falls_back_to_separate_vectors() -> None:
@@ -131,13 +148,22 @@ async def test_image_text_falls_back_to_separate_vectors() -> None:
             query_type=QueryType.IMAGE_TEXT,
             query_text="保留构图",
             query_image_url="https://example.com/query.png",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.VISUAL_STYLE,
+            ],
         )
     )
 
     assert plan.vectors[0].channel == "native_multimodal"
-    assert plan.vectors[0].weight == 1.0
+    assert plan.vectors[0].vector == [0.0, 1.0, 0.0]
+    assert plan.vectors[1].vector != plan.vectors[0].vector
     assert plan.degraded is True
-    assert "image:https://example.com/query.png" in client.calls
+    assert plan.degraded_reasons == (
+        "joint image_text embedding failed; image fallback used",
+    )
+    assert client.calls.count("image_text:https://example.com/query.png:保留构图") == 1
+    assert client.calls.count("image:https://example.com/query.png") == 1
 
 
 async def test_image_text_embeddings_run_concurrently() -> None:
@@ -179,12 +205,64 @@ class DistinctQueryEnhancementClient:
         )
 
 
+class NativeAndStyleEnhancementClient:
+    async def enhance_search_query(
+        self,
+        *,
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> QueryEnhancement:
+        assert embedding_types == [
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ]
+        return QueryEnhancement(
+            queries={
+                EmbeddingType.NATIVE_MULTIMODAL: "模型改写的原始内容",
+                EmbeddingType.VISUAL_STYLE: "强化后的视觉风格",
+            },
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: 0.5,
+                EmbeddingType.VISUAL_STYLE: 0.5,
+            },
+        )
+
+
+class SingleDimensionEnhancementClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def enhance_search_query(
+        self,
+        *,
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> QueryEnhancement:
+        self.calls += 1
+        assert embedding_types == [EmbeddingType.VISUAL_STYLE]
+        return QueryEnhancement(
+            queries={EmbeddingType.VISUAL_STYLE: "单维度强化视觉风格"},
+            weights={EmbeddingType.VISUAL_STYLE: 1.0},
+        )
+
+
 class ProjectionEmbeddingClient(FakeEmbeddingClient):
     async def embed_text(self, text: str) -> EmbeddingResult:
         self.calls.append(f"text:{text}")
         vectors = {
-            "动画视觉风格": [1.0, 0.0, 0.0],
-            "蓝紫色调与黄昏光影": [0.0, 1.0, 0.0],
+            "蓝紫色黄昏动画场景": [1.0, 0.0, 0.0],
+            "动画视觉风格": [0.0, 1.0, 0.0],
+            "蓝紫色调与黄昏光影": [0.0, 0.0, 1.0],
+        }
+        return EmbeddingResult(vector=vectors[text], model="fake")
+
+
+class NativeAndStyleEmbeddingClient(FakeEmbeddingClient):
+    async def embed_text(self, text: str) -> EmbeddingResult:
+        self.calls.append(f"text:{text}")
+        vectors = {
+            "原始查询": [1.0, 0.0, 0.0],
+            "强化后的视觉风格": [0.0, 1.0, 0.0],
         }
         return EmbeddingResult(vector=vectors[text], model="fake")
 
@@ -232,15 +310,70 @@ async def test_enhanced_queries_flow_to_independent_embedding_and_recall_routes(
     )
 
     assert reasons == ()
-    assert client.calls == [
+    assert len(client.calls) == 3
+    assert set(client.calls) == {
+        "text:蓝紫色黄昏动画场景",
         "text:动画视觉风格",
         "text:蓝紫色调与黄昏光影",
-    ]
+    }
     assert [vector.weight for vector in plan.vectors] == [0.6, 0.4]
-    assert recall_repository.calls == [
-        ("visual_style", [1.0, 0.0, 0.0]),
-        ("color_composition", [0.0, 1.0, 0.0]),
+    assert recall_repository.calls[0][0] == "visual_style"
+    assert recall_repository.calls[0][1] == pytest.approx(
+        [0.3939193, 0.91914503, 0.0]
+    )
+    assert recall_repository.calls[1][0] == "color_composition"
+    assert recall_repository.calls[1][1] == pytest.approx(
+        [0.3939193, 0.0, 0.91914503]
+    )
+
+
+async def test_native_query_stays_original_and_non_native_query_is_fused() -> None:
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="原始查询",
+        embedding_types=[
+            EmbeddingType.NATIVE_MULTIMODAL,
+            EmbeddingType.VISUAL_STYLE,
+        ],
+    )
+    parsed, reasons = await QueryParser(NativeAndStyleEnhancementClient()).parse(
+        request,
+        image_url=None,
+    )
+    client = NativeAndStyleEmbeddingClient()
+
+    plan = await QueryEmbeddingService(client, settings()).embed(request, parsed)
+
+    assert reasons == ()
+    assert [item.query for item in parsed.dimension_queries] == [
+        "原始查询",
+        "强化后的视觉风格",
     ]
+    assert set(client.calls) == {
+        "text:原始查询",
+        "text:强化后的视觉风格",
+    }
+    assert plan.vectors[0].vector == [1.0, 0.0, 0.0]
+    assert plan.vectors[1].vector == pytest.approx(
+        [0.3939193, 0.91914503, 0.0]
+    )
+
+
+async def test_single_non_native_dimension_is_enhanced() -> None:
+    client = SingleDimensionEnhancementClient()
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="原始查询",
+        embedding_types=[EmbeddingType.VISUAL_STYLE],
+    )
+
+    parsed, reasons = await QueryParser(client).parse(request, image_url=None)
+
+    assert reasons == ()
+    assert client.calls == 1
+    assert parsed.dimension_queries[0].query == "单维度强化视觉风格"
 
 
 async def test_image_query_reuses_image_vector_for_selected_semantic_channels() -> None:
@@ -265,3 +398,5 @@ async def test_image_query_reuses_image_vector_for_selected_semantic_channels() 
     ]
     assert client.calls == ["image:https://example.com/query.png"]
     assert [item.weight for item in plan.vectors] == [0.5, 0.5]
+    assert plan.vectors[0].vector == [0.0, 1.0, 0.0]
+    assert plan.vectors[1].vector == plan.vectors[0].vector

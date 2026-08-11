@@ -41,6 +41,8 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /Workspace Demo/);
   assert.match(html, /默认检索原始内容/);
   assert.match(html, /检索维度/);
+  assert.match(html, /智能选择/);
+  assert.match(html, /自动选择并判断倾向，最多 4 个维度/);
   assert.match(html, /原始内容/);
   assert.match(html, /目标素材类型/);
   assert.match(html, /Markdown 段落/);
@@ -50,6 +52,8 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /图片 \/ 视频内容不参与权重解析/);
   assert.match(html, /source 由后端根据输入类型决定/);
   assert.doesNotMatch(html, /精搜模式|普通模式|precision_mode/);
+  assert.doesNotMatch(html, /Agent 重排|豆包重排|Seed 重排/);
+  assert.doesNotMatch(html, /为什么命中|命中特征/);
   const targetTypeInputs = [
     ...html.matchAll(/<input[^>]*name="target_asset_types"[^>]*>/g),
   ].map((match) => match[0]);
@@ -148,7 +152,7 @@ test("workspace-aware pages render a shared workspace switcher", async () => {
 });
 
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, clustersPage, capsulesPage, api, worker] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, segmentPlayer, clustersPage, capsulesPage, api, worker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -157,6 +161,7 @@ test("removes all disposable starter-preview references", async () => {
     readFile(new URL("../app/tasks/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/assets/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/assets/[id]/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/SegmentVideoPlayer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/clusters/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/capsules/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
@@ -182,6 +187,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /workspaceReady/);
   assert.match(page, /AbortController/);
   assert.match(page, /requestWorkspaceId/);
+  assert.match(page, /\/assets\/\$\{encodeURIComponent\(result\.asset_id\)\}/);
   assert.doesNotMatch(page, /useState\("workspace_demo"\)/);
   assert.match(shell, /ProductTopbar/);
   assert.match(shell, /product-nav-compact/);
@@ -196,8 +202,17 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(tasksPage, /selected\.workspace_id/);
   assert.match(assetsPage, /source_file/);
   assert.match(detailPage, /source_contexts/);
-  assert.match(detailPage, /asset-video-player/);
+  assert.match(detailPage, /SegmentVideoPlayer/);
+  assert.match(detailPage, /asset\.playback/);
   assert.match(detailPage, /asset\.content_url/);
+  assert.match(segmentPlayer, /mode === "source_range"/);
+  assert.match(segmentPlayer, /clampToSegment/);
+  assert.match(segmentPlayer, /video\.currentTime = endMs \/ 1_000/);
+  assert.match(segmentPlayer, /seekRelative\(0\)/);
+  assert.match(segmentPlayer, /type="range"/);
+  assert.match(segmentPlayer, /effectivePlayback\.fallback_url/);
+  assert.match(segmentPlayer, /setUsingFallback\(true\)/);
+  assert.match(segmentPlayer, /源视频编码不受支持/);
   assert.match(clustersPage, /embedding/);
   assert.match(clustersPage, /URLSearchParams/);
   assert.match(clustersPage, /deepLinkTargetRef/);
@@ -220,6 +235,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /当前维度已有全量重聚类任务/);
   assert.match(clustersPage, /native_content_weight/);
   assert.match(clustersPage, /parseNativeContentWeight/);
+  assert.match(clustersPage, /useState\("0\.3"\)/);
   assert.match(clustersPage, /当前维度权重/);
   assert.match(clustersPage, /原始内容模式无需融合/);
   assert.doesNotMatch(clustersPage, /setInterval\(/);

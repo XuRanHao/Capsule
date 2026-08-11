@@ -2,25 +2,30 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 
 from capsule.api.app import create_app
 from capsule.config import Settings
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
     ChannelMatch,
     ClusterSearchResult,
     FusedHit,
+    QueryEnhancement,
     SearchAssetRecord,
+    SearchDimensionSuggestionResponse,
     SearchFilters,
     SearchRequest,
+    TextSearchHit,
     VectorSearchHit,
 )
 from capsule.search.query_embedding import QueryEmbeddingService
+from capsule.search.query_parser import QueryParser
 from capsule.search.recall import MultiChannelRecall
 from capsule.search.result_builder import SearchResultBuilder
-from capsule.search.service import SearchService
+from capsule.search.service import SearchService, SearchUnavailableError
 
 
 class FakeEmbeddingClient:
@@ -34,9 +39,42 @@ class FakeEmbeddingClient:
         return EmbeddingResult(vector=[1.0, 1.0, 0.0], model="fake")
 
 
+class FakeDimensionSelectionClient:
+    async def select_search_dimensions(
+        self,
+        *,
+        query_text: str,
+        asset_types: Sequence[AssetType],
+    ) -> SearchDimensionSuggestionResponse:
+        assert query_text == "想找小孩追着风筝跑的画面，最好是在空旷草地"
+        assert list(asset_types) == [AssetType.IMAGE]
+        return SearchDimensionSuggestionResponse(
+            embedding_types=[
+                EmbeddingType.SUBJECT_CONTENT,
+                EmbeddingType.SCENE_THEME,
+            ],
+            weights={
+                EmbeddingType.SUBJECT_CONTENT: 0.7,
+                EmbeddingType.SCENE_THEME: 0.3,
+            },
+        )
+
+    async def enhance_search_query(
+        self,
+        *,
+        query_text: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> QueryEnhancement:
+        return QueryEnhancement(
+            queries={embedding_type: query_text for embedding_type in embedding_types},
+            weights={embedding_type: 1 for embedding_type in embedding_types},
+        )
+
+
 class FakeVectorRepository:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_all: bool = False) -> None:
         self.calls: list[dict[str, object]] = []
+        self.fail_all = fail_all
 
     async def search(
         self,
@@ -55,7 +93,7 @@ class FakeVectorRepository:
                 "limit": limit,
             }
         )
-        if embedding_type == "visual_style":
+        if self.fail_all or embedding_type == "visual_style":
             raise RuntimeError("simulated channel outage")
         return [
             VectorSearchHit(
@@ -96,6 +134,56 @@ class FakeAssetRepository:
                 ),
             )
             for asset_id in asset_ids
+        }
+
+    async def get_children_by_parent_ids(
+        self,
+        *,
+        workspace_id: str,
+        parent_asset_ids: Sequence[str],
+    ) -> Mapping[str, SearchAssetRecord]:
+        return {}
+
+
+class FakeTextSearchRepository:
+    async def search_text(
+        self,
+        *,
+        workspace_id: str,
+        query_text: str,
+        filters: SearchFilters,
+        created_by: str,
+        limit: int,
+    ) -> Sequence[TextSearchHit]:
+        assert workspace_id == "workspace_demo"
+        assert query_text == "蓝紫色黄昏"
+        return [
+            TextSearchHit(
+                asset_id="asset_1",
+                source_file_id="source_shared",
+                asset_type="image",
+                score=0.95,
+            )
+        ]
+
+
+class FakeSearchVectorIndexPreparer:
+    def __init__(self, *, failed_types: set[EmbeddingType] | None = None) -> None:
+        self.failed_types = failed_types or set()
+        self.calls: list[EmbeddingType] = []
+
+    async def ensure_search_vectors(
+        self,
+        *,
+        workspace_id: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> Mapping[EmbeddingType, str]:
+        assert workspace_id == "workspace_demo"
+        self.calls.extend(embedding_types)
+        return {
+            embedding_type: f"failed to prepare {embedding_type.value}"
+            for embedding_type in embedding_types
+            if embedding_type in self.failed_types
         }
 
 
@@ -192,7 +280,13 @@ def asset_record(
     )
 
 
-def build_service() -> tuple[
+def build_service(
+    *,
+    query_parser: QueryParser | None = None,
+    search_vector_preparer: FakeSearchVectorIndexPreparer | None = None,
+    text_recall: FakeTextSearchRepository | None = None,
+    fail_all_vectors: bool = False,
+) -> tuple[
     SearchService,
     FakeVectorRepository,
     FakeAssetRepository,
@@ -205,7 +299,7 @@ def build_service() -> tuple[
         search_candidate_cap=300,
         search_same_source_limit=3,
     )
-    vectors = FakeVectorRepository()
+    vectors = FakeVectorRepository(fail_all=fail_all_vectors)
     assets = FakeAssetRepository()
     clusters = FakeClusterRepository()
     service = SearchService(
@@ -213,6 +307,9 @@ def build_service() -> tuple[
         recall=MultiChannelRecall(vectors, settings),
         assets=assets,
         clusters=clusters,
+        query_parser=query_parser,
+        search_vector_preparer=search_vector_preparer,
+        text_recall=text_recall,
         settings=settings,
     )
     return service, vectors, assets, clusters
@@ -274,6 +371,64 @@ def test_search_rejects_stale_not_applicable_feature_channel() -> None:
     assert validated[0].score == 0.2
 
 
+def test_search_accepts_local_text_hit_without_embedding_record() -> None:
+    asset = asset_record(
+        "asset_1",
+        "workspace_demo",
+        "source_1",
+        indexed_embedding_ids=frozenset(),
+    )
+    ranked = [
+        FusedHit(
+            asset_id=asset.asset_id,
+            source_file_id=asset.source_file_id,
+            asset_type=asset.asset_type,
+            matched_channels=[
+                ChannelMatch(
+                    channel="local_text",
+                    embedding_type=None,
+                    embedding_id=None,
+                    embedding_revision=None,
+                    rank=1,
+                    similarity=0.9,
+                    fusion_contribution=1 / 61,
+                )
+            ],
+        )
+    ]
+
+    validated = SearchResultBuilder.validate_hits(
+        ranked_hits=ranked,
+        assets={asset.asset_id: asset},
+        workspace_id="workspace_demo",
+    )
+
+    assert len(validated) == 1
+    assert validated[0].matched_channels[0].channel == "local_text"
+
+
+async def test_search_degrades_to_local_text_when_all_milvus_channels_fail() -> None:
+    service, _, _, _ = build_service(
+        text_recall=FakeTextSearchRepository(),
+        fail_all_vectors=True,
+    )
+
+    response = await service.search(
+        SearchRequest(
+            workspace_id="workspace_demo",
+            query_type="text",
+            query_text="蓝紫色黄昏",
+            embedding_types=[EmbeddingType.NATIVE_MULTIMODAL],
+            top_k=2,
+        )
+    )
+
+    assert response.total == 1
+    assert response.degraded is True
+    assert "all Milvus recall channels failed" in response.degraded_reasons
+    assert response.results[0].matched_channels[0].channel == "local_text"
+
+
 async def test_search_degrades_one_channel_and_caps_same_source() -> None:
     service, vectors, assets, clusters = build_service()
 
@@ -317,6 +472,61 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
     assert len(clusters.calls) == 1
 
 
+async def test_search_removes_failed_lazy_index_dimension_and_keeps_native() -> None:
+    preparer = FakeSearchVectorIndexPreparer(failed_types={EmbeddingType.SUBJECT_CONTENT})
+    service, vectors, _, _ = build_service(search_vector_preparer=preparer)
+
+    response = await service.search(
+        SearchRequest(
+            workspace_id="workspace_demo",
+            query_type="text",
+            query_text="黄昏动画场景",
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.SUBJECT_CONTENT,
+            ],
+            top_k=2,
+        )
+    )
+
+    assert preparer.calls == [EmbeddingType.SUBJECT_CONTENT]
+    assert [call["embedding_type"] for call in vectors.calls] == ["native_multimodal"]
+    assert response.total == 2
+    assert response.results[0].score == pytest.approx(1 / 61)
+    assert response.degraded is True
+    assert "search vector index preparation for subject_content failed" in response.degraded_reasons
+
+
+async def test_search_raises_when_all_lazy_index_dimensions_fail() -> None:
+    preparer = FakeSearchVectorIndexPreparer(
+        failed_types={EmbeddingType.SUBJECT_CONTENT, EmbeddingType.SCENE_THEME}
+    )
+    service, vectors, _, _ = build_service(search_vector_preparer=preparer)
+
+    with pytest.raises(
+        SearchUnavailableError,
+        match="all search vector index preparations failed",
+    ):
+        await service.search(
+            SearchRequest(
+                workspace_id="workspace_demo",
+                query_type="text",
+                query_text="黄昏动画场景",
+                embedding_types=[
+                    EmbeddingType.SUBJECT_CONTENT,
+                    EmbeddingType.SCENE_THEME,
+                ],
+                top_k=2,
+            )
+        )
+
+    assert set(preparer.calls) == {
+        EmbeddingType.SUBJECT_CONTENT,
+        EmbeddingType.SCENE_THEME,
+    }
+    assert vectors.calls == []
+
+
 async def test_search_api_returns_the_service_response() -> None:
     service, _, _, _ = build_service()
     app = create_app(search_service=service)
@@ -349,6 +559,28 @@ async def test_search_api_returns_the_service_response() -> None:
     assert payload["clusters"][0]["name"] == "蓝紫色黄昏"
     assert payload["assets"] == payload["results"]
     assert payload["results"][0]["source_contexts"][0]["text"] == "午后-黄昏"
+
+
+async def test_search_api_suggests_dimensions_and_explicit_weights() -> None:
+    service, _, _, _ = build_service(query_parser=QueryParser(FakeDimensionSelectionClient()))
+    app = create_app(search_service=service)
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/search/dimensions/suggest",
+                json={
+                    "query_text": "想找小孩追着风筝跑的画面，最好是在空旷草地",
+                    "asset_types": ["image"],
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "embedding_types": ["subject_content", "scene_theme"],
+        "weights": {"subject_content": 0.7, "scene_theme": 0.3},
+    }
 
 
 async def test_search_api_validates_query_inputs() -> None:

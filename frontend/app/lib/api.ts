@@ -11,6 +11,17 @@ export type AssetEmbeddingState = {
   embedding_revision: number | null;
 };
 
+export type VideoPlayback = {
+  mode: "derived_clip" | "source_range" | "transcoded_stream";
+  url: string;
+  mime_type: string;
+  start_ms: number | null;
+  end_ms: number | null;
+  duration_ms: number | null;
+  browser_compatible: boolean;
+  fallback_url: string | null;
+};
+
 export type AssetRecord = {
   asset_id: string;
   workspace_id: string;
@@ -48,6 +59,7 @@ export type AssetRecord = {
   error_message: string | null;
   preview_url: string | null;
   content_url: string | null;
+  playback: VideoPlayback | null;
   source_file: {
     source_file_id: string;
     original_file_name: string;
@@ -201,7 +213,6 @@ export type SearchCapsule = {
   query_text: string | null;
   query_image_uri: string | null;
   fusion_method: string;
-  rerank_method: string;
   is_favorite: boolean;
   result_count: number;
   last_used_at: string;

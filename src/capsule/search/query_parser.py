@@ -2,7 +2,8 @@ import logging
 import math
 from collections.abc import Mapping
 
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
+from capsule.features import embedding_type_supports_any_asset_type
 from capsule.search.contracts import SearchUnderstandingClient
 from capsule.search.models import (
     DimensionQuery,
@@ -10,6 +11,7 @@ from capsule.search.models import (
     QueryDimensionSource,
     QueryEnhancement,
     QueryType,
+    SearchDimensionSuggestionResponse,
     SearchRequest,
 )
 
@@ -18,11 +20,55 @@ logger = logging.getLogger(__name__)
 _ENHANCEMENT_FALLBACK_REASON = "query enhancement fallback used"
 
 
+class DimensionSelectionError(RuntimeError):
+    pass
+
+
 class QueryParser:
     """Build query routes and enhance every selected text-bearing dimension."""
 
     def __init__(self, client: SearchUnderstandingClient | None = None) -> None:
         self._client = client
+
+    async def suggest_dimensions(
+        self,
+        *,
+        query_text: str,
+        asset_types: list[AssetType],
+    ) -> SearchDimensionSuggestionResponse:
+        if self._client is None:
+            raise DimensionSelectionError("dimension selector is unavailable")
+        try:
+            suggestion = await self._client.select_search_dimensions(
+                query_text=query_text,
+                asset_types=asset_types,
+            )
+        except Exception as exc:
+            logger.warning("smart dimension selection failed", exc_info=True)
+            raise DimensionSelectionError("smart dimension selection failed") from exc
+        selected = suggestion.embedding_types
+        if not selected or len(selected) > 4:
+            raise DimensionSelectionError(
+                "dimension selector must return between one and four dimensions"
+            )
+        if len(selected) != len(set(selected)):
+            raise DimensionSelectionError(
+                "dimension selector returned duplicate dimensions"
+            )
+        unsupported = [
+            embedding_type.value
+            for embedding_type in selected
+            if not embedding_type_supports_any_asset_type(
+                embedding_type=embedding_type,
+                asset_types=asset_types,
+            )
+        ]
+        if unsupported:
+            raise DimensionSelectionError(
+                "dimension selector returned unsupported dimensions: "
+                + ", ".join(unsupported)
+            )
+        return suggestion
 
     async def parse(
         self,
@@ -46,9 +92,13 @@ class QueryParser:
                 enhancement,
                 requested_types=request.embedding_types,
             )
-            weights = _validate_and_normalize_weights(
-                enhancement,
-                requested_types=request.embedding_types,
+            weights = (
+                request.dimension_weights
+                if request.dimension_weights is not None
+                else _validate_and_normalize_weights(
+                    enhancement,
+                    requested_types=request.embedding_types,
+                )
             )
             return _build_query_plan(request, queries=queries, weights=weights), ()
         except Exception:
@@ -62,7 +112,10 @@ class QueryParser:
 def _should_enhance(request: SearchRequest) -> bool:
     return (
         request.query_type in {QueryType.TEXT, QueryType.IMAGE_TEXT}
-        and len(request.embedding_types) > 1
+        and any(
+            embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+            for embedding_type in request.embedding_types
+        )
     )
 
 
@@ -109,8 +162,11 @@ def _validate_and_normalize_weights(
 def _fallback_query_plan(request: SearchRequest) -> ParsedQuery:
     query = request.query_text or "参考图片"
     queries = {embedding_type: query for embedding_type in request.embedding_types}
-    weight = 1.0 / len(request.embedding_types)
-    weights = {embedding_type: weight for embedding_type in request.embedding_types}
+    if request.dimension_weights is not None:
+        weights = request.dimension_weights
+    else:
+        weight = 1.0 / len(request.embedding_types)
+        weights = {embedding_type: weight for embedding_type in request.embedding_types}
     return _build_query_plan(request, queries=queries, weights=weights)
 
 
@@ -124,7 +180,14 @@ def _build_query_plan(
         dimension_queries=[
             DimensionQuery(
                 embedding_type=embedding_type,
-                query=queries[embedding_type],
+                query=(
+                    request.query_text
+                    if (
+                        embedding_type is EmbeddingType.NATIVE_MULTIMODAL
+                        and request.query_text is not None
+                    )
+                    else queries[embedding_type]
+                ),
                 weight=weights[embedding_type],
                 source=_source_for(request.query_type, embedding_type),
             )

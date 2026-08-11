@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -18,11 +19,6 @@ class QueryType(StrEnum):
 class FusionMethod(StrEnum):
     WEIGHTED_RRF = "weighted_rrf"
     NORMALIZED_WEIGHTED_SIMILARITY = "normalized_weighted_similarity"
-
-
-class RerankMethod(StrEnum):
-    OFF = "off"
-    DOUBAO_SEED_2_LITE = "doubao_seed_2_lite"
 
 
 class QueryDimensionSource(StrEnum):
@@ -72,8 +68,8 @@ class SearchRequest(BaseModel):
         min_length=1,
         max_length=len(EmbeddingType),
     )
+    dimension_weights: dict[EmbeddingType, float] | None = None
     fusion_method: FusionMethod = FusionMethod.WEIGHTED_RRF
-    rerank: RerankMethod | bool = RerankMethod.OFF
     save_capsule: bool = False
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int = Field(default=20, ge=1, le=100)
@@ -100,10 +96,23 @@ class SearchRequest(BaseModel):
         self.query_text = text
         self.query_image_url = image_url
         self.query_image_upload_id = upload_id
-        if isinstance(self.rerank, bool):
-            self.rerank = RerankMethod.DOUBAO_SEED_2_LITE if self.rerank else RerankMethod.OFF
         if len(self.embedding_types) != len(set(self.embedding_types)):
             raise ValueError("embedding_types must contain unique values")
+        if self.dimension_weights is not None:
+            if set(self.dimension_weights) != set(self.embedding_types):
+                raise ValueError(
+                    "dimension_weights keys must exactly match embedding_types"
+                )
+            if any(
+                not math.isfinite(weight) or weight <= 0
+                for weight in self.dimension_weights.values()
+            ):
+                raise ValueError("dimension_weights must be positive finite numbers")
+            total_weight = sum(self.dimension_weights.values())
+            self.dimension_weights = {
+                embedding_type: weight / total_weight
+                for embedding_type, weight in self.dimension_weights.items()
+            }
         unsupported = [
             embedding_type.value
             for embedding_type in self.embedding_types
@@ -120,12 +129,6 @@ class SearchRequest(BaseModel):
             )
         return self
 
-    @property
-    def rerank_method(self) -> RerankMethod:
-        assert isinstance(self.rerank, RerankMethod)
-        return self.rerank
-
-
 class DimensionQuery(BaseModel):
     embedding_type: EmbeddingType
     query: str = Field(min_length=1, max_length=8_000)
@@ -138,6 +141,45 @@ class QueryEnhancement(BaseModel):
 
     queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=12)
     weights: dict[EmbeddingType, float] = Field(min_length=1, max_length=12)
+
+
+class SearchDimensionSuggestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query_text: str = Field(min_length=1, max_length=100_000)
+    asset_types: list[AssetType] = Field(min_length=1, max_length=len(AssetType))
+
+    @model_validator(mode="after")
+    def normalize_input(self) -> "SearchDimensionSuggestionRequest":
+        self.query_text = self.query_text.strip()
+        if not self.query_text:
+            raise ValueError("query_text must not be blank")
+        if len(self.asset_types) != len(set(self.asset_types)):
+            raise ValueError("asset_types must contain unique values")
+        return self
+
+
+class SearchDimensionSuggestionResponse(BaseModel):
+    embedding_types: list[EmbeddingType] = Field(min_length=1, max_length=4)
+    weights: dict[EmbeddingType, float] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_unique_dimensions(self) -> "SearchDimensionSuggestionResponse":
+        if len(self.embedding_types) != len(set(self.embedding_types)):
+            raise ValueError("embedding_types must contain unique values")
+        if set(self.weights) != set(self.embedding_types):
+            raise ValueError("weights keys must exactly match embedding_types")
+        if any(
+            not math.isfinite(weight) or weight <= 0
+            for weight in self.weights.values()
+        ):
+            raise ValueError("weights must be positive finite numbers")
+        total_weight = sum(self.weights.values())
+        self.weights = {
+            embedding_type: weight / total_weight
+            for embedding_type, weight in self.weights.items()
+        }
+        return self
 
 
 class ParsedQuery(BaseModel):
@@ -166,7 +208,7 @@ class SearchQueryEcho(BaseModel):
 
 class MatchedChannel(BaseModel):
     channel: str
-    embedding_type: EmbeddingType
+    embedding_type: EmbeddingType | None = None
     embedding_id: str | None = None
     embedding_revision: int | None = None
     rank: int
@@ -225,7 +267,6 @@ class SearchResult(BaseModel):
     matched_channels: list[MatchedChannel]
     matched_feature: str | None = None
     matched_reason: str | None = None
-    rerank_score: float | None = None
     group_kind: str | None = None
     folded_asset_ids: list[str] = Field(default_factory=list)
     available: bool = True
@@ -241,7 +282,6 @@ class SearchTimings(BaseModel):
     embedding_ms: float = 0
     recall_ms: float = 0
     fusion_ms: float = 0
-    rerank_ms: float = 0
     hydration_ms: float = 0
     cluster_ms: float = 0
     total_ms: float = 0
@@ -268,7 +308,6 @@ class SearchResponse(BaseModel):
     query: SearchQueryEcho
     parsed_query: ParsedQuery | None = None
     fusion_method: FusionMethod = FusionMethod.WEIGHTED_RRF
-    rerank_method: RerankMethod = RerankMethod.OFF
     search_engine_version: str = "search-v1"
     execution_id: str | None = None
     capsule_id: str | None = None
@@ -302,7 +341,6 @@ class SearchCapsuleSummary(BaseModel):
     query_text: str | None
     query_image_uri: str | None
     fusion_method: FusionMethod
-    rerank_method: RerankMethod
     is_favorite: bool
     result_count: int
     last_used_at: datetime
@@ -326,16 +364,6 @@ class SearchCapsulePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_favorite: bool
-
-
-class RerankItem(BaseModel):
-    asset_id: str
-    relevance_score: float = Field(ge=0, le=1)
-    reason: str = Field(min_length=1, max_length=1_000)
-
-
-class RerankBatch(BaseModel):
-    items: list[RerankItem] = Field(default_factory=list, max_length=30)
 
 
 @dataclass(slots=True, frozen=True)
@@ -364,6 +392,14 @@ class VectorSearchHit:
 
 
 @dataclass(slots=True, frozen=True)
+class TextSearchHit:
+    asset_id: str
+    source_file_id: str
+    asset_type: str
+    score: float
+
+
+@dataclass(slots=True, frozen=True)
 class ChannelRecall:
     query_vector: QueryVector
     hits: tuple[VectorSearchHit, ...]
@@ -379,9 +415,9 @@ class RecallBatch:
 @dataclass(slots=True, frozen=True)
 class ChannelMatch:
     channel: str
-    embedding_type: EmbeddingType
-    embedding_id: str
-    embedding_revision: int
+    embedding_type: EmbeddingType | None
+    embedding_id: str | None
+    embedding_revision: int | None
     rank: int
     similarity: float
     fusion_contribution: float = 0.0

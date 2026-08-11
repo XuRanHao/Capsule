@@ -84,6 +84,22 @@ class PreparedSourceFile:
     generation: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class PreparedVideoTaskSubmission:
+    """Database outcome of creating one durable whole-video submission.
+
+    The parent job, source-generation claim, and optional queued task are all
+    committed together.  A reused completed source has no new task because its
+    new parent job is terminal in that same transaction.
+    """
+
+    job_id: str
+    source_file_id: str
+    generation: int
+    task_id: str | None
+    already_processed: bool
+
+
 class StaleAssetGenerationError(ValueError):
     """A delayed queue delivery belongs to an older source processing run."""
 
@@ -429,71 +445,90 @@ class AssetRepository:
     ) -> "PreparedSourceFile":
         """Claim a logical source or reuse its completed, byte-identical assets."""
         async with self._database.session() as session, session.begin():
-            await self._ensure_workspace(session, workspace_id)
-            source = await self._find_source_file(
+            return await self._prepare_source_file_in_session(
                 session,
                 workspace_id=workspace_id,
-                relative_path=source_file.relative_path,
-                lock=True,
+                source_file=source_file,
+                sha256=sha256,
+                mime_type=mime_type,
+                processing_fingerprint=processing_fingerprint,
             )
-            source_path = _resolve_path(Path(source_file.path))
-            metadata = {
-                "original_file_name": source_path.name,
-                "file_type": source_file.extension,
-                "mime_type": mime_type,
-                "relative_path": source_file.relative_path,
-                "file_tree_context": list(Path(source_file.relative_path).parent.parts)
-                if Path(source_file.relative_path).parent != Path(".")
-                else [],
-                "storage_uri": source_path.as_uri(),
-                "file_size_bytes": source_file.size_bytes,
-            }
-            if (
-                source is not None
-                and source.sha256 == sha256
-                and source.processing_fingerprint == processing_fingerprint
-                and source.processing_status == ProcessingStatus.COMPLETED.value
-            ):
-                for field, value in metadata.items():
-                    setattr(source, field, value)
-                asset_count = int(
-                    await session.scalar(
-                        select(func.count(Asset.asset_id)).where(
-                            Asset.source_file_id == source.source_file_id
-                        )
-                    )
-                    or 0
-                )
-                return PreparedSourceFile(
-                    source_file_id=source.source_file_id,
+
+    async def create_video_task_submission(
+        self,
+        *,
+        workspace_id: str,
+        input_path: Path,
+        source_file: DiscoveredFile,
+        sha256: str,
+        mime_type: str,
+        processing_fingerprint: str,
+        result_version: int = 1,
+    ) -> PreparedVideoTaskSubmission:
+        """Commit a durable video submission before its Redis delivery exists.
+
+        Redis can be unavailable immediately after this returns: the scheduler
+        republishes the queued task.  Conversely, a database rollback leaves no
+        orphaned running job or claimed source generation behind.
+        """
+        if result_version < 1:
+            raise ValueError("video task result_version must be positive")
+        # Keep this import local: importing the task runtime loads the pipeline
+        # package, whose historical exports depend on this repository module.
+        from capsule.db.video_tasks import VideoProcessingTask
+
+        async with self._database.session() as session, session.begin():
+            await self._ensure_workspace(session, workspace_id)
+            job = ProcessingJob(
+                workspace_id=workspace_id,
+                input_path=str(_resolve_path(input_path)),
+                total_count=1,
+                status=JobStatus.RUNNING.value,
+                current_stage=PipelineStage.PARSING.value,
+                started_at=datetime.now(UTC),
+            )
+            session.add(job)
+            await session.flush()
+
+            prepared = await self._prepare_source_file_in_session(
+                session,
+                workspace_id=workspace_id,
+                source_file=source_file,
+                sha256=sha256,
+                mime_type=mime_type,
+                processing_fingerprint=processing_fingerprint,
+            )
+            if prepared.already_processed:
+                job.completed_count = 1
+                job.status = JobStatus.COMPLETED.value
+                job.current_stage = PipelineStage.COMPLETED.value
+                job.completed_at = datetime.now(UTC)
+                return PreparedVideoTaskSubmission(
+                    job_id=job.job_id,
+                    source_file_id=prepared.source_file_id,
+                    generation=prepared.generation,
+                    task_id=None,
                     already_processed=True,
-                    asset_count=asset_count,
-                    generation=source.processing_generation,
                 )
 
-            values = {
-                **metadata,
-                "sha256": sha256,
-                "processing_fingerprint": processing_fingerprint,
-                "processing_status": ProcessingStatus.PROCESSING.value,
-                "error_message": None,
-            }
-            if source is None:
-                source = SourceFile(
-                    workspace_id=workspace_id,
-                    processing_generation=1,
-                    **values,
-                )
-                session.add(source)
-            else:
-                for field, value in values.items():
-                    setattr(source, field, value)
-                source.processing_generation += 1
+            task = VideoProcessingTask(
+                parent_job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                source_generation=prepared.generation,
+                result_version=result_version,
+                status="queued",
+                stage="queued",
+                attempt=0,
+                progress={},
+            )
+            session.add(task)
             await session.flush()
-            return PreparedSourceFile(
-                source_file_id=source.source_file_id,
+            return PreparedVideoTaskSubmission(
+                job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                generation=prepared.generation,
+                task_id=task.task_id,
                 already_processed=False,
-                generation=source.processing_generation,
             )
 
     async def replace_assets(
@@ -1145,6 +1180,84 @@ class AssetRepository:
             job.current_stage = PipelineStage.COMPLETED.value
             job.completed_at = datetime.now(UTC)
 
+    async def _prepare_source_file_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        workspace_id: str,
+        source_file: DiscoveredFile,
+        sha256: str,
+        mime_type: str,
+        processing_fingerprint: str,
+    ) -> PreparedSourceFile:
+        """Implement ``prepare_source_file`` inside an existing transaction."""
+        await self._ensure_workspace(session, workspace_id)
+        source = await self._find_source_file(
+            session,
+            workspace_id=workspace_id,
+            relative_path=source_file.relative_path,
+            lock=True,
+        )
+        source_path = _resolve_path(Path(source_file.path))
+        metadata = {
+            "original_file_name": source_path.name,
+            "file_type": source_file.extension,
+            "mime_type": mime_type,
+            "relative_path": source_file.relative_path,
+            "file_tree_context": list(Path(source_file.relative_path).parent.parts)
+            if Path(source_file.relative_path).parent != Path(".")
+            else [],
+            "storage_uri": source_path.as_uri(),
+            "file_size_bytes": source_file.size_bytes,
+        }
+        if (
+            source is not None
+            and source.sha256 == sha256
+            and source.processing_fingerprint == processing_fingerprint
+            and source.processing_status == ProcessingStatus.COMPLETED.value
+        ):
+            for field, value in metadata.items():
+                setattr(source, field, value)
+            asset_count = int(
+                await session.scalar(
+                    select(func.count(Asset.asset_id)).where(
+                        Asset.source_file_id == source.source_file_id
+                    )
+                )
+                or 0
+            )
+            return PreparedSourceFile(
+                source_file_id=source.source_file_id,
+                already_processed=True,
+                asset_count=asset_count,
+                generation=source.processing_generation,
+            )
+
+        values = {
+            **metadata,
+            "sha256": sha256,
+            "processing_fingerprint": processing_fingerprint,
+            "processing_status": ProcessingStatus.PROCESSING.value,
+            "error_message": None,
+        }
+        if source is None:
+            source = SourceFile(
+                workspace_id=workspace_id,
+                processing_generation=1,
+                **values,
+            )
+            session.add(source)
+        else:
+            for field, value in values.items():
+                setattr(source, field, value)
+            source.processing_generation += 1
+        await session.flush()
+        return PreparedSourceFile(
+            source_file_id=source.source_file_id,
+            already_processed=False,
+            generation=source.processing_generation,
+        )
+
     @staticmethod
     async def _ensure_workspace(session: AsyncSession, workspace_id: str) -> None:
         if await session.get(Workspace, workspace_id) is None:
@@ -1242,6 +1355,9 @@ def _asset_view_record(
         file_info=dict(asset.file_info),
         source_locator=dict(asset.source_locator),
         raw_content=asset.raw_content,
+        source_storage_uri=source.storage_uri,
+        derived_file_uri=asset.derived_file_uri,
+        preview_uri=asset.preview_uri,
         processing_status=asset.processing_status,
         feature_revision=asset.feature_revision,
         embedding_revision=asset.embedding_revision,
@@ -1298,7 +1414,7 @@ def _update_asset(current: Asset, values: AssetCreate, *, content_changed: bool)
     current.processing_status = (
         ProcessingStatus.COMPLETED.value
         if values.index_role == AssetIndexRole.PARENT
-        else ProcessingStatus.PENDING.value
+        else values.processing_status.value
     )
     current.error_message = None
     if content_changed:
@@ -1423,6 +1539,7 @@ class EmbeddingRepository:
                 Asset.workspace_id == workspace_id,
                 Asset.generation == SourceFile.processing_generation,
                 Asset.index_role != AssetIndexRole.PARENT.value,
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
             )
             .order_by(Asset.created_at, Asset.asset_id)
         )
@@ -1554,6 +1671,7 @@ class EmbeddingRepository:
         model_name: str,
         dimension: int,
         milvus_collection: str,
+        asset_ids: Sequence[str] | None = None,
     ) -> list["ClusterEmbeddingAsset"]:
         """Return the latest indexed vector record for each Asset in one channel."""
         statement = (
@@ -1569,9 +1687,14 @@ class EmbeddingRepository:
                 EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
                 Asset.generation == SourceFile.processing_generation,
                 Asset.index_role != AssetIndexRole.PARENT.value,
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
             )
             .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
         )
+        if asset_ids is not None:
+            if not asset_ids:
+                return []
+            statement = statement.where(EmbeddingRecord.asset_id.in_(asset_ids))
         async with self._database.session() as session:
             rows = (await session.execute(statement)).all()
 
@@ -2220,6 +2343,7 @@ class CurrentClusterRepository:
                 EmbeddingRecord.asset_id.in_(requested_ids),
                 Asset.generation == SourceFile.processing_generation,
                 Asset.index_role != AssetIndexRole.PARENT.value,
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
             )
             .order_by(EmbeddingRecord.created_at.desc(), EmbeddingRecord.embedding_id.desc())
         )
@@ -2777,6 +2901,7 @@ async def _latest_eligible_cluster_assets(
                 EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
                 Asset.generation == SourceFile.processing_generation,
                 Asset.index_role != AssetIndexRole.PARENT.value,
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
             )
             .order_by(
                 EmbeddingRecord.created_at.desc(),

@@ -222,7 +222,12 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     assert summary_client.prompts
     for messages in summary_client.prompts:
         payload = json.loads(str(messages[1]["content"]))
-        assert 1 <= len(payload["representative_assets"]) <= 10
+        assert len(payload["cluster_assets"]) == 10
+        assert "representative_assets" not in payload
+        assert all("asset_description" in item for item in payload["cluster_assets"])
+        assert all(
+            "current_dimension_description" in item for item in payload["cluster_assets"]
+        )
 
 
 @pytest.mark.asyncio
@@ -283,7 +288,9 @@ async def test_asset_usage_capsules_keep_path_context_out_of_description() -> No
     assert repository.capsules
     assert all("海报/素材/" not in capsule.summary.description for capsule in repository.capsules)
     for messages in summary_client.prompts:
-        assert "不得写入 description" in str(messages[0]["content"])
+        assert "成员数量、完整路径、文件名和目录统计作为证据元数据保留" in str(
+            messages[0]["content"]
+        )
         payload = json.loads(str(messages[1]["content"]))
         assert payload["member_source_context"]["directory_counts"]
         assert payload["member_source_context"]["representative_files"]

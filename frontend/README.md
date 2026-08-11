@@ -38,11 +38,12 @@ npm run dev
 - `/search`：完整多模态搜索链路
 - `/capsules`：Cluster/Search Capsule 列表、详情、快照、刷新与收藏
 - 文字、图片上传/URL、图文组合检索
-- 用户选择目标素材类型与检索维度、Weighted RRF/Normalized Similarity、可选豆包重排
+- 用户选择目标素材类型与检索维度、Weighted RRF/Normalized Similarity
+- 根据自然语言智能选择最多 4 个检索维度并给出近似权重，仍可手动调整
 - Asset、Project、文件、Source File、模型版本、收藏和 Cluster Capsule 过滤
 - 多维文本 Query 强化、维度权重、source 与最终 Query 展示
 - 加载、空结果、错误及部分降级状态
-- 融合总分、命中通道、通道相似度、重排解释
+- 融合总分、命中通道与通道相似度
 - 图片、视频片段和 Markdown Block 结果
 - 相邻视频/Markdown 折叠、同来源限制
 - 来源文件、视频起始时间和 `source_contexts` 关联段落

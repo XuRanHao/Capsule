@@ -1,3 +1,4 @@
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -43,7 +44,8 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
         assert result.file_count == 4
         assert result.succeeded_count == 3
         assert result.failed_count == 1
-        assert result.asset_count == 3
+        assert result.asset_count == 5
+        assert len(result.indexable_asset_ids) == 3
         assert result.skipped_count == 0
         assert result.errors[0]["relative_path"] == "broken.png"
 
@@ -55,7 +57,7 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
         assert repeated.succeeded_count == 3
         assert repeated.failed_count == 1
         assert repeated.skipped_count == 3
-        assert repeated.asset_count == 3
+        assert repeated.asset_count == 5
 
         async with database.session() as session:
             job = await session.get(ProcessingJob, result.job_id)
@@ -78,7 +80,7 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
             assert job.status == JobStatus.PARTIAL_FAILED.value
             assert job.completed_count == 3
             assert job.failed_count == 1
-            assert asset_count == 3
+            assert asset_count == 5
             assert source_count == 4
             assert all(
                 source.processing_status == "completed"
@@ -89,10 +91,20 @@ async def test_file_input_to_asset_database_with_partial_failure(tmp_path: Path)
                     )
                 )
             )
-            assert [asset.file_name for asset in assets] == ["notes.md", "notes.txt", "valid.png"]
-            assert assets[0].raw_content == "# Capsule\n\n正文"
-            assert assets[1].raw_content == "普通文本\n\n第二段"
-            assert assets[2].raw_content is None
+            assert Counter(asset.file_name for asset in assets) == {
+                "notes.md": 2,
+                "notes.txt": 2,
+                "valid.png": 1,
+            }
+            markdown_assets = [asset for asset in assets if asset.file_name == "notes.md"]
+            text_assets = [asset for asset in assets if asset.file_name == "notes.txt"]
+            image_asset = next(asset for asset in assets if asset.file_name == "valid.png")
+            assert {asset.index_role for asset in markdown_assets} == {"parent", "child"}
+            assert {asset.raw_content for asset in markdown_assets} == {"# Capsule\n\n正文"}
+            assert {asset.index_role for asset in text_assets} == {"parent", "child"}
+            assert {asset.raw_content for asset in text_assets} == {"普通文本\n\n第二段"}
+            assert image_asset.index_role == "standalone"
+            assert image_asset.raw_content is None
     finally:
         try:
             async with database.session() as session, session.begin():

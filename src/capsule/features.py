@@ -16,6 +16,54 @@ _VISUAL_ONLY_EMBEDDING_TYPES = frozenset(
     {EmbeddingType.VISUAL_STYLE, EmbeddingType.COLOR_COMPOSITION}
 )
 
+FEATURE_DIMENSION_SCOPES: dict[EmbeddingType, str] = {
+    EmbeddingType.SUBJECT_CONTENT: (
+        "画面或文本中的人物、物体、可识别特征、正在发生的动作、主体关系和内容事实"
+    ),
+    EmbeddingType.SCENE_THEME: (
+        "整幅内容可辨识的叙事语境，包括空间环境、时间与天气、正在发生的事件或活动、题材和"
+        "主题情境；缺少整体场景语境的主体陈列或孤立元素不适用"
+    ),
+    EmbeddingType.VISUAL_STYLE: (
+        "素材的视觉表达方式，包括摄影、插画、三维渲染等媒介形态，艺术技法、审美语言、"
+        "造型方法、材质表现和渲染质感"
+    ),
+    EmbeddingType.COLOR_COMPOSITION: (
+        "画面的色彩与视觉组织，包括主辅色、冷暖、饱和度、明暗和对比关系，以及光线分布、"
+        "视角、景别、画面布局、空间层次和视觉重心"
+    ),
+    EmbeddingType.MOOD_ATMOSPHERE: (
+        "由画面或文本中可核验的光线、色彩、空间、天气、动作、声音和叙事表现共同形成的整体"
+        "氛围，包括情绪基调、氛围强度、节奏感和感官体验"
+    ),
+    EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY: (
+        "人物或拟人角色自身的可观察状态，包括表情、身体状态、姿态、神态、互动状态，"
+        "以及有明确证据支持的情绪和心理状态"
+    ),
+    EmbeddingType.ASSET_USAGE: (
+        "有具体证据支持的素材用途，包括目标交付物、投放或使用载体、制作任务、工作流环节"
+        "和创作参考目的"
+    ),
+    EmbeddingType.TARGET_AUDIENCE: (
+        "素材信息或上下文中明确指向的观看者、使用者、年龄人群、兴趣群体和传播对象"
+    ),
+    EmbeddingType.PROVENANCE: (
+        "素材的来源链路，包括来源平台、数据集或采集渠道，导入与生成方式、派生关系和参考关系"
+    ),
+    EmbeddingType.RIGHTS_VERSION_AUTHORSHIP: (
+        "素材的权利与创作身份信息，包括作者或创作者、所有权、授权范围、版权状态、版本关系和署名要求"
+    ),
+}
+
+
+def feature_dimension_scope_prompt() -> str:
+    """Render the canonical, positive scope of every model-derived Feature."""
+
+    return "；".join(
+        f"{embedding_type.value}={scope}"
+        for embedding_type, scope in FEATURE_DIMENSION_SCOPES.items()
+    )
+
 
 def embedding_type_supports_asset_type(
     *,
@@ -29,9 +77,7 @@ def embedding_type_supports_asset_type(
         if isinstance(embedding_type, EmbeddingType)
         else EmbeddingType(embedding_type)
     )
-    resolved_asset_type = (
-        asset_type if isinstance(asset_type, AssetType) else AssetType(asset_type)
-    )
+    resolved_asset_type = asset_type if isinstance(asset_type, AssetType) else AssetType(asset_type)
     return (
         resolved_embedding_type not in _VISUAL_ONLY_EMBEDDING_TYPES
         or resolved_asset_type in _VISUAL_ASSET_TYPES

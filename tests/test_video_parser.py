@@ -209,15 +209,31 @@ async def test_video_fixture_becomes_logical_segment_assets() -> None:
         assert asset.source_locator["start_ms"] < asset.source_locator["end_ms"]
         assert asset.file_info["candidate_frame_count"] >= 1
         assert 1 <= len(asset.file_info["representative_frames"]) <= 3
-        assert len(asset.transient_keyframe_jpegs) == len(
-            asset.file_info["representative_frames"]
-        )
-        for payload in asset.transient_keyframe_jpegs:
-            with Image.open(io.BytesIO(payload)) as image:
-                assert image.size == (224, 224)
+        assert asset.file_info["video_output_mode"] == "logical"
+        assert asset.transient_keyframe_jpegs == []
         segmentation = asset.file_info["segmentation"]
         assert 0.08 <= segmentation["first_stage_distance_threshold"] <= 0.25
         assert segmentation["second_stage_similarity_gate"] == pytest.approx(
             1 - segmentation["first_stage_distance_threshold"] - 0.05,
             abs=1e-6,
         )
+
+
+def test_logical_candidate_frame_skips_jpeg_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def fail_if_encoded(*_args: object, **_kwargs: object) -> tuple[bool, np.ndarray]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("logical video analysis must not encode JPEGs")
+
+    monkeypatch.setattr("capsule.parsers.video.cv2.imencode", fail_if_encoded)
+    candidate = _candidate_frame(
+        250,
+        250,
+        np.full((224, 224, 3), 80, dtype=np.uint8),
+        include_jpeg=False,
+    )
+
+    assert calls == 0
+    assert candidate.jpeg_bytes is None

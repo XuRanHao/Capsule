@@ -37,6 +37,8 @@ from capsule.pipeline.video_media import (
 )
 from capsule.schemas import AssetCreate, AssetDraft, DiscoveredFile, SourceContext
 from capsule.storage.object_storage import ObjectStorage
+from capsule.video_output import logical_video_asset
+from capsule.video_sources import validate_video_source_root
 
 AssetStoredCallback = Callable[[list[str]], Awaitable[None]]
 
@@ -144,7 +146,10 @@ class PipelineRunner:
         )
         object_storage = self._object_storage
         media_writer: VideoDerivedMediaWriter | None = None
-        if any(item.extension in {".mp4", ".mov"} for item in source_files):
+        if (
+            self._settings.video_output_mode == "materialized"
+            and any(item.extension in {".mp4", ".mov"} for item in source_files)
+        ):
             object_storage = object_storage or ObjectStorage(self._settings)
 
             async def persist_video_asset(
@@ -338,6 +343,15 @@ class PipelineRunner:
             PipelineStage.ASSET_STORED.value: 0.0,
         }
         try:
+            if (
+                source_file.extension in {".mp4", ".mov"}
+                and self._settings.video_output_mode == "logical"
+            ):
+                validate_video_source_root(
+                    Path(source_file.path),
+                    import_root=self._settings.import_root,
+                    video_source_roots=self._settings.video_source_roots,
+                )
             phase_started = time.perf_counter()
             try:
                 digest = await asyncio.to_thread(
@@ -405,22 +419,38 @@ class PipelineRunner:
                     generation=generation,
                 )
                 if any(asset.asset_type.value == "video_segment" for asset in assets):
-                    if media_writer is None:
-                        raise RuntimeError("video media writer is unavailable")
+                    if self._settings.video_output_mode == "logical":
+                        # Logical segments persist timeline metadata while model
+                        # stages read representative frames ephemerally.
+                        assets = [logical_video_asset(asset) for asset in assets]
+                        stored = await repository.replace_assets(
+                            source_file_id=source_file_id,
+                            assets=assets,
+                        )
+                        indexable_asset_ids = list(
+                            getattr(stored, "indexable_asset_ids", stored.asset_ids)
+                        )
+                        if on_assets_stored is not None and indexable_asset_ids:
+                            await on_assets_stored(indexable_asset_ids)
+                    else:
+                        if media_writer is None:
+                            raise RuntimeError("video media writer is unavailable")
 
-                    async def emit_segment(asset_id: str) -> None:
-                        if on_assets_stored is not None:
-                            await on_assets_stored([asset_id])
+                        async def emit_segment(asset_id: str) -> None:
+                            if on_assets_stored is not None:
+                                await on_assets_stored([asset_id])
 
-                    assets = await media_writer.persist(
-                        source_file=source_file,
-                        assets=assets,
-                        on_asset_committed=(emit_segment if on_assets_stored is not None else None),
-                    )
-                    stored = await repository.finalize_asset_generation(
-                        source_file_id=source_file_id,
-                        generation=generation,
-                    )
+                        assets = await media_writer.persist(
+                            source_file=source_file,
+                            assets=assets,
+                            on_asset_committed=(
+                                emit_segment if on_assets_stored is not None else None
+                            ),
+                        )
+                        stored = await repository.finalize_asset_generation(
+                            source_file_id=source_file_id,
+                            generation=generation,
+                        )
                 else:
                     stored = await repository.replace_assets(
                         source_file_id=source_file_id,
@@ -440,7 +470,9 @@ class PipelineRunner:
                 succeeded=True,
                 asset_count=len(stored.asset_ids),
                 asset_ids=stored.asset_ids,
-                indexable_asset_ids=list(getattr(stored, "indexable_asset_ids", stored.asset_ids)),
+                indexable_asset_ids=(
+                    list(getattr(stored, "indexable_asset_ids", stored.asset_ids))
+                ),
                 stage_durations_ms=stage_durations_ms,
             )
         except Exception as exc:
@@ -478,6 +510,7 @@ def _build_assetizer(
     video = VideoParser(
         concurrency=settings.ffmpeg_concurrency,
         config=VideoSegmentationConfig(
+            output_mode=settings.video_output_mode,
             sample_interval_seconds=settings.video_sample_interval_seconds,
             min_segment_seconds=settings.video_min_segment_seconds,
             distance_quantile=settings.video_distance_quantile,
@@ -582,6 +615,7 @@ def _processing_fingerprint(
         payload["document"] = document_fingerprint
     elif source_file.extension in {".mp4", ".mov"}:
         payload["video"] = {
+            "output_mode": settings.video_output_mode,
             "sample_interval_seconds": settings.video_sample_interval_seconds,
             "min_segment_seconds": settings.video_min_segment_seconds,
             "distance_quantile": settings.video_distance_quantile,

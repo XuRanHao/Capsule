@@ -7,6 +7,7 @@ import DemoShell, {
   AssetThumb,
   StatusBadge,
 } from "../../components/DemoShell";
+import SegmentVideoPlayer from "../../components/SegmentVideoPlayer";
 import {
   type AssetRecord,
   apiFetch,
@@ -111,7 +112,8 @@ export default function AssetDetailPage() {
     .filter(Boolean)
     .join("\n");
   const playableVideo =
-    asset.asset_type === "video_segment" && Boolean(asset.content_url);
+    asset.asset_type === "video_segment" &&
+    Boolean(asset.playback || asset.content_url);
 
   return (
     <DemoShell
@@ -129,15 +131,12 @@ export default function AssetDetailPage() {
       <div className="asset-detail-hero">
         <div className="asset-detail-preview">
           {playableVideo ? (
-            <video
-              className="asset-video-player"
-              controls
-              preload="metadata"
-              poster={asset.preview_url ?? undefined}
-            >
-              <source src={asset.content_url ?? undefined} type="video/mp4" />
-              当前浏览器不支持播放此视频片段。
-            </video>
+            <SegmentVideoPlayer
+              playback={asset.playback}
+              legacyContentUrl={asset.content_url}
+              posterUrl={asset.preview_url}
+              fallbackMimeType={asset.file_type}
+            />
           ) : (
             <AssetThumb
               preview={asset.preview_url}

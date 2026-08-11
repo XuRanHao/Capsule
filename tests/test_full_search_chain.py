@@ -1,10 +1,11 @@
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
 from capsule.search.fusion import FusionEngine
 from capsule.search.models import (
     ChannelMatch,
@@ -15,14 +16,12 @@ from capsule.search.models import (
     QueryEnhancement,
     QueryType,
     QueryVector,
-    RerankBatch,
-    RerankItem,
     SearchAssetRecord,
+    SearchDimensionSuggestionResponse,
     SearchRequest,
     VectorSearchHit,
 )
 from capsule.search.query_parser import QueryParser
-from capsule.search.rerank import SearchReranker
 from capsule.search.result_builder import SearchResultBuilder
 
 
@@ -71,6 +70,25 @@ class FakeUnderstandingClient:
     def __init__(self) -> None:
         self.enhancement_calls = 0
 
+    async def select_search_dimensions(
+        self,
+        *,
+        query_text: str,
+        asset_types: Sequence[AssetType],
+    ) -> SearchDimensionSuggestionResponse:
+        assert query_text == ("想找蓝紫色占满画面、明暗反差很强的动画场景，人物是谁无所谓")
+        assert list(asset_types) == [AssetType.IMAGE]
+        return SearchDimensionSuggestionResponse(
+            embedding_types=[
+                EmbeddingType.NATIVE_MULTIMODAL,
+                EmbeddingType.COLOR_COMPOSITION,
+            ],
+            weights={
+                EmbeddingType.NATIVE_MULTIMODAL: 0.3,
+                EmbeddingType.COLOR_COMPOSITION: 0.7,
+            },
+        )
+
     async def enhance_search_query(
         self,
         *,
@@ -86,19 +104,30 @@ class FakeUnderstandingClient:
             weights={embedding_type: 1 for embedding_type in embedding_types},
         )
 
-    async def rerank_search_results(
-        self,
-        request: SearchRequest,
-        *,
-        image_url: str | None,
-        candidates: Sequence[Mapping[str, object]],
-    ) -> RerankBatch:
-        return RerankBatch(
-            items=[
-                RerankItem(asset_id="b", relevance_score=0.95, reason="约束全部命中"),
-                RerankItem(asset_id="a", relevance_score=0.30, reason="氛围偏差"),
-            ]
-        )
+
+async def test_smart_dimension_selection_weights_are_used_by_query_plan() -> None:
+    client = FakeUnderstandingClient()
+    suggestion = await QueryParser(client).suggest_dimensions(
+        query_text="想找蓝紫色占满画面、明暗反差很强的动画场景，人物是谁无所谓",
+        asset_types=[AssetType.IMAGE],
+    )
+    request = SearchRequest(
+        workspace_id="workspace_demo",
+        query_type=QueryType.TEXT,
+        query_text="想找蓝紫色占满画面、明暗反差很强的动画场景，人物是谁无所谓",
+        embedding_types=suggestion.embedding_types,
+        dimension_weights=suggestion.weights,
+        filters={"asset_type": ["image"]},
+    )
+
+    parsed, reasons = await QueryParser(client).parse(request, image_url=None)
+
+    assert reasons == ()
+    assert [item.embedding_type for item in parsed.dimension_queries] == [
+        EmbeddingType.NATIVE_MULTIMODAL,
+        EmbeddingType.COLOR_COMPOSITION,
+    ]
+    assert [item.weight for item in parsed.dimension_queries] == pytest.approx([0.3, 0.7])
 
 
 async def test_image_query_uses_equal_weight_selected_routes_without_model() -> None:
@@ -125,9 +154,7 @@ async def test_image_query_uses_equal_weight_selected_routes_without_model() -> 
     assert reasons == ()
     assert len(parsed.dimension_queries) == 6
     assert math.isclose(sum(item.weight for item in parsed.dimension_queries), 1)
-    assert all(
-        math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries
-    )
+    assert all(math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries)
     assert all(item.source is QueryDimensionSource.IMAGE for item in parsed.dimension_queries)
     assert client.enhancement_calls == 0
 
@@ -160,9 +187,7 @@ class TextQueryEnhancementClient:
 async def test_text_bearing_queries_are_enhanced_with_intent_weights(
     query_type: QueryType,
 ) -> None:
-    image_url = (
-        "https://example.com/query.jpg" if query_type is QueryType.IMAGE_TEXT else None
-    )
+    image_url = "https://example.com/query.jpg" if query_type is QueryType.IMAGE_TEXT else None
     request = SearchRequest(
         workspace_id="workspace_demo",
         query_type=query_type,
@@ -182,7 +207,7 @@ async def test_text_bearing_queries_are_enhanced_with_intent_weights(
     assert reasons == ()
     assert [item.weight for item in parsed.dimension_queries] == [0.2, 0.8]
     assert [item.query for item in parsed.dimension_queries] == [
-        "蓝紫色黄昏动画场景",
+        "重点看动画风格，原始内容其次",
         "蓝紫色调的动画电影视觉风格",
     ]
     expected_sources = (
@@ -214,7 +239,7 @@ async def test_text_multidimension_always_uses_query_enhancer() -> None:
     ]
     assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
     assert [item.query for item in parsed.dimension_queries] == [
-        "native_multimodal:蓝紫色黄昏动画场景，主要人物在中央",
+        "蓝紫色黄昏动画场景，主要人物在中央",
         "visual_style:蓝紫色黄昏动画场景，主要人物在中央",
     ]
     assert client.enhancement_calls == 1
@@ -315,29 +340,6 @@ async def test_invalid_enhancement_falls_back_to_original_query_and_equal_weight
         request.query_text,
     ]
     assert reasons == ("query enhancement fallback used",)
-
-
-async def test_seed_reranker_reorders_only_hydrated_candidates() -> None:
-    request = SearchRequest(
-        workspace_id="workspace_demo",
-        query_type=QueryType.TEXT,
-        query_text="黄昏",
-        rerank="doubao_seed_2_lite",
-    )
-    assets = {asset_id: _asset(asset_id, source_id=f"source_{asset_id}") for asset_id in ("a", "b")}
-    ranked, annotations, reasons = await SearchReranker(FakeUnderstandingClient()).rerank(
-        request=request,
-        image_url=None,
-        ranked_hits=[
-            FusedHit(asset_id="a", source_file_id="source_a", asset_type="image", score=1),
-            FusedHit(asset_id="b", source_file_id="source_b", asset_type="image", score=0.5),
-        ],
-        assets=assets,
-    )
-
-    assert reasons == ()
-    assert [item.asset_id for item in ranked] == ["b", "a"]
-    assert annotations["b"] == (0.95, "约束全部命中")
 
 
 def test_adjacent_video_segments_are_folded_before_same_source_limit() -> None:
@@ -575,7 +577,75 @@ def test_result_builder_exposes_hierarchical_index_metadata() -> None:
     assert results[0].child_order == 2
 
 
-def test_result_builder_preserves_reranked_order_after_database_validation() -> None:
+def test_result_builder_expands_markdown_hit_with_adjacent_children() -> None:
+    siblings = {
+        f"chunk_{order}": replace(
+            _asset(
+                f"chunk_{order}",
+                source_id="source_a",
+                asset_type="markdown_block",
+                locator={
+                    "block_index": order,
+                    "char_start": order * 100,
+                    "char_end": (order + 1) * 100,
+                },
+                parent_asset_id="document_01",
+                index_role="child",
+                child_order=order,
+            ),
+            raw_content=f"第 {order} 块",
+            source_contexts=[{"text": f"章节 {order}"}],
+        )
+        for order in range(5)
+    }
+    hit = siblings["chunk_2"]
+    match = ChannelMatch(
+        channel="native_multimodal",
+        embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+        embedding_id="embedding_current",
+        embedding_revision=1,
+        rank=1,
+        similarity=0.9,
+        fusion_contribution=0.1,
+    )
+    results = SearchResultBuilder().build(
+        ranked_hits=[
+            FusedHit(
+                asset_id=hit.asset_id,
+                source_file_id=hit.source_file_id,
+                asset_type=hit.asset_type,
+                score=0.1,
+                matched_channels=[match],
+            )
+        ],
+        assets={hit.asset_id: hit},
+        workspace_id=hit.workspace_id,
+        allowed_asset_types=(),
+        top_k=20,
+    )
+
+    SearchResultBuilder.expand_adjacent_children(
+        results,
+        recalled_assets={hit.asset_id: hit},
+        sibling_assets=siblings,
+    )
+
+    assert results[0].asset_id == "chunk_2"
+    assert results[0].score == 0.1
+    assert results[0].folded_asset_ids == ["chunk_1", "chunk_2", "chunk_3"]
+    assert results[0].raw_content == "第 1 块\n\n第 2 块\n\n第 3 块"
+    assert results[0].source_locator["block_index"] == 2
+    assert results[0].source_locator["char_start"] == 100
+    assert results[0].source_locator["char_end"] == 400
+    assert results[0].group_kind == "markdown_blocks"
+    assert [context["text"] for context in results[0].source_contexts] == [
+        "章节 1",
+        "章节 2",
+        "章节 3",
+    ]
+
+
+def test_result_builder_preserves_fusion_order_after_database_validation() -> None:
     match = ChannelMatch(
         channel="native_multimodal",
         embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
@@ -622,6 +692,7 @@ def _asset(
     parent_asset_id: str | None = None,
     index_role: str = "standalone",
     child_order: int | None = None,
+    asset_features: dict[str, object] | None = None,
 ) -> SearchAssetRecord:
     created_at = datetime(2026, 7, 29, tzinfo=UTC)
     return SearchAssetRecord(
@@ -637,7 +708,7 @@ def _asset(
         asset_name=asset_id,
         asset_name_source="model",
         asset_description="黄昏素材",
-        asset_features={},
+        asset_features=asset_features or {},
         file_tree_context=[],
         source_contexts=[],
         file_info={},

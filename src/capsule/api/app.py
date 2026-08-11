@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from capsule.db.repositories import (
 )
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
+from capsule.media.video_frames import FFmpegVideoFrameExtractor
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.embedding import AssetEmbeddingService
@@ -38,7 +40,6 @@ from capsule.search.query_embedding import QueryEmbeddingService
 from capsule.search.query_parser import QueryParser
 from capsule.search.recall import MultiChannelRecall
 from capsule.search.repositories import PostgresAssetSearchRepository
-from capsule.search.rerank import SearchReranker
 from capsule.search.service import SearchService
 from capsule.search.uploads import QueryImageService
 from capsule.storage.object_storage import ObjectStorage
@@ -62,6 +63,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = resolved_settings
+        app.state.video_transcode_semaphore = asyncio.Semaphore(
+            resolved_settings.video_transcode_concurrency
+        )
         if (
             search_service is not None
             or cluster_service is not None
@@ -140,6 +144,9 @@ def create_app(
             max_edge=resolved_settings.model_image_max_edge,
             max_entries=resolved_settings.model_image_cache_entries,
         )
+        video_frame_extractor = FFmpegVideoFrameExtractor(
+            concurrency=resolved_settings.ffmpeg_concurrency
+        )
         embedding_service = AssetEmbeddingService(
             settings=resolved_settings,
             repository=embedding_repository,
@@ -147,6 +154,7 @@ def create_app(
             vector_store=vectors,
             artifact_reader=storage,
             image_cache=model_image_cache,
+            video_frame_extractor=video_frame_extractor,
         )
         understanding_service = AssetUnderstandingService(
             settings=resolved_settings,
@@ -155,6 +163,7 @@ def create_app(
             model_client=embedding_client,
             artifact_reader=storage,
             image_cache=model_image_cache,
+            video_frame_extractor=video_frame_extractor,
         )
         search_repository = PostgresAssetSearchRepository(database)
         app.state.search_service = SearchService(
@@ -164,11 +173,12 @@ def create_app(
             ),
             recall=MultiChannelRecall(vectors, resolved_settings),
             assets=search_repository,
+            text_recall=search_repository,
             clusters=search_repository,
             query_parser=QueryParser(embedding_client),
-            reranker=SearchReranker(embedding_client),
             history=history,
             image_resolver=query_images,
+            search_vector_preparer=embedding_service,
             settings=resolved_settings,
         )
         cluster_service_instance = ClusterService(
@@ -224,7 +234,13 @@ def create_app(
         allow_origins=resolved_settings.search_cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Range"],
+        expose_headers=[
+            "Accept-Ranges",
+            "Content-Range",
+            "Content-Length",
+            "ETag",
+        ],
     )
     application.include_router(search_router)
     application.include_router(assets_router)

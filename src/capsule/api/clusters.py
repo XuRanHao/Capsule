@@ -16,6 +16,7 @@ from capsule.enums import (
     NewAssetClusterStatus,
 )
 from capsule.pipeline.cluster_service import ClusterService
+from capsule.pipeline.vector_fusion import DEFAULT_NATIVE_CONTENT_WEIGHT
 from capsule.schemas import (
     ClusterCapsuleRecord,
     ClusterMemberRecord,
@@ -42,7 +43,7 @@ class ClusterRunCreate(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=64)
     embedding_type: EmbeddingType = EmbeddingType.NATIVE_MULTIMODAL
     native_content_weight: float = Field(
-        default=0.5,
+        default=DEFAULT_NATIVE_CONTENT_WEIGHT,
         ge=0.0,
         le=1.0,
         description=(

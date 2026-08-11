@@ -13,8 +13,15 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository, EmbeddingAsset, EmbeddingRepository
 from capsule.enums import AssetType, FeatureStatus
+from capsule.features import feature_dimension_scope_prompt
 from capsule.media.model_image import ModelImageCache
+from capsule.media.video_frames import (
+    FFmpegVideoFrameExtractor,
+    VideoFrameExtractor,
+    logical_video_frame_request,
+)
 from capsule.schemas import AssetUnderstanding
+from capsule.video_output import is_logical_video_asset
 
 logger = logging.getLogger(__name__)
 
@@ -43,30 +50,13 @@ _USAGE_PATH_HINTS = (
     ("插画", "插画创作"),
 )
 
-_GENERIC_USAGE_PATH_PARTS = {
-    "asset",
-    "assets",
-    "file",
-    "files",
-    "image",
-    "images",
-    "img",
-    "素材",
-    "文件",
-    "图片",
-    "图像",
-    "png",
-    "jpg",
-    "jpeg",
-    "webp",
-    "gif",
-}
-
 
 class UnderstandingClient(Protocol):
     async def understand_asset(
         self,
         messages: Sequence[Mapping[str, Any]],
+        *,
+        asset_id: str | None = None,
     ) -> AssetUnderstanding: ...
 
 
@@ -96,6 +86,7 @@ class AssetUnderstandingService:
         model_client: UnderstandingClient,
         artifact_reader: ArtifactReader | None = None,
         image_cache: ModelImageCache | None = None,
+        video_frame_extractor: VideoFrameExtractor | None = None,
     ) -> None:
         self._settings = settings
         self._embedding_repository = embedding_repository
@@ -106,6 +97,9 @@ class AssetUnderstandingService:
             target_bytes=settings.model_image_target_bytes,
             max_edge=settings.model_image_max_edge,
             max_entries=settings.model_image_cache_entries,
+        )
+        self._video_frame_extractor = video_frame_extractor or FFmpegVideoFrameExtractor(
+            concurrency=settings.ffmpeg_concurrency
         )
 
     async def run(
@@ -161,7 +155,12 @@ class AssetUnderstandingService:
                 messages = await self._messages(asset)
                 phase_started = time.perf_counter()
                 try:
-                    understanding = await self._model_client.understand_asset(messages)
+                    understanding = await self._model_client.understand_asset(
+                        messages,
+                        asset_id=asset.asset_id,
+                    )
+                    # Drop transient video-frame data URIs before the database write.
+                    del messages
                     _attach_asset_usage_path_context(understanding, asset)
                 finally:
                     model_ms = (time.perf_counter() - phase_started) * 1000
@@ -184,32 +183,33 @@ class AssetUnderstandingService:
             "role": "system",
             "content": (
                 "你是多模态 Asset 特征提取器，只描述当前 Asset；上下文仅用于消歧。"
-                "十个 Feature 彼此独立。主体词可以跨维度复用以锚定属性，但维度信息不得"
-                "跨维度重复、混写或推导。asset_name 不超过 20 字；"
+                "十个 Feature 彼此独立，每个 Feature 围绕自己的正向语义范围组织事实。"
+                "asset_name 不超过 20 字；"
                 "asset_description 用 40 到 120 字客观描述可检索内容。每个 Feature 的 value "
                 "只含该维度 0 到 5 条最具表现力和区分度的中文短语，按重要性排序并以分号连接。"
-                "每条必须是“主体 + 当前维度信息”，两部分之间只用一个空格分隔：先写属性实际"
-                "归属的具体主体，再写当前维度事实；例如 color_composition 写“桌子 红色；"
-                "星空 深蓝”，不得只写“红色；深蓝”。"
-                "主体必须来自素材或可靠上下文，不得虚构；用途、受众、来源、权利等素材级维度"
-                "使用“素材 + 维度事实”。evidence 最多一条且不超过 40 字。"
+                "描述局部属性且需要明确归属时，可以使用“具体对象 + 维度事实”，例如 "
+                "color_composition 写“桌子 红色；星空 深蓝”。"
+                "所有事实必须来自素材或可靠上下文，不得虚构；用途、受众、来源、权利等素材级"
+                "维度可以使用“素材 + 维度事实”。evidence 最多一条且不超过 40 字。"
                 f"{_DESCRIPTION_CONTEXT_RULES}"
-                "维度边界：subject_content=主体与动作；scene_theme=场景题材；"
-                "visual_style=表现技法；color_composition=色彩构图；"
-                "mood_atmosphere=情绪氛围；character_state_or_psychology=人物可观察状态；"
-                "asset_usage=用途；target_audience=受众；provenance=客观来源；"
-                "rights_version_authorship=有证据的权利版本作者。unknown 表示该维度适用但"
+                f"十个 Feature 的正向语义范围如下：{feature_dimension_scope_prompt()}。"
+                "unknown 表示该维度适用但"
                 "当前证据不足；not_applicable 表示当前 Asset 不存在该维度所需对象或该维度"
                 "不适用。status 为 unknown 或 not_applicable 时 value 必须为 null。"
-                "character_state_or_psychology 采用严格适用性判断：图像或视频中只有清晰可见"
-                "的人物或拟人角色，文本中只有明确描述人物状态时才适用；纯场景、建筑、物体、"
-                "树木、遗骸或非拟人怪物必须返回 null/not_applicable。不得根据文件名、IP 背景、"
-                "场景叙事或画面情绪推断不存在的人物，也不得把物体或场景状态写成人物状态。"
-                "asset_usage 必须优先使用 metadata.context.source_path 和 file_tree_context："
-                "当目录名能表达海报、宣传、封面、广告、预告、参考等用途时，status 使用 "
-                "metadata，value 按上述格式写“素材 + 规范化用途语义”；description 必须自然"
-                "说明完整相对路径"
-                "及其对应用途，source_path 必须原样返回该相对路径。不得返回本地绝对路径。"
+                "scene_theme 在素材具有可辨识的整体环境、时间、事件或叙事情境时适用；角色"
+                "三视图、产品白底陈列或孤立元素展示对应 null/not_applicable。"
+                "mood_atmosphere 依据画面或文本中可核验的光线、色彩、空间、天气、动作、"
+                "声音和叙事表现概括整体氛围；人物内心、动机或性格只有在素材明确呈现时才可"
+                "作为依据，线索不足时对应 null/unknown。"
+                "character_state_or_psychology 在图像或视频中出现清晰可见的人物或拟人角色，"
+                "或文本明确描述人物状态时适用；中性陈列视角没有可区分的表情、姿态、身体或"
+                "心理状态时对应 null/not_applicable。"
+                "asset_usage 使用 metadata.context.source_path 和 file_tree_context 中能够明确"
+                "回答具体交付物、载体、制作任务、工作流环节或参考目的的语义；只有文件组织"
+                "信息时对应 unknown。status 使用 metadata，value 写规范化用途语义；description "
+                "自然说明完整相对路径及其对应用途，source_path 原样返回该相对路径。"
+                "target_audience、provenance 和 rights_version_authorship 使用素材或上下文中"
+                "明确陈述的信息，当前证据不足时对应 unknown。"
                 "无证据不得虚构。只输出约定 JSON，不要 Markdown。"
             ),
         }
@@ -278,26 +278,38 @@ class AssetUnderstandingService:
 
     async def _video_keyframe_data_uris(self, asset: EmbeddingAsset) -> list[str]:
         raw_keyframes = asset.file_info.get("keyframes")
-        if not isinstance(raw_keyframes, list):
-            return []
         data_uris: list[str] = []
-        for item in raw_keyframes[:3]:
-            if not isinstance(item, Mapping):
-                continue
-            uri = item.get("uri")
-            if not isinstance(uri, str):
-                continue
-            parsed = urlparse(uri)
-            if parsed.scheme == "data":
-                data_uris.append(uri)
-                continue
-            if parsed.scheme != "s3" or self._artifact_reader is None:
-                continue
-            try:
-                content = await self._artifact_reader.download_uri(uri)
-                data_uris.append(_data_uri("image/jpeg", content))
-            except Exception:
-                logger.warning("could not load video keyframe %s", uri, exc_info=True)
+        if isinstance(raw_keyframes, list):
+            for item in raw_keyframes[:3]:
+                if not isinstance(item, Mapping):
+                    continue
+                uri = item.get("uri")
+                if not isinstance(uri, str):
+                    continue
+                parsed = urlparse(uri)
+                if parsed.scheme == "data":
+                    data_uris.append(uri)
+                    continue
+                if parsed.scheme != "s3" or self._artifact_reader is None:
+                    continue
+                try:
+                    content = await self._artifact_reader.download_uri(uri)
+                    data_uris.append(_data_uri("image/jpeg", content))
+                except Exception:
+                    logger.warning("could not load video keyframe %s", uri, exc_info=True)
+        if data_uris or not is_logical_video_asset(
+            asset_type=asset.asset_type,
+            file_info=asset.file_info,
+        ):
+            return data_uris
+        frames = await self._video_frame_extractor.extract(
+            logical_video_frame_request(
+                source_uri=asset.source_storage_uri,
+                file_info=asset.file_info,
+                source_locator=asset.source_locator,
+            )
+        )
+        data_uris.extend(_data_uri("image/jpeg", frame) for frame in frames)
         return data_uris
 
 
@@ -457,12 +469,7 @@ def _usage_hint_from_path(
         if token in combined:
             return usage
 
-    meaningful_parts = [
-        part
-        for part in dict.fromkeys([*PurePosixPath(directory).parts, *context_parts])
-        if part and part.lower() not in _GENERIC_USAGE_PATH_PARTS
-    ]
-    return "；".join(meaningful_parts[:3]) or None
+    return None
 
 
 def _compact_file_info(file_info: Mapping[str, Any]) -> dict[str, Any]:

@@ -1,6 +1,12 @@
 from capsule.enums import EmbeddingType
-from capsule.search.fusion import WeightedReciprocalRankFusion
-from capsule.search.models import ChannelRecall, QueryVector, VectorSearchHit
+from capsule.search.fusion import FusionEngine, WeightedReciprocalRankFusion
+from capsule.search.models import (
+    ChannelRecall,
+    FusionMethod,
+    QueryVector,
+    TextSearchHit,
+    VectorSearchHit,
+)
 
 
 def hit(asset_id: str, similarity: float) -> VectorSearchHit:
@@ -39,3 +45,42 @@ def test_weighted_rrf_merges_assets_and_keeps_channel_evidence() -> None:
     assert [item.asset_id for item in fused] == ["a", "b"]
     assert len(fused[0].matched_channels) == 2
     assert fused[0].score == (1.0 / 61) + (0.8 / 62)
+
+
+def test_fusion_treats_all_vectors_and_local_text_as_two_recall_classes() -> None:
+    native = ChannelRecall(
+        query_vector=QueryVector(
+            channel="native_multimodal",
+            embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+            vector=[1.0],
+            weight=1.0,
+        ),
+        hits=(hit("a", 0.99), hit("b", 0.90)),
+    )
+    text_hits = (
+        TextSearchHit(
+            asset_id="b",
+            source_file_id="source_b",
+            asset_type="image",
+            score=0.95,
+        ),
+        TextSearchHit(
+            asset_id="c",
+            source_file_id="source_c",
+            asset_type="image",
+            score=0.75,
+        ),
+    )
+
+    fused = FusionEngine(rrf_k=60, candidate_cap=10).fuse(
+        (native,),
+        FusionMethod.WEIGHTED_RRF,
+        text_hits=text_hits,
+    )
+
+    assert [item.asset_id for item in fused] == ["b", "a", "c"]
+    text_match = next(
+        match for match in fused[0].matched_channels if match.channel == "local_text"
+    )
+    assert text_match.embedding_type is None
+    assert text_match.embedding_id is None

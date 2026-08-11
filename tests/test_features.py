@@ -1,11 +1,34 @@
 from capsule.enums import AssetType, EmbeddingType
 from capsule.features import (
+    FEATURE_DIMENSION_SCOPES,
     asset_usage_embedding_text,
     effective_feature_text,
     embedding_channel_is_eligible,
     embedding_type_supports_any_asset_type,
     embedding_type_supports_asset_type,
 )
+from capsule.schemas import AssetFeatures
+
+
+def test_positive_dimension_scopes_cover_all_feature_embedding_types() -> None:
+    assert set(FEATURE_DIMENSION_SCOPES) == {
+        embedding_type
+        for embedding_type in EmbeddingType
+        if embedding_type not in {EmbeddingType.NATIVE_MULTIMODAL, EmbeddingType.ASSET_DESCRIPTION}
+    }
+    assert "可核验" in FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE]
+    assert "整体氛围" in FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE]
+    assert "来源平台" in FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE]
+    assert "作者或创作者" in FEATURE_DIMENSION_SCOPES[EmbeddingType.RIGHTS_VERSION_AUTHORSHIP]
+
+
+def test_asset_feature_schema_uses_dimension_specific_positive_scopes() -> None:
+    schema = str(AssetFeatures.model_json_schema())
+
+    assert "主体 + 维度信息" not in schema
+    assert "可核验的光线、色彩、空间" in schema
+    assert "整体氛围" in schema
+    assert "素材的来源链路" in schema
 
 
 def test_visual_dimensions_only_support_visual_asset_types() -> None:

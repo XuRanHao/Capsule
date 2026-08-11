@@ -86,6 +86,7 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
                     ],
                     file_info={"width": 1200, "height": 800},
                     source_locator={"block_index": 3},
+                    raw_content="原始文本记录了月湖与远山。",
                     preview_uri="s3://capsule/previews/sunset.jpg",
                     processing_status="completed",
                     feature_revision=2,
@@ -196,6 +197,16 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
         assert record.source_contexts[0]["text"] == "午后-黄昏"
         assert record.embedding_revision == 3
         assert record.indexed_embedding_ids == frozenset({embedding_id})
+
+        for query_text in ("sunset", "references", "月湖", "黄昏图片"):
+            text_hits = await repository.search_text(
+                workspace_id=workspace_id,
+                query_text=query_text,
+                filters=SearchFilters(),
+                created_by="user_demo",
+                limit=5,
+            )
+            assert [item.asset_id for item in text_hits] == [asset_id]
 
         source_file_type_does_not_override_asset = await repository.get_by_ids(
             workspace_id=workspace_id,

@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from capsule.video_output import VideoOutputMode
+
 DOCUMENT_CHUNK_MIN_TOKENS = 250
 DOCUMENT_CHUNK_TARGET_TOKENS = 400
 DOCUMENT_CHUNK_MAX_TOKENS = 500
@@ -25,6 +27,9 @@ class Settings(BaseSettings):
     milvus_uri: str = "http://localhost:19530"
     milvus_token: SecretStr | None = None
     milvus_collection: str = "asset_embeddings_seed16_1024"
+    milvus_fused_search_collection: str = (
+        "asset_embeddings_seed16_1024_fused_n03_v1"
+    )
 
     object_storage_endpoint: str = "http://localhost:9000"
     object_storage_public_endpoint: str | None = None
@@ -82,7 +87,7 @@ class Settings(BaseSettings):
     model_image_max_edge: int = Field(default=1536, ge=1)
     model_image_cache_entries: int = Field(default=128, ge=1)
     file_parse_concurrency: int = Field(default=4, ge=1)
-    ffmpeg_concurrency: int = Field(default=1, ge=1)
+    ffmpeg_concurrency: int = Field(default=2, ge=1)
     video_upload_concurrency: int = Field(default=4, ge=1)
     video_spool_root: Path = Path("data/video-spool")
     video_spool_max_items: int = Field(default=32, ge=1)
@@ -94,6 +99,31 @@ class Settings(BaseSettings):
     video_upload_claim_idle_ms: int = Field(default=30_000, ge=100)
     video_upload_max_attempts: int = Field(default=4, ge=1, le=20)
     video_upload_retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
+    # Durable whole-video task transport. PostgreSQL is authoritative; these
+    # settings only control Streams delivery, lease recovery, and polling.
+    video_task_stream: str = "capsule:video:tasks"
+    video_task_group: str = "capsule-video-workers"
+    video_task_dlq_stream: str = "capsule:video:dlq"
+    video_task_claim_idle_ms: int = Field(default=30_000, ge=100)
+    video_task_lease_seconds: float = Field(default=60.0, gt=0)
+    video_task_heartbeat_seconds: float = Field(default=10.0, gt=0)
+    video_task_progress_timeout_seconds: float = Field(default=120.0, gt=0)
+    video_task_hard_timeout_seconds: float = Field(default=7_200.0, gt=0)
+    video_task_redispatch_seconds: float = Field(default=60.0, gt=0)
+    video_task_max_attempts: int = Field(default=4, ge=1, le=20)
+    video_task_retry_delays_seconds: list[float] = Field(
+        default_factory=lambda: [5.0, 30.0, 300.0],
+        min_length=1,
+    )
+    video_task_scheduler_poll_seconds: float = Field(default=5.0, gt=0)
+    # ``materialized`` preserves the legacy playable MP4/keyframe artifacts.
+    # ``logical`` stores only content-aware ranges and representative timestamps;
+    # Assets still run through understanding, vectorization, and clustering.
+    video_output_mode: VideoOutputMode = "logical"
+    # Additional local roots permitted for durable video source references.
+    # They are checked before a file:// URI reaches PostgreSQL or Redis.
+    video_source_roots: list[Path] = Field(default_factory=list)
+    video_transcode_concurrency: int = Field(default=1, ge=1, le=8)
     video_sample_interval_seconds: float = Field(default=0.5, gt=0)
     video_min_segment_seconds: float = Field(default=1.0, gt=0)
     video_distance_quantile: float = Field(default=0.75, ge=0, le=1)
@@ -162,6 +192,9 @@ class Settings(BaseSettings):
     search_cluster_top_k: int = Field(default=12, ge=1, le=100)
     search_rrf_k: int = Field(default=60, ge=1)
     search_hnsw_ef: int = Field(default=128, ge=1)
+    search_vector_visibility_timeout_seconds: float = Field(default=5.0, ge=0)
+    search_vector_visibility_poll_initial_seconds: float = Field(default=0.05, gt=0)
+    search_vector_visibility_poll_max_seconds: float = Field(default=0.5, gt=0)
     search_engine_version: str = "search-v1"
     search_capsule_recent_limit: int = Field(default=10, ge=1)
     query_image_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
@@ -195,6 +228,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "document token limits must satisfy min <= target <= max <= merge_max <= parent"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_milvus_collections(self) -> "Settings":
+        if self.milvus_collection == self.milvus_fused_search_collection:
+            raise ValueError("raw and fused-search Milvus collections must be distinct")
+        if (
+            self.search_vector_visibility_poll_initial_seconds
+            > self.search_vector_visibility_poll_max_seconds
+        ):
+            raise ValueError(
+                "search-vector initial visibility poll interval must not exceed its maximum"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_video_task_health_intervals(self) -> "Settings":
+        if self.video_task_heartbeat_seconds >= self.video_task_lease_seconds:
+            raise ValueError("video task heartbeat must be shorter than its worker lease")
+        if self.video_task_progress_timeout_seconds >= self.video_task_hard_timeout_seconds:
+            raise ValueError("video task progress timeout must be shorter than its hard timeout")
         return self
 
 

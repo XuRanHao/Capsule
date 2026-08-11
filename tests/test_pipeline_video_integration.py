@@ -9,7 +9,7 @@ from PIL import Image
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from capsule.config import get_settings
+from capsule.config import Settings, get_settings
 from capsule.db.models import Asset, Workspace
 from capsule.db.session import Database
 from capsule.pipeline.runner import PipelineRunner
@@ -67,6 +67,7 @@ async def test_video_file_stores_playable_segment_media(tmp_path: Path) -> None:
 
         storage = FakeObjectStorage()
         result = await PipelineRunner(
+            settings=Settings(video_output_mode="materialized"),
             database=database,
             video_embedder=FakeVideoEmbedder(),
             object_storage=storage,
@@ -102,6 +103,7 @@ async def test_video_file_stores_playable_segment_media(tmp_path: Path) -> None:
         stored_objects = dict(storage.objects)
 
         repeated = await PipelineRunner(
+            settings=Settings(video_output_mode="materialized"),
             database=database,
             video_embedder=FakeVideoEmbedder(),
             object_storage=storage,
@@ -146,7 +148,13 @@ async def test_missing_mps_records_only_the_video_as_failed(
         await asyncio.to_thread(shutil.copyfile, VIDEO_FIXTURE, tmp_path / VIDEO_FIXTURE.name)
         await asyncio.to_thread(_create_png, tmp_path / "still.png")
 
-        result = await PipelineRunner(database=database).run(tmp_path, workspace_id)
+        settings = get_settings().model_copy(
+            update={"video_source_roots": [tmp_path]}
+        )
+        result = await PipelineRunner(database=database, settings=settings).run(
+            tmp_path,
+            workspace_id,
+        )
 
         assert result.succeeded_count == 1
         assert result.failed_count == 1

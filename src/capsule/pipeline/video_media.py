@@ -15,7 +15,11 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 from capsule.enums import AssetType
-from capsule.parsers.video import VideoToolingError, resolve_video_tool
+from capsule.parsers.video import (
+    VideoCancellationToken,
+    VideoToolingError,
+    resolve_video_tool,
+)
 from capsule.pipeline.video_upload_queue import (
     InMemoryUploadQueue,
     RedisStreamUploadQueue,
@@ -42,6 +46,7 @@ class VideoArtifactStorage(Protocol):
 AssetPersistedCallback = Callable[[AssetCreate, int], Awaitable[str]]
 AssetCommittedCallback = Callable[[str], Awaitable[None]]
 AssetGenerationValidator = Callable[[AssetCreate], Awaitable[None]]
+VideoMediaProgressCallback = Callable[[AssetCreate, str, int, int], None]
 _DEFAULT_SPOOL_ROOT = Path(tempfile.gettempdir()) / "capsule-video-spool"
 
 
@@ -58,6 +63,26 @@ class _UploadManifest(BaseModel):
     spool_bytes: int = Field(gt=0)
     generation_asset_count: int = Field(gt=0)
     attempt: int = Field(default=0, ge=0)
+
+
+class _PendingUpload:
+    """Callbacks owned by one ``persist`` call, not by the shared writer."""
+
+    def __init__(
+        self,
+        future: asyncio.Future[AssetCreate],
+        on_asset_committed: AssetCommittedCallback | None,
+        on_asset_persisted: AssetPersistedCallback | None,
+        validate_asset_generation: AssetGenerationValidator | None,
+        progress_callback: VideoMediaProgressCallback | None,
+        cancellation_token: VideoCancellationToken | None,
+    ) -> None:
+        self.future = future
+        self.on_asset_committed = on_asset_committed
+        self.on_asset_persisted = on_asset_persisted
+        self.validate_asset_generation = validate_asset_generation
+        self.progress_callback = progress_callback
+        self.cancellation_token = cancellation_token
 
 
 class _DiskSpool:
@@ -201,10 +226,7 @@ class VideoDerivedMediaWriter:
         self._bucket_ready = False
         self._start_lock = asyncio.Lock()
         self._workers: list[asyncio.Task[None]] = []
-        self._pending: dict[
-            str,
-            tuple[asyncio.Future[AssetCreate], AssetCommittedCallback | None],
-        ] = {}
+        self._pending: dict[str, _PendingUpload] = {}
         self._recovered_paths: set[str] = set()
         self._recovered_commits: list[tuple[str, str]] = []
 
@@ -214,12 +236,18 @@ class VideoDerivedMediaWriter:
         source_file: DiscoveredFile,
         assets: Sequence[AssetCreate],
         on_asset_committed: AssetCommittedCallback | None = None,
+        on_asset_persisted: AssetPersistedCallback | None = None,
+        validate_asset_generation: AssetGenerationValidator | None = None,
+        progress_callback: VideoMediaProgressCallback | None = None,
+        cancellation_token: VideoCancellationToken | None = None,
     ) -> list[AssetCreate]:
         video_assets = [asset for asset in assets if asset.asset_type is AssetType.VIDEO_SEGMENT]
         if not video_assets:
             return list(assets)
 
         source = await asyncio.to_thread(_resolve_source, source_file)
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
         source_has_audio = await asyncio.to_thread(_source_has_audio, source)
         await self._ensure_bucket()
         await self._start()
@@ -228,6 +256,10 @@ class VideoDerivedMediaWriter:
             source_has_audio=source_has_audio,
             assets=video_assets,
             on_asset_committed=on_asset_committed,
+            on_asset_persisted=on_asset_persisted,
+            validate_asset_generation=validate_asset_generation,
+            progress_callback=progress_callback,
+            cancellation_token=cancellation_token,
         )
         updated = {asset.asset_key: asset for asset in persisted}
         return [updated.get(asset.asset_key, asset) for asset in assets]
@@ -239,6 +271,10 @@ class VideoDerivedMediaWriter:
         source_has_audio: bool,
         assets: list[AssetCreate],
         on_asset_committed: AssetCommittedCallback | None,
+        on_asset_persisted: AssetPersistedCallback | None,
+        validate_asset_generation: AssetGenerationValidator | None,
+        progress_callback: VideoMediaProgressCallback | None,
+        cancellation_token: VideoCancellationToken | None,
     ) -> list[AssetCreate]:
         persisted: list[AssetCreate | None] = [None] * len(assets)
         workers = [
@@ -249,6 +285,10 @@ class VideoDerivedMediaWriter:
                     asset=asset,
                     generation_asset_count=len(assets),
                     on_asset_committed=on_asset_committed,
+                    on_asset_persisted=on_asset_persisted,
+                    validate_asset_generation=validate_asset_generation,
+                    progress_callback=progress_callback,
+                    cancellation_token=cancellation_token,
                 )
             )
             for asset in assets
@@ -258,6 +298,8 @@ class VideoDerivedMediaWriter:
             for index, asset in enumerate(results):
                 persisted[index] = asset
         except BaseException:
+            if cancellation_token is not None:
+                cancellation_token.cancel()
             for task in workers:
                 task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
@@ -294,7 +336,14 @@ class VideoDerivedMediaWriter:
             for manifest_path in recovered_manifests:
                 manifest = _read_manifest(manifest_path)
                 future: asyncio.Future[AssetCreate] = asyncio.get_running_loop().create_future()
-                self._pending[str(manifest_path)] = (future, None)
+                self._pending[str(manifest_path)] = _PendingUpload(
+                    future,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 self._recovered_paths.add(str(manifest_path))
                 recovered_futures.append(future)
                 try:
@@ -329,18 +378,33 @@ class VideoDerivedMediaWriter:
         asset: AssetCreate,
         generation_asset_count: int,
         on_asset_committed: AssetCommittedCallback | None,
+        on_asset_persisted: AssetPersistedCallback | None,
+        validate_asset_generation: AssetGenerationValidator | None,
+        progress_callback: VideoMediaProgressCallback | None,
+        cancellation_token: VideoCancellationToken | None,
     ) -> AssetCreate:
         output_directory = await self._spool.allocate(asset)
         manifest_path: Path | None = None
         try:
             async with self._semaphore:
-                artifacts = await asyncio.to_thread(
-                    _render_artifacts,
-                    source,
-                    asset,
-                    output_directory,
-                    source_has_audio,
-                )
+                if cancellation_token is None and progress_callback is None:
+                    artifacts = await asyncio.to_thread(
+                        _render_artifacts,
+                        source,
+                        asset,
+                        output_directory,
+                        source_has_audio,
+                    )
+                else:
+                    artifacts = await asyncio.to_thread(
+                        _render_artifacts,
+                        source,
+                        asset,
+                        output_directory,
+                        source_has_audio,
+                        progress_callback=progress_callback,
+                        cancellation_token=cancellation_token,
+                    )
             spool_bytes = sum(
                 path.stat().st_size for path in [artifacts.segment_path, *artifacts.keyframe_paths]
             )
@@ -356,7 +420,14 @@ class VideoDerivedMediaWriter:
             )
             manifest_path = await self._spool.commit(manifest, output_directory)
             future: asyncio.Future[AssetCreate] = asyncio.get_running_loop().create_future()
-            self._pending[str(manifest_path)] = (future, on_asset_committed)
+            self._pending[str(manifest_path)] = _PendingUpload(
+                future,
+                on_asset_committed,
+                on_asset_persisted,
+                validate_asset_generation,
+                progress_callback,
+                cancellation_token,
+            )
             await self._publish(
                 UploadQueueItem(manifest_path=self._spool.queue_path(manifest_path))
             )
@@ -403,21 +474,33 @@ class VideoDerivedMediaWriter:
             persisted: AssetCreate | None = None
             try:
                 manifest = _read_manifest(manifest_path)
-                if self._validate_asset_generation is not None:
-                    await self._validate_asset_generation(manifest.asset)
+                pending = self._pending.get(str(manifest_path))
+                if pending is not None and pending.cancellation_token is not None:
+                    pending.cancellation_token.raise_if_cancelled()
+                generation_validator = (
+                    pending.validate_asset_generation
+                    if pending is not None and pending.validate_asset_generation is not None
+                    else self._validate_asset_generation
+                )
+                if generation_validator is not None:
+                    await generation_validator(manifest.asset)
                 persisted = await self._upload_manifest(manifest, manifest_path)
                 asset_id = persisted.asset_id
-                if self._on_asset_persisted is not None:
-                    asset_id = await self._on_asset_persisted(
+                persisted_callback = (
+                    pending.on_asset_persisted
+                    if pending is not None and pending.on_asset_persisted is not None
+                    else self._on_asset_persisted
+                )
+                if persisted_callback is not None:
+                    asset_id = await persisted_callback(
                         persisted,
                         manifest.generation_asset_count,
                     )
                 if str(manifest_path) in self._recovered_paths:
                     self._recovered_paths.discard(str(manifest_path))
                     self._recovered_commits.append((persisted.workspace_id, asset_id))
-                pending = self._pending.get(str(manifest_path))
-                if pending is not None and pending[1] is not None:
-                    await pending[1](asset_id)
+                if pending is not None and pending.on_asset_committed is not None:
+                    await pending.on_asset_committed(asset_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -460,8 +543,8 @@ class VideoDerivedMediaWriter:
                 else:
                     await self._spool.abort(manifest_path.parent)
                 pending = self._pending.pop(str(manifest_path), None)
-                if pending is not None and not pending[0].done():
-                    pending[0].set_exception(exc)
+                if pending is not None and not pending.future.done():
+                    pending.future.set_exception(exc)
                 continue
 
             try:
@@ -470,16 +553,16 @@ class VideoDerivedMediaWriter:
                 # DB state is already durable and the active producer has been
                 # released. Keep the spool bundle for a later XAUTOCLAIM pass.
                 pending = self._pending.pop(str(manifest_path), None)
-                if pending is not None and not pending[0].done() and persisted is not None:
-                    pending[0].set_result(persisted)
+                if pending is not None and not pending.future.done() and persisted is not None:
+                    pending.future.set_result(persisted)
                 await asyncio.sleep(max(0.1, self._retry_base_seconds))
                 continue
             assert manifest is not None
             assert persisted is not None
             await self._spool.release(manifest_path, manifest.spool_bytes)
             pending = self._pending.pop(str(manifest_path), None)
-            if pending is not None and not pending[0].done():
-                pending[0].set_result(persisted)
+            if pending is not None and not pending.future.done():
+                pending.future.set_result(persisted)
 
     async def _upload_manifest(
         self,
@@ -564,7 +647,12 @@ def _render_artifacts(
     asset: AssetCreate,
     output_directory: Path,
     source_has_audio: bool,
+    *,
+    progress_callback: VideoMediaProgressCallback | None = None,
+    cancellation_token: VideoCancellationToken | None = None,
 ) -> _RenderedArtifacts:
+    if cancellation_token is not None:
+        cancellation_token.raise_if_cancelled()
     locator = asset.source_locator
     start_ms = _required_int(locator, "start_ms")
     end_ms = _required_int(locator, "end_ms")
@@ -614,10 +702,29 @@ def _render_artifacts(
             str(segment_path),
         ]
     )
-    _run_ffmpeg(
-        ffmpeg,
-        segment_arguments,
-    )
+    duration_ms = end_ms - start_ms
+    if progress_callback is not None:
+        progress_callback(asset, "rendering", 0, duration_ms)
+    if cancellation_token is None and progress_callback is None:
+        _run_ffmpeg(ffmpeg, segment_arguments)
+    else:
+        _run_ffmpeg(
+            ffmpeg,
+            segment_arguments,
+            cancellation_token=cancellation_token,
+            on_progress=(
+                None
+                if progress_callback is None
+                else lambda completed_ms: progress_callback(
+                    asset,
+                    "rendering",
+                    min(duration_ms, completed_ms),
+                    duration_ms,
+                )
+            ),
+        )
+    if cancellation_token is not None:
+        cancellation_token.raise_if_cancelled()
     if not segment_path.is_file() or segment_path.stat().st_size == 0:
         raise VideoToolingError("FFmpeg did not create a video segment")
 
@@ -635,6 +742,7 @@ def _object_prefix(asset: AssetCreate) -> str:
             "video-segments",
             asset.workspace_id,
             asset.source_file_id,
+            f"g{asset.generation}",
             asset.asset_key,
         )
     )
@@ -738,14 +846,54 @@ def _video_encoder_arguments(ffmpeg: Path) -> tuple[str, tuple[str, ...]]:
     return "mpeg4", ("-q:v", "4")
 
 
-def _run_ffmpeg(ffmpeg: Path, arguments: list[str]) -> None:
+def _run_ffmpeg(
+    ffmpeg: Path,
+    arguments: list[str],
+    *,
+    cancellation_token: VideoCancellationToken | None = None,
+    on_progress: Callable[[int], None] | None = None,
+) -> None:
+    """Run a derived-media FFmpeg in a dedicated, cancellation-safe group."""
+    token = cancellation_token or VideoCancellationToken()
+    token.raise_if_cancelled()
+    process = subprocess.Popen(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-nostdin",
+            "-progress",
+            "pipe:2",
+            "-nostats",
+            *arguments,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    unregister_process = token.register(process)
+    stderr_lines: list[str] = []
     try:
-        subprocess.run(
-            [str(ffmpeg), "-hide_banner", "-loglevel", "error", *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "FFmpeg failed").strip()
-        raise VideoToolingError(f"FFmpeg media generation failed: {detail[:1000]}") from exc
+        assert process.stderr is not None
+        for raw_line in iter(process.stderr.readline, b""):
+            token.raise_if_cancelled()
+            line = raw_line.decode(errors="replace").strip()
+            if line.startswith("out_time_us="):
+                try:
+                    completed_ms = int(line.partition("=")[2]) // 1_000
+                except ValueError:
+                    continue
+                if on_progress is not None:
+                    on_progress(completed_ms)
+            else:
+                stderr_lines.append(line)
+        return_code = process.wait()
+        token.raise_if_cancelled()
+        if return_code:
+            detail = "\n".join(stderr_lines).strip() or "FFmpeg failed"
+            raise VideoToolingError(f"FFmpeg media generation failed: {detail[:1000]}")
+    finally:
+        if process.poll() is None:
+            token.cancel()
+        unregister_process()
+        if process.stderr is not None:
+            process.stderr.close()

@@ -208,6 +208,7 @@ async def test_video_media_writer_bounds_work_and_initializes_storage_once(
             file_type=".mp4",
             asset_key=f"segment-{index}",
             content_hash=str(index) * 64,
+            generation=7,
             source_locator={"start_ms": index * 1000, "end_ms": (index + 1) * 1000},
             file_info={
                 "fps": 30.0,
@@ -241,6 +242,8 @@ async def test_video_media_writer_bounds_work_and_initializes_storage_once(
     assert storage.upload_calls == 16
     assert all(asset.derived_file_uri for asset in [*first, *second])
     assert all(asset.preview_uri for asset in [*first, *second])
+    assert all("/g7/" in str(asset.derived_file_uri) for asset in [*first, *second])
+    assert all("/g7/" in str(asset.preview_uri) for asset in [*first, *second])
     assert all(len(asset.file_info["keyframes"]) == 2 for asset in [*first, *second])
 
 

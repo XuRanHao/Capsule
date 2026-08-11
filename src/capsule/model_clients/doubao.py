@@ -1,5 +1,7 @@
 import json
+import logging
 import math
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
@@ -7,12 +9,25 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 
 from capsule.config import Settings
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType, FeatureStatus
+from capsule.features import (
+    FEATURE_DIMENSION_SCOPES,
+    embedding_type_supports_asset_type,
+)
 from capsule.model_clients.concurrency import AsyncCallPool
+from capsule.model_clients.structured_output import responses_json_schema_format
 from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
-from capsule.search.models import QueryEnhancement, RerankBatch, SearchRequest
+from capsule.search.models import QueryEnhancement, SearchDimensionSuggestionResponse
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+logger = logging.getLogger(__name__)
+
+_ASSET_UNDERSTANDING_RESPONSE_FORMAT = responses_json_schema_format(
+    AssetUnderstanding,
+    name="asset_understanding",
+    strip_annotations=True,
+)
+_ASSET_FEATURE_NAMES = frozenset(item.value for item in FEATURE_DIMENSION_SCOPES)
 
 
 class _SearchQueryOutput(BaseModel):
@@ -33,24 +48,20 @@ _EMBEDDING_TYPE_GUIDANCE: dict[EmbeddingType, str] = {
     EmbeddingType.ASSET_DESCRIPTION: (
         "素材完整描述：基于原查询已有信息，组织成对目标素材整体内容的客观完整描述"
     ),
-    EmbeddingType.SUBJECT_CONTENT: "主体内容：突出人物、物体、动作及主体之间的关系",
-    EmbeddingType.SCENE_THEME: "场景主题：突出地点、环境、时段、事件和主题语境",
-    EmbeddingType.VISUAL_STYLE: (
-        "视觉风格：突出媒介类型、艺术流派、材质、摄影或渲染风格"
-    ),
-    EmbeddingType.COLOR_COMPOSITION: (
-        "色彩构图：突出颜色、光影、明暗、视角、景别和画面布局"
-    ),
-    EmbeddingType.MOOD_ATMOSPHERE: "情绪氛围：突出情感、气氛和感官基调",
-    EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY: (
-        "人物状态与心理：突出人物可观察的表情、姿态、行为和明确心理状态"
-    ),
-    EmbeddingType.ASSET_USAGE: "素材用途：突出用户明确提到的使用场景、载体和任务目的",
-    EmbeddingType.TARGET_AUDIENCE: "目标受众：突出用户明确提到的受众群体和适用人群",
-    EmbeddingType.PROVENANCE: "来源：突出用户明确提供的出处、来源和生成方式线索",
-    EmbeddingType.RIGHTS_VERSION_AUTHORSHIP: (
-        "权利版本作者：突出用户明确提供的作者、版本、授权和版权线索"
-    ),
+    EmbeddingType.SUBJECT_CONTENT: FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT],
+    EmbeddingType.SCENE_THEME: FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME],
+    EmbeddingType.VISUAL_STYLE: FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_STYLE],
+    EmbeddingType.COLOR_COMPOSITION: FEATURE_DIMENSION_SCOPES[EmbeddingType.COLOR_COMPOSITION],
+    EmbeddingType.MOOD_ATMOSPHERE: FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE],
+    EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY: FEATURE_DIMENSION_SCOPES[
+        EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY
+    ],
+    EmbeddingType.ASSET_USAGE: FEATURE_DIMENSION_SCOPES[EmbeddingType.ASSET_USAGE],
+    EmbeddingType.TARGET_AUDIENCE: FEATURE_DIMENSION_SCOPES[EmbeddingType.TARGET_AUDIENCE],
+    EmbeddingType.PROVENANCE: FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE],
+    EmbeddingType.RIGHTS_VERSION_AUTHORSHIP: FEATURE_DIMENSION_SCOPES[
+        EmbeddingType.RIGHTS_VERSION_AUTHORSHIP
+    ],
 }
 
 
@@ -144,49 +155,103 @@ class DoubaoClient:
     async def understand_asset(
         self,
         messages: Sequence[Mapping[str, Any]],
+        *,
+        asset_id: str | None = None,
     ) -> AssetUnderstanding:
         constrained_messages = [
             _asset_understanding_schema_message(),
             *messages,
         ]
-        try:
-            return await self._responses_json(
-                messages=constrained_messages,
-                output_type=AssetUnderstanding,
-                pool=self.asset_understanding_pool,
-                timeout_seconds=self._settings.understanding_timeout_seconds,
+        trace_asset_id = asset_id or "unknown"
+        async with self.asset_understanding_pool.reserve() as slot:
+            first_started = time.perf_counter()
+            try:
+                result, decoded = await slot.run(
+                    lambda: self._responses_json_request(
+                        messages=constrained_messages,
+                        output_type=AssetUnderstanding,
+                        timeout_seconds=self._settings.understanding_timeout_seconds,
+                        response_format=_ASSET_UNDERSTANDING_RESPONSE_FORMAT,
+                    )
+                )
+                normalization_attempt = "first"
+                normalization_request_ms = (time.perf_counter() - first_started) * 1000
+            except (DoubaoResponseError, ValidationError) as exc:
+                first_attempt_ms = (time.perf_counter() - first_started) * 1000
+                validation_error = _validation_error_text(exc)[:2000]
+                logger.warning(
+                    "asset understanding requires model repair asset_id=%s "
+                    "error_type=%s first_attempt_ms=%.1f validation_error=%s",
+                    trace_asset_id,
+                    type(exc).__name__,
+                    first_attempt_ms,
+                    validation_error,
+                )
+                correction = {
+                    "role": "user",
+                    "content": (
+                        "上一份输出未通过 AssetUnderstanding 结构校验。请根据原始素材重新输出，"
+                        "不要解释或使用 Markdown。根节点和 features 都必须是 JSON 对象；features "
+                        "必须包含指定的十个命名字段，绝不能使用数组。"
+                        f"校验错误：{validation_error}"
+                    ),
+                }
+                repair_started = time.perf_counter()
+                try:
+                    result, decoded = await slot.run(
+                        lambda: self._responses_json_request(
+                            messages=[*constrained_messages, correction],
+                            output_type=AssetUnderstanding,
+                            timeout_seconds=self._settings.understanding_timeout_seconds,
+                            response_format=_ASSET_UNDERSTANDING_RESPONSE_FORMAT,
+                        )
+                    )
+                except Exception as repair_exc:
+                    repair_ms = (time.perf_counter() - repair_started) * 1000
+                    logger.error(
+                        "asset understanding model repair failed asset_id=%s "
+                        "error_type=%s first_attempt_ms=%.1f repair_ms=%.1f error=%s",
+                        trace_asset_id,
+                        type(repair_exc).__name__,
+                        first_attempt_ms,
+                        repair_ms,
+                        (str(repair_exc) or type(repair_exc).__name__)[:2000],
+                    )
+                    raise
+                repair_ms = (time.perf_counter() - repair_started) * 1000
+                logger.info(
+                    "asset understanding repaired asset_id=%s repair_method=model_retry "
+                    "first_attempt_ms=%.1f repair_ms=%.1f",
+                    trace_asset_id,
+                    first_attempt_ms,
+                    repair_ms,
+                )
+                normalization_attempt = "repair"
+                normalization_request_ms = repair_ms
+            _log_asset_understanding_normalization(
+                asset_id=trace_asset_id,
+                decoded=decoded,
+                request_attempt=normalization_attempt,
+                request_ms=normalization_request_ms,
             )
-        except (DoubaoResponseError, ValidationError) as exc:
-            correction = {
-                "role": "user",
-                "content": (
-                    "上一份输出未通过 AssetUnderstanding 结构校验。请根据原始素材重新输出，"
-                    "不要解释或使用 Markdown。根节点和 features 都必须是 JSON 对象；features "
-                    "必须包含指定的十个命名字段，绝不能使用数组。"
-                    f"校验错误：{_validation_error_text(exc)}"
-                ),
-            }
-            return await self._responses_json(
-                messages=[*constrained_messages, correction],
-                output_type=AssetUnderstanding,
-                pool=self.asset_understanding_pool,
-                timeout_seconds=self._settings.understanding_timeout_seconds,
-            )
+            return result
 
     async def summarize_cluster(
         self,
         messages: Sequence[Mapping[str, Any]],
     ) -> ClusterSummary:
         try:
-            return await self._responses_json(
+            return await self._deepseek_json(
                 messages=messages,
                 output_type=ClusterSummary,
                 pool=self.capsule_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
+                max_output_tokens=self._settings.understanding_max_output_tokens,
+                model=self._settings.search_query_model,
             )
         except ValidationError as exc:
-            # Responses can be valid JSON but still violate the concise Capsule contract.
-            # Retry once with the original representatives intact and explicit errors.
+            # Text-model responses can be valid JSON but still violate the Capsule contract.
+            # Retry once with the complete cluster text evidence intact and explicit errors.
             validation_errors = json.dumps(
                 exc.errors(include_url=False),
                 ensure_ascii=False,
@@ -195,18 +260,20 @@ class DoubaoClient:
             correction = {
                 "role": "user",
                 "content": (
-                    "上一份输出未通过结构校验。请仅基于前述代表资产重新输出完整合法 JSON，"
+                    "上一份输出未通过结构校验。请仅基于前述全部簇内资产文本重新输出完整合法 JSON，"
                     "不要解释或使用 Markdown。description 必须是 30 到 80 个中文字符；"
-                    "common_features 必须有 1 到 8 项；不要输出 keywords；"
+                    "common_features 必须有 1 到 3 项；不要输出 keywords；"
                     "internal_variance 只能为 low、medium 或 high。"
                     f"校验错误：{validation_errors}"
                 ),
             }
-            return await self._responses_json(
+            return await self._deepseek_json(
                 messages=[*messages, correction],
                 output_type=ClusterSummary,
                 pool=self.capsule_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
+                max_output_tokens=self._settings.understanding_max_output_tokens,
+                model=self._settings.search_query_model,
             )
 
     async def enhance_search_query(
@@ -244,10 +311,10 @@ class DoubaoClient:
                 "保留实际检索语义以及否定、排除、范围等内容约束。native_multimodal 要"
                 "围绕原始可见或可读内容及其关系组织整体表达；asset_description 要形成"
                 "完整客观描述，但都只能使用原查询已有信息。"
-                "weights 的每个值必须是大于 0 的有限数字，总和应为 1；没有"
-                "明确维度倾向时必须等权，出现“重点、主要、更看重、其次、优先、侧重、"
-                "为主”等倾向时才按 query_text 拉开权重。不要输出 source、embedding_type"
-                "列表、解释或 Markdown。"
+                "weights 的每个值必须是大于 0 的有限数字，总和应为 1。把 query_text 当作"
+                "普通用户对目标素材的自然描述，不要求用户说出系统维度名；根据表达中各类"
+                "信息的相对关注程度大致分配权重即可，不追求过度精确。看不出明显倾向时"
+                "使用等权。不要输出 source、embedding_type 列表、解释或 Markdown。"
             ),
         }
         instruction = json.dumps(
@@ -303,49 +370,86 @@ class DoubaoClient:
             },
         )
 
-    async def rerank_search_results(
+    async def select_search_dimensions(
         self,
-        request: SearchRequest,
         *,
-        image_url: str | None,
-        candidates: Sequence[Mapping[str, object]],
-    ) -> RerankBatch:
-        """Rerank at most 30 hydrated candidates and provide an explainable reason."""
+        query_text: str,
+        asset_types: Sequence[AssetType],
+    ) -> SearchDimensionSuggestionResponse:
+        """Select up to four dimensions and resolve explicit query preferences."""
         system = {
             "role": "system",
             "content": (
-                "你是素材检索重排器。只输出 JSON："
-                '{"items":[{"asset_id":"...","relevance_score":0.0,"reason":"..."}]}。'
-                "必须只使用候选中的 asset_id，每个候选恰好一次；按相关度降序。"
-                "同时遵守用户的保持、增加、修改和排除约束；排除项应给极低分。"
-                "relevance_score 范围为 0 到 1，reason 简洁说明命中的内容、场景、"
-                "风格、色彩或情绪。"
+                "你是素材检索维度选择器。根据用户查询、目标素材类型以及全部候选维度，"
+                "选择最有助于召回目标素材的最小维度集合。只输出 JSON，根节点必须且只能"
+                "包含 embedding_types 和 weights，例如 "
+                '{"embedding_types":["native_multimodal","visual_style"],'
+                '"weights":{"native_multimodal":0.3,"visual_style":0.7}}。'
+                "必须选择 1 到 4 个不同维度，只能使用候选维度中的 embedding_type，且所选"
+                "维度必须支持至少一种目标素材类型。不要为了凑数增加维度，不要输出理由、"
+                "查询改写或 Markdown。把 query_text 当作普通用户向素材管理员描述想找的"
+                "东西，不要求用户知道系统维度名；大致判断哪些方面更影响检索并映射到内部"
+                "维度，不要过度分析细微措辞。weights 的键必须与 embedding_types 完全一致，"
+                "每个值必须大于 0 且总和为 1；按相对关注程度给出近似权重，看不出明显差异"
+                "时使用等权。"
             ),
         }
-        query = {
-            "query_type": request.query_type.value,
-            "query_text": request.query_text,
-            "candidates": list(candidates)[:30],
-        }
-        content: list[dict[str, object]] = [
+        candidates = [
             {
-                "type": "text",
-                "text": json.dumps(query, ensure_ascii=False),
+                "embedding_type": embedding_type.value,
+                "description": _EMBEDDING_TYPE_GUIDANCE[embedding_type],
+                "supported_asset_types": [
+                    asset_type.value
+                    for asset_type in AssetType
+                    if embedding_type_supports_asset_type(
+                        embedding_type=embedding_type,
+                        asset_type=asset_type,
+                    )
+                ],
             }
+            for embedding_type in EmbeddingType
         ]
-        if image_url:
-            content.append(
+        parsed = await self._deepseek_json(
+            messages=[
+                system,
                 {
-                    "type": "image_url",
-                    "image_url": {"url": image_url},
-                }
-            )
-        return await self._chat_json(
-            messages=[system, {"role": "user", "content": content}],
-            output_type=RerankBatch,
-            pool=self.capsule_pool,
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "query_text": query_text,
+                            "target_asset_types": [item.value for item in asset_types],
+                            "candidate_dimensions": candidates,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            output_type=SearchDimensionSuggestionResponse,
+            pool=self.search_understanding_pool,
             timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=min(
+                self._settings.search_query_max_output_tokens,
+                256,
+            ),
+            model=self._settings.search_query_model,
         )
+        selected = parsed.embedding_types
+        if len(selected) != len(set(selected)):
+            raise DoubaoResponseError("dimension selector returned duplicate dimensions")
+        if any(
+            not any(
+                embedding_type_supports_asset_type(
+                    embedding_type=embedding_type,
+                    asset_type=asset_type,
+                )
+                for asset_type in asset_types
+            )
+            for embedding_type in selected
+        ):
+            raise DoubaoResponseError(
+                "dimension selector returned a dimension unsupported by target asset types"
+            )
+        return parsed
 
     async def embed_multimodal(
         self,
@@ -425,7 +529,7 @@ class DoubaoClient:
         client = self._deepseek_client
         if client is None:
             raise DoubaoConfigurationError(
-                "CAPSULE_DEEPSEEK_API_KEY is required for query enhancement"
+                "CAPSULE_DEEPSEEK_API_KEY is required for text-model calls"
             )
 
         async def request() -> ModelT:
@@ -492,32 +596,53 @@ class DoubaoClient:
     ) -> ModelT:
         """Call Ark Responses API for the Lite model with thinking disabled."""
 
-        response_input = _responses_input(messages)
-
         async def request() -> ModelT:
-            response = await self._client.post(
-                "/responses",
-                json={
-                    "model": model or self._settings.understanding_model,
-                    "input": response_input,
-                    "thinking": {"type": "disabled"},
-                    "max_output_tokens": (
-                        max_output_tokens
-                        if max_output_tokens is not None
-                        else self._settings.understanding_max_output_tokens
-                    ),
-                    "text": {"format": {"type": "json_object"}},
-                },
-                timeout=timeout_seconds,
+            result, _ = await self._responses_json_request(
+                messages=messages,
+                output_type=output_type,
+                timeout_seconds=timeout_seconds,
+                max_output_tokens=max_output_tokens,
+                model=model,
             )
-            response.raise_for_status()
-            try:
-                decoded = json.loads(_extract_response_output_text(response.json()))
-            except json.JSONDecodeError as exc:
-                raise DoubaoResponseError("model response is not valid JSON") from exc
-            return output_type.model_validate(decoded)
+            return result
 
         return await pool.run(request)
+
+    async def _responses_json_request(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        output_type: type[ModelT],
+        timeout_seconds: float,
+        max_output_tokens: int | None = None,
+        model: str | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> tuple[ModelT, Any]:
+        """Execute one Responses JSON request without acquiring a call-pool slot."""
+
+        response = await self._client.post(
+            "/responses",
+            json={
+                "model": model or self._settings.understanding_model,
+                "input": _responses_input(messages),
+                "thinking": {"type": "disabled"},
+                "max_output_tokens": (
+                    max_output_tokens
+                    if max_output_tokens is not None
+                    else self._settings.understanding_max_output_tokens
+                ),
+                "text": {
+                    "format": dict(response_format or {"type": "json_object"}),
+                },
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        try:
+            decoded = json.loads(_extract_response_output_text(response.json()))
+        except json.JSONDecodeError as exc:
+            raise DoubaoResponseError("model response is not valid JSON") from exc
+        return output_type.model_validate(decoded), decoded
 
 
 def _asset_understanding_schema_message() -> dict[str, str]:
@@ -533,17 +658,21 @@ def _asset_understanding_schema_message() -> dict[str, str]:
             "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
             "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
             "的对象；value 最多五条短语，按表现力和区分度从高到低排列，使用中文分号连接。"
-            "每条短语必须采用“主体 + 当前维度信息”的结构，两部分之间只用一个空格分隔："
-            "先写属性实际归属的具体主体，"
-            "再写该主体在当前维度中的事实。例如 color_composition 应写“桌子 红色；星空 深蓝”，"
-            "不得只写“红色；深蓝”，也不得写无法对应到具体主体的关键词堆。主体必须来自素材"
-            "中可见、可读或有可靠上下文证据的对象，不得虚构；同一主体可以跨 Feature 重复作为"
-            "属性锚点，但后半部分只能写当前维度信息，不得混入其他维度。对于用途、受众、来源、"
-            "权利等素材级维度，使用“素材 + 维度事实”。evidence 最多一条，无证据时使用 null "
-            "和空数组。"
+            "短语结构由当前维度的语义决定。描述局部属性且需要明确归属时，可以使用"
+            "“具体对象 + 维度事实”，例如 color_composition 写“桌子 红色；星空 深蓝”。"
+            "scene_theme 在素材具有可辨识的整体环境、时间、事件或叙事情境时适用；只有角色"
+            "三视图、产品白底陈列或孤立元素展示时使用 not_applicable。"
+            "mood_atmosphere 依据画面或文本中可核验的光线、色彩、空间、天气、动作、声音和"
+            "叙事表现概括整体氛围；人物内心、动机或性格只有在素材明确呈现时才可作为依据，"
+            "线索不足时使用 unknown。"
+            "character_state_or_psychology 在素材包含人物、拟人角色或文本明确描述人物状态时"
+            "适用；中性陈列视角没有可区分的表情、姿态、身体或心理状态时使用 not_applicable。"
+            "target_audience、provenance 和 rights_version_authorship 以素材或上下文中的明确"
+            "信息为证据，证据不足时使用 unknown。所有事实来自素材中可见、可读或有可靠上下文"
+            "证据的内容。对于用途、受众、来源、权利等素材级维度，可以使用“素材 + 维度事实”。"
+            "evidence 最多一条，无证据时使用 null 和空数组。"
             "unknown 表示维度适用但证据不足，not_applicable 表示当前 Asset 不适用该维度；"
-            "这两种状态的 value 必须为 null。人物状态维度在没有清晰可见或明确描述的人物、"
-            "拟人角色时必须使用 not_applicable，禁止用场景、物体或怪物状态代替人物状态。"
+            "这两种状态的 value 必须为 null。"
             "asset_name 和 asset_description 必须以素材本身为主体；文件名、相对路径、"
             "目录层级、标题和关联文字中与素材一致的有效语义必须自然融入描述，但不得"
             "机械复述文件名、扩展名、目录、路径、来源路径或“位于某文件夹”等元数据措辞。"
@@ -573,12 +702,6 @@ def _asset_understanding_json_example() -> dict[str, object]:
         "confidence": 0.0,
         "evidence": [],
     }
-    not_applicable: dict[str, object] = {
-        "value": None,
-        "status": "not_applicable",
-        "confidence": 1.0,
-        "evidence": [],
-    }
     asset_usage: dict[str, object] = {
         "value": "素材 海报制作",
         "status": "metadata",
@@ -594,12 +717,12 @@ def _asset_understanding_json_example() -> dict[str, object]:
         "asset_name": "基于素材生成的简洁名称",
         "asset_description": "基于素材生成的客观完整描述",
         "features": {
-            "subject_content": observed("女孩 手持雨伞；小狗 跟随女孩"),
-            "scene_theme": observed("女孩 雨夜街道；远处 城市天际线"),
-            "visual_style": observed("人物 写实摄影；背景 电影感光影"),
-            "color_composition": observed("桌子 红色；星空 深蓝"),
-            "mood_atmosphere": observed("人物 轻松愉悦；街道 安静神秘"),
-            "character_state_or_psychology": not_applicable,
+            "subject_content": observed("女孩手持雨伞；小狗跟随女孩"),
+            "scene_theme": observed("雨夜城市街道中的同行；都市夜行叙事情境"),
+            "visual_style": observed("写实摄影；电影化视觉语言；细腻雨雾质感"),
+            "color_composition": observed("冷蓝主色与暖黄点光对比；平视中景构图"),
+            "mood_atmosphere": observed("安静神秘；略带紧张感"),
+            "character_state_or_psychology": observed("女孩神情专注；身体微微前倾"),
             "asset_usage": asset_usage,
             "target_audience": unknown,
             "provenance": unknown,
@@ -612,6 +735,89 @@ def _validation_error_text(exc: DoubaoResponseError | ValidationError) -> str:
     if isinstance(exc, ValidationError):
         return json.dumps(exc.errors(include_url=False), ensure_ascii=False, default=str)
     return str(exc)
+
+
+def _log_asset_understanding_normalization(
+    *,
+    asset_id: str,
+    decoded: Any,
+    request_attempt: str,
+    request_ms: float,
+) -> None:
+    actions = _asset_understanding_normalization_actions(decoded)
+    if not actions:
+        return
+    logger.info(
+        "asset understanding normalized asset_id=%s repair_method=local_normalization "
+        "request_attempt=%s request_ms=%.1f actions=%s",
+        asset_id,
+        request_attempt,
+        request_ms,
+        ",".join(actions),
+    )
+
+
+def _asset_understanding_normalization_actions(decoded: Any) -> list[str]:
+    """Describe only deterministic changes made by AssetUnderstanding validators."""
+
+    if not isinstance(decoded, Mapping):
+        return []
+    actions: set[str] = set()
+    for field_name, max_length in (("asset_name", 40), ("asset_description", 500)):
+        value = decoded.get(field_name)
+        if isinstance(value, str) and (value != value.strip() or len(value) > max_length):
+            actions.add("asset_text_bounded")
+
+    features = decoded.get("features")
+    feature_values: list[Any]
+    if isinstance(features, list):
+        actions.add("feature_array_to_object")
+        feature_values = features
+    elif isinstance(features, Mapping):
+        missing = _ASSET_FEATURE_NAMES.difference(str(key) for key in features)
+        if missing:
+            actions.add("missing_features_filled")
+        feature_values = list(features.values())
+    else:
+        return sorted(actions)
+
+    valid_statuses = {status.value for status in FeatureStatus}
+    for feature in feature_values:
+        if isinstance(feature, str):
+            actions.add("feature_string_expanded")
+            continue
+        if not isinstance(feature, Mapping):
+            continue
+        if "value" not in feature:
+            actions.add("missing_feature_value_filled")
+        raw_value = feature.get("value")
+        if isinstance(raw_value, list):
+            actions.add("feature_value_list_joined")
+        if feature.get("status") not in valid_statuses:
+            actions.add("feature_status_normalized")
+        raw_confidence = feature.get("confidence", 0.0)
+        try:
+            numeric_confidence = float(raw_confidence)
+        except (TypeError, ValueError, OverflowError):
+            numeric_confidence = math.nan
+        if (
+            isinstance(raw_confidence, bool)
+            or not isinstance(raw_confidence, (int, float))
+            or not (
+                math.isfinite(numeric_confidence) and 0.0 <= numeric_confidence <= 1.0
+            )
+        ):
+            actions.add("feature_confidence_normalized")
+        evidence = feature.get("evidence", [])
+        if (
+            isinstance(evidence, str)
+            or evidence is None
+            or not isinstance(evidence, list)
+            or len(evidence) > 1
+            or any(not isinstance(item, str) or len(item) > 80 for item in evidence)
+        ):
+            actions.add("feature_evidence_normalized")
+    return sorted(actions)
 
 
 def _extract_message_content(payload: Mapping[str, Any]) -> str:

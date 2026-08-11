@@ -145,7 +145,7 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
     assert submitted.json() == {"cluster_run_id": "run_api_test", "status": "pending"}
     assert repository.run.preprocessing["requested_pca_dimension"] == 8
     assert repository.run.preprocessing["vector_fusion"] == {
-        "requested_native_content_weight": 0.5,
+        "requested_native_content_weight": 0.3,
         "effective_native_content_weight": 1.0,
         "native_content_weight": 1.0,
         "dimension_weight": 0.0,
@@ -161,7 +161,7 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "min_samples": 3,
             "min_cluster_size": 3,
             "optimize_parameters": False,
-            "native_content_weight": 0.5,
+            "native_content_weight": 0.3,
         }
     ]
     assert polled.json()["status"] == "completed"

@@ -582,7 +582,6 @@ class SearchCapsule(Base, TimestampMixin):
     parsed_query: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     filters: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     fusion_method: Mapped[str] = mapped_column(String(64), nullable=False)
-    rerank_method: Mapped[str] = mapped_column(String(64), nullable=False)
     search_engine_version: Mapped[str] = mapped_column(String(128), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
     is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)

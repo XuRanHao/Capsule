@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import TypeVar
 
 import httpx
@@ -28,6 +29,27 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or status_code in {500, 502, 503, 504}
 
 
+class AsyncCallSlot:
+    """One reserved pool slot that can execute multiple retried calls in sequence."""
+
+    def __init__(self, pool: "AsyncCallPool") -> None:
+        self._pool = pool
+        self._active = True
+        self._operation_lock = asyncio.Lock()
+
+    async def run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        """Run one operation with a fresh retry budget inside this reservation."""
+        if not self._active:
+            raise RuntimeError("async call slot is no longer reserved")
+        async with self._operation_lock:
+            if not self._active:
+                raise RuntimeError("async call slot is no longer reserved")
+            return await self._pool._run_with_retry(operation)
+
+    def _close(self) -> None:
+        self._active = False
+
+
 class AsyncCallPool:
     """Bounded asynchronous execution with transient-error retries."""
 
@@ -47,12 +69,21 @@ class AsyncCallPool:
         return self._max_observed
 
     async def run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        """Reserve one slot for one retry-protected operation."""
+        async with self.reserve() as slot:
+            return await slot.run(operation)
+
+    @asynccontextmanager
+    async def reserve(self) -> AsyncIterator[AsyncCallSlot]:
+        """Reserve one slot across multiple sequential ``slot.run`` calls."""
         async with self._semaphore:
             self._in_flight += 1
             self._max_observed = max(self._max_observed, self._in_flight)
+            slot = AsyncCallSlot(self)
             try:
-                return await self._run_with_retry(operation)
+                yield slot
             finally:
+                slot._close()
                 self._in_flight -= 1
 
     async def _run_with_retry(self, operation: Callable[[], Awaitable[T]]) -> T:

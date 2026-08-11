@@ -28,8 +28,19 @@ from capsule.features import (
     embedding_type_supports_asset_type,
 )
 from capsule.media.model_image import ModelImageCache
+from capsule.media.video_frames import (
+    FFmpegVideoFrameExtractor,
+    VideoFrameExtractor,
+    logical_video_frame_request,
+)
+from capsule.pipeline.search_vector_index import (
+    SearchVectorIndexMaterializer,
+    SearchVectorMaterializationFailure,
+    SearchVectorMaterializationResult,
+)
 from capsule.schemas import EmbeddingResult
 from capsule.vectorstore.milvus import VectorRecord
+from capsule.video_output import is_logical_video_asset
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +56,12 @@ class EmbeddingVectorStore(Protocol):
     async def ensure_collection(self) -> bool: ...
 
     async def aupsert(self, records: list[VectorRecord]) -> None: ...
+
+    async def aupsert_fused(self, records: list[VectorRecord]) -> None: ...
+
+    async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]: ...
+
+    async def fetch_fused_vector_ids(self, embedding_ids: Sequence[str]) -> set[str]: ...
 
 
 class ArtifactReader(Protocol):
@@ -108,16 +125,21 @@ class AssetEmbeddingService:
         vector_store: EmbeddingVectorStore,
         artifact_reader: ArtifactReader | None = None,
         image_cache: ModelImageCache | None = None,
+        video_frame_extractor: VideoFrameExtractor | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._model_client = model_client
         self._vector_store = vector_store
+        self._search_vector_materializer = SearchVectorIndexMaterializer(vector_store)
         self._artifact_reader = artifact_reader
         self._image_cache = image_cache or ModelImageCache(
             target_bytes=settings.model_image_target_bytes,
             max_edge=settings.model_image_max_edge,
             max_entries=settings.model_image_cache_entries,
+        )
+        self._video_frame_extractor = video_frame_extractor or FFmpegVideoFrameExtractor(
+            concurrency=settings.ffmpeg_concurrency
         )
         self._native_semaphore = asyncio.Semaphore(settings.native_embedding_concurrency)
         self._video_native_semaphore = asyncio.Semaphore(
@@ -126,6 +148,10 @@ class AssetEmbeddingService:
         self._text_semaphore = asyncio.Semaphore(settings.embedding_concurrency)
         self._collection_ready = False
         self._collection_lock = asyncio.Lock()
+        self._search_vector_locks: dict[tuple[str, EmbeddingType], asyncio.Lock] = {}
+        self._search_vector_source_fingerprints: dict[
+            tuple[str, EmbeddingType], str
+        ] = {}
 
     async def run(
         self,
@@ -180,6 +206,265 @@ class AssetEmbeddingService:
                 )
             )
         )
+
+    async def materialize_search_vectors(
+        self,
+        *,
+        workspace_id: str,
+        embedding_types: Sequence[EmbeddingType],
+        asset_ids: Sequence[str] | None = None,
+    ) -> SearchVectorMaterializationResult:
+        """Build current non-native search vectors from already indexed raw pairs."""
+        selected_types = tuple(
+            embedding_type
+            for embedding_type in dict.fromkeys(embedding_types)
+            if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+        )
+        if not selected_types or (asset_ids is not None and not asset_ids):
+            return SearchVectorMaterializationResult(
+                requested_count=0,
+                materialized_count=0,
+                embedding_ids=(),
+            )
+
+        assets = await self._repository.list_assets(
+            workspace_id=workspace_id,
+            asset_ids=asset_ids,
+        )
+        assets_by_id = {asset.asset_id: asset for asset in assets}
+        if not assets_by_id:
+            return SearchVectorMaterializationResult(
+                requested_count=0,
+                materialized_count=0,
+                embedding_ids=(),
+            )
+
+        native_embeddings, *dimension_embedding_groups = await asyncio.gather(
+            self._repository.list_indexed_cluster_embeddings(
+                workspace_id=workspace_id,
+                embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
+                model_name=self._settings.embedding_model,
+                dimension=self._settings.embedding_dimension,
+                milvus_collection=self._settings.milvus_collection,
+                asset_ids=tuple(assets_by_id),
+            ),
+            *(
+                self._repository.list_indexed_cluster_embeddings(
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type.value,
+                    model_name=self._settings.embedding_model,
+                    dimension=self._settings.embedding_dimension,
+                    milvus_collection=self._settings.milvus_collection,
+                    asset_ids=tuple(assets_by_id),
+                )
+                for embedding_type in selected_types
+            ),
+        )
+        native_embeddings = [
+            item for item in native_embeddings if item.asset_id in assets_by_id
+        ]
+        dimension_embeddings = [
+            (embedding_type, item)
+            for embedding_type, group in zip(
+                selected_types,
+                dimension_embedding_groups,
+                strict=True,
+            )
+            for item in group
+            if item.asset_id in assets_by_id
+        ]
+        dimension_asset_ids = {item.asset_id for _, item in dimension_embeddings}
+        native_embeddings = [
+            item for item in native_embeddings if item.asset_id in dimension_asset_ids
+        ]
+        if not dimension_embeddings:
+            return SearchVectorMaterializationResult(
+                requested_count=0,
+                materialized_count=0,
+                embedding_ids=(),
+            )
+
+        await self._ensure_collection()
+        raw_embedding_ids = {
+            item.embedding_id for item in native_embeddings
+        } | {
+            item.embedding_id for _, item in dimension_embeddings
+        }
+        raw_vectors = await self._fetch_visible_vectors(raw_embedding_ids)
+
+        native_records = [
+            _current_vector_record(
+                asset=assets_by_id[item.asset_id],
+                embedding_id=item.embedding_id,
+                embedding_type=EmbeddingType.NATIVE_MULTIMODAL,
+                model_name=self._settings.embedding_model,
+                vector=raw_vectors[item.embedding_id],
+            )
+            for item in native_embeddings
+            if item.embedding_id in raw_vectors
+        ]
+        dimension_records: list[VectorRecord] = []
+        preparation_failures: list[SearchVectorMaterializationFailure] = []
+        for embedding_type, item in dimension_embeddings:
+            vector = raw_vectors.get(item.embedding_id)
+            if vector is None:
+                preparation_failures.append(
+                    SearchVectorMaterializationFailure(
+                        asset_id=item.asset_id,
+                        embedding_id=item.embedding_id,
+                        reason="current dimension raw vector is missing",
+                    )
+                )
+                continue
+            dimension_records.append(
+                _current_vector_record(
+                    asset=assets_by_id[item.asset_id],
+                    embedding_id=item.embedding_id,
+                    embedding_type=embedding_type,
+                    model_name=self._settings.embedding_model,
+                    vector=vector,
+                )
+            )
+
+        materialized = await self._search_vector_materializer.materialize(
+            native_records=native_records,
+            dimension_records=dimension_records,
+        )
+        return SearchVectorMaterializationResult(
+            requested_count=len(dimension_embeddings),
+            materialized_count=materialized.materialized_count,
+            embedding_ids=materialized.embedding_ids,
+            failures=(*preparation_failures, *materialized.failures),
+        )
+
+    async def ensure_search_vectors(
+        self,
+        *,
+        workspace_id: str,
+        embedding_types: Sequence[EmbeddingType],
+    ) -> dict[EmbeddingType, str]:
+        """Lazily materialize changed non-native search channels once per service."""
+        selected_types = tuple(
+            embedding_type
+            for embedding_type in dict.fromkeys(embedding_types)
+            if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+        )
+        outcomes = await asyncio.gather(
+            *(
+                self._ensure_search_vector_dimension(
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type,
+                )
+                for embedding_type in selected_types
+            )
+        )
+        return {
+            embedding_type: error
+            for embedding_type, error in zip(selected_types, outcomes, strict=True)
+            if error is not None
+        }
+
+    async def _ensure_search_vector_dimension(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: EmbeddingType,
+    ) -> str | None:
+        cache_key = (workspace_id, embedding_type)
+        lock = self._search_vector_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            try:
+                fingerprint, expected_ids = await self._search_vector_source_state(
+                    workspace_id=workspace_id,
+                    embedding_type=embedding_type,
+                )
+                if self._search_vector_source_fingerprints.get(cache_key) == fingerprint:
+                    return None
+                visible_ids = await self._vector_store.fetch_fused_vector_ids(expected_ids)
+                if visible_ids == set(expected_ids):
+                    self._search_vector_source_fingerprints[cache_key] = fingerprint
+                    return None
+                result = await self.materialize_search_vectors(
+                    workspace_id=workspace_id,
+                    embedding_types=[embedding_type],
+                )
+            except Exception as exc:
+                logger.exception(
+                    "search-vector materialization failed workspace=%s dimension=%s",
+                    workspace_id,
+                    embedding_type.value,
+                )
+                return str(exc) or type(exc).__name__
+            if result.failures:
+                return _materialization_failure_message(result)
+            self._search_vector_source_fingerprints[cache_key] = fingerprint
+            return None
+
+    async def _search_vector_source_state(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: EmbeddingType,
+    ) -> tuple[str, tuple[str, ...]]:
+        native_embeddings, dimension_embeddings = await asyncio.gather(
+            self._repository.list_indexed_cluster_embeddings(
+                workspace_id=workspace_id,
+                embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
+                model_name=self._settings.embedding_model,
+                dimension=self._settings.embedding_dimension,
+                milvus_collection=self._settings.milvus_collection,
+            ),
+            self._repository.list_indexed_cluster_embeddings(
+                workspace_id=workspace_id,
+                embedding_type=embedding_type.value,
+                model_name=self._settings.embedding_model,
+                dimension=self._settings.embedding_dimension,
+                milvus_collection=self._settings.milvus_collection,
+            ),
+        )
+        dimension_asset_ids = {item.asset_id for item in dimension_embeddings}
+        source_ids = [
+            *(
+                f"native:{item.asset_id}:{item.embedding_id}"
+                for item in native_embeddings
+                if item.asset_id in dimension_asset_ids
+            ),
+            *(
+                f"dimension:{item.asset_id}:{item.embedding_id}"
+                for item in dimension_embeddings
+            ),
+        ]
+        encoded = "\n".join(sorted(source_ids)).encode("utf-8")
+        expected_ids = tuple(sorted(item.embedding_id for item in dimension_embeddings))
+        return hashlib.sha256(encoded).hexdigest(), expected_ids
+
+    async def _fetch_visible_vectors(
+        self,
+        embedding_ids: set[str],
+    ) -> dict[str, list[float]]:
+        remaining = set(embedding_ids)
+        vectors: dict[str, list[float]] = {}
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self._settings.search_vector_visibility_timeout_seconds
+        )
+        delay = self._settings.search_vector_visibility_poll_initial_seconds
+        while remaining:
+            fetched = await self._vector_store.fetch_vectors(sorted(remaining))
+            for embedding_id in remaining.intersection(fetched):
+                vectors[embedding_id] = fetched[embedding_id]
+            remaining.difference_update(fetched)
+            if not remaining:
+                break
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                break
+            await asyncio.sleep(min(delay, deadline - now))
+            delay = min(
+                delay * 2,
+                self._settings.search_vector_visibility_poll_max_seconds,
+            )
+        return vectors
 
     async def _ensure_collection(self) -> None:
         """Initialize Milvus once even when streaming Assets arrive concurrently."""
@@ -300,6 +585,8 @@ class AssetEmbeddingService:
                     response = await self._model_client.embed_multimodal(
                         embedding_input.input_items
                     )
+                    # Release transient image/video payloads before vector persistence.
+                    del embedding_input
                 finally:
                     model_duration_ms = (time.perf_counter() - phase_started) * 1000
                 latency_ms = round(model_duration_ms)
@@ -430,6 +717,38 @@ class AssetEmbeddingService:
                 source_mode=EmbeddingSourceMode.ORIGINAL_IMAGE,
             )
         if asset.asset_type == AssetType.VIDEO_SEGMENT.value:
+            if is_logical_video_asset(
+                asset_type=asset.asset_type,
+                file_info=asset.file_info,
+            ):
+                frames = await self._video_frame_extractor.extract(
+                    logical_video_frame_request(
+                        source_uri=asset.source_storage_uri,
+                        file_info=asset.file_info,
+                        source_locator=asset.source_locator,
+                    )
+                )
+                if not frames:
+                    raise EmbeddingInputUnavailable(
+                        "logical video Asset has no readable representative frame"
+                    )
+                return _EmbeddingInput(
+                    input_items=[
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _data_uri(mime_type="image/jpeg", content=frame)
+                            },
+                        }
+                        for frame in frames
+                    ],
+                    source_content_hash=_hash_bytes(
+                        EmbeddingType.NATIVE_MULTIMODAL.value.encode("utf-8"),
+                        EmbeddingSourceMode.ORIGINAL_VIDEO.value.encode("utf-8"),
+                        *frames,
+                    ),
+                    source_mode=EmbeddingSourceMode.ORIGINAL_VIDEO,
+                )
             video_data_uri = await self._video_data_uri(asset)
             return _EmbeddingInput(
                 input_items=[{"type": "video_url", "video_url": {"url": video_data_uri}}],
@@ -454,6 +773,39 @@ class AssetEmbeddingService:
             )
         content = await self._artifact_reader.download_uri(asset.derived_file_uri)
         return _data_uri(mime_type="video/mp4", content=content)
+
+
+def _current_vector_record(
+    *,
+    asset: EmbeddingAsset,
+    embedding_id: str,
+    embedding_type: EmbeddingType,
+    model_name: str,
+    vector: list[float],
+) -> VectorRecord:
+    return VectorRecord(
+        embedding_id=embedding_id,
+        workspace_id=asset.workspace_id,
+        project_id=asset.project_id,
+        asset_id=asset.asset_id,
+        source_file_id=asset.source_file_id,
+        asset_type=asset.asset_type,
+        file_type=asset.file_type,
+        embedding_type=embedding_type.value,
+        model_name=model_name,
+        embedding_revision=asset.embedding_revision,
+        created_at_ts=int(asset.created_at.timestamp()),
+        vector=vector,
+    )
+
+
+def _materialization_failure_message(
+    result: SearchVectorMaterializationResult,
+) -> str:
+    return "; ".join(
+        f"{failure.asset_id}/{failure.embedding_id}: {failure.reason}"
+        for failure in result.failures
+    )
 
 
 def _text_input(

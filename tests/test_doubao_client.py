@@ -2,10 +2,11 @@ import json
 
 import httpx
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from capsule.config import Settings
-from capsule.enums import EmbeddingType
+from capsule.enums import AssetType, EmbeddingType
+from capsule.features import feature_dimension_scope_prompt
 from capsule.model_clients.doubao import DoubaoClient, DoubaoResponseError, _extract_embedding
 
 
@@ -20,6 +21,81 @@ def test_extract_embedding_accepts_ark_object_shape() -> None:
 def test_extract_embedding_rejects_missing_vector() -> None:
     with pytest.raises(DoubaoResponseError, match="does not contain a vector"):
         _extract_embedding({"data": {}})
+
+
+@pytest.mark.asyncio
+async def test_dimension_selector_sends_all_dimensions_and_resolves_weights() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/chat/completions"
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "embedding_types": [
+                                        "native_multimodal",
+                                        "color_composition",
+                                    ],
+                                    "weights": {
+                                        "native_multimodal": 0.3,
+                                        "color_composition": 0.7,
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
+            search_query_max_output_tokens=500,
+        )
+    )
+    await client.close()
+    client._deepseek_client = httpx.AsyncClient(
+        base_url="https://deepseek.example.test",
+        headers={"Authorization": "Bearer deepseek-test-key"},
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        suggestion = await client.select_search_dimensions(
+            query_text="想找蓝紫色占满画面、明暗反差很强的动画场景，人物是谁无所谓",
+            asset_types=[AssetType.IMAGE, AssetType.VIDEO_SEGMENT],
+        )
+    finally:
+        await client.close()
+
+    assert suggestion.embedding_types == [
+        EmbeddingType.NATIVE_MULTIMODAL,
+        EmbeddingType.COLOR_COMPOSITION,
+    ]
+    assert suggestion.weights == {
+        EmbeddingType.NATIVE_MULTIMODAL: 0.3,
+        EmbeddingType.COLOR_COMPOSITION: 0.7,
+    }
+    assert captured["thinking"] == {"type": "disabled"}
+    assert captured["max_tokens"] == 256
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    payload = json.loads(messages[1]["content"])
+    assert payload["query_text"] == (
+        "想找蓝紫色占满画面、明暗反差很强的动画场景，人物是谁无所谓"
+    )
+    assert payload["target_asset_types"] == ["image", "video_segment"]
+    assert len(payload["candidate_dimensions"]) == len(EmbeddingType)
+    assert {
+        item["embedding_type"] for item in payload["candidate_dimensions"]
+    } == {item.value for item in EmbeddingType}
 
 
 @pytest.mark.asyncio
@@ -170,7 +246,7 @@ async def test_query_enhancer_uses_deepseek_chat_with_bounded_non_thinking_outpu
         captured["messages"]
     )
     assert "原始内容" in str(captured["messages"])
-    assert "媒介类型、艺术流派" in str(captured["messages"])
+    assert "摄影、插画、三维渲染等媒介形态" in str(captured["messages"])
     assert "不能把其中的类别示例或枚举词复制进 query" in str(captured["messages"])
     assert "以目标维度为中心提高该维度信息密度" in str(captured["messages"])
     assert "只保留必要上下文" in str(captured["messages"])
@@ -267,7 +343,10 @@ async def test_query_enhancer_rejects_invalid_output(content: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_understand_asset_constrains_object_schema_and_repairs_invalid_shape() -> None:
+async def test_understand_asset_constrains_object_schema_and_repairs_invalid_shape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
     calls: list[dict[str, object]] = []
     feature_names = [
         "subject_content",
@@ -296,9 +375,7 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
         payload = json.loads(request.content)
         calls.append(payload)
         features: object = (
-            [{"key": "subject_content", **valid_features["subject_content"]}]
-            if len(calls) == 1
-            else valid_features
+            [{**valid_features["subject_content"]}] if len(calls) == 1 else valid_features
         )
         return httpx.Response(
             200,
@@ -324,6 +401,13 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
         result = await client.understand_asset(
             [
                 {
+                    "role": "system",
+                    "content": (
+                        "十个 Feature 的正向语义范围如下："
+                        f"{feature_dimension_scope_prompt()}。"
+                    ),
+                },
+                {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "分析这条测试素材"},
@@ -333,7 +417,8 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
                         },
                     ],
                 }
-            ]
+            ],
+            asset_id="asset_structure_repair",
         )
     finally:
         await client.close()
@@ -342,27 +427,149 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
     assert len(calls) == 2
     assert calls[0]["thinking"] == {"type": "disabled"}
     assert calls[0]["max_output_tokens"] == 2048
-    assert calls[0]["text"] == {"format": {"type": "json_object"}}
+    response_format = calls[0]["text"]["format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["name"] == "asset_understanding"
+    assert response_format["strict"] is True
+    assert response_format["schema"]["additionalProperties"] is False
+    assert response_format["schema"]["required"] == [
+        "asset_name",
+        "asset_description",
+        "features",
+    ]
+    assert "十个 Feature 的正向语义范围" not in str(response_format["schema"])
     first_input = calls[0]["input"]
     assert isinstance(first_input, list)
     assert "features 必须是对象，不能是数组" in str(first_input[0])
-    assert "主体 + 当前维度信息" in str(first_input[0])
+    assert "十个 Feature 的正向语义范围" not in str(first_input[0])
+    assert str(first_input).count("十个 Feature 的正向语义范围") == 1
+    assert "scene_theme=整幅内容可辨识的叙事语境" in str(first_input)
+    assert "缺少整体场景语境的主体陈列或孤立元素不适用" in str(first_input)
+    assert "mood_atmosphere=由画面或文本中可核验的光线" in str(first_input)
+    assert "人物内心、动机或性格只有在素材明确呈现时" in str(first_input)
+    assert "provenance=素材的来源链路" in str(first_input)
+    assert "角色三视图、产品白底陈列或孤立元素展示" in str(first_input[0])
     assert "桌子 红色；星空 深蓝" in str(first_input[0])
-    assert "不得只写“红色；深蓝”" in str(first_input[0])
     assert "not_applicable" in str(first_input[0])
-    assert "没有清晰可见或明确描述的人物" in str(first_input[0])
     assert "有效语义必须自然融入描述" in str(first_input[0])
     assert "不得机械复述文件名、扩展名、目录、路径" in str(first_input[0])
     assert "纯编号、序号或通用文件名必须忽略" in str(first_input[0])
     assert "asset_usage" in str(first_input[0])
     assert "description 和 source_path" in str(first_input[0])
-    assert "目录语义能确认用途时 status 使用 metadata" in str(first_input[0])
+    assert "目标交付物、投放或使用载体、制作任务、工作流环节" in str(first_input)
     assert "海报/素材/example.png" in str(first_input[0])
     assert "JSON 结构示例" in str(first_input[0])
     assert "禁止照抄" in str(first_input[0])
     assert all(name in str(first_input[0]) for name in feature_names)
     assert "input_image" in str(first_input)
     assert "上一份输出未通过 AssetUnderstanding 结构校验" in str(calls[1]["input"])
+    assert "asset_id=asset_structure_repair" in caplog.text
+    assert "error_type=ValidationError" in caplog.text
+    assert "first_attempt_ms=" in caplog.text
+    assert "repair_method=model_retry" in caplog.text
+    assert "repair_ms=" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_understand_asset_normalizes_unambiguous_shape_without_model_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "output_text": json.dumps(
+                    {
+                        "asset_name": "测试素材",
+                        "asset_description": "一条用于验证本地结构归一化的素材描述。",
+                        "features": [
+                            {
+                                "key": "subject_content",
+                                "value": ["圆形角色", "挥手动作"],
+                                "status": "observed",
+                                "confidence": "0.8",
+                                "evidence": "画面中可见角色挥手",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        )
+
+    caplog.set_level("INFO")
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.understand_asset(
+            [{"role": "user", "content": "分析测试素材"}],
+            asset_id="asset_local_normalization",
+        )
+    finally:
+        await client.close()
+
+    assert len(calls) == 1
+    assert result.features.subject_content.value == "圆形角色；挥手动作"
+    assert result.features.subject_content.confidence == 0.8
+    assert result.features.subject_content.evidence == ["画面中可见角色挥手"]
+    assert result.features.scene_theme.status.value == "unknown"
+    assert "asset_id=asset_local_normalization" in caplog.text
+    assert "repair_method=local_normalization" in caplog.text
+    assert "request_attempt=first" in caplog.text
+    assert "request_ms=" in caplog.text
+    assert "feature_array_to_object" in caplog.text
+    assert "feature_confidence_normalized" in caplog.text
+    assert "feature_evidence_normalized" in caplog.text
+    assert "feature_value_list_joined" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_understand_asset_attempts_at_most_one_model_repair() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "output_text": json.dumps(
+                    {
+                        "asset_name": "测试素材",
+                        "asset_description": "一条持续返回歧义结构的测试素材描述。",
+                        "features": [{"value": "无法确定所属维度"}],
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        )
+
+    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    await client.close()
+    client._client = httpx.AsyncClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValidationError, match="features must be an object"):
+            await client.understand_asset(
+                [{"role": "user", "content": "分析测试素材"}],
+                asset_id="asset_repair_limit",
+            )
+    finally:
+        await client.close()
+
+    assert len(calls) == 2
+    assert "上一份输出未通过 AssetUnderstanding 结构校验" in str(
+        calls[1]["input"]
+    )
 
 
 @pytest.mark.asyncio
@@ -397,41 +604,42 @@ async def test_embed_multimodal_requests_configured_dimension() -> None:
 
 
 @pytest.mark.asyncio
-async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> None:
+async def test_summarize_cluster_uses_text_model_with_thinking_disabled() -> None:
     captured: dict[str, object] = {}
     description = "共同呈现蓝紫色冷光、低饱和度和高明暗对比，整体色彩关系保持稳定。"
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/responses"
+        assert request.url.path == "/chat/completions"
         captured.update(json.loads(request.content))
         return httpx.Response(
             200,
             json={
-                "output": [
+                "choices": [
                     {
-                        "type": "message",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    {
-                                        "name": "蓝紫色霓虹夜景",
-                                        "description": description,
-                                        "common_features": ["蓝紫色冷光", "城市夜景"],
-                                        "internal_variance": "low",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                            }
-                        ],
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "name": "蓝紫色霓虹夜景",
+                                    "description": description,
+                                    "common_features": ["蓝紫色冷光", "城市夜景"],
+                                    "internal_variance": "low",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
                     }
                 ]
             },
         )
 
-    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
+        )
+    )
     await client.close()
-    client._client = httpx.AsyncClient(
+    client._deepseek_client = httpx.AsyncClient(
         base_url="https://example.test",
         transport=httpx.MockTransport(handler),
     )
@@ -439,16 +647,16 @@ async def test_summarize_cluster_uses_responses_api_with_thinking_disabled() -> 
         summary = await client.summarize_cluster(
             [
                 {"role": "system", "content": "只输出 JSON"},
-                {"role": "user", "content": "代表资产只有 asset_1"},
+                {"role": "user", "content": "簇内全部资产文本只有 asset_1"},
             ]
         )
     finally:
         await client.close()
 
-    assert captured["model"] == "doubao-seed-2-0-lite-260215"
+    assert captured["model"] == "deepseek-v4-flash"
     assert captured["thinking"] == {"type": "disabled"}
-    assert captured["text"] == {"format": {"type": "json_object"}}
-    assert "asset_1" in str(captured["input"])
+    assert captured["response_format"] == {"type": "json_object"}
+    assert "asset_1" in str(captured["messages"])
     assert summary.name == "蓝紫色霓虹夜景"
 
 
@@ -464,21 +672,32 @@ async def test_summarize_cluster_retries_once_when_response_violates_contract() 
         return httpx.Response(
             200,
             json={
-                "output_text": json.dumps(
+                "choices": [
                     {
-                        "name": "蓝紫色霓虹夜景",
-                        "description": description,
-                        "common_features": ["蓝紫色光线"],
-                        "internal_variance": "low",
-                    },
-                    ensure_ascii=False,
-                )
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "name": "蓝紫色霓虹夜景",
+                                    "description": description,
+                                    "common_features": ["蓝紫色光线"],
+                                    "internal_variance": "low",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
             },
         )
 
-    client = DoubaoClient(Settings(ark_api_key=SecretStr("test-key")))
+    client = DoubaoClient(
+        Settings(
+            ark_api_key=SecretStr("test-key"),
+            deepseek_api_key=SecretStr("deepseek-test-key"),
+        )
+    )
     await client.close()
-    client._client = httpx.AsyncClient(
+    client._deepseek_client = httpx.AsyncClient(
         base_url="https://example.test",
         transport=httpx.MockTransport(handler),
     )
@@ -486,7 +705,7 @@ async def test_summarize_cluster_retries_once_when_response_violates_contract() 
         summary = await client.summarize_cluster(
             [
                 {"role": "system", "content": "只输出 JSON"},
-                {"role": "user", "content": "代表资产只有 asset_1"},
+                {"role": "user", "content": "簇内全部资产文本只有 asset_1"},
             ]
         )
     finally:
@@ -494,6 +713,7 @@ async def test_summarize_cluster_retries_once_when_response_violates_contract() 
 
     assert summary.description == valid_description
     assert len(calls) == 2
-    assert "上一份输出未通过结构校验" in str(calls[1]["input"])
-    assert "description 必须是 30 到 80 个中文字符" in str(calls[1]["input"])
-    assert "不要输出 keywords" in str(calls[1]["input"])
+    assert "上一份输出未通过结构校验" in str(calls[1]["messages"])
+    assert "description 必须是 30 到 80 个中文字符" in str(calls[1]["messages"])
+    assert "common_features 必须有 1 到 3 项" in str(calls[1]["messages"])
+    assert "不要输出 keywords" in str(calls[1]["messages"])

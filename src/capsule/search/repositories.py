@@ -1,6 +1,7 @@
+import re
 from collections.abc import Mapping, Sequence
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 
 from capsule.db.models import (
     Asset,
@@ -11,8 +12,16 @@ from capsule.db.models import (
     UserFavorite,
 )
 from capsule.db.session import Database
-from capsule.enums import EmbeddingStatus, EmbeddingType
-from capsule.search.models import ClusterSearchResult, SearchAssetRecord, SearchFilters
+from capsule.enums import EmbeddingStatus, EmbeddingType, ProcessingStatus
+from capsule.search.models import (
+    ClusterSearchResult,
+    SearchAssetRecord,
+    SearchFilters,
+    TextSearchHit,
+)
+
+_TEXT_PART_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
 
 
 class PostgresAssetSearchRepository:
@@ -43,6 +52,9 @@ class PostgresAssetSearchRepository:
                 # retrievable units. Exclude stale or mistakenly indexed
                 # parent vectors during PostgreSQL hydration.
                 Asset.index_role != "parent",
+                # Timeline-only logical video segments deliberately opt out of
+                # enrichment/vector retrieval; suppress any historical vectors.
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
             )
         )
         if filters.project_id:
@@ -146,6 +158,148 @@ class PostgresAssetSearchRepository:
             for asset, source_file in rows
         }
 
+    async def get_children_by_parent_ids(
+        self,
+        *,
+        workspace_id: str,
+        parent_asset_ids: Sequence[str],
+    ) -> Mapping[str, SearchAssetRecord]:
+        """Load the active child blocks belonging to the requested parents.
+
+        Parent IDs come from already-authorized search hits. The workspace and
+        active source generation checks remain mandatory so context expansion
+        cannot cross a tenant boundary or revive stale chunks.
+        """
+        if not parent_asset_ids:
+            return {}
+        statement = (
+            select(Asset.asset_id)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+            .where(
+                Asset.workspace_id == workspace_id,
+                SourceFile.workspace_id == workspace_id,
+                Asset.parent_asset_id.in_(parent_asset_ids),
+                Asset.index_role == "child",
+                Asset.generation == SourceFile.processing_generation,
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
+            )
+        )
+        async with self._database.session() as session:
+            asset_ids = list((await session.scalars(statement)).all())
+        return await self.get_by_ids(
+            workspace_id=workspace_id,
+            asset_ids=asset_ids,
+            embedding_ids=(),
+        )
+
+    async def search_text(
+        self,
+        *,
+        workspace_id: str,
+        query_text: str,
+        filters: SearchFilters,
+        created_by: str,
+        limit: int,
+    ) -> Sequence[TextSearchHit]:
+        """Recall filename, path, raw text and description as one local route."""
+
+        if limit < 1:
+            return []
+        terms = _text_search_terms(query_text)
+        if not terms:
+            return []
+        text_fields = (
+            Asset.file_name,
+            SourceFile.relative_path,
+            Asset.raw_content,
+            Asset.asset_description,
+        )
+        statement = (
+            select(Asset, SourceFile)
+            .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
+            .where(
+                Asset.workspace_id == workspace_id,
+                SourceFile.workspace_id == workspace_id,
+                Asset.generation == SourceFile.processing_generation,
+                Asset.index_role != "parent",
+                Asset.processing_status != ProcessingStatus.SKIPPED.value,
+                or_(
+                    *(
+                        field.ilike(_contains_pattern(term), escape="\\")
+                        for term in terms
+                        for field in text_fields
+                    )
+                ),
+            )
+        )
+        if filters.project_id:
+            statement = statement.where(Asset.project_id == filters.project_id)
+        if filters.asset_type:
+            statement = statement.where(
+                Asset.asset_type.in_([item.value for item in filters.asset_type])
+            )
+        if filters.file_type:
+            statement = statement.where(Asset.file_type.in_(filters.file_type))
+        if filters.source_file_id:
+            statement = statement.where(Asset.source_file_id.in_(filters.source_file_id))
+        if filters.created_at_from:
+            statement = statement.where(Asset.created_at >= filters.created_at_from)
+        if filters.created_at_to:
+            statement = statement.where(Asset.created_at <= filters.created_at_to)
+        if filters.cluster_capsule_id:
+            statement = statement.join(
+                CurrentClusterMember,
+                CurrentClusterMember.asset_id == Asset.asset_id,
+            ).where(CurrentClusterMember.cluster_id == filters.cluster_capsule_id)
+        if filters.favorite is not None:
+            statement = statement.outerjoin(
+                UserFavorite,
+                and_(
+                    UserFavorite.asset_id == Asset.asset_id,
+                    UserFavorite.workspace_id == workspace_id,
+                    UserFavorite.created_by == created_by,
+                ),
+            )
+            statement = statement.where(
+                UserFavorite.favorite_id.is_not(None)
+                if filters.favorite
+                else UserFavorite.favorite_id.is_(None)
+            )
+        if filters.model_name:
+            statement = statement.where(
+                Asset.asset_id.in_(
+                    select(EmbeddingRecord.asset_id).where(
+                        EmbeddingRecord.workspace_id == workspace_id,
+                        EmbeddingRecord.status == EmbeddingStatus.INDEXED.value,
+                        EmbeddingRecord.model_name.in_(filters.model_name),
+                    )
+                )
+            )
+        candidate_limit = min(max(limit * 20, 200), 2_000)
+        statement = statement.order_by(Asset.updated_at.desc()).limit(candidate_limit)
+        async with self._database.session() as session:
+            rows = (await session.execute(statement)).all()
+
+        hits = [
+            TextSearchHit(
+                asset_id=asset.asset_id,
+                source_file_id=asset.source_file_id,
+                asset_type=asset.asset_type,
+                score=_text_relevance(
+                    query_text=query_text,
+                    terms=terms,
+                    file_name=asset.file_name,
+                    relative_path=source.relative_path,
+                    raw_content=asset.raw_content,
+                    asset_description=asset.asset_description,
+                ),
+            )
+            for asset, source in rows
+        ]
+        hits = [item for item in hits if item.score > 0]
+        hits.sort(key=lambda item: (-item.score, item.asset_id))
+        return hits[:limit]
+
     async def search_by_assets(
         self,
         *,
@@ -162,9 +316,7 @@ class PostgresAssetSearchRepository:
             select(
                 CurrentClusterMember.cluster_id,
                 func.count(CurrentClusterMember.asset_id).label("member_count"),
-                func.avg(func.coalesce(CurrentClusterMember.score, 1.0)).label(
-                    "average_score"
-                ),
+                func.avg(func.coalesce(CurrentClusterMember.score, 1.0)).label("average_score"),
             )
             .group_by(CurrentClusterMember.cluster_id)
             .subquery()
@@ -246,3 +398,68 @@ class PostgresAssetSearchRepository:
             )
         results.sort(key=lambda item: (-item.score, item.cluster_capsule_id))
         return results[:limit]
+
+
+def _text_search_terms(query_text: str, *, limit: int = 24) -> tuple[str, ...]:
+    normalized = " ".join(query_text.casefold().split())
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> bool:
+        if term not in seen:
+            seen.add(term)
+            candidates.append(term)
+        return len(candidates) >= limit
+
+    if 1 < len(normalized) <= 128 and add(normalized):
+        return tuple(candidates)
+    for part in _TEXT_PART_RE.findall(normalized[:2_000]):
+        if len(part) < 2:
+            continue
+        if _CJK_RE.search(part):
+            if len(part) <= 8 and add(part):
+                break
+            if any(add(part[index : index + 2]) for index in range(len(part) - 1)):
+                break
+        elif add(part):
+            break
+    return tuple(candidates)
+
+
+def _contains_pattern(term: str) -> str:
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _text_relevance(
+    *,
+    query_text: str,
+    terms: Sequence[str],
+    file_name: str | None,
+    relative_path: str | None,
+    raw_content: str | None,
+    asset_description: str | None,
+) -> float:
+    normalized_query = " ".join(query_text.casefold().split())
+    best = 0.0
+    fields = (
+        (file_name, 1.0),
+        (relative_path, 0.9),
+        (raw_content, 0.8),
+        (asset_description, 0.75),
+    )
+    for value, weight in fields:
+        normalized = value.casefold() if value else ""
+        if not normalized:
+            continue
+        matched = sum(term in normalized for term in terms)
+        if not matched:
+            continue
+        coverage = matched / len(terms)
+        full_match = bool(normalized_query and normalized_query in normalized)
+        exact_match = bool(normalized_query and normalized.strip() == normalized_query)
+        field_score = weight * (
+            0.2 + 0.45 * coverage + 0.2 * full_match + 0.15 * exact_match
+        )
+        best = max(best, field_score)
+    return min(1.0, best)

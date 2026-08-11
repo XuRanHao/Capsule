@@ -46,6 +46,153 @@ def test_video_processing_fingerprint_tracks_adaptive_segmentation_settings() ->
     assert baseline != changed
 
 
+async def test_logical_video_runner_rejects_an_unconfigured_source_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video = tmp_path / "external.mp4"
+    video.write_bytes(b"video")
+    failures: list[dict[str, object]] = []
+
+    class FakeDatabase:
+        pass
+
+    class FakeRepository:
+        async def create_job(self, **_values: object) -> str:
+            return "job-video-root"
+
+        async def prepare_source_file(self, **_values: object) -> object:
+            raise AssertionError("unapproved logical source must not be prepared")
+
+        async def record_file_failure(self, **values: object) -> None:
+            failures.append(values)
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
+        async def finalize_job(self, **_values: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        runner_module,
+        "AssetRepository",
+        lambda _database: FakeRepository(),
+    )
+
+    result = await PipelineRunner(
+        settings=Settings(
+            file_parse_concurrency=1,
+            import_root=tmp_path / "imports",
+            video_output_mode="logical",
+        ),
+        database=FakeDatabase(),  # type: ignore[arg-type]
+    ).run(tmp_path, "workspace-video")
+
+    assert result.failed_count == 1
+    assert result.asset_count == 0
+    assert len(failures) == 1
+    assert "CAPSULE_VIDEO_SOURCE_ROOTS" in str(failures[0]["error"])
+
+
+async def test_logical_video_runner_persists_pending_assets_and_dispatches_enrichment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+
+    class FakeDatabase:
+        pass
+
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.assets = []
+
+        async def create_job(self, **_values: object) -> str:
+            return "job_logical_video"
+
+        async def prepare_source_file(self, **_values: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_file_id="source_logical_video",
+                already_processed=False,
+                asset_count=0,
+                generation=3,
+            )
+
+        async def replace_assets(self, *, assets, **_values: object) -> SimpleNamespace:
+            self.assets = list(assets)
+            asset_ids = [asset.asset_id for asset in self.assets]
+            return SimpleNamespace(
+                asset_ids=asset_ids,
+                indexable_asset_ids=asset_ids,
+            )
+
+        async def record_file_success(self, **_values: object) -> None:
+            return None
+
+        async def record_file_failure(self, **_values: object) -> None:
+            raise AssertionError("logical video should be persisted")
+
+        async def add_job_stage_durations(self, **_values: object) -> None:
+            return None
+
+        async def finalize_job(self, **_values: object) -> None:
+            return None
+
+    class VideoAssetizer:
+        async def assetize(self, source_file) -> AssetizationResult:
+            return AssetizationResult(
+                source_file=source_file,
+                succeeded=True,
+                assets=[
+                    AssetDraft(
+                        asset_type=AssetType.VIDEO_SEGMENT,
+                        file_name=source.name,
+                        source_locator={
+                            "start_ms": index * 1_000,
+                            "end_ms": (index + 1) * 1_000,
+                        },
+                        file_info={
+                            "representative_frames": [
+                                {"timestamp_ms": index * 1_000 + 500}
+                            ]
+                        },
+                    )
+                    for index in range(2)
+                ],
+            )
+
+    repository = FakeRepository()
+    monkeypatch.setattr(runner_module, "AssetRepository", lambda _database: repository)
+    monkeypatch.setattr(runner_module, "_build_assetizer", lambda *_args: VideoAssetizer())
+    dispatched: list[list[str]] = []
+
+    async def on_assets_stored(asset_ids: list[str]) -> None:
+        dispatched.append(asset_ids)
+
+    result = await PipelineRunner(
+        settings=Settings(
+            file_parse_concurrency=1,
+            import_root=tmp_path,
+            video_output_mode="logical",
+        ),
+        database=FakeDatabase(),  # type: ignore[arg-type]
+    ).run(tmp_path, "workspace-video", on_assets_stored=on_assets_stored)
+
+    assert result.succeeded_count == 1
+    assert result.indexable_asset_ids == result.asset_ids
+    assert dispatched == [result.asset_ids]
+    assert len(repository.assets) == 2
+    assert all(asset.processing_status.value == "pending" for asset in repository.assets)
+    assert all(asset.derived_file_uri is None for asset in repository.assets)
+    assert all(asset.preview_uri is None for asset in repository.assets)
+    assert all(asset.transient_keyframe_jpegs == [] for asset in repository.assets)
+    assert all(
+        asset.file_info["video_output_mode"] == "logical"
+        for asset in repository.assets
+    )
+
+
 async def test_runner_reuses_resident_video_worker_across_runs(
     tmp_path: Path,
     monkeypatch,
@@ -232,7 +379,7 @@ async def test_run_skips_completed_source_with_same_fingerprint(
         lambda *_args: UnexpectedAssetizer(),
     )
     runner = PipelineRunner(
-        settings=Settings(file_parse_concurrency=1),
+        settings=Settings(file_parse_concurrency=1, video_output_mode="materialized"),
         database=FakeDatabase(),  # type: ignore[arg-type]
     )
 
@@ -426,7 +573,7 @@ async def test_video_segments_are_committed_and_emitted_one_by_one(
         events.append(f"understanding:{asset_ids[0]}")
 
     result = await PipelineRunner(
-        settings=Settings(file_parse_concurrency=1),
+        settings=Settings(file_parse_concurrency=1, video_output_mode="materialized"),
         database=FakeDatabase(),  # type: ignore[arg-type]
         object_storage=object(),  # type: ignore[arg-type]
     ).run(tmp_path, "workspace_video", on_assets_stored=on_assets_stored)

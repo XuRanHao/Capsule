@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
@@ -27,7 +28,13 @@ from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeCluste
 from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.import_service import AssetEnrichmentResult, enrich_assets
 from capsule.pipeline.runner import PipelineRunner
+from capsule.pipeline.search_vector_index import SearchVectorMaterializationResult
 from capsule.pipeline.understanding import AssetUnderstandingService
+from capsule.pipeline.video_task_service import (
+    VideoTaskScheduler,
+    VideoTaskSubmissionService,
+    VideoTaskWorker,
+)
 from capsule.search.evaluation import evaluate_search_file
 from capsule.storage.object_storage import ObjectStorage
 from capsule.vectorstore.milvus import MilvusVectorStore
@@ -147,6 +154,65 @@ def mps_video_command(
     typer.echo(result.model_dump_json(indent=2))
     if result.failed_count:
         raise typer.Exit(code=2)
+
+
+@app.command(name="submit-video-task")
+def submit_video_task_command(
+    input_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+) -> None:
+    """Create the durable PostgreSQL task, then publish one video delivery."""
+    result = asyncio.run(
+        VideoTaskSubmissionService().submit(input_path=input_path, workspace_id=workspace)
+    )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+
+
+@app.command(name="video-worker")
+def video_worker_command(
+    worker_id: Annotated[str | None, typer.Option("--worker-id")] = None,
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Process one Streams delivery and exit."),
+    ] = False,
+) -> None:
+    """Run the resident-MPS, PostgreSQL-fenced whole-video worker."""
+    worker = VideoTaskWorker.from_settings(worker_id=worker_id)
+    if once:
+        outcome = asyncio.run(_run_video_worker_once(worker))
+        typer.echo(json.dumps({"outcome": outcome}, ensure_ascii=False))
+        return
+    asyncio.run(worker.run_forever())
+
+
+@app.command(name="video-scheduler")
+def video_scheduler_command(
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Recover and publish due tasks once, then exit."),
+    ] = False,
+) -> None:
+    """Recover expired leases and dispatch PostgreSQL-backed video retries."""
+    scheduler = VideoTaskScheduler.from_settings()
+    if once:
+        published = asyncio.run(_run_video_scheduler_once(scheduler))
+        typer.echo(json.dumps({"published": published}, ensure_ascii=False))
+        return
+    asyncio.run(scheduler.run_forever())
+
+
+async def _run_video_worker_once(worker: VideoTaskWorker) -> str:
+    try:
+        return await worker.run_once()
+    finally:
+        await worker.close()
+
+
+async def _run_video_scheduler_once(scheduler: VideoTaskScheduler) -> int:
+    try:
+        return await scheduler.run_once()
+    finally:
+        await scheduler.close()
 
 
 @app.command(name="embed")
@@ -274,6 +340,42 @@ def evaluate_search_command(
     typer.echo(report.model_dump_json(indent=2))
     if strict and not report.passed:
         raise typer.Exit(code=1)
+
+
+@app.command(name="materialize-search-vectors")
+def materialize_search_vectors_command(
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+) -> None:
+    """Rebuild fixed 0.3/0.7 search vectors from existing raw embeddings."""
+    result = asyncio.run(_materialize_search_vectors(workspace_id=workspace))
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+
+
+async def _materialize_search_vectors(
+    *, workspace_id: str
+) -> SearchVectorMaterializationResult:
+    settings = get_settings()
+    database = Database(settings)
+    model_client = DoubaoClient(settings)
+    try:
+        service = AssetEmbeddingService(
+            settings=settings,
+            repository=EmbeddingRepository(database),
+            model_client=model_client,
+            vector_store=MilvusVectorStore(settings),
+            artifact_reader=ObjectStorage(settings),
+        )
+        return await service.materialize_search_vectors(
+            workspace_id=workspace_id,
+            embedding_types=[
+                embedding_type
+                for embedding_type in EmbeddingType
+                if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
+            ],
+        )
+    finally:
+        await model_client.close()
+        await database.dispose()
 
 
 async def _embed_assets(

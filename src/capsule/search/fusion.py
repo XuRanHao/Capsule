@@ -1,4 +1,14 @@
-from capsule.search.models import ChannelMatch, ChannelRecall, FusedHit, FusionMethod
+from collections.abc import Callable, Sequence
+
+from capsule.search.models import (
+    ChannelMatch,
+    ChannelRecall,
+    FusedHit,
+    FusionMethod,
+    TextSearchHit,
+)
+
+_LOCAL_TEXT_CHANNEL = "local_text"
 
 
 class WeightedReciprocalRankFusion:
@@ -98,6 +108,8 @@ class NormalizedWeightedSimilarityFusion:
 
 class FusionEngine:
     def __init__(self, *, rrf_k: int = 60, candidate_cap: int = 300) -> None:
+        self._rrf_k = rrf_k
+        self._candidate_cap = candidate_cap
         self._rrf = WeightedReciprocalRankFusion(
             rrf_k=rrf_k,
             candidate_cap=candidate_cap,
@@ -110,7 +122,66 @@ class FusionEngine:
         self,
         channels: tuple[ChannelRecall, ...],
         method: FusionMethod,
+        *,
+        text_hits: Sequence[TextSearchHit] = (),
     ) -> list[FusedHit]:
         if method is FusionMethod.NORMALIZED_WEIGHTED_SIMILARITY:
-            return self._normalized.fuse(channels)
-        return self._rrf.fuse(channels)
+            ranked = self._normalized.fuse(channels)
+            return _merge_text_hits(
+                ranked,
+                text_hits,
+                candidate_cap=self._candidate_cap,
+                contribution=lambda score, _rank: score,
+            )
+        ranked = self._rrf.fuse(channels)
+        return _merge_text_hits(
+            ranked,
+            text_hits,
+            candidate_cap=self._candidate_cap,
+            contribution=lambda _score, rank: 1 / (self._rrf_k + rank),
+        )
+
+
+def _merge_text_hits(
+    ranked: list[FusedHit],
+    text_hits: Sequence[TextSearchHit],
+    *,
+    candidate_cap: int,
+    contribution: Callable[[float, int], float],
+) -> list[FusedHit]:
+    """Merge one unified local-text route with the collective vector route."""
+
+    fused = {item.asset_id: item for item in ranked}
+    if not text_hits:
+        return ranked
+    scores = [item.score for item in text_hits]
+    minimum = min(scores)
+    maximum = max(scores)
+    spread = maximum - minimum
+    for rank, hit in enumerate(text_hits, start=1):
+        normalized = 1.0 if spread <= 1e-12 else (hit.score - minimum) / spread
+        amount = contribution(normalized, rank)
+        candidate = fused.setdefault(
+            hit.asset_id,
+            FusedHit(
+                asset_id=hit.asset_id,
+                source_file_id=hit.source_file_id,
+                asset_type=hit.asset_type,
+            ),
+        )
+        candidate.score += amount
+        candidate.matched_channels.append(
+            ChannelMatch(
+                channel=_LOCAL_TEXT_CHANNEL,
+                embedding_type=None,
+                embedding_id=None,
+                embedding_revision=None,
+                rank=rank,
+                similarity=hit.score,
+                fusion_contribution=amount,
+                rrf_contribution=amount,
+            )
+        )
+    return sorted(fused.values(), key=lambda item: (-item.score, item.asset_id))[
+        :candidate_cap
+    ]

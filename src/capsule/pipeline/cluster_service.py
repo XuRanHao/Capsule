@@ -26,7 +26,7 @@ from capsule.enums import (
     EmbeddingType,
 )
 from capsule.pipeline.cluster_summary import (
-    ClusterSummaryRepresentative,
+    ClusterSummaryAsset,
     build_cluster_summary_messages,
     ensure_path_aware_cluster_summary,
 )
@@ -44,6 +44,7 @@ from capsule.pipeline.clustering import (
     select_cluster_representatives,
 )
 from capsule.pipeline.vector_fusion import (
+    DEFAULT_NATIVE_CONTENT_WEIGHT,
     fuse_native_dimension_vectors,
     validate_native_content_weight,
 )
@@ -123,7 +124,7 @@ class ClusterService:
         min_samples: int = 3,
         min_cluster_size: int = 3,
         optimize_parameters: bool = False,
-        native_content_weight: float = 0.5,
+        native_content_weight: float = DEFAULT_NATIVE_CONTENT_WEIGHT,
         trigger: str = "user",
     ) -> EmbeddingTypeClusterResult:
         """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
@@ -535,8 +536,7 @@ class ClusterService:
         loaded: list[_LoadedClusterVector],
         selections: Mapping[int, list[RepresentativeSelection]],
     ) -> dict[int, _StoredClusterCapsule]:
-        """Call the naming model with each cluster's selected Asset rows only."""
-        assets_by_id = {item.asset.asset_id: item.asset for item in loaded}
+        """Call the naming model with complete text evidence from every cluster member."""
         concurrency = self._settings.capsule_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
@@ -549,20 +549,14 @@ class ClusterService:
             member_source_paths = [
                 loaded[int(index)].asset.source_relative_path for index in member_indices
             ]
-            prompt_representatives = [
-                ClusterSummaryRepresentative(
-                    asset_id=representative.asset_id,
-                    role=ClusterRepresentativeRole(representative.role),
-                    asset_type=assets_by_id[representative.asset_id].asset_type,
-                    asset_name=assets_by_id[representative.asset_id].asset_name,
-                    asset_description=assets_by_id[representative.asset_id].asset_description,
-                    asset_features=assets_by_id[representative.asset_id].asset_features,
-                    file_tree_context=assets_by_id[representative.asset_id].file_tree_context,
-                    membership_probability=representative.membership_probability,
-                    distance_to_medoid=representative.distance_to_medoid,
-                    source_relative_path=assets_by_id[representative.asset_id].source_relative_path,
+            prompt_assets = [
+                ClusterSummaryAsset(
+                    asset_id=loaded[int(index)].asset.asset_id,
+                    asset_description=loaded[int(index)].asset.asset_description,
+                    asset_features=loaded[int(index)].asset.asset_features,
+                    source_relative_path=loaded[int(index)].asset.source_relative_path,
                 )
-                for representative in representatives
+                for index in member_indices
             ]
             async with semaphore:
                 summary = await self._model_client.summarize_cluster(
@@ -570,7 +564,7 @@ class ClusterService:
                         embedding_type=embedding_type.value,
                         member_count=len(member_indices),
                         average_membership_probability=average_probability,
-                        representatives=prompt_representatives,
+                        assets=prompt_assets,
                         member_source_paths=member_source_paths,
                     )
                 )

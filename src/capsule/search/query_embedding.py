@@ -4,6 +4,7 @@ import math
 from collections.abc import Awaitable
 
 from capsule.config import Settings
+from capsule.enums import EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.contracts import QueryEmbeddingClient
 from capsule.search.models import (
@@ -16,6 +17,10 @@ from capsule.search.models import (
     SearchRequest,
 )
 from capsule.search.query_parser import QueryParser
+from capsule.vector_fusion import (
+    DEFAULT_NATIVE_CONTENT_WEIGHT,
+    fuse_native_dimension_vectors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +95,11 @@ class QueryEmbeddingService:
                 for item in vectors
             ]
             reasons.append("failed query routes were removed and weights were renormalized")
+        deduplicated_reasons = tuple(dict.fromkeys(reasons))
         return QueryEmbeddingPlan(
             vectors=tuple(vectors),
-            degraded=bool(reasons),
-            degraded_reasons=tuple(reasons),
+            degraded=bool(deduplicated_reasons),
+            degraded_reasons=deduplicated_reasons,
         )
 
     async def _embed_dimension(
@@ -104,6 +110,78 @@ class QueryEmbeddingService:
         image_url: str | None,
         operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
     ) -> tuple[QueryVector, str | None]:
+        original_embedding = self._embed_original_query(
+            request=request,
+            image_url=image_url,
+            operation_cache=operation_cache,
+        )
+        if dimension.embedding_type is EmbeddingType.NATIVE_MULTIMODAL:
+            original_result, fallback_reason = await original_embedding
+            vector = self._normalize(original_result)
+        else:
+            (original_result, original_fallback), (
+                dimension_result,
+                dimension_fallback,
+            ) = await asyncio.gather(
+                original_embedding,
+                self._embed_dimension_query(
+                    request=request,
+                    dimension=dimension,
+                    image_url=image_url,
+                    operation_cache=operation_cache,
+                ),
+            )
+            vector = fuse_native_dimension_vectors(
+                native_vector=self._normalize(original_result),
+                dimension_vector=self._normalize(dimension_result),
+                native_content_weight=DEFAULT_NATIVE_CONTENT_WEIGHT,
+            )
+            fallback_reason = original_fallback or dimension_fallback
+
+        return (
+            QueryVector(
+                channel=dimension.embedding_type.value,
+                embedding_type=dimension.embedding_type,
+                vector=vector,
+                weight=dimension.weight,
+            ),
+            fallback_reason,
+        )
+
+    async def _embed_original_query(
+        self,
+        *,
+        request: SearchRequest,
+        image_url: str | None,
+        operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
+    ) -> tuple[EmbeddingResult, str | None]:
+        operation_key: tuple[str, ...]
+        if request.query_type is QueryType.IMAGE:
+            if image_url is None:
+                raise QueryEmbeddingError("image route requires a resolved image URL")
+            operation_key = ("image", image_url)
+        elif request.query_type is QueryType.IMAGE_TEXT:
+            if image_url is None:
+                raise QueryEmbeddingError("joint route requires a resolved image URL")
+            assert request.query_text is not None
+            operation_key = ("image_text", image_url, request.query_text)
+        else:
+            assert request.query_text is not None
+            operation_key = ("text", request.query_text)
+        return await self._embed_with_joint_fallback(
+            operation_key=operation_key,
+            image_url=image_url,
+            operation_cache=operation_cache,
+        )
+
+    async def _embed_dimension_query(
+        self,
+        *,
+        request: SearchRequest,
+        dimension: DimensionQuery,
+        image_url: str | None,
+        operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
+    ) -> tuple[EmbeddingResult, str | None]:
         operation_key: tuple[str, ...]
         if dimension.source is QueryDimensionSource.IMAGE:
             if image_url is None:
@@ -121,6 +199,19 @@ class QueryEmbeddingService:
         else:
             operation_key = ("text", dimension.query)
 
+        return await self._embed_with_joint_fallback(
+            operation_key=operation_key,
+            image_url=image_url,
+            operation_cache=operation_cache,
+        )
+
+    async def _embed_with_joint_fallback(
+        self,
+        *,
+        operation_key: tuple[str, ...],
+        image_url: str | None,
+        operation_cache: dict[tuple[str, ...], asyncio.Task[EmbeddingResult]],
+    ) -> tuple[EmbeddingResult, str | None]:
         fallback_reason: str | None = None
         try:
             result = await self._cached_call(
@@ -128,10 +219,7 @@ class QueryEmbeddingService:
                 operation_key,
             )
         except Exception as exc:
-            if (
-                dimension.source is QueryDimensionSource.JOINT
-                and image_url is not None
-            ):
+            if operation_key[0] == "image_text" and image_url is not None:
                 logger.warning(
                     "joint image_text embedding failed; image fallback used",
                     exc_info=True,
@@ -142,19 +230,8 @@ class QueryEmbeddingService:
                 )
                 fallback_reason = "joint image_text embedding failed; image fallback used"
             else:
-                raise QueryEmbeddingError(
-                    f"{dimension.embedding_type.value} query embedding failed"
-                ) from exc
-
-        return (
-            QueryVector(
-                channel=dimension.embedding_type.value,
-                embedding_type=dimension.embedding_type,
-                vector=self._normalize(result),
-                weight=dimension.weight,
-            ),
-            fallback_reason,
-        )
+                raise QueryEmbeddingError("query embedding operation failed") from exc
+        return result, fallback_reason
 
     async def _call(self, operation: Awaitable[EmbeddingResult]) -> EmbeddingResult:
         async with self._semaphore:

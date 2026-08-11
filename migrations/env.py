@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from capsule.config import get_settings
 from capsule.db import Base
+from capsule.db.video_tasks import VideoProcessingTask  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
