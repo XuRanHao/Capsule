@@ -15,7 +15,12 @@ from capsule.db.repositories import (
     ClusterMembershipWrite,
     CurrentClusterPublish,
 )
-from capsule.enums import ClusterInternalVariance, ClusterRunStatus, EmbeddingType
+from capsule.enums import (
+    ClusterAlgorithm,
+    ClusterInternalVariance,
+    ClusterRunStatus,
+    EmbeddingType,
+)
 from capsule.pipeline import cluster_service as cluster_service_module
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.clustering import ClusterResult, HdbscanParameters, dataset_hash
@@ -150,14 +155,14 @@ class ConcurrentSummaryClient(FakeSummaryClient):
 
 @pytest.mark.asyncio
 async def test_cluster_service_runs_each_requested_embedding_type_independently() -> None:
-    visual_assets = _assets(EmbeddingType.VISUAL_STYLE)
+    visual_assets = _assets(EmbeddingType.VISUAL_PRESENTATION)
     native_assets = [
         replace(asset, embedding_id=f"emb_{EmbeddingType.NATIVE_MULTIMODAL.value}_{index}")
         for index, asset in enumerate(visual_assets)
     ]
     assets_by_type = {
         EmbeddingType.NATIVE_MULTIMODAL: native_assets,
-        EmbeddingType.VISUAL_STYLE: visual_assets,
+        EmbeddingType.VISUAL_PRESENTATION: visual_assets,
     }
     vectors = {
         asset.embedding_id: _vector(index)
@@ -185,7 +190,8 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     )
     visual_result = await service.run(
         workspace_id="workspace_cluster_service",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
+        algorithm=ClusterAlgorithm.HDBSCAN,
         pca_dimension=2,
         min_cluster_size=4,
         min_samples=2,
@@ -193,31 +199,32 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
     )
 
     assert native_result.embedding_type == EmbeddingType.NATIVE_MULTIMODAL
-    assert visual_result.embedding_type == EmbeddingType.VISUAL_STYLE
+    assert visual_result.embedding_type == EmbeddingType.VISUAL_PRESENTATION
     assert native_result.status == ClusterRunStatus.COMPLETED
     assert visual_result.status == ClusterRunStatus.COMPLETED
     assert len(repository.runs) == 2
     assert {run["embedding_type"] for run in repository.runs.values()} == {
         "native_multimodal",
-        "visual_style",
+        "visual_presentation",
     }
     runs_by_type = {run["embedding_type"]: run for run in repository.runs.values()}
     assert (
         runs_by_type["native_multimodal"]["preprocessing"]["parameter_selection"] == "user_defined"
     )
+    assert runs_by_type["native_multimodal"]["parameters"]["algorithm"] == "complete_link"
     assert runs_by_type["native_multimodal"]["parameters"]["candidates_evaluated"] == 1
     assert (
-        runs_by_type["visual_style"]["preprocessing"]["parameter_selection"]
+        runs_by_type["visual_presentation"]["preprocessing"]["parameter_selection"]
         == "user_defined_selection_optimized"
     )
-    assert runs_by_type["visual_style"]["parameters"]["candidates_evaluated"] > 1
-    assert runs_by_type["visual_style"]["preprocessing"]["pca_dimension"] == 2
-    assert runs_by_type["visual_style"]["parameters"]["min_cluster_size"] == 4
-    assert runs_by_type["visual_style"]["parameters"]["min_samples"] == 2
+    assert runs_by_type["visual_presentation"]["parameters"]["candidates_evaluated"] > 1
+    assert runs_by_type["visual_presentation"]["preprocessing"]["pca_dimension"] == 2
+    assert runs_by_type["visual_presentation"]["parameters"]["min_cluster_size"] == 4
+    assert runs_by_type["visual_presentation"]["parameters"]["min_samples"] == 2
     assert all(len(memberships) == 20 for memberships in repository.memberships.values())
     assert {capsule.embedding_type for capsule in repository.capsules} == {
         "native_multimodal",
-        "visual_style",
+        "visual_presentation",
     }
     assert summary_client.prompts
     for messages in summary_client.prompts:
@@ -225,9 +232,7 @@ async def test_cluster_service_runs_each_requested_embedding_type_independently(
         assert len(payload["cluster_assets"]) == 10
         assert "representative_assets" not in payload
         assert all("asset_description" in item for item in payload["cluster_assets"])
-        assert all(
-            "current_dimension_description" in item for item in payload["cluster_assets"]
-        )
+        assert all("current_dimension_description" in item for item in payload["cluster_assets"])
 
 
 @pytest.mark.asyncio
@@ -256,44 +261,6 @@ async def test_cluster_service_records_insufficient_type_without_model_call() ->
     assert result.vector_count == 0
     assert not summary_client.prompts
     assert next(iter(repository.runs.values()))["status"] == ClusterRunStatus.INSUFFICIENT_DATA
-
-
-@pytest.mark.asyncio
-async def test_asset_usage_capsules_keep_path_context_out_of_description() -> None:
-    embedding_type = EmbeddingType.ASSET_USAGE
-    assets = _assets(embedding_type)
-    repository = FakeClusterRepository()
-    summary_client = FakeSummaryClient()
-    service = ClusterService(
-        settings=Settings(
-            ark_api_key=SecretStr("test-key"),
-            embedding_model="test-embedding",
-            embedding_dimension=2,
-            milvus_collection="cluster-test",
-        ),
-        embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
-        cluster_repository=repository,  # type: ignore[arg-type]
-        vector_store=FakeVectorStore(
-            {asset.embedding_id: _vector(index) for index, asset in enumerate(assets)}
-        ),
-        model_client=summary_client,
-    )
-
-    result = await service.run(
-        workspace_id="workspace_cluster_service",
-        embedding_type=embedding_type,
-    )
-
-    assert result.status == ClusterRunStatus.COMPLETED
-    assert repository.capsules
-    assert all("海报/素材/" not in capsule.summary.description for capsule in repository.capsules)
-    for messages in summary_client.prompts:
-        assert "成员数量、完整路径、文件名和目录统计作为证据元数据保留" in str(
-            messages[0]["content"]
-        )
-        payload = json.loads(str(messages[1]["content"]))
-        assert payload["member_source_context"]["directory_counts"]
-        assert payload["member_source_context"]["representative_files"]
 
 
 @pytest.mark.asyncio
@@ -326,13 +293,14 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
     result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=embedding_type,
+        algorithm=ClusterAlgorithm.HDBSCAN,
     )
 
     assert result.status == ClusterRunStatus.COMPLETED
     assert result.vector_count == 12
     assert result.cluster_count > 0
     run = next(iter(repository.runs.values()))
-    assert run["parameters"]["min_cluster_size"] == 3
+    assert run["parameters"]["min_cluster_size"] == 2
     assert run["parameters"]["min_samples"] == 3
     assert run["parameters"]["cluster_selection_epsilon"] == 0.5
     assert len(next(iter(repository.memberships.values()))) == 12
@@ -340,21 +308,17 @@ async def test_cluster_service_clusters_fewer_than_fifteen_vectors() -> None:
 
 @pytest.mark.asyncio
 async def test_dimension_clustering_fuses_native_vectors_and_excludes_missing_native() -> None:
-    dimension_type = EmbeddingType.VISUAL_STYLE
+    dimension_type = EmbeddingType.VISUAL_PRESENTATION
     dimension_assets = _assets(dimension_type, count=4)
     native_assets = [
         replace(asset, embedding_id=f"native_{index}")
         for index, asset in enumerate(dimension_assets)
     ]
     vectors = {
-        asset.embedding_id: [1.0, float(index + 1)]
-        for index, asset in enumerate(dimension_assets)
+        asset.embedding_id: [1.0, float(index + 1)] for index, asset in enumerate(dimension_assets)
     }
     vectors.update(
-        {
-            native_assets[index].embedding_id: [float(index + 1), 1.0]
-            for index in range(3)
-        }
+        {native_assets[index].embedding_id: [float(index + 1), 1.0] for index in range(3)}
     )
     repository = FakeClusterRepository()
     service = ClusterService(
@@ -392,14 +356,14 @@ async def test_dimension_clustering_fuses_native_vectors_and_excludes_missing_na
         "effective_native_content_weight": 0.25,
         "native_content_weight": 0.25,
         "dimension_weight": 0.75,
-        "components": ["native_multimodal", "visual_style"],
+        "components": ["native_multimodal", "visual_presentation"],
     }
     assert run["dataset_hash"] != dataset_hash(run["embedding_ids"])
 
 
 @pytest.mark.asyncio
 async def test_dimension_clustering_fetches_only_nonzero_weight_components() -> None:
-    dimension_type = EmbeddingType.VISUAL_STYLE
+    dimension_type = EmbeddingType.VISUAL_PRESENTATION
     dimension_assets = _assets(dimension_type, count=3)
     native_assets = [
         replace(asset, embedding_id=f"native_{index}")
@@ -472,7 +436,7 @@ async def test_dimension_clustering_fetches_only_nonzero_weight_components() -> 
 
 
 @pytest.mark.asyncio
-async def test_cluster_service_merges_capsules_but_preserves_raw_hdbscan_labels(
+async def test_cluster_service_preserves_hdbscan_clusters_without_post_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     embedding_type = EmbeddingType.TARGET_AUDIENCE
@@ -515,17 +479,16 @@ async def test_cluster_service_merges_capsules_but_preserves_raw_hdbscan_labels(
     result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=embedding_type,
+        algorithm=ClusterAlgorithm.HDBSCAN,
     )
 
     assert result.status == ClusterRunStatus.COMPLETED
-    assert result.cluster_count == 2
-    assert sorted(capsule.member_count for capsule in repository.capsules) == [3, 6]
+    assert result.cluster_count == 3
+    assert sorted(capsule.member_count for capsule in repository.capsules) == [3, 3, 3]
 
     run = next(iter(repository.runs.values()))
-    merge_metadata = run["parameters"]["semantic_merge"]
-    assert merge_metadata["raw_cluster_count"] == 3
-    assert merge_metadata["merged_cluster_count"] == 2
-    assert merge_metadata["raw_to_merged_labels"] == {"0": 0, "1": 0, "2": 2}
+    assert "semantic_merge" not in run["parameters"]
+    assert "semantic_merge_vector_space" not in run["preprocessing"]
 
     memberships = next(iter(repository.memberships.values()))
     assert {membership.hdbscan_label for membership in memberships} == {0, 1, 2}
@@ -537,15 +500,14 @@ async def test_cluster_service_merges_capsules_but_preserves_raw_hdbscan_labels(
         }
         for label in {0, 1, 2}
     }
-    assert capsule_ids_by_raw_label[0] == capsule_ids_by_raw_label[1]
-    assert capsule_ids_by_raw_label[0] != capsule_ids_by_raw_label[2]
+    assert len({next(iter(ids)) for ids in capsule_ids_by_raw_label.values()}) == 3
 
 
 @pytest.mark.asyncio
 async def test_cluster_service_generates_capsules_with_configured_concurrency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    embedding_type = EmbeddingType.VISUAL_STYLE
+    embedding_type = EmbeddingType.VISUAL_PRESENTATION
     assets = _assets(embedding_type, count=12)
     matrix = np.asarray(
         [[1.0, float(index) / 100.0] for index in range(len(assets))],
@@ -573,7 +535,6 @@ async def test_cluster_service_generates_capsules_with_configured_concurrency(
             embedding_model="test-embedding",
             embedding_dimension=2,
             milvus_collection="cluster-test",
-            cluster_semantic_merge_enabled=False,
             capsule_concurrency=3,
         ),
         embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
@@ -587,6 +548,7 @@ async def test_cluster_service_generates_capsules_with_configured_concurrency(
     result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=embedding_type,
+        algorithm=ClusterAlgorithm.HDBSCAN,
     )
 
     assert result.status == ClusterRunStatus.COMPLETED
@@ -598,7 +560,7 @@ async def test_cluster_service_generates_capsules_with_configured_concurrency(
 async def test_cluster_service_excludes_residents_and_publishes_only_dynamic_clusters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    embedding_type = EmbeddingType.VISUAL_STYLE
+    embedding_type = EmbeddingType.VISUAL_PRESENTATION
     assets = _assets(embedding_type, count=12)
     resident_ids = {asset.asset_id for asset in assets[:3]}
     dynamic_assets = assets[3:]
@@ -628,7 +590,6 @@ async def test_cluster_service_excludes_residents_and_publishes_only_dynamic_clu
             embedding_model="test-embedding",
             embedding_dimension=2,
             milvus_collection="cluster-test",
-            cluster_semantic_merge_enabled=False,
         ),
         embedding_repository=FakeEmbeddingRepository({embedding_type: assets}),  # type: ignore[arg-type]
         cluster_repository=history,  # type: ignore[arg-type]
@@ -645,21 +606,19 @@ async def test_cluster_service_excludes_residents_and_publishes_only_dynamic_clu
     result = await service.run(
         workspace_id="workspace_cluster_service",
         embedding_type=embedding_type,
+        algorithm=ClusterAlgorithm.HDBSCAN,
     )
 
     assert result.status == ClusterRunStatus.COMPLETED
     run = next(iter(history.runs.values()))
     assert run["preprocessing"]["resident_excluded_count"] == 3
-    assert set(run["embedding_ids"]).isdisjoint(
-        {asset.embedding_id for asset in assets[:3]}
-    )
+    assert set(run["embedding_ids"]).isdisjoint({asset.embedding_id for asset in assets[:3]})
     published_asset_ids = {
-        member.asset_id
-        for cluster in current.publish_calls[0]
-        for member in cluster.members
+        member.asset_id for cluster in current.publish_calls[0] for member in cluster.members
     }
     assert published_asset_ids == {asset.asset_id for asset in dynamic_assets}
     assert published_asset_ids.isdisjoint(resident_ids)
+    assert all(not cluster.embedding_vector for cluster in current.publish_calls[0])
 
 
 def _assets(
@@ -676,7 +635,7 @@ def _assets(
             asset_name=f"测试资产 {index}",
             asset_description=f"测试资产 {index} 的描述。",
             asset_features={
-                "visual_style": {"value": "测试风格"},
+                "visual_presentation": {"value": "测试风格"},
                 "asset_usage": {
                     "value": "海报制作",
                     "status": "metadata",

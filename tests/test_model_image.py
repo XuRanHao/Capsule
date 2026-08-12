@@ -63,6 +63,27 @@ def test_model_image_enforces_edge_limit_even_when_source_is_below_byte_limit() 
     assert prepared.resized is True
 
 
+def test_understanding_model_image_uses_fixed_square_without_cropping() -> None:
+    output = BytesIO()
+    Image.new("RGBA", (400, 100), (255, 0, 0, 128)).save(output, format="PNG")
+
+    prepared = prepare_model_image(
+        output.getvalue(),
+        "image/png",
+        target_bytes=512 * 1024,
+        fixed_size=256,
+    )
+
+    assert (prepared.width, prepared.height) == (256, 256)
+    assert prepared.mime_type == "image/jpeg"
+    assert prepared.resized
+    with Image.open(BytesIO(prepared.content)) as image:
+        assert image.size == (256, 256)
+        # The wide source is contained and letterboxed vertically rather than cropped.
+        assert image.getpixel((128, 10))[0] > 240
+        assert image.getpixel((128, 128))[0] > image.getpixel((128, 128))[1]
+
+
 @pytest.mark.asyncio
 async def test_model_image_cache_coalesces_concurrent_preparation() -> None:
     output = BytesIO()

@@ -14,7 +14,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from capsule.config import Settings
 from capsule.db.repositories import ClusterBootstrapState
@@ -110,10 +110,27 @@ class FullClusterRunner(Protocol):
         cluster_run_id: str | None = None,
         pca_dimension: int = 8,
         min_samples: int = 3,
-        min_cluster_size: int = 3,
+        min_cluster_size: int = 2,
         optimize_parameters: bool = False,
         trigger: str = "user",
     ) -> object: ...
+
+
+class IncrementalRelationGraphUpdater(Protocol):
+    async def update_assets(
+        self,
+        *,
+        workspace_id: str,
+        asset_ids: Sequence[str],
+        affected_cluster_ids: Sequence[str],
+    ) -> Any: ...
+
+    async def build(
+        self,
+        *,
+        workspace_id: str,
+        force_rebuild: bool = False,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(slots=True, frozen=True)
@@ -183,6 +200,9 @@ class ClusterBootstrapDecision:
     eligible_asset_count: int
     minimum_asset_count: int
     should_bootstrap: bool
+    new_asset_count: int = 0
+    new_asset_ratio: float = 0.0
+    should_recluster: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -393,11 +413,13 @@ class IncrementalClusterCoordinator:
         assignment_service: IncrementalClusterService,
         repository: ClusterBootstrapRepository,
         cluster_runner: FullClusterRunner,
+        relation_graph_updater: IncrementalRelationGraphUpdater | None = None,
     ) -> None:
         self._settings = settings
         self._assignment_service = assignment_service
         self._repository = repository
         self._cluster_runner = cluster_runner
+        self._relation_graph_updater = relation_graph_updater
         self._semaphore = asyncio.Semaphore(settings.cluster_bootstrap_concurrency)
         self._running_keys: set[tuple[str, EmbeddingType]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -426,12 +448,44 @@ class IncrementalClusterCoordinator:
             embedding_type=embedding_type,
             state=state,
             minimum_asset_count=self._settings.cluster_bootstrap_minimum_count,
+            auto_recluster_new_ratio=self._settings.cluster_auto_recluster_new_ratio,
+            auto_recluster_minimum_new_count=(
+                self._settings.cluster_auto_recluster_minimum_new_count
+            ),
         )
+        if (
+            embedding_type is EmbeddingType.SUBJECT_CONTENT
+            and self._relation_graph_updater is not None
+        ):
+            try:
+                await self._relation_graph_updater.update_assets(
+                    workspace_id=workspace_id,
+                    asset_ids=asset_ids,
+                    affected_cluster_ids=tuple(
+                        dict.fromkeys(item.cluster_id for item in assignment.assignments)
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "incremental relationship update failed for workspace=%s",
+                    workspace_id,
+                )
         key = (workspace_id, embedding_type)
-        scheduled = decision.should_bootstrap and key not in self._running_keys
+        scheduled = (
+            decision.should_bootstrap
+            or (
+                embedding_type is EmbeddingType.SUBJECT_CONTENT
+                and decision.should_recluster
+            )
+        ) and key not in self._running_keys
         if scheduled:
             self._running_keys.add(key)
-            task = asyncio.create_task(self._run_bootstrap(key))
+            trigger = (
+                "automatic_bootstrap"
+                if decision.should_bootstrap
+                else "automatic_recluster"
+            )
+            task = asyncio.create_task(self._run_full(key, trigger=trigger))
             self._tasks.add(task)
             task.add_done_callback(self._bootstrap_done)
         return IncrementalClusterProcessResult(
@@ -444,15 +498,30 @@ class IncrementalClusterCoordinator:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _run_bootstrap(self, key: tuple[str, EmbeddingType]) -> None:
+    async def _run_full(
+        self,
+        key: tuple[str, EmbeddingType],
+        *,
+        trigger: str,
+    ) -> None:
         workspace_id, embedding_type = key
         try:
             async with self._semaphore:
-                await self._cluster_runner.run(
+                result = await self._cluster_runner.run(
                     workspace_id=workspace_id,
                     embedding_type=embedding_type,
-                    trigger="automatic_bootstrap",
+                    trigger=trigger,
                 )
+                status = getattr(getattr(result, "status", None), "value", None)
+                if (
+                    embedding_type is EmbeddingType.SUBJECT_CONTENT
+                    and self._relation_graph_updater is not None
+                    and status in {"completed", "insufficient_data"}
+                ):
+                    await self._relation_graph_updater.build(
+                        workspace_id=workspace_id,
+                        force_rebuild=True,
+                    )
         finally:
             self._running_keys.discard(key)
 
@@ -470,6 +539,8 @@ def evaluate_cluster_bootstrap(
     embedding_type: EmbeddingType,
     state: ClusterBootstrapState,
     minimum_asset_count: int,
+    auto_recluster_new_ratio: float = 1.0,
+    auto_recluster_minimum_new_count: int = 2**31 - 1,
 ) -> ClusterBootstrapDecision:
     """Decide whether one dimension needs its first automatic baseline run."""
 
@@ -477,6 +548,12 @@ def evaluate_cluster_bootstrap(
         raise ValueError("minimum_asset_count must be at least 1")
     if state.eligible_asset_count < 0:
         raise ValueError("eligible_asset_count cannot be negative")
+    new_asset_count = state.new_asset_count
+    new_asset_ratio = (
+        new_asset_count / state.eligible_asset_count
+        if state.eligible_asset_count
+        else 0.0
+    )
     return ClusterBootstrapDecision(
         workspace_id=workspace_id,
         embedding_type=embedding_type,
@@ -488,6 +565,14 @@ def evaluate_cluster_bootstrap(
             not state.has_baseline
             and not state.run_in_progress
             and state.eligible_asset_count >= minimum_asset_count
+        ),
+        new_asset_count=new_asset_count,
+        new_asset_ratio=new_asset_ratio,
+        should_recluster=(
+            state.has_baseline
+            and not state.run_in_progress
+            and new_asset_count >= auto_recluster_minimum_new_count
+            and new_asset_ratio >= auto_recluster_new_ratio
         ),
     )
 

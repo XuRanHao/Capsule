@@ -7,7 +7,12 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from capsule.enums import AssetType, EmbeddingType
-from capsule.features import embedding_type_supports_any_asset_type
+from capsule.features import (
+    ACTIVE_EMBEDDING_TYPES,
+    embedding_type_supports_any_asset_type,
+)
+
+_ACTIVE_EMBEDDING_TYPE_SET = frozenset(ACTIVE_EMBEDDING_TYPES)
 
 
 class QueryType(StrEnum):
@@ -66,7 +71,7 @@ class SearchRequest(BaseModel):
     embedding_types: list[EmbeddingType] = Field(
         default_factory=lambda: [EmbeddingType.NATIVE_MULTIMODAL],
         min_length=1,
-        max_length=len(EmbeddingType),
+        max_length=len(ACTIVE_EMBEDDING_TYPES),
     )
     dimension_weights: dict[EmbeddingType, float] | None = None
     fusion_method: FusionMethod = FusionMethod.WEIGHTED_RRF
@@ -98,6 +103,15 @@ class SearchRequest(BaseModel):
         self.query_image_upload_id = upload_id
         if len(self.embedding_types) != len(set(self.embedding_types)):
             raise ValueError("embedding_types must contain unique values")
+        inactive = [
+            embedding_type.value
+            for embedding_type in self.embedding_types
+            if embedding_type not in _ACTIVE_EMBEDDING_TYPE_SET
+        ]
+        if inactive:
+            raise ValueError(
+                f"embedding_types {', '.join(inactive)} are no longer active"
+            )
         if self.dimension_weights is not None:
             if set(self.dimension_weights) != set(self.embedding_types):
                 raise ValueError(
@@ -139,8 +153,8 @@ class DimensionQuery(BaseModel):
 class QueryEnhancement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=12)
-    weights: dict[EmbeddingType, float] = Field(min_length=1, max_length=12)
+    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=4)
+    weights: dict[EmbeddingType, float] = Field(min_length=1, max_length=4)
 
 
 class SearchDimensionSuggestionRequest(BaseModel):
@@ -170,6 +184,11 @@ class SearchDimensionSuggestionResponse(BaseModel):
         if set(self.weights) != set(self.embedding_types):
             raise ValueError("weights keys must exactly match embedding_types")
         if any(
+            embedding_type not in _ACTIVE_EMBEDDING_TYPE_SET
+            for embedding_type in self.embedding_types
+        ):
+            raise ValueError("dimension selector returned an inactive embedding type")
+        if any(
             not math.isfinite(weight) or weight <= 0
             for weight in self.weights.values()
         ):
@@ -183,7 +202,7 @@ class SearchDimensionSuggestionResponse(BaseModel):
 
 
 class ParsedQuery(BaseModel):
-    dimension_queries: list[DimensionQuery] = Field(min_length=1, max_length=12)
+    dimension_queries: list[DimensionQuery] = Field(min_length=1, max_length=4)
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> "ParsedQuery":

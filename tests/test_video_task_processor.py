@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from capsule.enums import AssetType
 from capsule.parsers.video import VideoAnalysisProgress
@@ -12,6 +15,8 @@ from capsule.pipeline.asset_factory import AssetFactory
 from capsule.pipeline.video_task_processor import CapsuleVideoTaskProcessor
 from capsule.pipeline.video_task_runtime import (
     LeaseLostError,
+    ProcessingTaskKind,
+    ResourceClass,
     VideoTaskLease,
     VideoTaskMessage,
     VideoTaskProgress,
@@ -54,6 +59,42 @@ class _AdaptiveParser:
                 transient_keyframe_jpegs=[b"adaptive-frame"],
             ),
         ]
+
+
+@pytest.mark.parametrize(
+    "message_changes",
+    [
+        {"task_kind": ProcessingTaskKind.TEXT},
+        {"resource_class": ResourceClass.CPU},
+        {"route_key": "untrusted-route"},
+        {"processor_version": 2},
+    ],
+)
+def test_processor_rejects_each_message_lease_identity_mismatch(
+    message_changes: dict[str, object],
+) -> None:
+    message = VideoTaskMessage(
+        task_id="task-1",
+        job_id="job-1",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=1,
+    )
+    lease = VideoTaskLease(
+        task_id="task-1",
+        source_file_id="source-1",
+        source_generation=1,
+        attempt=1,
+        worker_id="worker-1",
+        result_version=1,
+        lease_token="claim-unique-token",
+    )
+
+    with pytest.raises(LeaseLostError, match="does not match"):
+        CapsuleVideoTaskProcessor._assert_message_matches_lease(
+            replace(message, **message_changes),  # type: ignore[arg-type]
+            lease,
+        )
 
 
 class _Writer:
@@ -114,6 +155,7 @@ async def test_processor_reuses_adaptive_parser_and_fences_every_segment_commit(
         attempt=2,
         worker_id="worker-1",
         result_version=3,
+        lease_token="test-claim-token-1",
     )
     parser = _AdaptiveParser()
     committer = _Committer()
@@ -176,6 +218,7 @@ async def test_processor_rejects_a_lease_for_another_source_generation(tmp_path:
         attempt=1,
         worker_id="worker-1",
         result_version=1,
+        lease_token="test-claim-token-2",
     )
     processor = CapsuleVideoTaskProcessor(
         parser=_AdaptiveParser(),  # type: ignore[arg-type]
@@ -215,6 +258,7 @@ async def test_logical_processor_commits_timeline_metadata_without_media_writer(
         attempt=1,
         worker_id="worker-1",
         result_version=1,
+        lease_token="test-claim-token-3",
     )
     committer = _Committer()
     processor = CapsuleVideoTaskProcessor(

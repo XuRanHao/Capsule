@@ -36,6 +36,16 @@ export type AssetRecord = {
     string,
     | string
     | {
+        applicability?: "applicable" | "unknown" | "not_applicable";
+        items?: Array<{
+          subject?: string;
+          description: string;
+          salience: number | "high" | "medium" | "low";
+          status: "observed" | "inferred" | "metadata" | "user_supplied";
+          evidence: string[];
+          ocr_confidence?: number | null;
+        }>;
+        // Historical records are normalized by the UI until Understanding reruns.
         value?: string | null;
         status?: string;
         confidence?: number;

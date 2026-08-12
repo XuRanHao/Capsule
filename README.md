@@ -1,436 +1,157 @@
 # Capsule
 
-Capsule is a proof-of-concept system for turning local Markdown, plain-text,
-Word, PDF, image, and video files into multimodal assets, embeddings, explainable HDBSCAN
-clusters, and searchable results.
+Capsule 是一个面向个人多模态素材的整理、理解与检索系统。
 
-The repository is split at the Asset/Embedding handoff. The role B retrieval
-path is implemented end to end:
+它可以统一处理文档、图片和视频，将原始文件转换为结构化素材，并提供内容理解、
+自动切分、聚类、关系图和多模态搜索能力。
+
+## 主要能力
+
+- 导入 Markdown、TXT、Word、PDF、图片和视频。
+- 自动提取文档中的正文、表格和图片。
+- 统一切分不同格式的文档，并保留父子层级和来源信息。
+- 对视频进行内容感知切分，生成适合检索和浏览的片段。
+- 为素材生成内容描述与多维语义特征。
+- 对相近素材进行自动聚类，并支持增量归类和人工调整。
+- 构建素材与实体之间的关系图。
+- 使用文字、图片或图文组合搜索素材。
+- 在网页中查看素材、任务、聚类、关系图和搜索结果。
+
+## 处理流程
 
 ```text
-text / image / image+text
-  -> manual or text-model-assisted dimension selection
-  -> optional text Dimension Query Enhancer
-  -> fixed 0.3 original-content + 0.7 dimension query-vector fusion
-  -> 12-channel Milvus recall
-  -> PostgreSQL filters
-  -> RRF or normalized-similarity fusion
-  -> deduplication and source folding
-  -> Search Capsule snapshot
+导入文件
+  -> 识别文件类型
+  -> 文档 / 图片 / 视频处理
+  -> 生成结构化素材
+  -> 内容理解与向量化
+  -> 聚类和关系图更新
+  -> 搜索与浏览
 ```
 
-The ingestion/orchestration skeleton, Asset contracts, clustering primitives,
-local runtime, full retrieval API, and web workbench live in the same project.
-The non-dry-run role A import runner is still a separate implementation
-boundary; retrieval starts from persisted Assets and Embedding Records.
+### 文档
 
-## Core decisions
+TXT、Word 和 PDF 会先转换为统一的 Markdown 结构，再进入公共切块流程。
 
-- Python 3.11+ and a single-process asynchronous runner.
-- Separate concurrency pools for Asset understanding, search Dimension Query Enhancer,
-  native embedding, text embedding, capsule naming, file parsing, and FFmpeg.
-- Enrichment overlaps native embedding with Asset understanding, then runs the
-  independent description and Feature embedding channels concurrently.
-- PostgreSQL stores business metadata; Milvus stores vectors; S3/TOS-compatible
-  object storage stores source and derived media.
-- Re-imports replace a source file by `(workspace_id, relative_path)` and keep
-  stable Asset IDs where the Asset locator is unchanged.
-- Images referenced by Markdown preserve nearby source text separately from
-  model-generated descriptions.
-- Native video vectors use the rendered segment MP4 through a temporary signed
-  object-storage URL; they record `embedding_source_mode=original_video`.
-- Document chunk token counts run locally with the bundled DeepSeek V3 BPE
-  tokenizer. Ark `/tokenization` remains available only as an explicit
-  validation client and is not required for parsing documents.
+- 普通内容以约 400 Token 为目标切分。
+- 理想范围为 250～500 Token。
+- 过短内容会与相邻内容合并，合并后最多约 600 Token。
+- 表格保持完整，不在表格内部切分。
+- 文档中的图片会作为独立素材处理，并保留原文档来源。
+- 子块用于精确检索，父块用于补充完整上下文。
+- Token 数量默认由项目内置的 DeepSeek V3 tokenizer 在本地计算。
 
-## Local environment
+### 图片
 
-The supported local stack is:
+图片会生成适合模型处理的统一尺寸版本，并保留其文件、文档或页面来源。
+文档内嵌图片会先过滤无效小图，再按需要进行 OCR 和内容理解。
 
-- Python 3.11 managed by `uv`
-- Node.js 22+ and npm
+### 视频
+
+视频先按固定时间间隔采样，再结合连续画面内容和变化强度生成时间片段。
+关键帧直接复用采样结果，最终保留轻量图片，避免重复解码原视频。
+
+当前方案的重点是：先尽量识别真实内容边界，再合并过碎且内容连续的片段，
+而不是简单地把所有视频固定切成相同时长。
+
+## 聚类与关系图
+
+系统可以从不同语义维度组织素材，例如主体内容、场景主题和视觉呈现。
+新素材可先尝试加入现有聚类；积累到一定数量后，再触发整体重聚类。
+
+关系图用于展示素材、人物、物体或其他实体之间的联系，并支持持久化和增量更新。
+
+## 搜索
+
+搜索支持：
+
+- 纯文本查询。
+- 纯图片查询。
+- 图片与文字组合查询。
+- 按 Workspace、文件类型、时间和聚类过滤。
+- 从多个语义维度召回并合并结果。
+
+## 本地启动
+
+### 环境要求
+
+- Python 3.11+
+- `uv`
+- Node.js 22+
 - Docker Desktop
-- FFmpeg and FFprobe
-- PostgreSQL 17, Milvus 2.5, etcd, and MinIO from Docker Compose
+- FFmpeg 与 FFprobe
+- Apple Silicon + MPS（仅视频处理需要）
 
-The setup is idempotent. It installs backend/frontend dependencies, starts all
-infrastructure, applies PostgreSQL migrations, creates the MinIO bucket and
-Milvus collection, and seeds `workspace_demo`.
+### 初始化
 
 ```bash
 make setup
 ```
 
-Then put the real provider keys in the ignored local `.env` file:
+首次运行时，在项目根目录的 `.env` 中填写模型服务密钥：
 
 ```dotenv
 CAPSULE_ARK_API_KEY=your-ark-api-key
 CAPSULE_DEEPSEEK_API_KEY=your-deepseek-api-key
-CAPSULE_DEEPSEEK_BASE_URL=https://api.deepseek.com
-# 可选：覆盖项目内置的 DeepSeek V3 tokenizer.json
-# CAPSULE_DOCUMENT_TOKENIZER_PATH=/absolute/path/to/tokenizer.json
-# 子块以 400 token 为目标，低于 250 时与邻块合并，500 是结构化软上限
-CAPSULE_DOCUMENT_CHUNK_MIN_TOKENS=250
-CAPSULE_DOCUMENT_CHUNK_TARGET_TOKENS=400
-CAPSULE_DOCUMENT_CHUNK_MAX_TOKENS=500
-CAPSULE_DOCUMENT_CHUNK_MERGE_MAX_TOKENS=600
-CAPSULE_DOCUMENT_PARENT_MAX_TOKENS=2000
-# Word/PDF 内嵌图片在本地抽取，并按需使用 RapidOCR
-CAPSULE_DOCUMENT_OCR_ENABLED=true
 ```
 
-Start the API and frontend together:
+`.env` 不会被 Git 跟踪；其他可配置项可参考 `.env.example`。
+
+### 启动开发环境
 
 ```bash
 make dev
 ```
 
-Open `http://localhost:3000`. The API is at `http://localhost:8010`, its
-interactive documentation is at `http://localhost:8010/docs`, MinIO is at
-`http://localhost:9001`, and Milvus listens on `localhost:19530`.
+默认入口：
 
-Useful commands:
+- Web：<http://localhost:3000>
+- API：<http://localhost:8010>
+- API 文档：<http://localhost:8010/docs>
 
-```bash
-make status       # configuration, containers, and API health
-make bootstrap    # re-run migrations and idempotent resource initialization
-make test         # backend and frontend quality gates
-make down         # stop containers without deleting persisted data
-```
-
-The assetization CLI persists Markdown, plain-text, Word, PDF, image and video Assets to
-PostgreSQL. Video segments additionally persist playable MP4/JPEG artifacts in
-MinIO/S3. A failed file is recorded without aborting the batch. Use the `embed`
-CLI command after import to write `EmbeddingRecord` metadata and vectors to
-Milvus.
-
-Repeated imports reuse a completed source when its workspace-relative path,
-SHA-256 digest, and assetization fingerprint are unchanged. The fingerprint
-includes parser configuration that affects generated Assets. Increment
-`CAPSULE_ASSETIZATION_VERSION` after changing parser behavior or media output
-semantics so unchanged source bytes are processed once with the new logic.
-
-To reset persisted PostgreSQL/Milvus/MinIO data, use
-`docker compose down -v` deliberately; `make down` preserves it.
-
-## Manual quick start
-
-1. Copy the environment template.
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   Model workloads are configured independently: `CAPSULE_SEARCH_QUERY_MODEL`
-   and `CAPSULE_DEEPSEEK_API_KEY` control text Dimension Query Enhancer calls;
-   `CAPSULE_UNDERSTANDING_MODEL`, `CAPSULE_EMBEDDING_MODEL`, and
-   `CAPSULE_ARK_API_KEY` control the Ark workloads. Changing the embedding model
-   requires rebuilding its indexes; changing only the Query Enhancer model does not.
-
-2. Start local infrastructure.
-
-   ```bash
-   docker compose up -d
-   ```
-
-3. Create a virtual environment and install the project.
-
-   ```bash
-   uv sync --extra dev
-   . .venv/bin/activate
-   ```
-
-4. Apply migrations and initialize all storage resources.
-
-   ```bash
-   uv run capsule bootstrap --workspace workspace_demo
-   ```
-
-5. Inspect the configuration and scan a test directory.
-
-   ```bash
-   capsule doctor
-   capsule scan ./test-data
-   capsule pipeline ./test-data --workspace workspace_demo --dry-run
-   capsule pipeline ./test-data --workspace workspace_demo --execute
-   capsule embed --workspace workspace_demo
-   capsule materialize-search-vectors --workspace workspace_demo
-   ```
-
-The non-dry-run pipeline persists Markdown, plain-text, Word, PDF, image and video Assets
-to PostgreSQL. Video input requires the host MPS worker described below; a
-video failure is recorded without aborting the rest of the batch.
-
-Browser imports stream each committed Asset into a bounded enrichment queue
-instead of waiting for the complete folder. Native embedding starts alongside
-Understanding; that Asset's text embedding channels start only after its
-description and Feature fields have been committed. The import Job is finalized
-only after both file processing and the enrichment queue have drained.
-
-`capsule embed` processes one embedding route at a time. Its default is native
-multimodal: Markdown uses the block text, images are sent inline as their
-original bytes, and video uses the derived playable MP4 inline as a Base64 Data
-URI. Repeat `--asset-id` to limit a batch; already indexed logical inputs are
-skipped unless `--force` is set.
-
-Raw model vectors remain in the canonical Milvus collection. Browser imports
-automatically materialize each non-native search vector as normalized
-`0.3 * native_multimodal + 0.7 * current_dimension` in a separate, rebuildable
-Milvus collection. Run `capsule materialize-search-vectors` after upgrading an
-existing workspace; it performs no model calls and does not overwrite raw vectors.
-
-## Cluster lifecycle
-
-Automatic clustering is scoped independently by workspace and embedding type.
-Before a dimension has a completed or insufficient-data baseline, eligible
-Assets accumulate until `CAPSULE_CLUSTER_BOOTSTRAP_MINIMUM_COUNT` (default 50),
-then one automatic full bootstrap run is scheduled. Pending or running runs
-suppress duplicate bootstrap scheduling. After any baseline exists, newly
-embedded Assets are handled only by incremental assignment into resident-open
-or dynamic clusters; resident-manual clusters are never automatic candidates.
-The service does not automatically rebuild clusters based on later Asset counts
-or growth ratios. Users can explicitly request a full rebuild through
-`POST /api/v1/cluster-runs`.
-
-## Video MPS worker
-
-Video visual features run only on the macOS host because Docker cannot access
-MPS. A single FFmpeg decode uses VideoToolbox on macOS and emits only 6 fps of
-224px analysis data instead of transferring every full-resolution frame into
-Python. It measures activity at 6 fps and samples a centered 224x224 frame every
-0.5 seconds for MobileCLIP-S0 embeddings. Time-constrained content clustering derives a
-per-video first-stage distance threshold from the adjacent-distance Q75. A
-second stage greedily merges content-compatible neighbors using adaptive
-duration and sustained activity-shift costs. The default
-`CAPSULE_VIDEO_OUTPUT_MODE=logical` persists only each final Segment's time
-range and representative-frame timestamp/quality metadata. It does not encode
-JPEGs, render MP4 clips, or touch MinIO. Segment Assets are still persisted to
-PostgreSQL and continue through Understanding, vector embedding, search-vector
-materialization, and clustering. Understanding and native multimodal embedding
-decode the recorded representative timestamps from the original video into
-memory and release those bytes after the model request. The original video is
-never copied; its `file://` source must be under `CAPSULE_IMPORT_ROOT` or one of
-`CAPSULE_VIDEO_SOURCE_ROOTS`.
-
-`CAPSULE_VIDEO_OUTPUT_MODE=materialized` is retained only for compatibility
-with the legacy playable-Segment contract. In that mode Capsule renders a
-playable MP4 plus representative JPEGs, uploads them to the private
-S3-compatible bucket, and keeps the legacy model-input path available.
-
-Run the command from a native Apple-silicon Python environment that has the
-Capsule dependencies plus PyTorch, Apple `ml-mobileclip`, FFmpeg and FFprobe:
+### 常用命令
 
 ```bash
-CAPSULE_VIDEO_SOURCE_ROOTS='["data/dev-fixtures"]' \
-uv run capsule mps-video data/dev-fixtures/nature/hiking-trip.mp4 \
-  --workspace workspace_demo
+make status     # 检查本地服务状态
+make test       # 运行测试
+make down       # 停止本地基础设施
 ```
 
-`mps-video` remains the synchronous compatibility command. For durable
-whole-video execution, first apply the current Alembic migrations, then run the
-PostgreSQL-backed scheduler and Redis Streams worker on the host:
+## 页面
+
+- `/import`：导入文件。
+- `/tasks`：查看处理任务和进度。
+- `/assets`：浏览已生成的素材。
+- `/clusters`：查看和调整聚类。
+- `/graph`：查看素材关系图。
+- `/search`：执行多模态搜索。
+- `/capsules`：查看保存的搜索结果。
+
+## 开发检查
+
+后端：
+
+```bash
+uv run ruff check .
+uv run mypy src/capsule
+uv run pytest
+```
+
+前端：
+
+```bash
+cd frontend
+npm run lint
+npm test
+```
+
+数据库结构更新后执行：
 
 ```bash
 uv run alembic upgrade head
-uv run capsule video-scheduler
-uv run capsule video-worker --worker-id mps-worker-1
-CAPSULE_VIDEO_SOURCE_ROOTS='["data/dev-fixtures"]' \
-  uv run capsule submit-video-task data/dev-fixtures/nature/hiking-trip.mp4 \
-  --workspace workspace_demo
 ```
 
-PostgreSQL is authoritative for task state, attempts, leases and results;
-Redis Streams is only the delivery transport. The scheduler reconstructs
-missing queued/retry deliveries from PostgreSQL and republishes final failures
-to the DLQ. Workers ACK only after a fenced database outcome, separate worker
-heartbeats from actual FFmpeg/MobileCLIP progress, and terminate process groups
-when an attempt loses its lease or deadline. Derived object keys include the
-source generation so stale workers cannot overwrite the current generation.
-Use `--once` with `video-worker` or `video-scheduler` for service probes.
-Logical video tasks store source time ranges instead of derived MP4/JPEG files.
-Local sources outside `CAPSULE_IMPORT_ROOT` must be explicitly listed in
-`CAPSULE_VIDEO_SOURCE_ROOTS`; avoid granting broad roots such as the home or
-Downloads directory.
+## 数据说明
 
-The MobileCLIP-S0 checkpoint defaults to
-`data/models/mobileclip-s0/mobileclip_s0.pt` and can be changed with
-`CAPSULE_MOBILECLIP_MODEL_PATH`. The command fails clearly when MPS, FFmpeg,
-FFprobe, MobileCLIP or the checkpoint is unavailable; it never silently uses
-Docker CPU.
-
-A long-running `PipelineRunner` owns one lazy, process-resident MobileCLIP
-worker. The model is loaded by the first video and reused by later import jobs;
-concurrent video analysis cannot initialize duplicate MPS model copies. Runs
-that contain only images or documents do not load the model. A one-shot CLI
-process still releases the model when that process exits.
-
-Video rendering and object-storage upload use separate bounded pools. FFmpeg
-writes one Segment bundle (MP4, preview source, and representative keyframes)
-to `CAPSULE_VIDEO_SPOOL_ROOT`, publishes its manifest to Redis Streams, and
-releases the FFmpeg slot immediately. Upload workers retry deterministic object
-keys and reclaim abandoned pending messages with `XAUTOCLAIM`. A source-level
-generation guard makes repeated delivery idempotent and rejects stale work.
-Each successfully uploaded Segment is committed and submitted to Understanding
-immediately; generation finalization removes obsolete Segments only after the
-whole source succeeds. Set `CAPSULE_VIDEO_UPLOAD_QUEUE_BACKEND=memory` to run
-the bounded in-process transport for local comparison tests.
-
-Without Homebrew, this checkout can use the ignored project-local binaries at
-`tmp/tools/ffmpeg/bin/`; the macOS parser discovers them automatically. Docker
-continues to use its Linux FFmpeg instead.
-
-6. Start the search API after configuring `CAPSULE_ARK_API_KEY` and
-   `CAPSULE_DEEPSEEK_API_KEY`.
-
-   ```bash
-   uv run uvicorn capsule.api.app:app --host 0.0.0.0 --port 8010
-   ```
-
-7. Start the role B search workspace in another terminal.
-
-   ```bash
-   cd frontend
-   cp .env.example .env.local
-   npm ci
-   npm run dev
-   ```
-
-   Open `http://localhost:3000`. The page supports text, uploaded image,
-   image URL, and combined image-text queries. It exposes target asset and
-   dimension selection, both fusion algorithms, all documented
-   filters, enhanced dimension queries and weights, channel evidence, source folding,
-   and Search Capsules.
-
-   Search accepts text, image, and combined image-text queries:
-
-   ```bash
-   curl http://localhost:8010/api/v1/search \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "workspace_id": "workspace_demo",
-       "query_type": "text",
-       "query_text": "蓝紫色黄昏动画场景",
-       "embedding_types": ["native_multimodal", "visual_style"],
-       "fusion_method": "weighted_rrf",
-       "save_capsule": true,
-       "filters": {"asset_type": ["image", "video_segment"]},
-       "top_k": 20
-     }'
-   ```
-
-   For uploaded image queries, call `POST /api/v1/query-images` first and pass
-   the returned `upload_id` as `query_image_upload_id`. Doubao must be able to
-   fetch the generated URL, so local MinIO uploads require
-   `CAPSULE_OBJECT_STORAGE_PUBLIC_ENDPOINT`; a public image URL needs no tunnel.
-
-   Search Capsule APIs:
-
-   ```text
-   GET    /api/v1/search-capsules
-   GET    /api/v1/search-capsules/{id}
-   POST   /api/v1/search-capsules/{id}/refresh
-   PATCH  /api/v1/search-capsules/{id}
-   DELETE /api/v1/search-capsules/{id}
-   ```
-
-   Run the documented relevance gates with a labeled JSONL file:
-
-   ```bash
-   uv run capsule evaluate-search evaluation.jsonl --strict
-   ```
-
-   Each line contains `{"request": {...}, "relevant_asset_ids": ["asset_..."]}`.
-   The command reports Precision@5 and Recall@10 overall and by query type.
-
-## Search pipeline
-
-```text
-query
-  -> user-selected dimensions and optional text Dimension Query Enhancer
-  -> native query vector plus dimension-focused query vectors
-  -> fixed normalized 0.3 native + 0.7 dimension fusion per non-native route
-  -> concurrent Milvus recall scoped by workspace and Asset metadata
-  -> PostgreSQL-authoritative hydration, indexed-status and revision validation
-  -> PostgreSQL favorite / cluster filters and exact Asset field recheck
-  -> weighted RRF or normalized weighted similarity
-  -> exact dedup, same-source cap and video / Markdown folding
-  -> Search Capsule execution and immutable result snapshot
-```
-
-The available embedding routes are `native_multimodal`, `asset_description`,
-and all ten Asset Feature dimensions. Requests default to `native_multimodal`
-only and may explicitly select multiple routes with `embedding_types`.
-Multi-route text and image-text queries use a text-only Dimension Query Enhancer
-to produce a focused query for each selected route and normalized route weights;
-images and videos are never sent to it. The enhancer reorganizes each query around
-its target dimension, retaining other information only when it provides useful
-context or a meaningful cross-dimension relationship. It must not invent facts or
-add/remove routes. Queries without an explicit dimension preference remain
-equal-weighted; explicit textual preferences may adjust weights.
-Pure-image queries skip enhancement and remain equal-weighted. Any failed route is
-removed, surviving weights are renormalized, and the response reports `degraded=true`.
-The fixed 0.3/0.7 vector composition is independent of those route weights: it is
-applied symmetrically to both Asset and Query vectors, while route weights are used
-only when combining results from multiple selected dimensions.
-
-Search dimensions are validated against the target `filters.asset_type` values.
-`visual_style` and `color_composition` are available only for images and video
-segments; Markdown and plain-text assets skip those channels during indexing.
-Mixed target-type searches use union semantics, so visual channels remain
-available but apply only to their image/video subset.
-
-The search UI can ask the text model to suggest one to four dimensions from the
-natural-language query and target Asset types. The same response provides approximate
-route weights. Users may still adjust the selected dimensions manually; doing so clears
-the suggestion and lets the normal Query Parser resolve weights again.
-
-Search filter names follow PostgreSQL columns. In particular, use
-`filters.model_name` for the Embedding model and `filters.file_type` for the
-Asset extension. The former `embedding_model_version` request key remains
-accepted only as an input compatibility alias.
-
-## Concurrency defaults
-
-| Stage | Default |
-| --- | ---: |
-| Asset understanding | 32 |
-| Pending asset enrichment queue | 64 |
-| Search query understanding | 4 |
-| Native embedding generation | 24 |
-| Text embedding generation | 96 |
-| Search query embedding | 16 |
-| Cluster naming | 8 |
-| File parsing | 4 |
-| FFmpeg | 2 |
-
-All values are environment-driven. HTTP 429, transient 5xx errors, and network
-timeouts are retried with exponential backoff and jitter.
-
-The 2026-07-29 local Ark benchmark measured Asset Understanding throughput at
-20.80, 29.10, 36.03, 40.32, and 45.64 Assets/minute for concurrency 16, 24,
-32, 36, and 40 respectively. The recommended shared-host configuration is
-Asset Understanding 32, Search Understanding 4, Native Embedding 16, and Text
-Embedding 16. Concurrency 40 remains a dedicated-worker load-test ceiling
-until full video keyframe, object-storage, and PostgreSQL pressure is
-validated. On nine real images, the earlier bounded Understanding-to-Embedding
-pipeline reduced full enrichment time from 45.60 seconds to 43.28 seconds
-(5.1%) with no recorded failures; the current upstream pipeline additionally
-overlaps native embedding and fans out all text channels concurrently.
-The committed Asset-stored streaming pipeline was then measured in two
-cross-ordered live Ark runs over three images and three Markdown files. Average
-end-to-end time fell from 13.008 seconds to 10.911 seconds (16.12%); both runs
-produced all six descriptions and Feature objects without processing errors.
-
-## Development
-
-```bash
-ruff check .
-pytest
-mypy src/capsule
-```
-
-## Repository status
-
-The role B retrieval and Search Capsule chain is executable. Real relevance
-targets must be measured with the project evaluation set and a valid Ark key;
-unit and integration tests verify behavior, not Precision@5/Recall@10 quality.
+本地运行产生的原文件、缓存、模型、日志、基准数据和 Demo 数据不会随代码提交。
+仓库只保存程序、迁移、测试、配置示例和必要文档。

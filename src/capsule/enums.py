@@ -55,6 +55,11 @@ class AssetNameSource(StrEnum):
 
 class EmbeddingType(StrEnum):
     NATIVE_MULTIMODAL = "native_multimodal"
+    VISUAL_PRESENTATION = "visual_presentation"
+
+    # Historical channels remain readable so existing search and clustering
+    # records can still be displayed. New Assets are indexed only through the
+    # active channel set declared in ``capsule.features``.
     ASSET_DESCRIPTION = "asset_description"
     SUBJECT_CONTENT = "subject_content"
     SCENE_THEME = "scene_theme"
@@ -89,8 +94,18 @@ class FeatureStatus(StrEnum):
     INFERRED = "inferred"
     METADATA = "metadata"
     USER_SUPPLIED = "user_supplied"
+
+
+class FeatureApplicability(StrEnum):
+    APPLICABLE = "applicable"
     UNKNOWN = "unknown"
     NOT_APPLICABLE = "not_applicable"
+
+
+class FeatureSalience(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 
 class ClusterRunStatus(StrEnum):
@@ -99,6 +114,11 @@ class ClusterRunStatus(StrEnum):
     COMPLETED = "completed"
     INSUFFICIENT_DATA = "insufficient_data"
     FAILED = "failed"
+
+
+class ClusterAlgorithm(StrEnum):
+    HDBSCAN = "hdbscan"
+    COMPLETE_LINK = "complete_link"
 
 
 class ClusterMode(StrEnum):

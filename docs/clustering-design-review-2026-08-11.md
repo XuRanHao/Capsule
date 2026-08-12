@@ -460,7 +460,7 @@ min_samples
 cluster_selection_epsilon
 ```
 
-`cluster_selection_method` 固定为 `eom`；融合权重和语义合并阈值先固定。
+`cluster_selection_method` 固定为 `eom`；融合权重先固定，HDBSCAN 输出后不再执行二次语义合并。
 
 局部 Complete-link 必须作为另一组算法实验，不能混入上述四参数网格，否则无法判断指标变化来自 PCA/HDBSCAN 参数，还是来自聚类算法变化。
 

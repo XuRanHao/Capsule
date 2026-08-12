@@ -31,6 +31,12 @@ async def account_video_task_outcome(
         job.failed_count += 1
     if job.completed_count + job.failed_count < job.total_count:
         return
+    job.assetization_completed_at = func.now()
+    if job.post_asset_action == "enrich" and job.completed_count:
+        job.status = JobStatus.RUNNING.value
+        job.current_stage = PipelineStage.ASSET_STORED.value
+        job.completed_at = None
+        return
     if job.failed_count == 0:
         job.status = JobStatus.COMPLETED.value
         job.current_stage = PipelineStage.COMPLETED.value

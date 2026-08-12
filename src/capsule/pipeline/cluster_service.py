@@ -1,4 +1,4 @@
-"""Run independent HDBSCAN clustering for every configured Embedding Type."""
+"""Run one selected clustering algorithm for an Embedding Type."""
 
 import asyncio
 import logging
@@ -21,6 +21,7 @@ from capsule.db.repositories import (
     EmbeddingRepository,
 )
 from capsule.enums import (
+    ClusterAlgorithm,
     ClusterRepresentativeRole,
     ClusterRunStatus,
     EmbeddingType,
@@ -28,19 +29,17 @@ from capsule.enums import (
 from capsule.pipeline.cluster_summary import (
     ClusterSummaryAsset,
     build_cluster_summary_messages,
-    ensure_path_aware_cluster_summary,
 )
 from capsule.pipeline.clustering import (
     ClusterMemberCandidate,
+    CompleteLinkParameters,
     HdbscanParameters,
     InsufficientDataError,
     RepresentativeSelection,
-    SemanticMergeParameters,
-    SemanticMergeResult,
     cluster_vectors,
+    cluster_vectors_complete_link,
     dataset_hash,
     dynamic_hdbscan_parameters,
-    merge_semantically_overlapping_clusters,
     select_cluster_representatives,
 )
 from capsule.pipeline.vector_fusion import (
@@ -122,12 +121,14 @@ class ClusterService:
         cluster_run_id: str | None = None,
         pca_dimension: int = 8,
         min_samples: int = 3,
-        min_cluster_size: int = 3,
+        min_cluster_size: int = 2,
         optimize_parameters: bool = False,
+        algorithm: ClusterAlgorithm = ClusterAlgorithm.COMPLETE_LINK,
+        distance_threshold: float = 0.5,
         native_content_weight: float = DEFAULT_NATIVE_CONTENT_WEIGHT,
         trigger: str = "user",
     ) -> EmbeddingTypeClusterResult:
-        """Run PCA, HDBSCAN, and Capsule generation for one explicit channel."""
+        """Run PCA, the selected algorithm, and Capsule generation for one channel."""
         return await self._run_embedding_type(
             workspace_id=workspace_id,
             embedding_type=embedding_type,
@@ -136,6 +137,8 @@ class ClusterService:
             min_samples=min_samples,
             min_cluster_size=min_cluster_size,
             optimize_parameters=optimize_parameters,
+            algorithm=algorithm,
+            distance_threshold=distance_threshold,
             native_content_weight=native_content_weight,
             trigger=trigger,
         )
@@ -150,27 +153,35 @@ class ClusterService:
         min_samples: int,
         min_cluster_size: int,
         optimize_parameters: bool,
+        algorithm: ClusterAlgorithm,
+        distance_threshold: float,
         native_content_weight: float,
         trigger: str,
     ) -> EmbeddingTypeClusterResult:
         assets: list[ClusterEmbeddingAsset] = []
         loaded: list[_LoadedClusterVector] = []
         run_id = cluster_run_id
-        semantic_merge_parameters = SemanticMergeParameters(
-            enabled=self._settings.cluster_semantic_merge_enabled,
-            centroid_cosine_threshold=(self._settings.cluster_merge_centroid_cosine_threshold),
-            cross_cluster_mean_cosine_threshold=(
-                self._settings.cluster_merge_cross_mean_cosine_threshold
-            ),
-            merged_member_min_cosine_threshold=(
-                self._settings.cluster_merge_member_min_cosine_threshold
-            ),
-        )
         requested_native_content_weight = validate_native_content_weight(native_content_weight)
         effective_native_content_weight = (
             1.0
             if embedding_type is EmbeddingType.NATIVE_MULTIMODAL
             else requested_native_content_weight
+        )
+        requested_parameters = (
+            {
+                "algorithm": ClusterAlgorithm.HDBSCAN.value,
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+                "cluster_selection_epsilon": self._settings.cluster_selection_epsilon,
+            }
+            if algorithm is ClusterAlgorithm.HDBSCAN
+            else {
+                "algorithm": ClusterAlgorithm.COMPLETE_LINK.value,
+                "distance_threshold": distance_threshold,
+                "min_cluster_size": min_cluster_size,
+                "metric": "euclidean",
+                "linkage": "complete",
+            }
         )
         try:
             assets = await self._embedding_repository.list_indexed_cluster_embeddings(
@@ -210,6 +221,7 @@ class ClusterService:
             )
             preprocessing = {
                 "trigger": trigger,
+                "algorithm": algorithm.value,
                 "normalization": "l2",
                 "post_pca_normalization": "l2",
                 "vector_fusion": _vector_fusion_metadata(
@@ -219,7 +231,9 @@ class ClusterService:
                 ),
                 "requested_pca_dimension": pca_dimension,
                 "parameter_selection": (
-                    "user_defined_selection_optimized" if optimize_parameters else "user_defined"
+                    "user_defined_selection_optimized"
+                    if algorithm is ClusterAlgorithm.HDBSCAN and optimize_parameters
+                    else "user_defined"
                 ),
                 "indexed_asset_count": len(assets),
                 "missing_vector_count": len(assets) - len(loaded),
@@ -240,14 +254,7 @@ class ClusterService:
                     embedding_ids=embedding_ids,
                     dataset_hash=run_dataset_hash,
                     preprocessing=preprocessing,
-                    parameters={
-                        "min_cluster_size": min_cluster_size,
-                        "min_samples": min_samples,
-                        "cluster_selection_epsilon": (
-                            self._settings.cluster_selection_epsilon
-                        ),
-                        "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
-                    },
+                    parameters=requested_parameters,
                 )
             else:
                 await self._cluster_repository.start_pending_run(
@@ -257,14 +264,7 @@ class ClusterService:
                     embedding_ids=embedding_ids,
                     dataset_hash=run_dataset_hash,
                     preprocessing=preprocessing,
-                    parameters={
-                        "min_cluster_size": min_cluster_size,
-                        "min_samples": min_samples,
-                        "cluster_selection_epsilon": (
-                            self._settings.cluster_selection_epsilon
-                        ),
-                        "semantic_merge": _semantic_merge_metadata(semantic_merge_parameters),
-                    },
+                    parameters=requested_parameters,
                 )
         except Exception as exc:
             error = str(exc) or type(exc).__name__
@@ -291,13 +291,6 @@ class ClusterService:
         try:
             dynamic_hdbscan_parameters(len(loaded))
         except InsufficientDataError:
-            await self._cluster_repository.complete_run(
-                cluster_run_id=run_id,
-                cluster_count=0,
-                noise_count=len(loaded),
-                noise_ratio=1.0 if loaded else 0.0,
-                status=ClusterRunStatus.INSUFFICIENT_DATA,
-            )
             if self._current_cluster_repository is not None:
                 await self._current_cluster_repository.publish_dynamic_clusters(
                     run_id=run_id,
@@ -305,6 +298,13 @@ class ClusterService:
                     embedding_type=embedding_type.value,
                     clusters=[],
                 )
+            await self._cluster_repository.complete_run(
+                cluster_run_id=run_id,
+                cluster_count=0,
+                noise_count=len(loaded),
+                noise_ratio=1.0 if loaded else 0.0,
+                status=ClusterRunStatus.INSUFFICIENT_DATA,
+            )
             return EmbeddingTypeClusterResult(
                 embedding_type=embedding_type,
                 cluster_run_id=run_id,
@@ -317,30 +317,25 @@ class ClusterService:
 
         try:
             matrix = np.asarray([item.vector for item in loaded], dtype=np.float32)
-            clustered = cluster_vectors(
-                matrix,
-                pca_dimension=pca_dimension,
-                parameters=HdbscanParameters(
-                    min_cluster_size=min_cluster_size,
-                    min_samples=min_samples,
-                    cluster_selection_epsilon=self._settings.cluster_selection_epsilon,
-                ),
-                optimize_parameters=optimize_parameters,
-            )
-            semantic_merge = merge_semantically_overlapping_clusters(
-                matrix,
-                clustered.labels,
-                parameters=semantic_merge_parameters,
-            )
-            if semantic_merge.decisions:
-                logger.info(
-                    "merged %s overlapping semantic clusters for workspace=%s "
-                    "embedding_type=%s raw_cluster_count=%s final_cluster_count=%s",
-                    len(semantic_merge.decisions),
-                    workspace_id,
-                    embedding_type.value,
-                    semantic_merge.raw_cluster_count,
-                    semantic_merge.cluster_count,
+            if algorithm is ClusterAlgorithm.HDBSCAN:
+                clustered = cluster_vectors(
+                    matrix,
+                    pca_dimension=pca_dimension,
+                    parameters=HdbscanParameters(
+                        min_cluster_size=min_cluster_size,
+                        min_samples=min_samples,
+                        cluster_selection_epsilon=self._settings.cluster_selection_epsilon,
+                    ),
+                    optimize_parameters=optimize_parameters,
+                )
+            else:
+                clustered = cluster_vectors_complete_link(
+                    matrix,
+                    pca_dimension=pca_dimension,
+                    parameters=CompleteLinkParameters(
+                        distance_threshold=distance_threshold,
+                        min_cluster_size=min_cluster_size,
+                    ),
                 )
             candidates = [
                 ClusterMemberCandidate(
@@ -352,28 +347,26 @@ class ClusterService:
             ]
             selections = select_cluster_representatives(
                 clustered.transformed_vectors,
-                semantic_merge.labels,
+                clustered.labels,
                 candidates,
             )
             stored_clusters = await self._summarize_and_store_capsules(
                 run_id=run_id,
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
-                labels=semantic_merge.labels,
+                labels=clustered.labels,
                 probabilities=clustered.probabilities,
                 transformed_vectors=clustered.transformed_vectors,
                 loaded=loaded,
                 selections=selections,
             )
             capsule_ids = {
-                label: stored.cluster_capsule_id
-                for label, stored in stored_clusters.items()
+                label: stored.cluster_capsule_id for label, stored in stored_clusters.items()
             }
             await self._cluster_repository.store_memberships(
                 cluster_run_id=run_id,
                 memberships=_build_memberships(
-                    raw_labels=clustered.labels,
-                    capsule_labels=semantic_merge.labels,
+                    labels=clustered.labels,
                     probabilities=clustered.probabilities,
                     transformed_vectors=clustered.transformed_vectors,
                     loaded=loaded,
@@ -381,44 +374,34 @@ class ClusterService:
                     capsule_ids=capsule_ids,
                 ),
             )
-            await self._cluster_repository.complete_run(
-                cluster_run_id=run_id,
-                cluster_count=semantic_merge.cluster_count,
-                noise_count=clustered.noise_count,
-                noise_ratio=clustered.noise_ratio,
-                preprocessing={
-                    **preprocessing,
-                    "pca_dimension": clustered.pca_dimension,
-                    "semantic_merge_vector_space": "original_l2_normalized",
-                },
-                parameters={
-                    "min_cluster_size": clustered.parameters.min_cluster_size,
-                    "min_samples": clustered.parameters.min_samples,
-                    "cluster_selection_method": clustered.parameters.cluster_selection_method,
-                    "cluster_selection_epsilon": (
-                        clustered.parameters.cluster_selection_epsilon
-                    ),
-                    "quality_score": clustered.quality_score,
-                    "candidates_evaluated": clustered.parameter_candidates_evaluated,
-                    "semantic_merge": _semantic_merge_metadata(
-                        semantic_merge_parameters,
-                        semantic_merge,
-                    ),
-                },
-            )
             if self._current_cluster_repository is not None:
                 await self._current_cluster_repository.publish_dynamic_clusters(
                     run_id=run_id,
                     workspace_id=workspace_id,
                     embedding_type=embedding_type.value,
                     clusters=_build_current_cluster_publish(
-                        labels=semantic_merge.labels,
+                        labels=clustered.labels,
                         probabilities=clustered.probabilities,
                         loaded=loaded,
                         selections=selections,
                         stored_clusters=stored_clusters,
                     ),
                 )
+            await self._cluster_repository.complete_run(
+                cluster_run_id=run_id,
+                cluster_count=clustered.cluster_count,
+                noise_count=clustered.noise_count,
+                noise_ratio=clustered.noise_ratio,
+                preprocessing={
+                    **preprocessing,
+                    "pca_dimension": clustered.pca_dimension,
+                },
+                parameters={
+                    **_cluster_result_parameters(clustered.parameters),
+                    "quality_score": clustered.quality_score,
+                    "candidates_evaluated": clustered.parameter_candidates_evaluated,
+                },
+            )
             return EmbeddingTypeClusterResult(
                 embedding_type=embedding_type,
                 cluster_run_id=run_id,
@@ -426,7 +409,7 @@ class ClusterService:
                 indexed_asset_count=len(assets),
                 vector_count=len(loaded),
                 missing_vector_count=len(assets) - len(loaded),
-                cluster_count=semantic_merge.cluster_count,
+                cluster_count=clustered.cluster_count,
                 noise_count=clustered.noise_count,
                 capsule_ids=[capsule_ids[label] for label in sorted(capsule_ids)],
             )
@@ -485,15 +468,11 @@ class ClusterService:
                     )
                 )
                 continue
-            dimension_vector = (
-                vectors.get(asset.embedding_id) if dimension_weight > 0.0 else None
-            )
+            dimension_vector = vectors.get(asset.embedding_id) if dimension_weight > 0.0 else None
             if dimension_weight > 0.0 and dimension_vector is None:
                 continue
             native_asset = (
-                native_assets_by_id.get(asset.asset_id)
-                if native_content_weight > 0.0
-                else None
+                native_assets_by_id.get(asset.asset_id) if native_content_weight > 0.0 else None
             )
             native_vector = (
                 vectors.get(native_asset.embedding_id) if native_asset is not None else None
@@ -555,6 +534,7 @@ class ClusterService:
                     asset_description=loaded[int(index)].asset.asset_description,
                     asset_features=loaded[int(index)].asset.asset_features,
                     source_relative_path=loaded[int(index)].asset.source_relative_path,
+                    file_tree_context=tuple(loaded[int(index)].asset.file_tree_context),
                 )
                 for index in member_indices
             ]
@@ -568,15 +548,6 @@ class ClusterService:
                         member_source_paths=member_source_paths,
                     )
                 )
-                if embedding_type in {
-                    EmbeddingType.SUBJECT_CONTENT,
-                    EmbeddingType.ASSET_USAGE,
-                }:
-                    summary = ensure_path_aware_cluster_summary(
-                        summary,
-                        member_source_paths,
-                        embedding_type=embedding_type.value,
-                    )
                 stored = await self._cluster_repository.upsert_capsule(
                     ClusterCapsuleWrite(
                         cluster_run_id=run_id,
@@ -603,10 +574,7 @@ class ClusterService:
                 summary=summary,
             )
 
-        tasks = [
-            asyncio.create_task(summarize_and_store(label))
-            for label in sorted(selections)
-        ]
+        tasks = [asyncio.create_task(summarize_and_store(label)) for label in sorted(selections)]
         try:
             stored_capsules = await asyncio.gather(*tasks)
         except BaseException:
@@ -653,8 +621,7 @@ def _build_current_cluster_publish(
 
 def _build_memberships(
     *,
-    raw_labels: NDArray[np.int_],
-    capsule_labels: NDArray[np.int_],
+    labels: NDArray[np.int_],
     probabilities: NDArray[np.float64],
     transformed_vectors: NDArray[np.float32],
     loaded: list[_LoadedClusterVector],
@@ -673,60 +640,24 @@ def _build_memberships(
 
     memberships: list[ClusterMembershipWrite] = []
     for index, item in enumerate(loaded):
-        raw_label = int(raw_labels[index])
-        capsule_label = int(capsule_labels[index])
-        is_noise = raw_label == -1
+        label = int(labels[index])
+        is_noise = label == -1
         distance = (
             None
             if is_noise
-            else float(np.linalg.norm(transformed_vectors[index] - medoid_vectors[capsule_label]))
+            else float(np.linalg.norm(transformed_vectors[index] - medoid_vectors[label]))
         )
         memberships.append(
             ClusterMembershipWrite(
                 asset_id=item.asset.asset_id,
-                cluster_capsule_id=None if is_noise else capsule_ids[capsule_label],
-                hdbscan_label=raw_label,
+                cluster_capsule_id=None if is_noise else capsule_ids[label],
+                hdbscan_label=label,
                 membership_probability=float(probabilities[index]),
                 is_noise=is_noise,
                 distance_to_representative=distance,
             )
         )
     return memberships
-
-
-def _semantic_merge_metadata(
-    parameters: SemanticMergeParameters,
-    result: SemanticMergeResult | None = None,
-) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "enabled": parameters.enabled,
-        "centroid_cosine_threshold": parameters.centroid_cosine_threshold,
-        "cross_cluster_mean_cosine_threshold": (parameters.cross_cluster_mean_cosine_threshold),
-        "merged_member_min_cosine_threshold": (parameters.merged_member_min_cosine_threshold),
-    }
-    if result is None:
-        return metadata
-    return {
-        **metadata,
-        "raw_cluster_count": result.raw_cluster_count,
-        "merged_cluster_count": result.cluster_count,
-        "merge_count": len(result.decisions),
-        "raw_to_merged_labels": {
-            str(label): merged_label
-            for label, merged_label in sorted(result.raw_to_merged_labels.items())
-        },
-        "decisions": [
-            {
-                "left_label": decision.left_label,
-                "right_label": decision.right_label,
-                "target_label": decision.target_label,
-                "centroid_cosine": decision.centroid_cosine,
-                "cross_cluster_mean_cosine": decision.cross_cluster_mean_cosine,
-                "merged_member_min_cosine": decision.merged_member_min_cosine,
-            }
-            for decision in result.decisions
-        ],
-    }
 
 
 def _dataset_hash_inputs(
@@ -749,6 +680,26 @@ def _dataset_hash_inputs(
             if item.native_embedding_id is not None
         )
     return inputs
+
+
+def _cluster_result_parameters(
+    parameters: HdbscanParameters | CompleteLinkParameters,
+) -> dict[str, Any]:
+    if isinstance(parameters, HdbscanParameters):
+        return {
+            "algorithm": ClusterAlgorithm.HDBSCAN.value,
+            "min_cluster_size": parameters.min_cluster_size,
+            "min_samples": parameters.min_samples,
+            "cluster_selection_method": parameters.cluster_selection_method,
+            "cluster_selection_epsilon": parameters.cluster_selection_epsilon,
+        }
+    return {
+        "algorithm": ClusterAlgorithm.COMPLETE_LINK.value,
+        "distance_threshold": parameters.distance_threshold,
+        "min_cluster_size": parameters.min_cluster_size,
+        "metric": "euclidean",
+        "linkage": "complete",
+    }
 
 
 def _vector_fusion_metadata(

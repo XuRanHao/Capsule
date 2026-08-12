@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from capsule.model_clients.structured_output import (
     responses_json_schema_format,
@@ -21,6 +21,11 @@ class _ResultItem(BaseModel):
 class _ResultBatch(BaseModel):
     items: list[_ResultItem]
     summary: str | None = None
+
+
+class _NamedLikeSchemaAnnotations(BaseModel):
+    description: str = Field(description="annotation to strip")
+    title: str = Field(description="another annotation to strip")
 
 
 def test_responses_json_schema_format_makes_root_and_defs_strict() -> None:
@@ -90,3 +95,16 @@ def test_responses_json_schema_format_can_strip_prompt_annotations() -> None:
     assert "description" not in rendered
     assert "default" not in rendered
     assert result["schema"]["required"] == ["items", "summary"]
+
+
+def test_strip_annotations_preserves_fields_named_description_and_title() -> None:
+    result = responses_json_schema_format(
+        _NamedLikeSchemaAnnotations,
+        strip_annotations=True,
+    )
+
+    properties = result["schema"]["properties"]
+    assert set(properties) == {"description", "title"}
+    assert properties["description"] == {"type": "string"}
+    assert properties["title"] == {"type": "string"}
+    assert result["schema"]["required"] == ["description", "title"]

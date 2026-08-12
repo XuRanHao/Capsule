@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -9,14 +10,26 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 
 from capsule.config import Settings
-from capsule.enums import AssetType, EmbeddingType, FeatureStatus
+from capsule.enums import (
+    AssetType,
+    EmbeddingType,
+    FeatureApplicability,
+    FeatureSalience,
+    FeatureStatus,
+)
 from capsule.features import (
+    ACTIVE_EMBEDDING_TYPES,
     FEATURE_DIMENSION_SCOPES,
     embedding_type_supports_asset_type,
 )
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.model_clients.structured_output import responses_json_schema_format
-from capsule.schemas import AssetUnderstanding, ClusterSummary, EmbeddingResult
+from capsule.relation_graph import (
+    AssetEntityRelationResolution,
+    MergedEntityResolution,
+    MetadataContentResolution,
+)
+from capsule.schemas import AssetFeatures, AssetUnderstanding, ClusterSummary, EmbeddingResult
 from capsule.search.models import QueryEnhancement, SearchDimensionSuggestionResponse
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -25,18 +38,30 @@ logger = logging.getLogger(__name__)
 _ASSET_UNDERSTANDING_RESPONSE_FORMAT = responses_json_schema_format(
     AssetUnderstanding,
     name="asset_understanding",
-    strip_annotations=True,
 )
+_METADATA_CONTENT_RESPONSE_FORMAT = responses_json_schema_format(
+    MetadataContentResolution,
+    name="metadata_content_resolution",
+)
+_MERGED_ENTITY_RESPONSE_FORMAT = responses_json_schema_format(
+    MergedEntityResolution,
+    name="merged_entity_resolution",
+)
+_ASSET_ENTITY_RELATION_RESPONSE_FORMAT = responses_json_schema_format(
+    AssetEntityRelationResolution,
+    name="asset_entity_relation_resolution",
+)
+_ASSET_ENTITY_RELATION_BATCH_SIZE = 10
 _ASSET_FEATURE_NAMES = frozenset(item.value for item in FEATURE_DIMENSION_SCOPES)
 
 
 class _SearchQueryOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=12)
+    queries: dict[EmbeddingType, str] = Field(min_length=1, max_length=4)
     weights: dict[EmbeddingType, StrictFloat | StrictInt] = Field(
         min_length=1,
-        max_length=12,
+        max_length=4,
     )
 
 
@@ -45,23 +70,9 @@ _EMBEDDING_TYPE_GUIDANCE: dict[EmbeddingType, str] = {
         "原始内容：聚焦原查询中可见或可读的主体、动作、场景、关系和内容约束，"
         "形成对素材本身的整体内容表达"
     ),
-    EmbeddingType.ASSET_DESCRIPTION: (
-        "素材完整描述：基于原查询已有信息，组织成对目标素材整体内容的客观完整描述"
-    ),
     EmbeddingType.SUBJECT_CONTENT: FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT],
     EmbeddingType.SCENE_THEME: FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME],
-    EmbeddingType.VISUAL_STYLE: FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_STYLE],
-    EmbeddingType.COLOR_COMPOSITION: FEATURE_DIMENSION_SCOPES[EmbeddingType.COLOR_COMPOSITION],
-    EmbeddingType.MOOD_ATMOSPHERE: FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE],
-    EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY: FEATURE_DIMENSION_SCOPES[
-        EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY
-    ],
-    EmbeddingType.ASSET_USAGE: FEATURE_DIMENSION_SCOPES[EmbeddingType.ASSET_USAGE],
-    EmbeddingType.TARGET_AUDIENCE: FEATURE_DIMENSION_SCOPES[EmbeddingType.TARGET_AUDIENCE],
-    EmbeddingType.PROVENANCE: FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE],
-    EmbeddingType.RIGHTS_VERSION_AUTHORSHIP: FEATURE_DIMENSION_SCOPES[
-        EmbeddingType.RIGHTS_VERSION_AUTHORSHIP
-    ],
+    EmbeddingType.VISUAL_PRESENTATION: FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_PRESENTATION],
 }
 
 
@@ -99,9 +110,7 @@ class DoubaoClient:
             httpx.AsyncClient(
                 base_url=settings.deepseek_base_url.rstrip("/"),
                 headers={
-                    "Authorization": (
-                        f"Bearer {settings.deepseek_api_key.get_secret_value()}"
-                    ),
+                    "Authorization": (f"Bearer {settings.deepseek_api_key.get_secret_value()}"),
                     "Content-Type": "application/json",
                 },
                 limits=httpx.Limits(
@@ -192,7 +201,8 @@ class DoubaoClient:
                     "content": (
                         "上一份输出未通过 AssetUnderstanding 结构校验。请根据原始素材重新输出，"
                         "不要解释或使用 Markdown。根节点和 features 都必须是 JSON 对象；features "
-                        "必须包含指定的十个命名字段，绝不能使用数组。"
+                        f"必须包含当前 Schema 指定的 {len(AssetFeatures.model_fields)} 个命名字段："
+                        f"{', '.join(AssetFeatures.model_fields)}，绝不能使用数组。"
                         f"校验错误：{validation_error}"
                     ),
                 }
@@ -276,6 +286,142 @@ class DoubaoClient:
                 model=self._settings.search_query_model,
             )
 
+    async def resolve_metadata_content_entities(
+        self,
+        groups: Sequence[Mapping[str, Any]],
+        *,
+        guidance: str | None = None,
+    ) -> MetadataContentResolution:
+        """Classify metadata/content relationships once per reusable metadata group."""
+
+        system = {
+            "role": "system",
+            "content": guidance
+            or (
+                "合并元数据实体和内容实体。same_entity 表示元数据名称就是内容主体的身份；"
+                "contains_content 表示元数据是容纳内容主体的场景或集合；其余为 related。"
+                "结合组内多项内容整体判断，并为形成后的 Entity 生成 entity_semantic，描述"
+                "该实体自身是谁或是什么。entity_semantic 保持实体名称对应的稳定语义层级，"
+                "不因当前成员里出现的局部人物、物体或陈设而缩窄。用 build_entity 表示该"
+                "元数据实体是否适合作为关系图谱节点。角色、地点、场景、组织、事件、道具等"
+                "具有实际语义的实体设为 true；如果它只是用于存放或整理文件的通用容器，"
+                "只呈现文件包含关系而不包含实际语义，设为 false，不参与关系构建。"
+            ),
+        }
+        async with self.asset_understanding_pool.reserve() as slot:
+            result, _ = await slot.run(
+                lambda: self._responses_json_request(
+                    messages=[
+                        system,
+                        {
+                            "role": "user",
+                            "content": json.dumps({"groups": list(groups)}, ensure_ascii=False),
+                        },
+                    ],
+                    output_type=MetadataContentResolution,
+                    timeout_seconds=self._settings.understanding_timeout_seconds,
+                    response_format=_METADATA_CONTENT_RESPONSE_FORMAT,
+                )
+            )
+        return result
+
+    async def generate_asset_entity_relations(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> AssetEntityRelationResolution:
+        """Judge relations between an Asset's internal subject and an Entity subject."""
+
+        system = {
+            "role": "system",
+            "content": (
+                "输入是一批彼此独立的候选关系。每项包含一个 asset 和一个 entity。判断 asset"
+                "与 entity 是否存在关系。asset.metadata、asset.content_description、"
+                "asset.content_subject，以及 entity.name 和 entity.semantic 都是关系判断依据。"
+                "内容能够揭示关系时，结合内容主体自然描述它与 entity 的关系；元数据已经揭示"
+                "归属等关系时，描述 asset 与 entity 的关系。元数据与内容判断冲突时以元数据为准；"
+                "元数据已经揭示节点关系时优先采用，即使内容上没有关联。自然生成最贴切的 relation"
+                "和 description。asset.metadata.entity_hints 中的目录名称与 entity.name 的核心名称"
+                "一致时，可视为明确的归属证据。"
+                "用 establishes_relation 表示关系"
+                "是否成立。reason 用一句话简述最关键依据，控制在 40 个汉字以内；不建立关系时"
+                "简述缺少的依据或冲突。每项独立判断，source_id 和 target_id 原样返回。"
+                "输出 JSON 格式为"
+                '{"relations":[{"source_id":"","target_id":"",'
+                '"establishes_relation":true,"relation":"",'
+                '"description":"","reason":""}]}。'
+            ),
+        }
+        batches = [
+            list(candidates[offset : offset + _ASSET_ENTITY_RELATION_BATCH_SIZE])
+            for offset in range(0, len(candidates), _ASSET_ENTITY_RELATION_BATCH_SIZE)
+        ]
+        if not batches:
+            return AssetEntityRelationResolution()
+
+        async def resolve_batch(
+            batch: list[Mapping[str, Any]],
+        ) -> AssetEntityRelationResolution:
+            return await self._deepseek_json(
+                messages=[
+                    system,
+                    {
+                        "role": "user",
+                        "content": json.dumps({"candidates": batch}, ensure_ascii=False),
+                    },
+                ],
+                output_type=AssetEntityRelationResolution,
+                pool=self.capsule_pool,
+                timeout_seconds=self._settings.understanding_timeout_seconds,
+                max_output_tokens=max(
+                    self._settings.understanding_max_output_tokens,
+                    4096,
+                ),
+                model=self._settings.search_query_model,
+            )
+
+        resolutions = await asyncio.gather(*(resolve_batch(batch) for batch in batches))
+        return AssetEntityRelationResolution(
+            relations=[relation for resolution in resolutions for relation in resolution.relations]
+        )
+
+    async def merge_entity_candidates(
+        self,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> MergedEntityResolution:
+        """Merge metadata and subject-cluster candidates before edge judgment."""
+
+        system = {
+            "role": "system",
+            "content": (
+                "输入是来自元数据和主体聚类的实体候选。判断哪些候选指向同一个实际实体，"
+                "合并后生成统一的 name、semantic 和 candidate_ids。主体聚类只是候选发现结果，"
+                "相似主题、风格或类别不代表同一实体；元数据候选也不天然正确。角色、地点、场景、"
+                "组织、事件、道具等具有实际语义且能跨至少两个资产复用的实体可设 build_entity"
+                "为 true。只是用于存放或整理文件的通用容器，或不具备可复用实际意义的候选设为"
+                "false。不要在此判断 Asset 与 Entity 的最终关系。每个输入 candidate_id 在输出中"
+                "出现一次，保留未与其他候选合并的有效实体候选，并在 reason 中说明合并或拒绝依据。"
+                '只输出 JSON，格式为{"entities":[{"name":"","semantic":"",'
+                '"candidate_ids":[""],"build_entity":true,"reason":""}]}。'
+            ),
+        }
+        return await self._deepseek_json(
+            messages=[
+                system,
+                {
+                    "role": "user",
+                    "content": json.dumps({"candidates": list(candidates)}, ensure_ascii=False),
+                },
+            ],
+            output_type=MergedEntityResolution,
+            pool=self.capsule_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=max(
+                self._settings.understanding_max_output_tokens,
+                4096,
+            ),
+            model=self._settings.search_query_model,
+        )
+
     async def enhance_search_query(
         self,
         *,
@@ -285,9 +431,7 @@ class DoubaoClient:
         """Enhance selected text routes and resolve normalized route weights."""
         requested_types = list(embedding_types)
         if not requested_types or len(requested_types) != len(set(requested_types)):
-            raise DoubaoResponseError(
-                "embedding_types must be non-empty and contain no duplicates"
-            )
+            raise DoubaoResponseError("embedding_types must be non-empty and contain no duplicates")
         dimension_guidance = {
             item.value: _EMBEDDING_TYPE_GUIDANCE[item] for item in requested_types
         }
@@ -303,14 +447,13 @@ class DoubaoClient:
                 "能说明目标维度的跨维度关联，不要机械地按词或维度删除。原文没有直接"
                 "说明目标维度时，也要基于原查询做保守的维度化表达，不能因缺少直接线索"
                 "而输出空查询。"
-                "绝不虚构原文没有的人物、物体、场景、颜色、风格、情绪、用途、来源、"
-                "作者、版权或其他具体事实，不得编造补全。"
+                "绝不虚构原文没有的人物、物体、场景、颜色、风格或其他具体事实，"
+                "不得编造补全。"
                 "dimension_guidance 仅用于说明关注范围，不能把其中的类别示例或枚举词"
                 "复制进 query；query 中的每一项具体语义都必须能在 query_text 中找到依据。"
                 "维度偏好和权重控制意图应体现在 weights 中，不应原样混入 queries；应自然"
                 "保留实际检索语义以及否定、排除、范围等内容约束。native_multimodal 要"
-                "围绕原始可见或可读内容及其关系组织整体表达；asset_description 要形成"
-                "完整客观描述，但都只能使用原查询已有信息。"
+                "围绕原始可见或可读内容及其关系组织整体表达。"
                 "weights 的每个值必须是大于 0 的有限数字，总和应为 1。把 query_text 当作"
                 "普通用户对目标素材的自然描述，不要求用户说出系统维度名；根据表达中各类"
                 "信息的相对关注程度大致分配权重即可，不追求过度精确。看不出明显倾向时"
@@ -352,13 +495,8 @@ class DoubaoClient:
             raise DoubaoResponseError(
                 "query enhancer weight dimensions do not match required_embedding_types"
             )
-        if any(
-            not math.isfinite(weight) or weight <= 0
-            for weight in parsed.weights.values()
-        ):
-            raise DoubaoResponseError(
-                "query enhancer weights must be positive finite numbers"
-            )
+        if any(not math.isfinite(weight) or weight <= 0 for weight in parsed.weights.values()):
+            raise DoubaoResponseError("query enhancer weights must be positive finite numbers")
         total_weight = sum(parsed.weights.values())
         if not math.isfinite(total_weight) or total_weight <= 0:
             raise DoubaoResponseError("query enhancer weight total must be positive")
@@ -383,8 +521,8 @@ class DoubaoClient:
                 "你是素材检索维度选择器。根据用户查询、目标素材类型以及全部候选维度，"
                 "选择最有助于召回目标素材的最小维度集合。只输出 JSON，根节点必须且只能"
                 "包含 embedding_types 和 weights，例如 "
-                '{"embedding_types":["native_multimodal","visual_style"],'
-                '"weights":{"native_multimodal":0.3,"visual_style":0.7}}。'
+                '{"embedding_types":["native_multimodal","visual_presentation"],'
+                '"weights":{"native_multimodal":0.3,"visual_presentation":0.7}}。'
                 "必须选择 1 到 4 个不同维度，只能使用候选维度中的 embedding_type，且所选"
                 "维度必须支持至少一种目标素材类型。不要为了凑数增加维度，不要输出理由、"
                 "查询改写或 Markdown。把 query_text 当作普通用户向素材管理员描述想找的"
@@ -407,7 +545,7 @@ class DoubaoClient:
                     )
                 ],
             }
-            for embedding_type in EmbeddingType
+            for embedding_type in ACTIVE_EMBEDDING_TYPES
         ]
         parsed = await self._deepseek_json(
             messages=[
@@ -646,88 +784,20 @@ class DoubaoClient:
 
 
 def _asset_understanding_schema_message() -> dict[str, str]:
-    example = json.dumps(
-        _asset_understanding_json_example(),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
     return {
         "role": "system",
         "content": (
-            "以下输出结构约束优先于其他格式描述。只返回一个符合 JSON Schema 的 JSON 对象，"
-            "不要返回 Markdown、解释或代码围栏。features 必须是对象，不能是数组；它必须包含"
-            "十个命名 Feature 字段。每个 Feature 必须是包含 value、status、confidence、evidence "
-            "的对象；value 最多五条短语，按表现力和区分度从高到低排列，使用中文分号连接。"
-            "短语结构由当前维度的语义决定。描述局部属性且需要明确归属时，可以使用"
-            "“具体对象 + 维度事实”，例如 color_composition 写“桌子 红色；星空 深蓝”。"
-            "scene_theme 在素材具有可辨识的整体环境、时间、事件或叙事情境时适用；只有角色"
-            "三视图、产品白底陈列或孤立元素展示时使用 not_applicable。"
-            "mood_atmosphere 依据画面或文本中可核验的光线、色彩、空间、天气、动作、声音和"
-            "叙事表现概括整体氛围；人物内心、动机或性格只有在素材明确呈现时才可作为依据，"
-            "线索不足时使用 unknown。"
-            "character_state_or_psychology 在素材包含人物、拟人角色或文本明确描述人物状态时"
-            "适用；中性陈列视角没有可区分的表情、姿态、身体或心理状态时使用 not_applicable。"
-            "target_audience、provenance 和 rights_version_authorship 以素材或上下文中的明确"
-            "信息为证据，证据不足时使用 unknown。所有事实来自素材中可见、可读或有可靠上下文"
-            "证据的内容。对于用途、受众、来源、权利等素材级维度，可以使用“素材 + 维度事实”。"
-            "evidence 最多一条，无证据时使用 null 和空数组。"
-            "unknown 表示维度适用但证据不足，not_applicable 表示当前 Asset 不适用该维度；"
-            "这两种状态的 value 必须为 null。"
-            "asset_name 和 asset_description 必须以素材本身为主体；文件名、相对路径、"
-            "目录层级、标题和关联文字中与素材一致的有效语义必须自然融入描述，但不得"
-            "机械复述文件名、扩展名、目录、路径、来源路径或“位于某文件夹”等元数据措辞。"
-            "路径与素材冲突时以素材为准，纯编号、序号或通用文件名必须忽略。"
-            "唯一例外是 asset_usage：它除了通用字段外还必须返回 description 和 source_path。"
-            "source_path 必须逐字复制输入 metadata.context.source_path；description 必须明确"
-            "说明该完整相对路径及其对应用途。目录语义能确认用途时 status 使用 metadata，"
-            "value 按上述格式写“素材 + 规范化用途语义”，不得写绝对路径。"
-            "下面的手工示例只说明结构，禁止照抄；实际值必须根据输入素材重新判断。"
-            f"JSON 结构示例：{example}"
+            "严格按照随请求提供的 JSON Schema 输出一个紧凑单行 JSON 对象，不要缩进、"
+            "换行、Markdown、解释或代码围栏。description 表示当前维度的事实本身，"
+            "evidence 表示支持该事实的可核验依据；两者必须分别填写，不能用 evidence 代替"
+            "description。features 必须是对象且包含 Schema 指定的三个字段，不能输出数组。"
+            "每个 item 完整包含 description、salience、status、evidence 和 "
+            "ocr_confidence；subject_content 的每个 item 同时包含 subject。"
+            "subject 是主体名称，description 是主体描述，不能互相代替；"
+            "subject_content.salience 使用 0 到 1 的数字，其他 Feature 的 salience "
+            "仍使用 high、medium 或 low；"
+            "ocr_confidence 输出 null。"
         ),
-    }
-
-
-def _asset_understanding_json_example() -> dict[str, object]:
-    def observed(value: str) -> dict[str, object]:
-        return {
-            "value": value,
-            "status": "observed",
-            "confidence": 0.9,
-            "evidence": ["输入中可核验的简短证据"],
-        }
-
-    unknown: dict[str, object] = {
-        "value": None,
-        "status": "unknown",
-        "confidence": 0.0,
-        "evidence": [],
-    }
-    asset_usage: dict[str, object] = {
-        "value": "素材 海报制作",
-        "status": "metadata",
-        "confidence": 0.95,
-        "evidence": ["相对文件路径：海报/素材/example.png"],
-        "description": (
-            "该素材对应相对文件路径「海报/素材/example.png」，"
-            "所属目录为「海报/素材」，路径语义表明其用于海报制作。"
-        ),
-        "source_path": "海报/素材/example.png",
-    }
-    return {
-        "asset_name": "基于素材生成的简洁名称",
-        "asset_description": "基于素材生成的客观完整描述",
-        "features": {
-            "subject_content": observed("女孩手持雨伞；小狗跟随女孩"),
-            "scene_theme": observed("雨夜城市街道中的同行；都市夜行叙事情境"),
-            "visual_style": observed("写实摄影；电影化视觉语言；细腻雨雾质感"),
-            "color_composition": observed("冷蓝主色与暖黄点光对比；平视中景构图"),
-            "mood_atmosphere": observed("安静神秘；略带紧张感"),
-            "character_state_or_psychology": observed("女孩神情专注；身体微微前倾"),
-            "asset_usage": asset_usage,
-            "target_audience": unknown,
-            "provenance": unknown,
-            "rights_version_authorship": unknown,
-        },
     }
 
 
@@ -781,42 +851,47 @@ def _asset_understanding_normalization_actions(decoded: Any) -> list[str]:
     else:
         return sorted(actions)
 
-    valid_statuses = {status.value for status in FeatureStatus}
+    valid_applicability = {item.value for item in FeatureApplicability}
+    valid_salience = {item.value for item in FeatureSalience}
+    valid_statuses = {item.value for item in FeatureStatus}
     for feature in feature_values:
         if isinstance(feature, str):
             actions.add("feature_string_expanded")
             continue
         if not isinstance(feature, Mapping):
             continue
-        if "value" not in feature:
-            actions.add("missing_feature_value_filled")
-        raw_value = feature.get("value")
-        if isinstance(raw_value, list):
-            actions.add("feature_value_list_joined")
-        if feature.get("status") not in valid_statuses:
-            actions.add("feature_status_normalized")
-        raw_confidence = feature.get("confidence", 0.0)
-        try:
-            numeric_confidence = float(raw_confidence)
-        except (TypeError, ValueError, OverflowError):
-            numeric_confidence = math.nan
-        if (
-            isinstance(raw_confidence, bool)
-            or not isinstance(raw_confidence, (int, float))
-            or not (
-                math.isfinite(numeric_confidence) and 0.0 <= numeric_confidence <= 1.0
+        if "items" not in feature:
+            actions.add("legacy_feature_shape_expanded")
+            continue
+        if feature.get("applicability") not in valid_applicability:
+            actions.add("feature_applicability_normalized")
+        items = feature.get("items")
+        if not isinstance(items, list):
+            actions.add("feature_items_normalized")
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                actions.add("feature_items_normalized")
+                continue
+            raw_salience = item.get("salience")
+            valid_relative_salience = (
+                isinstance(raw_salience, (int, float))
+                and not isinstance(raw_salience, bool)
+                and 0.0 <= raw_salience <= 1.0
             )
-        ):
-            actions.add("feature_confidence_normalized")
-        evidence = feature.get("evidence", [])
-        if (
-            isinstance(evidence, str)
-            or evidence is None
-            or not isinstance(evidence, list)
-            or len(evidence) > 1
-            or any(not isinstance(item, str) or len(item) > 80 for item in evidence)
-        ):
-            actions.add("feature_evidence_normalized")
+            if raw_salience not in valid_salience and not valid_relative_salience:
+                actions.add("feature_salience_normalized")
+            if item.get("status") not in valid_statuses:
+                actions.add("feature_status_normalized")
+            evidence = item.get("evidence", [])
+            if (
+                isinstance(evidence, str)
+                or evidence is None
+                or not isinstance(evidence, list)
+                or len(evidence) > 1
+                or any(not isinstance(entry, str) or len(entry) > 80 for entry in evidence)
+            ):
+                actions.add("feature_evidence_normalized")
     return sorted(actions)
 
 

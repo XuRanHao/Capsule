@@ -1,4 +1,3 @@
-import math
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -12,6 +11,8 @@ from capsule.enums import (
     ClusterMode,
     ClusterRepresentativeRole,
     EmbeddingType,
+    FeatureApplicability,
+    FeatureSalience,
     FeatureStatus,
     NewAssetClusterStatus,
     ProcessingStatus,
@@ -256,44 +257,62 @@ class StoredFileResult(BaseModel):
     indexable_asset_ids: list[str] = Field(default_factory=list)
 
 
-class FeatureValue(BaseModel):
-    value: str | None = Field(
-        description=(
-            "当前维度内最多五条互不重复的事实短语，表达结构由维度语义决定，"
-            "按表现力和区分度排序并使用中文分号连接；无法确定时为 null"
-        )
+class FeatureItem(BaseModel):
+    """One independently attributable fact inside a Feature dimension."""
+
+    description: str = Field(
+        min_length=1,
+        max_length=120,
+        description="当前维度内的一条事实本身，不是证据说明",
     )
-    status: FeatureStatus
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    evidence: list[str] = Field(default_factory=list)
+    salience: FeatureSalience = Field(
+        default=FeatureSalience.MEDIUM,
+        description="该事实在当前维度内的相对显著程度",
+    )
+    status: FeatureStatus = Field(
+        default=FeatureStatus.INFERRED,
+        description="事实的依据类型",
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        max_length=1,
+        description="支持 description 的一条可核验依据；不能用它代替 description",
+    )
+    ocr_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="模型始终输出 null；若使用本地 OCR，真实置信度由后端写入",
+    )
 
     @model_validator(mode="before")
     @classmethod
     def normalize_model_output(cls, value: Any) -> Any:
         if isinstance(value, str):
-            return {
-                "value": value,
-                "status": FeatureStatus.INFERRED.value,
-                "confidence": 0.5,
-                "evidence": [],
-            }
+            value = {"description": value}
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
-        normalized.setdefault("value", None)
-        raw_value = normalized.get("value")
-        if isinstance(raw_value, list):
-            terms = [
-                item.strip()[:32] for item in raw_value if isinstance(item, str) and item.strip()
-            ]
-            normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
-        elif isinstance(raw_value, str):
-            terms = [
-                item.strip()[:32]
-                for item in raw_value.replace(";", "；").split("；")
-                if item.strip()
-            ]
-            normalized["value"] = "；".join(dict.fromkeys(terms[:5])) or None
+        description = normalized.get("description")
+        if isinstance(description, str):
+            normalized["description"] = description.strip()[:120]
+
+        valid_salience = {item.value for item in FeatureSalience}
+        raw_salience = normalized.get("salience")
+        uses_relative_salience = cls.model_fields["salience"].annotation is float
+        if uses_relative_salience:
+            if isinstance(raw_salience, str) and raw_salience in valid_salience:
+                normalized["salience"] = {
+                    FeatureSalience.HIGH.value: 1.0,
+                    FeatureSalience.MEDIUM.value: 0.5,
+                    FeatureSalience.LOW.value: 0.2,
+                }[raw_salience]
+        elif raw_salience not in valid_salience:
+            normalized["salience"] = FeatureSalience.MEDIUM.value
+        valid_statuses = {item.value for item in FeatureStatus}
+        if normalized.get("status") not in valid_statuses:
+            normalized["status"] = FeatureStatus.INFERRED.value
+
         evidence = normalized.get("evidence")
         if isinstance(evidence, str):
             normalized["evidence"] = [evidence.strip()[:80]] if evidence.strip() else []
@@ -301,78 +320,259 @@ class FeatureValue(BaseModel):
             normalized["evidence"] = [
                 item.strip()[:80] for item in evidence if isinstance(item, str) and item.strip()
             ][:1]
-        elif evidence is None:
+        else:
             normalized["evidence"] = []
-        raw_confidence = normalized.get("confidence", 0.0)
-        try:
-            confidence = (
-                float(raw_confidence)
-                if not isinstance(raw_confidence, bool)
-                else 0.0
-            )
-        except (TypeError, ValueError, OverflowError):
-            confidence = 0.0
-        if not math.isfinite(confidence):
-            confidence = 0.0
-        normalized["confidence"] = min(1.0, max(0.0, confidence))
-        valid_statuses = {status.value for status in FeatureStatus}
-        if normalized.get("status") not in valid_statuses:
-            normalized["status"] = (
-                FeatureStatus.INFERRED.value
-                if normalized.get("value")
-                else FeatureStatus.UNKNOWN.value
-            )
-        if normalized.get("status") in {
-            FeatureStatus.UNKNOWN.value,
-            FeatureStatus.NOT_APPLICABLE.value,
-        }:
-            normalized["value"] = None
+
+        raw_ocr_confidence = normalized.get("ocr_confidence")
+        if isinstance(raw_ocr_confidence, bool):
+            normalized["ocr_confidence"] = None
+        elif raw_ocr_confidence is not None:
+            try:
+                parsed = float(raw_ocr_confidence)
+            except (TypeError, ValueError, OverflowError):
+                parsed = -1.0
+            normalized["ocr_confidence"] = parsed if 0.0 <= parsed <= 1.0 else None
         return normalized
 
 
-class AssetUsageFeatureValue(FeatureValue):
-    """Usage semantics plus the deterministic relative-path evidence behind them."""
+class SubjectFeatureItem(FeatureItem):
+    """One named subject plus the facts that distinguish it."""
 
-    description: str | None = Field(
-        default=None,
-        max_length=500,
-        description="明确包含相对文件路径的素材用途说明",
+    subject: str = Field(
+        min_length=1,
+        max_length=60,
+        description=(
+            "可跨素材复用的主体名称；优先采用输入元数据中与素材内容一致的有效专名，"
+            "否则使用可观察到的具体类别名"
+        ),
     )
-    source_path: str | None = Field(
-        default=None,
-        max_length=2048,
-        description="用于判断素材用途的 Workspace 相对路径",
+    description: str = Field(
+        min_length=1,
+        max_length=120,
+        description="该主体的身份、类别、外观、动作或关系等可区分事实，不是主体名称的重复",
     )
+    # This Pydantic specialization intentionally changes the wire type from the
+    # categorical salience used by ordinary features to a relative numeric score.
+    salience: float = Field(  # type: ignore[assignment]
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "该主体在当前 Asset 中相对于其他主体的重要程度，取 0 到 1；"
+            "多个不同层次的实体可以同时具有较高数值"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_subject_output(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"subject": value, "description": value}
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        subject = next(
+            (
+                normalized.get(field_name)
+                for field_name in ("subject", "entity_name", "name")
+                if isinstance(normalized.get(field_name), str)
+                and normalized[field_name].strip()
+            ),
+            None,
+        )
+        description = normalized.get("description")
+        # Historical subject_content items stored only description. Keeping this
+        # fallback makes those records readable while new structured output is
+        # required to provide subject explicitly.
+        if subject is None and isinstance(description, str) and description.strip():
+            subject = description
+        if isinstance(subject, str):
+            normalized["subject"] = subject.strip()[:60]
+        return normalized
+
+
+class FeatureValue(BaseModel):
+    """A dimension-level envelope with zero to five salience-ranked facts."""
+
+    applicability: FeatureApplicability = Field(
+        description=(
+            "applicable 表示有可描述事实；unknown 表示维度适用但证据不足；"
+            "not_applicable 表示该维度不适用于当前素材"
+        )
+    )
+    items: list[FeatureItem] = Field(
+        default_factory=list,
+        max_length=5,
+        description=(
+            "当前维度内 0 到 5 条互不重复的事实，按 salience 从 high 到 low 排列；"
+            "unknown 或 not_applicable 时必须为空"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_output(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return _legacy_feature_value(value=value, status=FeatureStatus.INFERRED.value)
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "items" not in normalized:
+            raw_value = next(
+                (
+                    normalized[field]
+                    for field in ("effective_value", "user_value", "model_value", "value")
+                    if field in normalized
+                ),
+                None,
+            )
+            return _legacy_feature_value(
+                value=raw_value,
+                status=normalized.get("status"),
+                evidence=normalized.get("evidence"),
+            )
+
+        items = normalized.get("items")
+        normalized["items"] = items if isinstance(items, list) else []
+        valid_applicability = {item.value for item in FeatureApplicability}
+        if normalized.get("applicability") not in valid_applicability:
+            normalized["applicability"] = (
+                FeatureApplicability.APPLICABLE.value
+                if normalized["items"]
+                else FeatureApplicability.UNKNOWN.value
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def normalize_items(self) -> "FeatureValue":
+        if self.applicability is not FeatureApplicability.APPLICABLE:
+            self.items = []
+            return self
+        if not self.items:
+            self.applicability = FeatureApplicability.UNKNOWN
+            return self
+
+        priority = {
+            FeatureSalience.HIGH: 0,
+            FeatureSalience.MEDIUM: 1,
+            FeatureSalience.LOW: 2,
+        }
+        unique: dict[str, FeatureItem] = {}
+        for item in self.items:
+            key = item.description.casefold()
+            unique.setdefault(key, item)
+        self.items = sorted(
+            unique.values(),
+            key=lambda item: (
+                priority[item.salience]
+                if isinstance(item.salience, FeatureSalience)
+                else -float(item.salience)
+            ),
+        )[:5]
+        return self
+
+    @property
+    def value(self) -> str | None:
+        """Legacy read-only projection for internal callers during data migration."""
+
+        if self.applicability is not FeatureApplicability.APPLICABLE:
+            return None
+        return "；".join(item.description for item in self.items) or None
+
+
+class SubjectFeatureValue(FeatureValue):
+    """Subject dimension whose items preserve names separately from descriptions."""
+
+    # Pydantic supports narrowing a model field in a subclass; list invariance
+    # means the static checker needs this explicit acknowledgement.
+    items: list[SubjectFeatureItem] = Field(  # type: ignore[assignment]
+        default_factory=list,
+        max_length=5,
+        description=(
+            "当前素材中 0 到 5 个不同主体，按 salience 数值从高到低排列；"
+            "每项同时给出 subject 和 description"
+        ),
+    )
+
+
+class AssetUsageFeatureValue(FeatureValue):
+    """Compatibility name for the now-uniform Feature envelope."""
+
+
+def _legacy_feature_value(
+    *,
+    value: object,
+    status: object = None,
+    evidence: object = None,
+) -> dict[str, object]:
+    if status in {
+        FeatureApplicability.UNKNOWN.value,
+        FeatureApplicability.NOT_APPLICABLE.value,
+    }:
+        return {"applicability": status, "items": []}
+
+    if isinstance(value, str):
+        descriptions = [
+            item.strip()[:120]
+            for item in value.replace(";", "；").split("；")
+            if item.strip()
+        ]
+    elif isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            return {
+                "applicability": FeatureApplicability.APPLICABLE.value,
+                "items": value[:5],
+            }
+        descriptions = [
+            item.strip()[:120] for item in value if isinstance(item, str) and item.strip()
+        ]
+    else:
+        descriptions = []
+
+    descriptions = list(dict.fromkeys(descriptions))[:5]
+    if not descriptions:
+        return {"applicability": FeatureApplicability.UNKNOWN.value, "items": []}
+
+    item_status = status if status in {item.value for item in FeatureStatus} else "inferred"
+    if isinstance(evidence, str):
+        normalized_evidence = [evidence.strip()[:80]] if evidence.strip() else []
+    elif isinstance(evidence, list):
+        normalized_evidence = [
+            item.strip()[:80] for item in evidence if isinstance(item, str) and item.strip()
+        ][:1]
+    else:
+        normalized_evidence = []
+    salience_by_index = (
+        FeatureSalience.HIGH.value,
+        FeatureSalience.MEDIUM.value,
+        FeatureSalience.MEDIUM.value,
+        FeatureSalience.LOW.value,
+        FeatureSalience.LOW.value,
+    )
+    return {
+        "applicability": FeatureApplicability.APPLICABLE.value,
+        "items": [
+            {
+                "description": description,
+                "salience": salience_by_index[index],
+                "status": item_status,
+                "evidence": normalized_evidence if index == 0 else [],
+                "ocr_confidence": None,
+            }
+            for index, description in enumerate(descriptions)
+        ],
+    }
 
 
 class AssetFeatures(BaseModel):
-    subject_content: FeatureValue = Field(
+    subject_content: SubjectFeatureValue = Field(
         description=FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT]
     )
     scene_theme: FeatureValue = Field(
         description=FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME]
     )
-    visual_style: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_STYLE]
-    )
-    color_composition: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.COLOR_COMPOSITION]
-    )
-    mood_atmosphere: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE]
-    )
-    character_state_or_psychology: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY]
-    )
-    asset_usage: AssetUsageFeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.ASSET_USAGE]
-    )
-    target_audience: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.TARGET_AUDIENCE]
-    )
-    provenance: FeatureValue = Field(description=FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE])
-    rights_version_authorship: FeatureValue = Field(
-        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.RIGHTS_VERSION_AUTHORSHIP]
+    visual_presentation: FeatureValue = Field(
+        description=FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_PRESENTATION]
     )
 
     @model_validator(mode="before")
@@ -383,14 +583,26 @@ class AssetFeatures(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
+        if "visual_presentation" not in normalized:
+            legacy_visual_items: list[Any] = []
+            for legacy_name in ("visual_style", "color_composition"):
+                legacy_value = normalized.get(legacy_name)
+                if isinstance(legacy_value, dict):
+                    converted = FeatureValue.model_validate(legacy_value)
+                    legacy_visual_items.extend(
+                        item.model_dump(mode="json") for item in converted.items[:3]
+                    )
+            if legacy_visual_items:
+                normalized["visual_presentation"] = {
+                    "applicability": FeatureApplicability.APPLICABLE.value,
+                    "items": legacy_visual_items[:5],
+                }
         for field_name in cls.model_fields:
             normalized.setdefault(
                 field_name,
                 {
-                    "value": None,
-                    "status": FeatureStatus.UNKNOWN.value,
-                    "confidence": 0.0,
-                    "evidence": [],
+                    "applicability": FeatureApplicability.UNKNOWN.value,
+                    "items": [],
                 },
             )
         return normalized
@@ -452,9 +664,9 @@ class AssetFeatures(BaseModel):
 
 
 class AssetUnderstanding(BaseModel):
-    asset_name: str
-    asset_description: str
-    features: AssetFeatures
+    asset_name: str = Field(description="不超过 20 字的素材名称")
+    asset_description: str = Field(description="40 到 120 字的素材整体客观描述")
+    features: AssetFeatures = Field(description="三个独立语义维度的结构化描述")
 
     @model_validator(mode="before")
     @classmethod

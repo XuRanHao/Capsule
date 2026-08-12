@@ -18,17 +18,9 @@ type AssetType = "image" | "video_segment" | "markdown_block" | "text_block";
 type FusionMethod = "weighted_rrf" | "normalized_weighted_similarity";
 type EmbeddingType =
   | "native_multimodal"
-  | "asset_description"
   | "subject_content"
   | "scene_theme"
-  | "visual_style"
-  | "color_composition"
-  | "mood_atmosphere"
-  | "character_state_or_psychology"
-  | "asset_usage"
-  | "target_audience"
-  | "provenance"
-  | "rights_version_authorship";
+  | "visual_presentation";
 
 type DimensionQuery = {
   embedding_type: string;
@@ -157,17 +149,9 @@ const QUERY_TYPES: Array<{ value: QueryType; label: string; marker: string }> = 
 
 const CHANNEL_LABELS: Record<string, string> = {
   native_multimodal: "原始内容",
-  asset_description: "内容描述",
   subject_content: "主体内容",
   scene_theme: "场景主题",
-  visual_style: "视觉风格",
-  color_composition: "色彩构图",
-  mood_atmosphere: "情绪氛围",
-  character_state_or_psychology: "人物状态",
-  asset_usage: "素材用途",
-  target_audience: "目标受众",
-  provenance: "来源",
-  rights_version_authorship: "版权版本",
+  visual_presentation: "视觉表现",
 };
 
 const SEARCH_DIMENSIONS = Object.entries(CHANNEL_LABELS).map(
@@ -183,8 +167,7 @@ const ASSET_LABELS: Record<AssetType, string> = {
 
 const VISUAL_ASSET_TYPES = new Set<AssetType>(["image", "video_segment"]);
 const VISUAL_ONLY_DIMENSIONS = new Set<EmbeddingType>([
-  "visual_style",
-  "color_composition",
+  "visual_presentation",
 ]);
 
 function dimensionSupportCount(
@@ -241,8 +224,8 @@ const DEMO_RESULTS: SearchResult[] = [
         rrf_contribution: 0.01639,
       },
       {
-        channel: "visual_style",
-        embedding_type: "visual_style",
+        channel: "visual_presentation",
+        embedding_type: "visual_presentation",
         rank: 2,
         similarity: 0.901,
         fusion_contribution: 0.00968,
@@ -288,8 +271,8 @@ const DEMO_RESULTS: SearchResult[] = [
         rrf_contribution: 0.01311,
       },
       {
-        channel: "mood_atmosphere",
-        embedding_type: "mood_atmosphere",
+        channel: "scene_theme",
+        embedding_type: "scene_theme",
         rank: 3,
         similarity: 0.867,
         fusion_contribution: 0.0084,
@@ -326,8 +309,8 @@ const DEMO_RESULTS: SearchResult[] = [
     score: 0.03021,
     matched_channels: [
       {
-        channel: "asset_description",
-        embedding_type: "asset_description",
+        channel: "subject_content",
+        embedding_type: "subject_content",
         rank: 2,
         similarity: 0.892,
         fusion_contribution: 0.0129,
@@ -346,7 +329,7 @@ const DEMO_CLUSTERS: ClusterSearchResult[] = [
   {
     cluster_capsule_id: "cc_demo_twilight",
     cluster_run_id: "run_demo_mood",
-    embedding_type: "mood_atmosphere",
+    embedding_type: "scene_theme",
     name: "蓝紫与暖金交界的黄昏",
     description:
       "这个簇聚合了蓝调时刻、暖金斜阳与克制叙事感的图片和视频片段，主要差异来自人物是否出现以及环境尺度。",
@@ -372,16 +355,15 @@ const DEMO_RESPONSE: SearchResponse = {
     query_image_url: null,
     query_image_upload_id: null,
     embedding_types: [
-      "asset_description",
       "native_multimodal",
       "subject_content",
-      "visual_style",
+      "visual_presentation",
     ],
   },
   parsed_query: {
     dimension_queries: [
       {
-        embedding_type: "asset_description",
+        embedding_type: "scene_theme",
         query: "蓝紫色黄昏时分的动画场景，呈现完整画面内容与环境氛围",
         weight: 0.35,
         source: "text",
@@ -399,7 +381,7 @@ const DEMO_RESPONSE: SearchResponse = {
         source: "text",
       },
       {
-        embedding_type: "visual_style",
+        embedding_type: "visual_presentation",
         query: "蓝紫色调的动画电影视觉风格",
         weight: 0.15,
         source: "text",

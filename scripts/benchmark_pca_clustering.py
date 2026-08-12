@@ -38,7 +38,6 @@ from capsule.enums import EmbeddingType
 from capsule.pipeline.clustering import (
     HdbscanParameters,
     cluster_vectors,
-    merge_semantically_overlapping_clusters,
 )
 from capsule.vector_fusion import (
     DEFAULT_NATIVE_CONTENT_WEIGHT,
@@ -270,10 +269,9 @@ def _cluster_metrics(
             except (ArithmeticError, ValueError):
                 dbcv = None
 
-    merged = merge_semantically_overlapping_clusters(vectors, labels)
     final_metrics = _final_structure_metrics(
         normalized,
-        merged.labels,
+        labels,
         compute_dbcv=extended,
     )
     clustered_probabilities = result.probabilities[clustered]
@@ -282,8 +280,6 @@ def _cluster_metrics(
         "effective_pca_dimension": target_dimension,
         "sample_count": len(vectors),
         "cluster_count": cluster_count,
-        "merged_cluster_count": merged.cluster_count,
-        "semantic_merge_count": len(merged.decisions),
         "noise_ratio": result.noise_ratio,
         "coverage": 1.0 - result.noise_ratio,
         "mean_membership_probability": (
@@ -301,7 +297,7 @@ def _cluster_metrics(
         "pca_fit_transform_ms": pca_fit_transform_ms,
         "cluster_runtime_ms": cluster_ms,
         "raw_labels": labels.tolist(),
-        "final_labels": merged.labels.tolist(),
+        "final_labels": labels.tolist(),
         **final_metrics,
     }
 
@@ -379,7 +375,6 @@ def _aggregate_full_results(full_results: list[dict[str, Any]]) -> list[dict[str
     aggregates: list[dict[str, Any]] = []
     fields = (
         "cluster_count",
-        "merged_cluster_count",
         "noise_ratio",
         "coverage",
         "mean_membership_probability",
@@ -394,7 +389,6 @@ def _aggregate_full_results(full_results: list[dict[str, Any]]) -> list[dict[str
         "pairwise_distance_spearman",
         "cluster_runtime_ms",
         "pca_fit_transform_ms",
-        "semantic_merge_count",
         "final_original_cosine_silhouette",
         "final_coverage_aware_silhouette",
         "final_original_dbcv",

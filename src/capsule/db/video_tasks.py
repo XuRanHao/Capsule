@@ -8,7 +8,10 @@ source_generation)`` fence carried in :class:`VideoTaskLease`.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from posixpath import normpath
 from typing import Any
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from uuid import uuid4
 
 from sqlalchemy import (
     DateTime,
@@ -19,6 +22,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    bindparam,
+    false,
     func,
     or_,
     select,
@@ -32,6 +37,8 @@ from capsule.db.base import Base, id_factory
 from capsule.db.models import ProcessingJob, SourceFile
 from capsule.db.video_task_accounting import account_video_task_outcome
 from capsule.pipeline.video_task_runtime import (
+    ProcessingTaskKind,
+    ResourceClass,
     VideoTaskLease,
     VideoTaskMessage,
     VideoTaskProgress,
@@ -51,6 +58,19 @@ class VideoProcessingTask(Base):
             name="uq_video_task_source_generation_result_version",
         ),
         Index("ix_video_processing_tasks_status_next_retry", "status", "next_retry_at"),
+        Index(
+            "ix_video_processing_tasks_kind_status_next_retry",
+            "task_kind",
+            "status",
+            "next_retry_at",
+        ),
+        Index(
+            "ix_video_processing_tasks_kind_identity",
+            "source_file_id",
+            "source_generation",
+            "task_kind",
+            "result_version",
+        ),
         Index("ix_video_processing_tasks_parent_status", "parent_job_id", "status"),
     )
 
@@ -65,10 +85,17 @@ class VideoProcessingTask(Base):
     )
     source_generation: Mapped[int] = mapped_column(Integer, nullable=False)
     result_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    task_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="video", index=True)
+    resource_class: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="mps_video", index=True
+    )
+    processor_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    route_key: Mapped[str] = mapped_column(String(128), nullable=False, default="mps_video")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     owner_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64))
     message_id: Mapped[str | None] = mapped_column(String(128))
     progress: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     lease_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -80,6 +107,7 @@ class VideoProcessingTask(Base):
     last_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     dlq_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    input_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text)
     parent_accounted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -107,22 +135,37 @@ class PostgresVideoTaskRepository:
         hard_timeout_seconds: float = 7_200.0,
         redispatch_seconds: float = 60.0,
         max_attempts: int = 4,
+        task_kind: str = "video",
+        resource_class: str = "mps_video",
+        processor_version: int = 1,
+        route_key: str = "mps_video",
     ) -> None:
-        if min(
-            lease_seconds,
-            progress_timeout_seconds,
-            hard_timeout_seconds,
-            redispatch_seconds,
-        ) <= 0:
+        if (
+            min(
+                lease_seconds,
+                progress_timeout_seconds,
+                hard_timeout_seconds,
+                redispatch_seconds,
+            )
+            <= 0
+        ):
             raise ValueError("video task lease and deadline durations must be positive")
         if max_attempts < 1:
             raise ValueError("video task max_attempts must be positive")
+        if not task_kind or not resource_class or not route_key:
+            raise ValueError("video task kind, resource class, and route key are required")
+        if processor_version < 1:
+            raise ValueError("video task processor_version must be positive")
         self._session_factory = session_factory
         self._lease_duration = timedelta(seconds=lease_seconds)
         self._progress_timeout = timedelta(seconds=progress_timeout_seconds)
         self._hard_timeout = timedelta(seconds=hard_timeout_seconds)
         self._redispatch_duration = timedelta(seconds=redispatch_seconds)
         self._max_attempts = max_attempts
+        self._task_kind = task_kind
+        self._resource_class = resource_class
+        self._processor_version = processor_version
+        self._route_key = route_key
 
     async def create(
         self,
@@ -131,12 +174,18 @@ class PostgresVideoTaskRepository:
         hard_deadline_at: datetime | None = None,
     ) -> VideoProcessingTask:
         """Atomically create a task, or return its idempotent logical duplicate."""
+        if not self._message_matches_identity(message):
+            raise ValueError("video task message does not match repository identity")
         values: dict[str, Any] = {
             "task_id": message.task_id,
             "parent_job_id": message.job_id,
             "source_file_id": message.source_file_id,
             "source_generation": message.generation,
             "result_version": message.result_version,
+            "task_kind": self._task_kind,
+            "resource_class": self._resource_class,
+            "processor_version": self._processor_version,
+            "route_key": self._route_key,
             "status": "queued",
             "stage": "queued",
             "attempt": 0,
@@ -146,9 +195,7 @@ class PostgresVideoTaskRepository:
         stmt = (
             insert(VideoProcessingTask)
             .values(**values)
-            .on_conflict_do_nothing(
-                constraint="uq_video_task_source_generation_result_version"
-            )
+            .on_conflict_do_nothing(constraint="uq_video_task_source_generation_result_version")
             .returning(VideoProcessingTask)
         )
         async with self._session_factory() as session, session.begin():
@@ -174,6 +221,7 @@ class PostgresVideoTaskRepository:
                     VideoProcessingTask.source_file_id == message.source_file_id,
                     VideoProcessingTask.source_generation == message.generation,
                     VideoProcessingTask.result_version == message.result_version,
+                    *self._task_identity_clauses(),
                 )
             )
             if existing is None:  # pragma: no cover - defensive against a broken schema
@@ -190,7 +238,12 @@ class PostgresVideoTaskRepository:
         """Claim only the delivery which represents the next database attempt."""
         if not worker_id or not receipt:
             raise ValueError("worker_id and receipt are required")
+        if not self._message_matches_identity(message):
+            return None
+        if message.task_id is None:  # pragma: no cover - normalized in message construction.
+            return None
         previous_attempt = 0 if message.attempt == 0 else message.attempt - 1
+        lease_token = uuid4().hex
         stmt = (
             update(VideoProcessingTask)
             .where(
@@ -198,6 +251,7 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.source_file_id == message.source_file_id,
                 VideoProcessingTask.source_generation == message.generation,
                 VideoProcessingTask.result_version == message.result_version,
+                *self._task_identity_clauses(),
                 VideoProcessingTask.attempt == previous_attempt,
                 VideoProcessingTask.owner_id.is_(None),
                 VideoProcessingTask.status.in_(("queued", "retry_wait")),
@@ -212,6 +266,7 @@ class PostgresVideoTaskRepository:
                 stage="processing",
                 attempt=VideoProcessingTask.attempt + 1,
                 owner_id=worker_id,
+                lease_token=lease_token,
                 message_id=receipt,
                 lease_deadline_at=func.now() + self._lease_duration,
                 progress_deadline_at=func.now() + self._progress_timeout,
@@ -219,30 +274,70 @@ class PostgresVideoTaskRepository:
                 next_retry_at=None,
                 updated_at=func.now(),
             )
-            .returning(
-                VideoProcessingTask.task_id,
-                VideoProcessingTask.source_file_id,
-                VideoProcessingTask.source_generation,
-                VideoProcessingTask.attempt,
-                VideoProcessingTask.owner_id,
-                VideoProcessingTask.result_version,
-            )
         )
         async with self._session_factory() as session, session.begin():
+            claim = await session.execute(stmt)
+        if getattr(claim, "rowcount", 0) != 1:
+            return None
+        return VideoTaskLease(
+            task_id=message.task_id,
+            source_file_id=message.source_file_id,
+            source_generation=message.generation,
+            attempt=previous_attempt + 1,
+            worker_id=worker_id,
+            result_version=message.result_version,
+            # The UPDATE predicate already fenced these four fields against
+            # this repository's trusted processor contract. Reuse that exact
+            # contract for the lease instead of trusting concurrently adapted
+            # RETURNING labels for processor identity.
+            task_kind=ProcessingTaskKind(self._task_kind),
+            resource_class=ResourceClass(self._resource_class),
+            route_key=self._route_key,
+            processor_version=self._processor_version,
+            lease_token=lease_token,
+        )
+
+    async def inspect_message_contract(self, message: VideoTaskMessage) -> bool | None:
+        """Compare a transport message with its durable task contract.
+
+        The lookup deliberately uses only ``task_id``: an incoming message must
+        not be able to hide a mismatched task behind this repository's local
+        routing configuration. ``None`` means the task does not exist.
+        """
+        stmt = (
+            select(
+                VideoProcessingTask,
+                ProcessingJob.workspace_id,
+                SourceFile.storage_uri,
+            )
+            .join(ProcessingJob, ProcessingJob.job_id == VideoProcessingTask.parent_job_id)
+            .join(SourceFile, SourceFile.source_file_id == VideoProcessingTask.source_file_id)
+            .where(VideoProcessingTask.task_id == message.task_id)
+        )
+        async with self._session_factory() as session:
             row = (await session.execute(stmt)).one_or_none()
         if row is None:
             return None
-        return VideoTaskLease(
-            task_id=row.task_id,
-            source_file_id=row.source_file_id,
-            source_generation=row.source_generation,
-            attempt=row.attempt,
-            worker_id=row.owner_id,
-            result_version=row.result_version,
+        task, parent_workspace_id, source_storage_uri = row
+        return (
+            task.parent_job_id == message.job_id
+            and parent_workspace_id == message.workspace_id
+            and task.source_file_id == message.source_file_id
+            and task.source_generation == message.generation
+            and task.result_version == message.result_version
+            and task.task_kind == message.task_kind.value
+            and message.resource_class is not None
+            and task.resource_class == message.resource_class.value
+            and task.route_key == message.route_key
+            and task.processor_version == message.processor_version
+            and _normalize_source_uri(message.source_uri)
+            == _normalize_source_uri(source_storage_uri)
         )
 
     async def can_ack_unclaimed(self, message: VideoTaskMessage) -> bool:
         """ACK only terminal or result-committed duplicates, never active work."""
+        if not self._message_matches_identity(message):
+            return False
         stmt = select(
             VideoProcessingTask.status,
             VideoProcessingTask.dlq_published_at,
@@ -251,11 +346,12 @@ class PostgresVideoTaskRepository:
             VideoProcessingTask.source_file_id == message.source_file_id,
             VideoProcessingTask.source_generation == message.generation,
             VideoProcessingTask.result_version == message.result_version,
+            *self._task_identity_clauses(),
         )
         async with self._session_factory() as session:
             row = (await session.execute(stmt)).one_or_none()
         if row is None:
-            return True
+            return False
         if row.status == "failed":
             return row.dlq_published_at is not None
         return row.status in {"result_committed", "completed", "invalidated", "cancelled"}
@@ -296,6 +392,7 @@ class PostgresVideoTaskRepository:
                 "result": {"result_ref": result.result_ref, "metadata": dict(result.metadata)},
                 "error_message": None,
                 "owner_id": None,
+                "lease_token": None,
                 "message_id": None,
                 "lease_deadline_at": None,
                 "progress_deadline_at": None,
@@ -313,6 +410,7 @@ class PostgresVideoTaskRepository:
                 "status": "completed",
                 "stage": "completed",
                 "owner_id": None,
+                "lease_token": None,
                 "message_id": None,
                 "lease_deadline_at": None,
                 "progress_deadline_at": None,
@@ -336,6 +434,7 @@ class PostgresVideoTaskRepository:
                 "error_message": error[:2_000],
                 "next_retry_at": _as_utc(retry_at),
                 "owner_id": None,
+                "lease_token": None,
                 "message_id": None,
                 "lease_deadline_at": None,
                 "progress_deadline_at": None,
@@ -344,6 +443,8 @@ class PostgresVideoTaskRepository:
 
     async def fail(self, lease: VideoTaskLease, *, error: str) -> bool:
         """Fail a live task and account both its source and parent exactly once."""
+        if not lease.lease_token:
+            return False
         bounded_error = error[:2_000]
         clauses = [
             VideoProcessingTask.status == "processing",
@@ -365,6 +466,7 @@ class PostgresVideoTaskRepository:
                 error_message=bounded_error,
                 parent_accounted_at=func.now(),
                 owner_id=None,
+                lease_token=None,
                 message_id=None,
                 lease_deadline_at=None,
                 progress_deadline_at=None,
@@ -403,6 +505,7 @@ class PostgresVideoTaskRepository:
                 "stage": "invalidated",
                 "error_message": error[:2_000],
                 "owner_id": None,
+                "lease_token": None,
                 "message_id": None,
                 "lease_deadline_at": None,
                 "progress_deadline_at": None,
@@ -420,6 +523,7 @@ class PostgresVideoTaskRepository:
         stmt = (
             select(VideoProcessingTask)
             .where(
+                *self._task_identity_clauses(),
                 or_(
                     VideoProcessingTask.status == "queued",
                     and_(
@@ -430,7 +534,7 @@ class PostgresVideoTaskRepository:
                         ),
                     ),
                     VideoProcessingTask.status == "result_committed",
-                )
+                ),
             )
             .order_by(VideoProcessingTask.created_at, VideoProcessingTask.task_id)
             .limit(limit)
@@ -442,6 +546,7 @@ class PostgresVideoTaskRepository:
         """Release expired processing leases and expose expired finalizers to repair."""
         current = _as_utc(now)
         stale = select(VideoProcessingTask).where(
+            *self._task_identity_clauses(),
             VideoProcessingTask.status.in_(("processing", "result_committed")),
             VideoProcessingTask.owner_id.is_not(None),
             or_(
@@ -466,6 +571,7 @@ class PostgresVideoTaskRepository:
                 # clause, so a racing renewed lease cannot be reclaimed incorrectly.
                 values: dict[str, Any] = {
                     "owner_id": None,
+                    "lease_token": None,
                     "message_id": None,
                     "lease_deadline_at": None,
                     "progress_deadline_at": None,
@@ -524,6 +630,7 @@ class PostgresVideoTaskRepository:
             .join(ProcessingJob, ProcessingJob.job_id == VideoProcessingTask.parent_job_id)
             .join(SourceFile, SourceFile.source_file_id == VideoProcessingTask.source_file_id)
             .where(
+                *self._task_identity_clauses(),
                 VideoProcessingTask.owner_id.is_(None),
                 or_(
                     and_(
@@ -554,12 +661,18 @@ class PostgresVideoTaskRepository:
                 attempt=(0 if task.attempt == 0 else task.attempt + 1),
                 result_version=task.result_version,
                 source_uri=storage_uri,
+                task_kind=ProcessingTaskKind(task.task_kind),
+                processor_version=task.processor_version,
+                resource_class=ResourceClass(task.resource_class),
+                route_key=task.route_key,
             )
             for task, workspace_id, storage_uri in rows
         ]
 
     async def mark_published(self, message: VideoTaskMessage) -> None:
         """Record publication after XADD; stale queued work remains redispatchable."""
+        if not self._message_matches_identity(message):
+            return
         previous_attempt = 0 if message.attempt == 0 else message.attempt - 1
         stmt = (
             update(VideoProcessingTask)
@@ -568,6 +681,7 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.source_file_id == message.source_file_id,
                 VideoProcessingTask.source_generation == message.generation,
                 VideoProcessingTask.result_version == message.result_version,
+                *self._task_identity_clauses(),
                 VideoProcessingTask.attempt == previous_attempt,
                 VideoProcessingTask.owner_id.is_(None),
                 VideoProcessingTask.status.in_(("queued", "retry_wait")),
@@ -583,9 +697,7 @@ class PostgresVideoTaskRepository:
         async with self._session_factory() as session, session.begin():
             await session.execute(stmt)
 
-    async def due_failed_dlq(
-        self, *, now: float
-    ) -> list[tuple[VideoTaskMessage, str]]:
+    async def due_failed_dlq(self, *, now: float) -> list[tuple[VideoTaskMessage, str]]:
         """Return final failures whose durable DLQ event has not been published."""
         del now
         stmt = (
@@ -597,6 +709,7 @@ class PostgresVideoTaskRepository:
             .join(ProcessingJob, ProcessingJob.job_id == VideoProcessingTask.parent_job_id)
             .join(SourceFile, SourceFile.source_file_id == VideoProcessingTask.source_file_id)
             .where(
+                *self._task_identity_clauses(),
                 VideoProcessingTask.status == "failed",
                 VideoProcessingTask.dlq_published_at.is_(None),
             )
@@ -615,6 +728,10 @@ class PostgresVideoTaskRepository:
                     attempt=task.attempt,
                     result_version=task.result_version,
                     source_uri=storage_uri,
+                    task_kind=ProcessingTaskKind(task.task_kind),
+                    processor_version=task.processor_version,
+                    resource_class=ResourceClass(task.resource_class),
+                    route_key=task.route_key,
                 ),
                 task.error_message or "video task failed",
             )
@@ -622,6 +739,8 @@ class PostgresVideoTaskRepository:
         ]
 
     async def mark_dlq_published(self, message: VideoTaskMessage) -> None:
+        if not self._message_matches_identity(message):
+            return
         stmt = (
             update(VideoProcessingTask)
             .where(
@@ -629,6 +748,7 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.source_file_id == message.source_file_id,
                 VideoProcessingTask.source_generation == message.generation,
                 VideoProcessingTask.result_version == message.result_version,
+                *self._task_identity_clauses(),
                 VideoProcessingTask.status == "failed",
                 VideoProcessingTask.dlq_published_at.is_(None),
             )
@@ -646,6 +766,8 @@ class PostgresVideoTaskRepository:
         extra_clauses: tuple[Any, ...] = (),
         values: dict[str, Any],
     ) -> bool:
+        if not lease.lease_token:
+            return False
         clauses = [
             VideoProcessingTask.status.in_(statuses),
             *self._fence_clauses(lease),
@@ -672,22 +794,141 @@ class PostgresVideoTaskRepository:
             updated_task_id = await session.scalar(stmt)
         return updated_task_id is not None
 
-    @staticmethod
-    def _fence_clauses(lease: VideoTaskLease | VideoProcessingTask) -> tuple[Any, ...]:
+    def _fence_clauses(self, lease: VideoTaskLease | VideoProcessingTask) -> tuple[Any, ...]:
         """Return the full identity/ownership/generation fence for every write."""
+        # A worker-provided lease without the per-claim token is never valid.
+        # Recovery passes the persisted row instead, where a nullable token is
+        # deliberately compared exactly (including ``IS NULL`` for old rows).
+        if isinstance(lease, VideoTaskLease) and not lease.lease_token:
+            token_clauses: tuple[Any, ...] = (false(),)
+        elif lease.lease_token is None:
+            token_clauses = (VideoProcessingTask.lease_token.is_(None),)
+        else:
+            token_clauses = (
+                VideoProcessingTask.lease_token
+                == bindparam(
+                    "fence_lease_token",
+                    lease.lease_token,
+                    type_=String(64),
+                ),
+            )
+        owner_id = lease.worker_id if isinstance(lease, VideoTaskLease) else lease.owner_id
+        owner_clause = (
+            VideoProcessingTask.owner_id.is_(None)
+            if owner_id is None
+            else VideoProcessingTask.owner_id
+            == bindparam("fence_owner_id", owner_id, type_=String(255))
+        )
         return (
-            VideoProcessingTask.task_id == lease.task_id,
-            VideoProcessingTask.source_file_id == lease.source_file_id,
-            VideoProcessingTask.source_generation == lease.source_generation,
-            VideoProcessingTask.result_version == lease.result_version,
-            VideoProcessingTask.attempt == lease.attempt,
-            (
-                VideoProcessingTask.owner_id == lease.worker_id
-                if isinstance(lease, VideoTaskLease)
-                else VideoProcessingTask.owner_id == lease.owner_id
+            *self._lease_identity_clauses(lease),
+            VideoProcessingTask.task_id
+            == bindparam("fence_task_id", lease.task_id, type_=String(64)),
+            VideoProcessingTask.source_file_id
+            == bindparam(
+                "fence_source_file_id",
+                lease.source_file_id,
+                type_=String(64),
             ),
+            VideoProcessingTask.source_generation
+            == bindparam(
+                "fence_source_generation",
+                lease.source_generation,
+                type_=Integer(),
+            ),
+            VideoProcessingTask.result_version
+            == bindparam(
+                "fence_result_version",
+                lease.result_version,
+                type_=Integer(),
+            ),
+            VideoProcessingTask.attempt
+            == bindparam("fence_attempt", lease.attempt, type_=Integer()),
+            owner_clause,
+            *token_clauses,
+        )
+
+    def _task_identity_clauses(self) -> tuple[Any, ...]:
+        """Bind this repository to one complete persisted processor identity."""
+        return (
+            VideoProcessingTask.task_kind
+            == bindparam("identity_task_kind", self._task_kind, type_=String(32)),
+            VideoProcessingTask.resource_class
+            == bindparam(
+                "identity_resource_class",
+                self._resource_class,
+                type_=String(32),
+            ),
+            VideoProcessingTask.route_key
+            == bindparam("identity_route_key", self._route_key, type_=String(128)),
+            VideoProcessingTask.processor_version
+            == bindparam(
+                "identity_processor_version",
+                self._processor_version,
+                type_=Integer(),
+            ),
+        )
+
+    @staticmethod
+    def _lease_identity_clauses(lease: VideoTaskLease | VideoProcessingTask) -> tuple[Any, ...]:
+        """Fence writes to the immutable identity carried by this exact lease."""
+        if isinstance(lease, VideoTaskLease):
+            task_kind = lease.task_kind.value
+            resource_class = lease.resource_class.value
+            route_key = lease.route_key
+            processor_version = lease.processor_version
+        else:
+            task_kind = lease.task_kind
+            resource_class = lease.resource_class
+            route_key = lease.route_key
+            processor_version = lease.processor_version
+        return (
+            VideoProcessingTask.task_kind
+            == bindparam("fence_task_kind", task_kind, type_=String(32)),
+            VideoProcessingTask.resource_class
+            == bindparam("fence_resource_class", resource_class, type_=String(32)),
+            VideoProcessingTask.route_key
+            == bindparam("fence_route_key", route_key, type_=String(128)),
+            VideoProcessingTask.processor_version
+            == bindparam(
+                "fence_processor_version",
+                processor_version,
+                type_=Integer(),
+            ),
+        )
+
+    def _message_matches_identity(self, message: VideoTaskMessage) -> bool:
+        """Reject transport identity that disagrees with this repository route.
+
+        Route identity is transported as data but remains constrained by this
+        server-owned repository configuration before database access.
+        """
+        route_key = getattr(message, "route_key", None)
+        return (
+            message.task_kind.value == self._task_kind
+            and message.resource_class is not None
+            and message.resource_class.value == self._resource_class
+            and message.processor_version == self._processor_version
+            and route_key == self._route_key
         )
 
 
 def _as_utc(timestamp: float) -> datetime:
     return datetime.fromtimestamp(timestamp, tz=UTC)
+
+
+def _normalize_source_uri(value: str) -> str:
+    """Canonicalize equivalent source URI spellings before contract comparison."""
+    parsed = urlsplit(value)
+    decoded_path = unquote(parsed.path)
+    normalized_path = normpath(decoded_path) if decoded_path else ""
+    if decoded_path.startswith("/") and not normalized_path.startswith("/"):
+        normalized_path = f"/{normalized_path}"
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            quote(normalized_path, safe="/%:@"),
+            parsed.query,
+            parsed.fragment,
+        )
+    )

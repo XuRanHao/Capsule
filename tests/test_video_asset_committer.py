@@ -1,20 +1,139 @@
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from capsule.config import get_settings
 from capsule.db.models import Asset, ProcessingJob, SourceFile, Workspace
 from capsule.db.repositories import AssetRepository
 from capsule.db.session import Database
-from capsule.db.video_asset_committer import PostgresFencedVideoAssetCommitter
+from capsule.db.video_asset_committer import (
+    PostgresFencedVideoAssetCommitter,
+    _message_matches_lease,
+    _owned_live_lease_clauses,
+)
 from capsule.db.video_tasks import PostgresVideoTaskRepository, VideoProcessingTask
 from capsule.enums import AssetType, ProcessingStatus
 from capsule.parsers.discovery import sha256_file
 from capsule.pipeline.asset_factory import AssetFactory
-from capsule.pipeline.video_task_runtime import VideoTaskMessage, VideoTaskResult
-from capsule.schemas import AssetDraft, DiscoveredFile
+from capsule.pipeline.video_task_runtime import (
+    LeaseLostError,
+    ProcessingTaskKind,
+    ResourceClass,
+    VideoTaskLease,
+    VideoTaskMessage,
+    VideoTaskResult,
+)
+from capsule.schemas import AssetCreate, AssetDraft, DiscoveredFile
+
+
+def test_asset_committer_includes_a_nonempty_lease_token_in_its_live_fence() -> None:
+    lease = VideoTaskLease(
+        task_id="task-1",
+        source_file_id="source-1",
+        source_generation=1,
+        attempt=1,
+        worker_id="worker-1",
+        result_version=1,
+        lease_token="claim-unique-token",
+    )
+
+    clauses = " AND ".join(str(clause) for clause in _owned_live_lease_clauses(lease))
+
+    assert "video_processing_tasks.lease_token" in clauses
+
+
+@pytest.mark.asyncio
+async def test_asset_committer_rejects_a_lease_without_a_claim_token() -> None:
+    message = VideoTaskMessage(
+        job_id="job-1",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=1,
+    )
+    lease = VideoTaskLease(
+        task_id=message.task_id or "",
+        source_file_id="source-1",
+        source_generation=1,
+        attempt=1,
+        worker_id="worker-1",
+        result_version=1,
+    )
+    committer = PostgresFencedVideoAssetCommitter(None)  # type: ignore[arg-type]
+
+    assert not await committer.validate_lease_source(message, lease)
+    clauses = " AND ".join(str(clause) for clause in _owned_live_lease_clauses(lease))
+    assert "false" in clauses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message_changes",
+    [
+        {"task_kind": ProcessingTaskKind.TEXT},
+        {"resource_class": ResourceClass.CPU},
+        {"route_key": "untrusted-route"},
+        {"processor_version": 2},
+    ],
+)
+async def test_asset_committer_rejects_each_message_identity_mismatch(
+    message_changes: dict[str, object],
+) -> None:
+    message = VideoTaskMessage(
+        task_id="task-1",
+        job_id="job-1",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=1,
+    )
+    lease = VideoTaskLease(
+        task_id="task-1",
+        source_file_id="source-1",
+        source_generation=1,
+        attempt=1,
+        worker_id="worker-1",
+        result_version=1,
+        lease_token="claim-unique-token",
+    )
+    tampered = replace(message, **message_changes)  # type: ignore[arg-type]
+    committer = PostgresFencedVideoAssetCommitter(None)  # type: ignore[arg-type]
+
+    assert not _message_matches_lease(tampered, lease)
+    assert not await committer.validate_lease_source(tampered, lease)
+    with pytest.raises(LeaseLostError, match="does not match"):
+        await committer.commit_segment(
+            tampered,
+            lease,
+            cast(AssetCreate, None),
+            expected_asset_count=1,
+        )
+
+
+def test_asset_committer_live_fence_includes_the_full_lease_identity() -> None:
+    lease = VideoTaskLease(
+        task_id="task-1",
+        source_file_id="source-1",
+        source_generation=1,
+        attempt=1,
+        worker_id="worker-1",
+        result_version=1,
+        lease_token="claim-unique-token",
+    )
+
+    clauses = " AND ".join(str(clause) for clause in _owned_live_lease_clauses(lease))
+
+    assert all(
+        field in clauses
+        for field in (
+            "video_processing_tasks.task_kind",
+            "video_processing_tasks.resource_class",
+            "video_processing_tasks.route_key",
+            "video_processing_tasks.processor_version",
+        )
+    )
 
 
 @pytest.mark.integration
@@ -102,6 +221,28 @@ async def test_fenced_segment_commit_publishes_only_complete_generation_once(
         )
         committer = PostgresFencedVideoAssetCommitter(database)
         assert await committer.validate_lease_source(message, lease)
+        tampered = replace(message, route_key="untrusted-route")
+        assert not await committer.validate_lease_source(tampered, lease)
+        with pytest.raises(LeaseLostError, match="does not match"):
+            await committer.commit_segment(
+                tampered,
+                lease,
+                task_assets[0],
+                expected_asset_count=2,
+            )
+        async with database.session() as session:
+            task = await session.get(VideoProcessingTask, message.task_id)
+            source = await session.get(SourceFile, submitted.source_file_id)
+            job = await session.get(ProcessingJob, submitted.job_id)
+            asset_count = await session.scalar(
+                select(func.count(Asset.asset_id)).where(
+                    Asset.source_file_id == submitted.source_file_id
+                )
+            )
+        assert task is not None and task.status == "processing"
+        assert source is not None and source.processing_status == ProcessingStatus.PROCESSING.value
+        assert job is not None and job.completed_count == 0
+        assert asset_count == 0
         await committer.commit_segment(message, lease, task_assets[0], expected_asset_count=2)
 
         async with database.session() as session:

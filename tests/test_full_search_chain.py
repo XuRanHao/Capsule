@@ -46,10 +46,10 @@ def test_normalized_weighted_similarity_is_selectable() -> None:
         ),
         hits=(_hit("a", 0.7), _hit("b", 0.9)),
     )
-    mood = ChannelRecall(
+    scene = ChannelRecall(
         query_vector=QueryVector(
-            channel="mood_atmosphere",
-            embedding_type=EmbeddingType.MOOD_ATMOSPHERE,
+            channel="scene_theme",
+            embedding_type=EmbeddingType.SCENE_THEME,
             vector=[1],
             weight=0.4,
         ),
@@ -57,7 +57,7 @@ def test_normalized_weighted_similarity_is_selectable() -> None:
     )
 
     result = FusionEngine(candidate_cap=10).fuse(
-        (subject, mood),
+        (subject, scene),
         FusionMethod.NORMALIZED_WEIGHTED_SIMILARITY,
     )
 
@@ -81,11 +81,11 @@ class FakeUnderstandingClient:
         return SearchDimensionSuggestionResponse(
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
-                EmbeddingType.COLOR_COMPOSITION,
+                EmbeddingType.VISUAL_PRESENTATION,
             ],
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: 0.3,
-                EmbeddingType.COLOR_COMPOSITION: 0.7,
+                EmbeddingType.VISUAL_PRESENTATION: 0.7,
             },
         )
 
@@ -125,7 +125,7 @@ async def test_smart_dimension_selection_weights_are_used_by_query_plan() -> Non
     assert reasons == ()
     assert [item.embedding_type for item in parsed.dimension_queries] == [
         EmbeddingType.NATIVE_MULTIMODAL,
-        EmbeddingType.COLOR_COMPOSITION,
+        EmbeddingType.VISUAL_PRESENTATION,
     ]
     assert [item.weight for item in parsed.dimension_queries] == pytest.approx([0.3, 0.7])
 
@@ -141,9 +141,7 @@ async def test_image_query_uses_equal_weight_selected_routes_without_model() -> 
             EmbeddingType.NATIVE_MULTIMODAL,
             EmbeddingType.SUBJECT_CONTENT,
             EmbeddingType.SCENE_THEME,
-            EmbeddingType.VISUAL_STYLE,
-            EmbeddingType.COLOR_COMPOSITION,
-            EmbeddingType.MOOD_ATMOSPHERE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ],
     )
     parsed, reasons = await QueryParser(client).parse(
@@ -152,9 +150,9 @@ async def test_image_query_uses_equal_weight_selected_routes_without_model() -> 
     )
 
     assert reasons == ()
-    assert len(parsed.dimension_queries) == 6
+    assert len(parsed.dimension_queries) == 4
     assert math.isclose(sum(item.weight for item in parsed.dimension_queries), 1)
-    assert all(math.isclose(item.weight, 1 / 6) for item in parsed.dimension_queries)
+    assert all(math.isclose(item.weight, 1 / 4) for item in parsed.dimension_queries)
     assert all(item.source is QueryDimensionSource.IMAGE for item in parsed.dimension_queries)
     assert client.enhancement_calls == 0
 
@@ -169,16 +167,16 @@ class TextQueryEnhancementClient:
         assert query_text == "重点看动画风格，原始内容其次"
         assert list(embedding_types) == [
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ]
         return QueryEnhancement(
             queries={
                 EmbeddingType.NATIVE_MULTIMODAL: "蓝紫色黄昏动画场景",
-                EmbeddingType.VISUAL_STYLE: "蓝紫色调的动画电影视觉风格",
+                EmbeddingType.VISUAL_PRESENTATION: "蓝紫色调的动画电影视觉风格",
             },
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: 2,
-                EmbeddingType.VISUAL_STYLE: 8,
+                EmbeddingType.VISUAL_PRESENTATION: 8,
             },
         )
 
@@ -195,7 +193,7 @@ async def test_text_bearing_queries_are_enhanced_with_intent_weights(
         query_image_url=image_url,
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ],
     )
 
@@ -226,7 +224,7 @@ async def test_text_multidimension_always_uses_query_enhancer() -> None:
         query_text="蓝紫色黄昏动画场景，主要人物在中央",
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ],
     )
 
@@ -235,12 +233,12 @@ async def test_text_multidimension_always_uses_query_enhancer() -> None:
     assert reasons == ()
     assert [item.embedding_type for item in parsed.dimension_queries] == [
         EmbeddingType.NATIVE_MULTIMODAL,
-        EmbeddingType.VISUAL_STYLE,
+        EmbeddingType.VISUAL_PRESENTATION,
     ]
     assert [item.weight for item in parsed.dimension_queries] == [0.5, 0.5]
     assert [item.query for item in parsed.dimension_queries] == [
         "蓝紫色黄昏动画场景，主要人物在中央",
-        "visual_style:蓝紫色黄昏动画场景，主要人物在中央",
+        "visual_presentation:蓝紫色黄昏动画场景，主要人物在中央",
     ]
     assert client.enhancement_calls == 1
 
@@ -283,33 +281,33 @@ class StaticEnhancementClient:
             queries={EmbeddingType.NATIVE_MULTIMODAL: "内容查询"},
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: 0.5,
-                EmbeddingType.VISUAL_STYLE: 0.5,
+                EmbeddingType.VISUAL_PRESENTATION: 0.5,
             },
         ),
         QueryEnhancement(
             queries={
                 EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
-                EmbeddingType.VISUAL_STYLE: "   ",
+                EmbeddingType.VISUAL_PRESENTATION: "   ",
             },
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: 0.5,
-                EmbeddingType.VISUAL_STYLE: 0.5,
+                EmbeddingType.VISUAL_PRESENTATION: 0.5,
             },
         ),
         QueryEnhancement(
             queries={
                 EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
-                EmbeddingType.VISUAL_STYLE: "风格查询",
+                EmbeddingType.VISUAL_PRESENTATION: "风格查询",
             },
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: float("nan"),
-                EmbeddingType.VISUAL_STYLE: 0.5,
+                EmbeddingType.VISUAL_PRESENTATION: 0.5,
             },
         ),
         QueryEnhancement(
             queries={
                 EmbeddingType.NATIVE_MULTIMODAL: "内容查询",
-                EmbeddingType.VISUAL_STYLE: "风格查询",
+                EmbeddingType.VISUAL_PRESENTATION: "风格查询",
             },
             weights={EmbeddingType.NATIVE_MULTIMODAL: 1.0},
         ),
@@ -325,7 +323,7 @@ async def test_invalid_enhancement_falls_back_to_original_query_and_equal_weight
         query_text="重点看风格，内容其次",
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ],
     )
 

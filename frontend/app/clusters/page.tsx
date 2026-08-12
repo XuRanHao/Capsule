@@ -17,8 +17,6 @@ import DemoShell, {
 } from "../components/DemoShell";
 import {
   ApiRequestError,
-  type ClusterAssetStatus,
-  type ClusterAssetStatusItem,
   type ClusterCapsule,
   type ClusterMember,
   type ClusterRun,
@@ -31,23 +29,9 @@ import { useWorkspaceSelection, WorkspaceSelect } from "../lib/workspaces";
 
 const FEATURE_TYPES = [
   { value: "native_multimodal", label: "原始内容" },
-  { value: "asset_description", label: "素材完整描述" },
   { value: "subject_content", label: "主体与内容" },
   { value: "scene_theme", label: "场景与题材" },
-  { value: "visual_style", label: "视觉风格" },
-  { value: "color_composition", label: "色彩与构图" },
-  { value: "mood_atmosphere", label: "画面情绪氛围" },
-  {
-    value: "character_state_or_psychology",
-    label: "人物状态或心理",
-  },
-  { value: "asset_usage", label: "资产用途" },
-  { value: "target_audience", label: "目标受众" },
-  { value: "provenance", label: "来源与创作关系" },
-  {
-    value: "rights_version_authorship",
-    label: "权利、版本与作者",
-  },
+  { value: "visual_presentation", label: "视觉表现" },
 ] as const;
 
 const GROUP_COLORS = [
@@ -66,6 +50,7 @@ const GRAPH_MAX_SCALE = 2.4;
 const GRAPH_MEMBER_LIMIT = 32;
 const RUN_POLL_INTERVAL_MS = 1_000;
 const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
+type ClusterAlgorithm = "hdbscan" | "complete_link";
 
 const CURRENT_CLUSTER_MODES: Array<{
   value: CurrentClusterMode;
@@ -93,14 +78,6 @@ function currentClusterModeLabel(mode: CurrentClusterMode) {
   return (
     CURRENT_CLUSTER_MODES.find((item) => item.value === mode)?.label ?? mode
   );
-}
-
-function clusterAssetStatusLabel(status: ClusterAssetStatusItem["status"]) {
-  return {
-    incrementally_clustered: "已增量归簇",
-    pending: "待聚类",
-    manual_management: "手动管理",
-  }[status];
 }
 
 function parseAssetIds(value: string) {
@@ -181,6 +158,19 @@ function parseIntegerParameter(
   return parsed;
 }
 
+function parseNumberParameter(
+  label: string,
+  value: string,
+  exclusiveMinimum: number,
+  maximum: number,
+) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= exclusiveMinimum || parsed > maximum) {
+    throw new Error(`${label} 必须大于 ${exclusiveMinimum} 且不超过 ${maximum}`);
+  }
+  return parsed;
+}
+
 function parseNativeContentWeight(value: string) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
@@ -205,9 +195,18 @@ function runOptionLabel(run: ClusterRun) {
     FEATURE_TYPES.find((item) => item.value === run.embedding_type)?.label ??
     run.embedding_type;
   const pca = runPcaDimension(run);
-  const minSamples = runParameter(run.parameters.min_samples);
   const minClusterSize = runParameter(run.parameters.min_cluster_size);
-  return `${feature} · ${run.status} · ${run.sample_count} 条 · PCA ${pca} / MS ${minSamples} / MCS ${minClusterSize}`;
+  const algorithm = runAlgorithm(run);
+  const algorithmParameters =
+    algorithm === "complete_link"
+      ? `CL / DT ${runParameter(run.parameters.distance_threshold)} / MCS ${minClusterSize}`
+      : `HDBSCAN / MS ${runParameter(run.parameters.min_samples)} / MCS ${minClusterSize}`;
+  return `${feature} · ${run.status} · ${run.sample_count} 条 · PCA ${pca} / ${algorithmParameters}`;
+}
+
+function runAlgorithm(run: ClusterRun | undefined): ClusterAlgorithm {
+  const value = run?.parameters.algorithm ?? run?.preprocessing.algorithm;
+  return value === "complete_link" ? "complete_link" : "hdbscan";
 }
 
 function isActiveRun(run: ClusterRun | undefined) {
@@ -491,20 +490,18 @@ export default function ClustersPage() {
     FEATURE_TYPES[0].value,
   );
   const [nativeContentWeight, setNativeContentWeight] = useState("0.3");
+  const [algorithm, setAlgorithm] =
+    useState<ClusterAlgorithm>("complete_link");
   const [pcaDimension, setPcaDimension] = useState("8");
   const [minSamples, setMinSamples] = useState("3");
-  const [minClusterSize, setMinClusterSize] = useState("3");
+  const [minClusterSize, setMinClusterSize] = useState("2");
+  const [distanceThreshold, setDistanceThreshold] = useState("0.5");
   const [capsules, setCapsules] = useState<ClusterCapsule[]>([]);
   const [selectedCapsuleId, setSelectedCapsuleId] = useState("");
   const [membersByCapsule, setMembersByCapsule] = useState<
     Record<string, ClusterMember[]>
   >({});
   const [currentClusters, setCurrentClusters] = useState<CurrentCluster[]>([]);
-  const [assetStatus, setAssetStatus] = useState<ClusterAssetStatus | null>(
-    null,
-  );
-  const [assetStatusLoading, setAssetStatusLoading] = useState(true);
-  const [assetStatusError, setAssetStatusError] = useState<string | null>(null);
   const [selectedCurrentClusterId, setSelectedCurrentClusterId] = useState("");
   const [currentMembers, setCurrentMembers] = useState<CurrentClusterMember[]>(
     [],
@@ -520,7 +517,6 @@ export default function ClustersPage() {
   const [error, setError] = useState<string | null>(null);
   const runRequestRef = useRef(0);
   const currentClusterRequestRef = useRef(0);
-  const assetStatusRequestRef = useRef(0);
   const currentMemberRequestRef = useRef(0);
   const currentClusterWorkspaceRef = useRef<HTMLElement>(null);
   const capsuleCardRefs = useRef(new Map<string, HTMLElement>());
@@ -613,45 +609,13 @@ export default function ClustersPage() {
     }
   }, [embeddingType, workspaceId, workspaceReady]);
 
-  const loadAssetStatus = useCallback(async () => {
-    if (!workspaceReady) return;
-    const requestId = ++assetStatusRequestRef.current;
-    setAssetStatusLoading(true);
-    try {
-      const params = new URLSearchParams({
-        workspace_id: workspaceId,
-        embedding_type: embeddingType,
-      });
-      const payload = await apiFetch<ClusterAssetStatus>(
-        `/api/v1/clusters/assets/status?${params}`,
-      );
-      if (requestId !== assetStatusRequestRef.current) return;
-      setAssetStatus(payload);
-      setAssetStatusError(null);
-    } catch (requestError) {
-      if (requestId !== assetStatusRequestRef.current) return;
-      setAssetStatus(null);
-      setAssetStatusError(
-        requestError instanceof Error
-          ? requestError.message
-          : "Asset 聚类状态加载失败",
-      );
-    } finally {
-      if (requestId === assetStatusRequestRef.current) {
-        setAssetStatusLoading(false);
-      }
-    }
-  }, [embeddingType, workspaceId, workspaceReady]);
-
   const refreshClusterDimension = useCallback(async () => {
-    await Promise.all([loadCurrentClusters(), loadAssetStatus()]);
-  }, [loadAssetStatus, loadCurrentClusters]);
+    await loadCurrentClusters();
+  }, [loadCurrentClusters]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => {
       setCurrentClusters([]);
-      setAssetStatus(null);
-      setAssetStatusError(null);
       setSelectedCurrentClusterId("");
       setCurrentMembers([]);
       setCurrentNotice(null);
@@ -900,18 +864,30 @@ export default function ClustersPage() {
         embeddingType === "native_multimodal"
           ? 1
           : parseNativeContentWeight(nativeContentWeight);
-      const parsedMinSamples = parseIntegerParameter(
-        "Min Samples",
-        minSamples,
-        1,
-        10_000,
-      );
       const parsedMinClusterSize = parseIntegerParameter(
         "Min Cluster Size",
         minClusterSize,
         2,
         10_000,
       );
+      const algorithmParameters =
+        algorithm === "hdbscan"
+          ? {
+              min_samples: parseIntegerParameter(
+                "Min Samples",
+                minSamples,
+                1,
+                10_000,
+              ),
+            }
+          : {
+              distance_threshold: parseNumberParameter(
+                "Distance Threshold",
+                distanceThreshold,
+                0,
+                2,
+              ),
+            };
       const submitted = await apiFetch<{ cluster_run_id: string }>(
         "/api/v1/cluster-runs",
         {
@@ -919,10 +895,11 @@ export default function ClustersPage() {
           body: JSON.stringify({
             workspace_id: workspaceId,
             embedding_type: embeddingType,
+            algorithm,
             native_content_weight: parsedNativeContentWeight,
             pca_dimension: parsedPcaDimension,
-            min_samples: parsedMinSamples,
             min_cluster_size: parsedMinClusterSize,
+            ...algorithmParameters,
           }),
         },
       );
@@ -937,7 +914,6 @@ export default function ClustersPage() {
         ),
       ]);
       setRunNotice("全量重聚类已提交，完成后会自动展示结果…");
-      await loadAssetStatus();
     } catch (requestError) {
       setRunNotice(null);
       setError(
@@ -1158,7 +1134,6 @@ export default function ClustersPage() {
           onChange={(nextWorkspaceId) => {
             runRequestRef.current += 1;
             currentClusterRequestRef.current += 1;
-            assetStatusRequestRef.current += 1;
             currentMemberRequestRef.current += 1;
             setRuns([]);
             setSelectedRunId("");
@@ -1166,7 +1141,6 @@ export default function ClustersPage() {
             setMembersByCapsule({});
             setCurrentClusters([]);
             setCurrentMembers([]);
-            setAssetStatus(null);
             setError(null);
             setWorkspaceId(nextWorkspaceId);
           }}
@@ -1174,7 +1148,7 @@ export default function ClustersPage() {
       }
       eyebrow="CLUSTER LAB / LIVE"
       title="从相似中，看见结构。"
-      description="首次达到样本阈值会自动初始化；之后新增 Asset 只做增量归簇，全量重聚类由用户手动启动。"
+      description="聚类任务在后台执行，簇发布完成后页面立即刷新；主体簇向量和关系图谱随后在后台生成。"
       actions={
         <button
           className="primary-action"
@@ -1228,6 +1202,27 @@ export default function ClustersPage() {
               ))}
             </select>
           </label>
+          <div className="algorithm-control">
+            <span>Algorithm</span>
+            <div className="algorithm-switch" role="group" aria-label="聚类算法">
+              <button
+                type="button"
+                className={algorithm === "complete_link" ? "active" : ""}
+                aria-pressed={algorithm === "complete_link"}
+                onClick={() => setAlgorithm("complete_link")}
+              >
+                Complete-link
+              </button>
+              <button
+                type="button"
+                className={algorithm === "hdbscan" ? "active" : ""}
+                aria-pressed={algorithm === "hdbscan"}
+                onClick={() => setAlgorithm("hdbscan")}
+              >
+                HDBSCAN
+              </button>
+            </div>
+          </div>
           <label className="native-content-weight-control">
             原始内容权重
             <input
@@ -1262,17 +1257,32 @@ export default function ClustersPage() {
               onChange={(event) => setPcaDimension(event.target.value)}
             />
           </label>
-          <label>
-            Min Samples
-            <input
-              type="number"
-              min="1"
-              max="10000"
-              step="1"
-              value={minSamples}
-              onChange={(event) => setMinSamples(event.target.value)}
-            />
-          </label>
+          {algorithm === "hdbscan" ? (
+            <label>
+              Min Samples
+              <input
+                type="number"
+                min="1"
+                max="10000"
+                step="1"
+                value={minSamples}
+                onChange={(event) => setMinSamples(event.target.value)}
+              />
+            </label>
+          ) : (
+            <label className="distance-threshold-control">
+              Distance Threshold
+              <input
+                type="number"
+                min="0.01"
+                max="2"
+                step="0.05"
+                value={distanceThreshold}
+                onChange={(event) => setDistanceThreshold(event.target.value)}
+              />
+              <small>L2 归一化距离，越小分组越严格。</small>
+            </label>
+          )}
           <label>
             Min Cluster Size
             <input
@@ -1291,9 +1301,23 @@ export default function ClustersPage() {
             <strong>{runPcaDimension(selectedRun)}</strong>
           </span>
           <span>
-            <small>MIN SAMPLES</small>
+            <small>ALGORITHM</small>
             <strong>
-              {runParameter(selectedRun?.parameters.min_samples)}
+              {runAlgorithm(selectedRun) === "complete_link"
+                ? "Complete-link"
+                : "HDBSCAN"}
+            </strong>
+          </span>
+          <span>
+            <small>
+              {runAlgorithm(selectedRun) === "complete_link"
+                ? "DISTANCE"
+                : "MIN SAMPLES"}
+            </small>
+            <strong>
+              {runAlgorithm(selectedRun) === "complete_link"
+                ? runParameter(selectedRun?.parameters.distance_threshold)
+                : runParameter(selectedRun?.parameters.min_samples)}
             </strong>
           </span>
           <span>
@@ -1333,108 +1357,6 @@ export default function ClustersPage() {
         </p>
       </section>
 
-      <section className="cluster-asset-status">
-        <header>
-          <div>
-            <span className="eyebrow">INCREMENTAL STATUS</span>
-            <h2>Asset 聚类进度</h2>
-            <p>
-              首次达到
-              {assetStatus?.bootstrap_minimum_count == null
-                ? "配置的"
-                : ` ${assetStatus.bootstrap_minimum_count} 条`}
-              样本阈值会自动初始化；初始化后新增 Asset 只增量归簇，不会自动触发全量重聚类。
-            </p>
-          </div>
-          <span
-            className={`asset-status-phase ${assetStatus?.initialized ? "initialized" : "waiting"}`}
-          >
-            {assetStatusLoading
-              ? "同步中…"
-              : assetStatus?.initialized
-                ? "增量运行中"
-                : "等待首次初始化"}
-          </span>
-        </header>
-
-        <div className="asset-status-summary">
-          <span>
-            <small>基线样本数</small>
-            <strong>{assetStatus?.baseline_sample_count ?? "—"}</strong>
-            <em>{assetStatus?.baseline_cluster_run_id || "尚无基线 Run"}</em>
-          </span>
-          <span>
-            <small>当前 eligible</small>
-            <strong>{assetStatus?.eligible_asset_count ?? "—"}</strong>
-            <em>当前维度可参与样本</em>
-          </span>
-          <span>
-            <small>新增 Asset</small>
-            <strong>{assetStatus?.new_asset_count ?? "—"}</strong>
-            <em>相对基线新增</em>
-          </span>
-          <span>
-            <small>已增量归簇</small>
-            <strong>{assetStatus?.incrementally_clustered_count ?? "—"}</strong>
-            <em>自动加入动态 / 开放常驻簇</em>
-          </span>
-          <span>
-            <small>待聚类</small>
-            <strong>{assetStatus?.pending_count ?? "—"}</strong>
-            <em>等待下次增量处理</em>
-          </span>
-          <span>
-            <small>手动管理</small>
-            <strong>{assetStatus?.manual_management_count ?? "—"}</strong>
-            <em>不由算法自动调整</em>
-          </span>
-        </div>
-
-        <div className="asset-status-table">
-          <div className="asset-status-row asset-status-head">
-            <span>新增 Asset</span>
-            <span>状态</span>
-            <span>目标簇</span>
-            <span>分数</span>
-          </div>
-          {assetStatusError && (
-            <p className="asset-status-message error">{assetStatusError}</p>
-          )}
-          {!assetStatusError && assetStatusLoading && !assetStatus && (
-            <p className="asset-status-message">正在读取 Asset 聚类状态…</p>
-          )}
-          {!assetStatusError && !assetStatusLoading && !assetStatus?.items.length && (
-            <p className="asset-status-message">当前维度暂无新增 Asset。</p>
-          )}
-          {assetStatus?.items.map((item) => (
-            <div className="asset-status-row" key={item.asset_id}>
-              <span className="asset-status-identity">
-                <strong>{item.asset_name || item.file_name || item.asset_id}</strong>
-                <small title={item.asset_id}>{item.asset_id}</small>
-                <em>{item.asset_type}</em>
-              </span>
-              <span>
-                <strong className={`asset-status-label ${item.status}`}>
-                  {clusterAssetStatusLabel(item.status)}
-                </strong>
-                <small>{item.member_source || "尚无成员来源"}</small>
-              </span>
-              <span>
-                <strong>{item.cluster_name || item.cluster_id || "尚未分配"}</strong>
-                <small>
-                  {item.cluster_mode
-                    ? currentClusterModeLabel(item.cluster_mode)
-                    : "—"}
-                </small>
-              </span>
-              <strong className="asset-status-score">
-                {item.score == null ? "—" : item.score.toFixed(3)}
-              </strong>
-            </div>
-          ))}
-        </div>
-      </section>
-
       <section
         className="current-cluster-workspace"
         id="current-clusters"
@@ -1448,16 +1370,16 @@ export default function ClustersPage() {
               当前维度为
               {FEATURE_TYPES.find((item) => item.value === embeddingType)
                 ?.label || embeddingType}
-              。新增 Asset 日常只走增量；仅点击页面顶部按钮才执行全量重聚类。
+              。页面展示已发布的簇结果；仅点击页面顶部按钮才执行全量重聚类。
             </p>
           </div>
           <button
             type="button"
             className="secondary-action"
-            disabled={currentLoading || assetStatusLoading}
+            disabled={currentLoading}
             onClick={() => void refreshClusterDimension()}
           >
-            {currentLoading || assetStatusLoading ? "加载中…" : "刷新状态"}
+            {currentLoading ? "加载中…" : "刷新状态"}
           </button>
         </header>
 

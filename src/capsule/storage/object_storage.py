@@ -6,6 +6,7 @@ from urllib.parse import unquote, urlparse
 
 import boto3
 from botocore.client import BaseClient
+from botocore.config import Config
 
 from capsule.config import Settings
 
@@ -29,6 +30,10 @@ class ObjectStorage:
             "aws_access_key_id": settings.object_storage_access_key.get_secret_value(),
             "aws_secret_access_key": settings.object_storage_secret_key.get_secret_value(),
             "region_name": settings.object_storage_region,
+            "config": Config(
+                proxies={},
+                s3={"addressing_style": "path"},
+            ),
         }
         self._client: BaseClient = boto3.client(
             "s3",

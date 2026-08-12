@@ -1,19 +1,20 @@
+import base64
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
 
 from capsule.config import Settings
 from capsule.db.repositories import EmbeddingAsset
-from capsule.enums import AssetType, FeatureStatus
+from capsule.enums import AssetType
 from capsule.pipeline.understanding import (
     _DESCRIPTION_CONTEXT_RULES,
+    _SUBJECT_OUTPUT_RULES,
     AssetUnderstandingService,
     _asset_context_payload,
-    _attach_asset_usage_path_context,
-    _usage_hint_from_path,
+    _content_context_payload,
 )
-from capsule.schemas import AssetUnderstanding
 
 
 def test_asset_context_payload_includes_source_path_and_linked_paragraph() -> None:
@@ -53,86 +54,34 @@ def test_asset_context_payload_includes_source_path_and_linked_paragraph() -> No
     assert payload["context"]["source_path"] == "images/sunset.png"
     assert payload["context"]["associated_text"] == ["午后黄昏呈现金黄色调。"]
     assert payload["context"]["heading_path"] == ["光线参考", "午后黄昏"]
+    assert payload["entity_hints"] == [
+        {"source": "directory", "value": "images", "scope": "collection"},
+        {"source": "document_title", "value": "光线参考", "scope": "document"},
+        {"source": "heading", "value": "午后黄昏", "scope": "section"},
+        {"source": "file_name", "value": "sunset", "scope": "asset"},
+    ]
     assert "source_uri" not in str(payload)
     assert "asset_storage_uri" not in str(payload)
     assert "source_storage_uri" not in str(payload)
 
-
-def test_description_context_rules_require_semantic_fusion_without_path_repetition() -> None:
-    assert "有实际语义的信息必须自然融入描述" in _DESCRIPTION_CONTEXT_RULES
-    assert "路径或文字与素材内容冲突时，以素材本身为准" in _DESCRIPTION_CONTEXT_RULES
-    assert "忽略纯编号、序号、通用词" in _DESCRIPTION_CONTEXT_RULES
-    assert "禁止在结果中机械复述文件名、扩展名、目录、路径" in _DESCRIPTION_CONTEXT_RULES
-
-
-def test_asset_usage_path_is_persisted_as_metadata_evidence() -> None:
-    feature_names = [
-        "subject_content",
-        "scene_theme",
-        "visual_style",
-        "color_composition",
-        "mood_atmosphere",
-        "character_state_or_psychology",
-        "asset_usage",
-        "target_audience",
-        "provenance",
-        "rights_version_authorship",
-    ]
-    understanding = AssetUnderstanding.model_validate(
-        {
-            "asset_name": "测试海报",
-            "asset_description": "一张用于测试的视觉海报。",
-            "features": {
-                name: {
-                    "value": None,
-                    "status": "unknown",
-                    "confidence": 0,
-                    "evidence": [],
-                }
-                for name in feature_names
-            },
-        }
-    )
-    asset = EmbeddingAsset(
-        asset_id="asset_usage",
-        workspace_id="workspace",
-        project_id="project_default",
-        source_file_id="source_usage",
-        asset_type=AssetType.IMAGE.value,
-        file_type=".png",
-        content_hash="b" * 64,
-        embedding_revision=1,
-        created_at=datetime(2026, 7, 30, tzinfo=UTC),
-        raw_content=None,
-        asset_description=None,
-        asset_features={},
-        derived_file_uri=None,
-        source_storage_uri="file:///temporary/import/海报/素材/20251216-143446.png",
-        source_mime_type="image/png",
-        file_name="20251216-143446.png",
-        source_relative_path="海报/素材/20251216-143446.png",
-        file_tree_context=["海报", "素材"],
-    )
-
-    _attach_asset_usage_path_context(understanding, asset)
-
-    usage = understanding.features.asset_usage
-    assert usage.status is FeatureStatus.METADATA
-    assert usage.value == "海报制作"
-    assert usage.source_path == "海报/素材/20251216-143446.png"
-    assert usage.description is not None
-    assert "海报/素材/20251216-143446.png" in usage.description
-    assert usage.evidence == ["相对文件路径：海报/素材/20251216-143446.png"]
+    content_payload = _content_context_payload(asset)
+    assert content_payload == {
+        "asset_type": "image",
+        "file_info": {},
+    }
+    assert "sunset" not in str(content_payload)
+    assert "images" not in str(content_payload)
 
 
-def test_generic_storage_path_does_not_create_usage_semantics() -> None:
-    assert (
-        _usage_hint_from_path(
-            source_path="测试素材2（打乱素材集合）/黄.png",
-            file_tree_context=["测试素材2（打乱素材集合）"],
-        )
-        is None
-    )
+def test_description_and_subject_rules_use_positive_independent_paths() -> None:
+    assert "描述直接呈现可观察或可阅读的事实" in _DESCRIPTION_CONTEXT_RULES
+    assert "元数据由独立路径处理" in _DESCRIPTION_CONTEXT_RULES
+    assert "无需在内容描述中解释其来源" in _DESCRIPTION_CONTEXT_RULES
+    assert "必须" not in _DESCRIPTION_CONTEXT_RULES
+    assert "subject_content 走内容提取路径" in _SUBJECT_OUTPUT_RULES
+    assert "元数据实体会由独立路径提取" in _SUBJECT_OUTPUT_RULES
+    assert "必须" not in _SUBJECT_OUTPUT_RULES
+    assert "salience 使用 0 到 1 的相对数值" in _SUBJECT_OUTPUT_RULES
 
 
 async def test_video_understanding_uses_keyframe_data_uris() -> None:
@@ -180,15 +129,17 @@ async def test_video_understanding_uses_keyframe_data_uris() -> None:
     content = messages[1]["content"]
     image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
 
-    assert "0 到 5 条最具表现力和区分度" in messages[0]["content"]
-    assert "每个 Feature 围绕自己的正向语义范围组织事实" in messages[0]["content"]
-    assert "整幅内容可辨识的叙事语境" in messages[0]["content"]
-    assert "角色三视图、产品白底陈列或孤立元素展示" in messages[0]["content"]
-    assert "缺少整体场景语境的主体陈列或孤立元素不适用" in messages[0]["content"]
-    assert "可核验的光线、色彩、空间、天气、动作、声音和叙事表现" in messages[0]["content"]
-    assert "人物内心、动机或性格只有在素材明确呈现时" in messages[0]["content"]
-    assert "来源平台、数据集或采集渠道" in messages[0]["content"]
-    assert "桌子 红色；星空 深蓝" in messages[0]["content"]
+    assert "主体维度把不同实体拆成不同 item" in messages[0]["content"]
+    assert "subject 写简短稳定的实体名称" in messages[0]["content"]
+    assert "元数据实体会由独立路径提取" in messages[0]["content"]
+    assert "三个互补的检索视角" in messages[0]["content"]
+    assert "分别完成三次聚焦" in messages[0]["content"]
+    assert "不要把“冷蓝逆光”作为主体特征" in messages[0]["content"]
+    assert "根据当前维度相关信息在素材中的占比、显著性和丰富程度" in messages[0]["content"]
+    assert "scene_theme 在素材具有可辨识" not in messages[0]["content"]
+    assert "mood_atmosphere 依据画面或文本" not in messages[0]["content"]
+    assert "人物内心、动机或性格只有在素材明确呈现时" not in messages[0]["content"]
+    assert "description 表示当前维度的事实本身" not in messages[0]["content"]
 
     assert reader.uris == [
         "s3://capsule/video/keyframes/01.jpg",
@@ -289,4 +240,7 @@ async def test_document_image_understanding_uses_materialised_image(tmp_path: Pa
     content = messages[1]["content"]
     image_urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
 
-    assert image_urls[0].startswith("data:image/png;base64,")
+    assert image_urls[0].startswith("data:image/jpeg;base64,")
+    encoded = image_urls[0].split(",", 1)[1]
+    with Image.open(BytesIO(base64.b64decode(encoded))) as prepared:
+        assert prepared.size == (768, 768)

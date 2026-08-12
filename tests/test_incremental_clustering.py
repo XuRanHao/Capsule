@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from capsule.config import Settings
 from capsule.db.repositories import ClusterBootstrapState
-from capsule.enums import ClusterMemberSource, ClusterMode, EmbeddingType
+from capsule.enums import (
+    ClusterMemberSource,
+    ClusterMode,
+    ClusterRunStatus,
+    EmbeddingType,
+)
 from capsule.pipeline.incremental_clustering import (
     IncrementalAssignmentThresholds,
     IncrementalClusterCoordinator,
@@ -159,7 +165,21 @@ class FakeClusterRunner:
         **_: object,
     ) -> object:
         self.calls.append((workspace_id, embedding_type, trigger))
+        return SimpleNamespace(status=ClusterRunStatus.COMPLETED)
+
+
+class FakeRelationGraphUpdater:
+    def __init__(self) -> None:
+        self.incremental_calls: list[dict[str, object]] = []
+        self.rebuild_calls: list[dict[str, object]] = []
+
+    async def update_assets(self, **values: object) -> object:
+        self.incremental_calls.append(values)
         return object()
+
+    async def build(self, **values: object) -> dict[str, object]:
+        self.rebuild_calls.append(values)
+        return {}
 
 
 class FakeVectorStore:
@@ -214,7 +234,7 @@ async def test_resident_open_is_preferred_over_more_similar_dynamic_cluster() ->
 
     result = await service.assign_assets(
         workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         asset_ids=["new_asset"],
     )
 
@@ -224,7 +244,7 @@ async def test_resident_open_is_preferred_over_more_similar_dynamic_cluster() ->
     assert repository.list_cluster_calls == [
         {
             "workspace_id": "workspace_a",
-            "embedding_type": "visual_style",
+            "embedding_type": "visual_presentation",
             "modes": (ClusterMode.RESIDENT_OPEN, ClusterMode.DYNAMIC),
         }
     ]
@@ -381,7 +401,7 @@ async def test_candidate_fusion_weight_changes_incremental_assignment() -> None:
             ],
             embeddings=dimension_embeddings,
             embeddings_by_type={
-                EmbeddingType.VISUAL_STYLE.value: dimension_embeddings,
+                EmbeddingType.VISUAL_PRESENTATION.value: dimension_embeddings,
                 EmbeddingType.NATIVE_MULTIMODAL.value: native_embeddings,
             },
         )
@@ -399,7 +419,7 @@ async def test_candidate_fusion_weight_changes_incremental_assignment() -> None:
         )
         return await service.assign_assets(
             workspace_id="workspace_a",
-            embedding_type=EmbeddingType.VISUAL_STYLE,
+            embedding_type=EmbeddingType.VISUAL_PRESENTATION,
             asset_ids=["new_asset"],
         )
 
@@ -478,13 +498,20 @@ def _bootstrap_state(
     has_baseline: bool = False,
     run_in_progress: bool = False,
     eligible_asset_count: int = 50,
+    latest_sample_count: int = 0,
+    new_asset_count: int | None = None,
 ) -> ClusterBootstrapState:
     return ClusterBootstrapState(
         has_baseline=has_baseline,
         run_in_progress=run_in_progress,
         eligible_asset_count=eligible_asset_count,
+        new_asset_count=(
+            eligible_asset_count - latest_sample_count
+            if new_asset_count is None
+            else new_asset_count
+        ),
         latest_run_id=None,
-        latest_sample_count=0,
+        latest_sample_count=latest_sample_count,
     )
 
 
@@ -504,14 +531,14 @@ def test_bootstrap_requires_minimum_without_baseline_or_active_run(
 ) -> None:
     decision = evaluate_cluster_bootstrap(
         workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         state=state,
         minimum_asset_count=50,
     )
 
     assert decision.should_bootstrap is should_bootstrap
     assert decision.eligible_asset_count == state.eligible_asset_count
-    assert decision.embedding_type is EmbeddingType.VISUAL_STYLE
+    assert decision.embedding_type is EmbeddingType.VISUAL_PRESENTATION
 
 
 def test_cosine_similarity_rejects_invalid_vectors() -> None:
@@ -519,6 +546,26 @@ def test_cosine_similarity_rejects_invalid_vectors() -> None:
     assert cosine_similarity([1.0], [1.0, 0.0]) is None
     assert cosine_similarity([0.0, 0.0], [1.0, 0.0]) is None
     assert cosine_similarity([float("nan"), 1.0], [1.0, 0.0]) is None
+
+
+def test_recluster_ratio_uses_exact_new_embedding_count() -> None:
+    decision = evaluate_cluster_bootstrap(
+        workspace_id="workspace_a",
+        embedding_type=EmbeddingType.SUBJECT_CONTENT,
+        state=_bootstrap_state(
+            has_baseline=True,
+            eligible_asset_count=80,
+            latest_sample_count=100,
+            new_asset_count=10,
+        ),
+        minimum_asset_count=50,
+        auto_recluster_new_ratio=0.3,
+        auto_recluster_minimum_new_count=5,
+    )
+
+    assert decision.new_asset_count == 10
+    assert decision.new_asset_ratio == pytest.approx(0.125)
+    assert not decision.should_recluster
 
 
 @pytest.mark.asyncio
@@ -542,7 +589,7 @@ async def test_coordinator_schedules_first_bootstrap_independently_per_dimension
 
     visual = await coordinator.process_assets(
         workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         asset_ids=["asset_visual"],
     )
     subject = await coordinator.process_assets(
@@ -555,7 +602,7 @@ async def test_coordinator_schedules_first_bootstrap_independently_per_dimension
     assert visual.bootstrap_scheduled
     assert subject.bootstrap_scheduled
     assert runner.calls == [
-        ("workspace_a", EmbeddingType.VISUAL_STYLE, "automatic_bootstrap"),
+        ("workspace_a", EmbeddingType.VISUAL_PRESENTATION, "automatic_bootstrap"),
         ("workspace_a", EmbeddingType.SUBJECT_CONTENT, "automatic_bootstrap"),
     ]
 
@@ -581,7 +628,7 @@ async def test_coordinator_never_reclusters_automatically_after_baseline() -> No
 
     result = await coordinator.process_assets(
         workspace_id="workspace_a",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         asset_ids=["new_asset"],
     )
     await coordinator.close()
@@ -589,3 +636,52 @@ async def test_coordinator_never_reclusters_automatically_after_baseline() -> No
     assert not result.bootstrap.should_bootstrap
     assert not result.bootstrap_scheduled
     assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_coordinator_reclusters_when_new_subject_sample_ratio_is_large() -> None:
+    repository = FakeCoordinatorRepository(
+        bootstrap_state=_bootstrap_state(
+            has_baseline=True,
+            eligible_asset_count=150,
+            latest_sample_count=100,
+        )
+    )
+    runner = FakeClusterRunner()
+    graph_updater = FakeRelationGraphUpdater()
+    coordinator = IncrementalClusterCoordinator(
+        settings=Settings(
+            cluster_auto_recluster_new_ratio=0.3,
+            cluster_auto_recluster_minimum_new_count=20,
+        ),
+        assignment_service=IncrementalClusterService(
+            repository=repository,
+            vector_store=FakeVectorStore({}),
+        ),
+        repository=repository,
+        cluster_runner=runner,
+        relation_graph_updater=graph_updater,
+    )
+
+    result = await coordinator.process_assets(
+        workspace_id="workspace_a",
+        embedding_type=EmbeddingType.SUBJECT_CONTENT,
+        asset_ids=["new_asset"],
+    )
+    await coordinator.close()
+
+    assert result.bootstrap.should_recluster
+    assert result.bootstrap_scheduled
+    assert runner.calls == [
+        ("workspace_a", EmbeddingType.SUBJECT_CONTENT, "automatic_recluster")
+    ]
+    assert graph_updater.incremental_calls == [
+        {
+            "workspace_id": "workspace_a",
+            "asset_ids": ["new_asset"],
+            "affected_cluster_ids": (),
+        }
+    ]
+    assert graph_updater.rebuild_calls == [
+        {"workspace_id": "workspace_a", "force_rebuild": True}
+    ]

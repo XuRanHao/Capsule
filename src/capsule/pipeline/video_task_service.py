@@ -237,6 +237,7 @@ class VideoTaskWorker:
                 retry_delays_seconds=tuple(runtime_settings.video_task_retry_delays_seconds),
             ),
             heartbeat_seconds=runtime_settings.video_task_heartbeat_seconds,
+            expected_route_key="mps_video",
         )
 
         async def close() -> None:
@@ -253,11 +254,11 @@ class VideoTaskWorker:
         )
 
     async def run_once(self) -> str:
-        await self._start()
+        await self.start()
         return await self._runtime.handle_delivery(await self._queue.receive())
 
     async def run_forever(self) -> None:
-        await self._start()
+        await self.start()
         slots = [asyncio.create_task(self._run_slot()) for _ in range(self._concurrency)]
         try:
             await asyncio.gather(*slots)
@@ -276,7 +277,8 @@ class VideoTaskWorker:
             close, self._close = self._close, None
             await close()
 
-    async def _start(self) -> None:
+    async def start(self) -> None:
+        """Open the queue before the runtime receives its first delivery."""
         if not self._started:
             await _start_queue(self._queue)
             self._started = True
@@ -329,11 +331,11 @@ class VideoTaskScheduler:
         )
 
     async def run_once(self) -> int:
-        await self._start()
+        await self.start()
         return await self._scheduler.run_once()
 
     async def run_forever(self) -> None:
-        await self._start()
+        await self.start()
         try:
             while True:
                 await self._scheduler.run_once()
@@ -346,7 +348,8 @@ class VideoTaskScheduler:
             close, self._close = self._close, None
             await close()
 
-    async def _start(self) -> None:
+    async def start(self) -> None:
+        """Open the queue before the first durable recovery pass."""
         if not self._started:
             await _start_queue(self._queue)
             self._started = True

@@ -57,7 +57,7 @@ def test_fused_search_record_reuses_dimension_identity_and_metadata() -> None:
     dimension = _record(
         embedding_id="emb_visual",
         asset_id="asset_1",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         vector=[0.0, 4.0],
     )
 
@@ -68,7 +68,7 @@ def test_fused_search_record_reuses_dimension_identity_and_metadata() -> None:
 
     assert replace(fused, vector=dimension.vector) == dimension
     assert fused.embedding_id == "emb_visual"
-    assert fused.embedding_type == EmbeddingType.VISUAL_STYLE.value
+    assert fused.embedding_type == EmbeddingType.VISUAL_PRESENTATION.value
     assert fused.vector == pytest.approx([0.3 / math.sqrt(0.58), 0.7 / math.sqrt(0.58)])
     assert math.isclose(
         sum(value * value for value in fused.vector),
@@ -94,7 +94,7 @@ async def test_materializer_batches_current_pairs_into_destination_store() -> No
         _record(
             embedding_id=f"visual_{index}",
             asset_id=f"asset_{index}",
-            embedding_type=EmbeddingType.VISUAL_STYLE,
+            embedding_type=EmbeddingType.VISUAL_PRESENTATION,
             vector=[float(index), 1.0],
         )
         for index in (1, 2)
@@ -130,13 +130,13 @@ async def test_materializer_reports_missing_or_stale_native_pair() -> None:
     current_dimension = _record(
         embedding_id="visual_1",
         asset_id="asset_1",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         vector=[0.0, 1.0],
     )
     missing_native_dimension = _record(
         embedding_id="visual_2",
         asset_id="asset_2",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         vector=[0.0, 1.0],
     )
     stale_native_dimension = replace(
@@ -189,7 +189,7 @@ def test_fused_search_record_rejects_cross_asset_pair() -> None:
     dimension = _record(
         embedding_id="visual_2",
         asset_id="asset_2",
-        embedding_type=EmbeddingType.VISUAL_STYLE,
+        embedding_type=EmbeddingType.VISUAL_PRESENTATION,
         vector=[0.0, 1.0],
     )
 

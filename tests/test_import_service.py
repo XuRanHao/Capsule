@@ -9,9 +9,11 @@ from pydantic import ValidationError
 
 from capsule.config import Settings
 from capsule.enums import EmbeddingType, PipelineStage
+from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.pipeline.import_service import (
     BrowserImportService,
     ImportCompletion,
+    ImportWorkflowCoordinator,
     enrich_assets,
 )
 from capsule.schemas import AssetUnderstanding, ProcessingJobRecord
@@ -46,8 +48,15 @@ class FakeAssetRepository:
             completed_at=None,
         )
 
-    async def start_import_job(self, *, job_id: str, total_count: int) -> None:
+    async def start_import_job(
+        self,
+        *,
+        job_id: str,
+        total_count: int,
+        post_asset_action: str = "none",
+    ) -> None:
         assert job_id == "job_import_test"
+        assert post_asset_action in {"none", "enrich"}
         self.status = "running"
         self.started_count = total_count
 
@@ -113,6 +122,60 @@ async def test_browser_import_uploads_each_file_before_assetization(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_browser_import_dispatches_one_existing_job_to_durable_tasks(
+    tmp_path: Path,
+) -> None:
+    repository = FakeAssetRepository()
+    runner = FakeRunner()
+
+    class DurableSubmitter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def submit_batch(self, **values: object) -> list[SimpleNamespace]:
+            self.calls.append(values)
+            source_files = values["source_files"]
+            assert isinstance(source_files, list)
+            return [
+                SimpleNamespace(task_id=f"task-{index}")
+                for index, _ in enumerate(source_files)
+            ]
+
+    durable = DurableSubmitter()
+    service = BrowserImportService(
+        settings=Settings(import_root=tmp_path / "imports"),
+        repository=repository,  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        durable_task_submitter=durable,  # type: ignore[arg-type]
+    )
+    job = await service.create_job(workspace_id="workspace_import_test")
+    await service.upload_file(
+        job_id=job.job_id,
+        workspace_id="workspace_import_test",
+        file=UploadFile(filename="note.md", file=BytesIO(b"# Durable")),
+        relative_path="notes/note.md",
+    )
+    completion = await service.complete_job(
+        job_id=job.job_id,
+        workspace_id="workspace_import_test",
+    )
+
+    result = await service.execute(
+        completion=completion,
+        workspace_id="workspace_import_test",
+    )
+
+    assert result is not None
+    assert result.file_count == 1
+    assert completion.durable_dispatched
+    assert repository.started_count is None
+    assert runner.calls == []
+    assert len(durable.calls) == 1
+    assert durable.calls[0]["job_id"] == "job_import_test"
+    assert durable.calls[0]["post_asset_action"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_browser_import_can_cancel_an_active_execution(tmp_path: Path) -> None:
     repository = FakeAssetRepository()
     started = asyncio.Event()
@@ -146,6 +209,220 @@ async def test_browser_import_can_cancel_an_active_execution(tmp_path: Path) -> 
 
     assert cancelled_count == 1
     assert await execution is None
+
+
+@pytest.mark.asyncio
+async def test_import_workflow_coordinator_resumes_ready_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Repository:
+        async def claim_ready_import_workflow(self, **_: object) -> tuple[str, str, str]:
+            return "job-1", "workspace-1", "lease-1"
+
+        async def list_import_job_asset_ids(self, *, job_id: str) -> list[str]:
+            assert job_id == "job-1"
+            return ["asset-1"]
+
+        async def release_import_workflow(self, **_: object) -> bool:
+            raise AssertionError("successful enrichment must not release its lease")
+
+        async def heartbeat_import_workflow(self, **_: object) -> bool:
+            return True
+
+    async def fake_enrich_assets(**values: object) -> SimpleNamespace:
+        calls.append(values)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "capsule.pipeline.import_service.enrich_assets",
+        fake_enrich_assets,
+    )
+    coordinator = ImportWorkflowCoordinator(
+        repository=Repository(),  # type: ignore[arg-type]
+        understanding_service=object(),  # type: ignore[arg-type]
+        embedding_service=object(),  # type: ignore[arg-type]
+        worker_id="workflow-worker",
+    )
+
+    assert await coordinator.run_once()
+    assert len(calls) == 1
+    assert calls[0]["job_id"] == "job-1"
+    assert calls[0]["asset_ids"] == ["asset-1"]
+    assert calls[0]["workflow_lease_token"] == "lease-1"
+
+
+@pytest.mark.asyncio
+async def test_import_workflow_coordinator_cancels_enrichment_when_lease_is_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    enrichment_started = asyncio.Event()
+    enrichment_cancelled = asyncio.Event()
+
+    class Repository:
+        heartbeat_calls = 0
+
+        async def claim_ready_import_workflow(self, **_: object) -> tuple[str, str, str]:
+            return "job-1", "workspace-1", "lease-1"
+
+        async def list_import_job_asset_ids(self, *, job_id: str) -> list[str]:
+            assert job_id == "job-1"
+            return ["asset-1"]
+
+        async def heartbeat_import_workflow(self, **_: object) -> bool:
+            self.heartbeat_calls += 1
+            if self.heartbeat_calls == 1:
+                return True
+            await enrichment_started.wait()
+            events.append("lease-lost")
+            return False
+
+        async def release_import_workflow(self, **_: object) -> bool:
+            events.append("released")
+            return True
+
+    async def fake_enrich_assets(**_: object) -> SimpleNamespace:
+        events.append("enrichment-started")
+        enrichment_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("enrichment-cancelled")
+            enrichment_cancelled.set()
+            raise
+        events.extend(("stage", "finalize"))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "capsule.pipeline.import_service.enrich_assets",
+        fake_enrich_assets,
+    )
+    coordinator = ImportWorkflowCoordinator(
+        repository=Repository(),  # type: ignore[arg-type]
+        understanding_service=object(),  # type: ignore[arg-type]
+        embedding_service=object(),  # type: ignore[arg-type]
+        worker_id="workflow-worker",
+        lease_seconds=0.003,
+    )
+
+    assert not await coordinator.run_once()
+    assert enrichment_cancelled.is_set()
+    assert "lease-lost" in events
+    assert "stage" not in events
+    assert "finalize" not in events
+    assert events[-1] == "released"
+
+
+@pytest.mark.asyncio
+async def test_import_workflow_coordinator_retries_after_claim_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enriched = asyncio.Event()
+
+    class Repository:
+        claim_calls = 0
+
+        async def claim_ready_import_workflow(self, **_: object) -> tuple[str, str, str] | None:
+            self.claim_calls += 1
+            if self.claim_calls == 1:
+                raise RuntimeError("temporary database failure")
+            if self.claim_calls == 2:
+                return "job-1", "workspace-1", "lease-1"
+            return None
+
+        async def list_import_job_asset_ids(self, *, job_id: str) -> list[str]:
+            assert job_id == "job-1"
+            return ["asset-1"]
+
+        async def heartbeat_import_workflow(self, **_: object) -> bool:
+            return True
+
+        async def release_import_workflow(self, **_: object) -> bool:
+            raise AssertionError("successful enrichment must not release its lease")
+
+    async def fake_enrich_assets(**_: object) -> SimpleNamespace:
+        enriched.set()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "capsule.pipeline.import_service.enrich_assets",
+        fake_enrich_assets,
+    )
+    coordinator = ImportWorkflowCoordinator(
+        repository=Repository(),  # type: ignore[arg-type]
+        understanding_service=object(),  # type: ignore[arg-type]
+        embedding_service=object(),  # type: ignore[arg-type]
+        worker_id="workflow-worker",
+        poll_seconds=0.001,
+    )
+    runner = asyncio.create_task(coordinator.run_forever())
+
+    await asyncio.wait_for(enriched.wait(), timeout=1)
+    await coordinator.close()
+    await asyncio.wait_for(runner, timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["run_once", "run_forever"])
+async def test_import_workflow_coordinator_cancellation_cleans_up_enrichment_and_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    events: list[str] = []
+    enrichment_started = asyncio.Event()
+    enrichment_cancelled = asyncio.Event()
+
+    class Repository:
+        async def claim_ready_import_workflow(self, **_: object) -> tuple[str, str, str]:
+            return "job-1", "workspace-1", "lease-1"
+
+        async def list_import_job_asset_ids(self, *, job_id: str) -> list[str]:
+            assert job_id == "job-1"
+            return ["asset-1"]
+
+        async def heartbeat_import_workflow(self, **_: object) -> bool:
+            return True
+
+        async def release_import_workflow(self, **values: object) -> bool:
+            assert values["error"] == "import workflow coordinator cancelled"
+            events.append("lease-released")
+            return True
+
+    async def fake_enrich_assets(**_: object) -> SimpleNamespace:
+        enrichment_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("enrichment-cancelled")
+            enrichment_cancelled.set()
+            raise
+        raise AssertionError("cancelled enrichment must not resume")
+
+    monkeypatch.setattr(
+        "capsule.pipeline.import_service.enrich_assets",
+        fake_enrich_assets,
+    )
+    coordinator = ImportWorkflowCoordinator(
+        repository=Repository(),  # type: ignore[arg-type]
+        understanding_service=object(),  # type: ignore[arg-type]
+        embedding_service=object(),  # type: ignore[arg-type]
+        worker_id="workflow-worker",
+    )
+    task = asyncio.create_task(
+        coordinator.run_once()
+        if entrypoint == "run_once"
+        else coordinator.run_forever()
+    )
+
+    await asyncio.wait_for(enrichment_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert enrichment_cancelled.is_set()
+    assert events == ["enrichment-cancelled", "lease-released"]
 
 
 @pytest.mark.asyncio
@@ -269,7 +546,7 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         PipelineStage.EMBEDDING,
         PipelineStage.INDEXING,
     ]
-    assert embedding.types == list(EmbeddingType)
+    assert embedding.types == list(ACTIVE_EMBEDDING_TYPES)
     assert embedding.materialize_calls == []
     assert result.completed_asset_count == 1
     assert result.partial_failed_asset_count == 1
@@ -287,7 +564,9 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     assert repository.durations["embedding"] / repository.durations[
         "indexing"
     ] == pytest.approx(10)
-    assert [embedding_type for embedding_type, _ in processor.calls] == list(EmbeddingType)
+    assert [embedding_type for embedding_type, _ in processor.calls] == list(
+        ACTIVE_EMBEDDING_TYPES
+    )
     assert all(asset_ids == ["asset_a", "asset_b"] for _, asset_ids in processor.calls)
 
 
@@ -531,21 +810,21 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
                     "confidence": 0.9,
                     "evidence": "画面中可直接观察",
                 },
-                "asset_usage": "动画场景参考",
+                "scene_theme": "动画场景参考",
             },
         }
     )
 
-    assert understanding.features.subject_content.evidence == ["画面中可直接观察"]
-    assert understanding.features.asset_usage.value == "动画场景参考"
-    assert understanding.features.target_audience.status.value == "unknown"
+    assert understanding.features.subject_content.items[0].evidence == ["画面中可直接观察"]
+    assert understanding.features.scene_theme.value == "动画场景参考"
+    assert understanding.features.visual_presentation.applicability.value == "unknown"
 
     inapplicable = AssetUnderstanding.model_validate(
         {
             "asset_name": "空场景",
             "asset_description": "画面中没有人物。",
             "features": {
-                "character_state_or_psychology": {
+                "scene_theme": {
                     "value": "静止",
                     "status": "not_applicable",
                     "confidence": 1.0,
@@ -554,14 +833,14 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
             },
         }
     )
-    assert inapplicable.features.character_state_or_psychology.value is None
+    assert inapplicable.features.scene_theme.value is None
 
     normalized_terms = AssetUnderstanding.model_validate(
         {
             "asset_name": "黄昏街景",
             "asset_description": "暖色夕阳下的城市街景。",
             "features": {
-                "visual_style": {
+                "visual_presentation": {
                     "value": ["数字插画", "赛博艺术", "数字插画"],
                     "status": "observed",
                     "confidence": 0.9,
@@ -570,7 +849,7 @@ def test_asset_understanding_normalizes_loose_model_feature_json() -> None:
             },
         }
     )
-    assert normalized_terms.features.visual_style.value == "数字插画；赛博艺术"
+    assert normalized_terms.features.visual_presentation.value == "数字插画；赛博艺术"
 
     with pytest.raises(ValidationError, match="features must be an object"):
         AssetUnderstanding.model_validate(

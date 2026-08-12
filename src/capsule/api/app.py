@@ -2,6 +2,8 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +12,7 @@ from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
 from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
+from capsule.api.relation_graphs import router as relation_graphs_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
@@ -18,19 +21,23 @@ from capsule.db.repositories import (
     ClusterRepository,
     CurrentClusterRepository,
     EmbeddingRepository,
+    RelationGraphRepository,
 )
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
 from capsule.media.video_frames import FFmpegVideoFrameExtractor
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.pipeline.cluster_service import ClusterService
+from capsule.pipeline.durable_task_supervisor import DurableTaskRuntimeSupervisor
 from capsule.pipeline.embedding import AssetEmbeddingService
-from capsule.pipeline.import_service import BrowserImportService
+from capsule.pipeline.import_service import BrowserImportService, ImportWorkflowCoordinator
 from capsule.pipeline.incremental_clustering import (
     IncrementalAssignmentThresholds,
     IncrementalClusterCoordinator,
     IncrementalClusterService,
 )
+from capsule.pipeline.processing_task_service import BrowserProcessingTaskSubmissionService
+from capsule.pipeline.relation_graph_service import RelationGraphService
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.pipeline.workspace_clear import LibraryClearService
@@ -57,6 +64,7 @@ def create_app(
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
+    relation_graph_service: RelationGraphService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -75,6 +83,7 @@ def create_app(
             or asset_repository is not None
             or library_clear_service is not None
             or workspace_service is not None
+            or relation_graph_service is not None
         ):
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
@@ -85,6 +94,7 @@ def create_app(
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
             app.state.workspace_service = workspace_service
+            app.state.relation_graph_service = relation_graph_service
             yield
             return
 
@@ -100,12 +110,35 @@ def create_app(
         current_cluster_repo = CurrentClusterRepository(database)
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
+        relation_graph_repository = RelationGraphRepository(database)
         vectors = MilvusVectorStore(resolved_settings)
         pipeline_runner = PipelineRunner(
             settings=resolved_settings,
             database=database,
             object_storage=storage,
         )
+        durable_task_submitter = BrowserProcessingTaskSubmissionService(
+            settings=resolved_settings,
+            database=database,
+            source_repository=asset_repo,
+        )
+        durable_task_supervisor: DurableTaskRuntimeSupervisor | None = None
+        app.state.durable_task_runtime_mode = "external"
+        app.state.durable_task_supervisor = None
+        if resolved_settings.api_embedded_cpu_tasks_enabled:
+            durable_task_supervisor = DurableTaskRuntimeSupervisor.from_settings(
+                settings=resolved_settings
+            )
+            try:
+                await asyncio.wait_for(
+                    durable_task_supervisor.start(),
+                    timeout=(resolved_settings.api_embedded_cpu_tasks_startup_timeout_seconds),
+                )
+            except BaseException:
+                await durable_task_supervisor.close()
+                raise
+            app.state.durable_task_runtime_mode = "embedded"
+            app.state.durable_task_supervisor = durable_task_supervisor
         app.state.cluster_repository = cluster_repo
         app.state.current_cluster_repository = current_cluster_repo
         app.state.asset_repository = asset_repo
@@ -127,19 +160,29 @@ def create_app(
             )
             app.state.search_service = None
             app.state.cluster_service = None
+            app.state.relation_graph_service = None
             app.state.import_service = BrowserImportService(
                 settings=resolved_settings,
                 repository=asset_repo,
                 runner=pipeline_runner,
+                durable_task_submitter=durable_task_submitter,
             )
             try:
                 yield
             finally:
+                if durable_task_supervisor is not None:
+                    await durable_task_supervisor.close()
                 await database.dispose()
             return
 
         embedding_client = DoubaoClient(resolved_settings)
-        model_image_cache = ModelImageCache(
+        understanding_image_cache = ModelImageCache(
+            target_bytes=resolved_settings.model_image_target_bytes,
+            max_edge=resolved_settings.model_image_max_edge,
+            fixed_size=resolved_settings.understanding_image_size,
+            max_entries=resolved_settings.model_image_cache_entries,
+        )
+        embedding_image_cache = ModelImageCache(
             target_bytes=resolved_settings.model_image_target_bytes,
             max_edge=resolved_settings.model_image_max_edge,
             max_entries=resolved_settings.model_image_cache_entries,
@@ -153,7 +196,7 @@ def create_app(
             model_client=embedding_client,
             vector_store=vectors,
             artifact_reader=storage,
-            image_cache=model_image_cache,
+            image_cache=embedding_image_cache,
             video_frame_extractor=video_frame_extractor,
         )
         understanding_service = AssetUnderstandingService(
@@ -162,7 +205,7 @@ def create_app(
             asset_repository=asset_repo,
             model_client=embedding_client,
             artifact_reader=storage,
-            image_cache=model_image_cache,
+            image_cache=understanding_image_cache,
             video_frame_extractor=video_frame_extractor,
         )
         search_repository = PostgresAssetSearchRepository(database)
@@ -190,6 +233,26 @@ def create_app(
             model_client=embedding_client,
         )
         app.state.cluster_service = cluster_service_instance
+        relation_graph_service_instance = RelationGraphService(
+            embedding_repository=embedding_repository,
+            understanding_service=understanding_service,
+            model_client=embedding_client,
+            current_cluster_repository=current_cluster_repo,
+            subject_cluster_runner=cluster_service_instance,
+            relation_repository=relation_graph_repository,
+            vector_store=vectors,
+            entity_merge_similarity_threshold=(
+                resolved_settings.relation_entity_merge_similarity_threshold
+            ),
+            asset_recall_similarity_threshold=(
+                resolved_settings.relation_asset_recall_similarity_threshold
+            ),
+            asset_recall_top_k=resolved_settings.relation_asset_recall_top_k,
+            asset_recall_path_boost=(
+                resolved_settings.relation_asset_recall_path_boost
+            ),
+        )
+        app.state.relation_graph_service = relation_graph_service_instance
         assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold
         incremental_coordinator = IncrementalClusterCoordinator(
             settings=resolved_settings,
@@ -203,6 +266,7 @@ def create_app(
             ),
             repository=current_cluster_repo,
             cluster_runner=cluster_service_instance,
+            relation_graph_updater=relation_graph_service_instance,
         )
         app.state.incremental_cluster_coordinator = incremental_coordinator
         app.state.import_service = BrowserImportService(
@@ -212,12 +276,25 @@ def create_app(
             understanding_service=understanding_service,
             embedding_service=embedding_service,
             incremental_cluster_processor=incremental_coordinator,
+            durable_task_submitter=durable_task_submitter,
         )
+        import_workflow_coordinator = ImportWorkflowCoordinator(
+            repository=asset_repo,
+            understanding_service=understanding_service,
+            embedding_service=embedding_service,
+            incremental_cluster_processor=incremental_coordinator,
+        )
+        import_workflow_task = asyncio.create_task(import_workflow_coordinator.run_forever())
         try:
             yield
         finally:
+            await import_workflow_coordinator.close()
+            import_workflow_task.cancel()
+            await asyncio.gather(import_workflow_task, return_exceptions=True)
             await incremental_coordinator.close()
             await embedding_client.close()
+            if durable_task_supervisor is not None:
+                await durable_task_supervisor.close()
             await database.dispose()
 
     logging.basicConfig(
@@ -248,13 +325,32 @@ def create_app(
     application.include_router(cluster_runs_router)
     application.include_router(imports_router)
     application.include_router(workspaces_router)
+    application.include_router(relation_graphs_router)
 
     @application.get("/health")
-    async def health() -> dict[str, str | bool]:
+    async def health() -> dict[str, Any]:
+        supervisor = getattr(application.state, "durable_task_supervisor", None)
+        components = (
+            {name: asdict(component) for name, component in supervisor.health_snapshot().items()}
+            if supervisor is not None
+            else {}
+        )
+        processing_ready = not components or all(
+            component["ready"] and component["running"] for component in components.values()
+        )
         return {
-            "status": "ok",
+            "status": "ok" if processing_ready else "degraded",
             "search_ready": resolved_settings.ark_api_key is not None,
             "cluster_ready": resolved_settings.ark_api_key is not None,
+            "processing_tasks": {
+                "mode": getattr(
+                    application.state,
+                    "durable_task_runtime_mode",
+                    "external",
+                ),
+                "ready": processing_ready,
+                "components": components,
+            },
         }
 
     return application

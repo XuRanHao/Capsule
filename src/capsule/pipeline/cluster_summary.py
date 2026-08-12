@@ -10,13 +10,13 @@ from typing import Any
 
 from capsule.enums import EmbeddingType
 from capsule.features import FEATURE_DIMENSION_SCOPES, effective_feature_text
-from capsule.schemas import ClusterSummary
 
 EMBEDDING_DIMENSION_LABELS: dict[str, str] = {
     "native_multimodal": "跨模态内容语义",
     "asset_description": "资产自然语言描述",
     "subject_content": "主体与内容",
     "scene_theme": "场景与题材",
+    "visual_presentation": "视觉表现",
     "visual_style": "视觉风格",
     "color_composition": "色彩与构图",
     "mood_atmosphere": "画面情绪氛围",
@@ -27,7 +27,6 @@ EMBEDDING_DIMENSION_LABELS: dict[str, str] = {
     "rights_version_authorship": "权利、版本与作者",
 }
 
-_PATH_AWARE_EMBEDDING_TYPES = frozenset({"subject_content", "asset_usage"})
 _GENERIC_PATH_TERMS = frozenset(
     {
         "asset",
@@ -102,60 +101,23 @@ _GENERIC_PATH_SUFFIXES = (
 
 @dataclass(slots=True, frozen=True)
 class ClusterSummaryDimensionPolicy:
-    """The semantic boundary used to describe and name one embedding channel."""
+    """The shared semantic boundary for one embedding channel's summary."""
 
-    description_focus: str
-    title_focus: str
+    summary_focus: str
 
 
 CLUSTER_SUMMARY_DIMENSION_POLICIES: dict[str, ClusterSummaryDimensionPolicy] = {
     "native_multimodal": ClusterSummaryDimensionPolicy(
-        description_focus="跨模态内容中共同出现的核心语义、对象关系、行为和上下文",
-        title_focus="最能区分该簇的核心内容语义",
-    ),
-    "asset_description": ClusterSummaryDimensionPolicy(
-        description_focus="资产自然语言描述中反复出现的事实、对象、行为和语义关系",
-        title_focus="自然语言描述中的核心共同语义",
+        summary_focus="跨模态内容中共同出现且最能区分该簇的核心语义、对象关系、行为和上下文",
     ),
     "subject_content": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT],
-        title_focus="最有区分度的主体、内容事实、主体动作或主体关系",
+        summary_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.SUBJECT_CONTENT],
     ),
     "scene_theme": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME],
-        title_focus="核心场景、事件或叙事情境",
+        summary_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.SCENE_THEME],
     ),
-    "visual_style": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_STYLE],
-        title_focus="最有区分度的媒介形态、艺术技法、视觉语言或渲染质感",
-    ),
-    "color_composition": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.COLOR_COMPOSITION],
-        title_focus="最有区分度的色彩关系、光线组织、视角、布局或视觉重心",
-    ),
-    "mood_atmosphere": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.MOOD_ATMOSPHERE],
-        title_focus="整幅内容最稳定、最有区分度的情绪基调或感官氛围",
-    ),
-    "character_state_or_psychology": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.CHARACTER_STATE_OR_PSYCHOLOGY],
-        title_focus="人物最有区分度的表情、身体状态、姿态、神态或心理状态",
-    ),
-    "asset_usage": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.ASSET_USAGE],
-        title_focus="最具体的交付物、使用载体、制作任务、工作流环节或参考目的",
-    ),
-    "target_audience": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.TARGET_AUDIENCE],
-        title_focus="证据最明确的观看者、使用者、兴趣群体或传播对象",
-    ),
-    "provenance": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.PROVENANCE],
-        title_focus="证据最明确的来源平台、采集渠道、生成方式或派生关系",
-    ),
-    "rights_version_authorship": ClusterSummaryDimensionPolicy(
-        description_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.RIGHTS_VERSION_AUTHORSHIP],
-        title_focus="证据最明确的作者、所有权、授权、版权、版本或署名关系",
+    "visual_presentation": ClusterSummaryDimensionPolicy(
+        summary_focus=FEATURE_DIMENSION_SCOPES[EmbeddingType.VISUAL_PRESENTATION],
     ),
 }
 
@@ -168,6 +130,7 @@ class ClusterSummaryAsset:
     asset_description: str | None
     asset_features: dict[str, Any]
     source_relative_path: str = ""
+    file_tree_context: tuple[str, ...] = ()
 
 
 def build_cluster_summary_messages(
@@ -186,16 +149,14 @@ def build_cluster_summary_messages(
     policy = CLUSTER_SUMMARY_DIMENSION_POLICIES.get(
         embedding_type,
         ClusterSummaryDimensionPolicy(
-            description_focus=f"{dimension_label}这一语义维度中的共同特征",
-            title_focus=f"{dimension_label}维度中最有区分度的语义",
+            summary_focus=f"{dimension_label}这一维度中共同且有区分度的语义",
         ),
     )
     payload = {
         "embedding_type": embedding_type,
         "semantic_dimension": dimension_label,
         "dimension_policy": {
-            "description_focus": policy.description_focus,
-            "title_focus": policy.title_focus,
+            "summary_focus": policy.summary_focus,
         },
         "cluster_statistics": {
             "member_count": member_count,
@@ -205,38 +166,33 @@ def build_cluster_summary_messages(
             _cluster_asset_evidence(asset, embedding_type=embedding_type) for asset in assets
         ],
     }
-    if embedding_type in _PATH_AWARE_EMBEDDING_TYPES:
-        payload["member_source_context"] = cluster_source_context(member_source_paths)
-    path_instruction = (
-        f"当前维度为 {embedding_type}。member_source_context 来自该簇全部成员的真实相对"
-        "路径。semantic_path_terms 中被多个成员支持、且与当前维度直接相关的代表性语义实体，"
-        "可以为 name 或 common_features 提供一个补充事实。description 直接表达簇的共同语义；"
-        "成员数量、完整路径、文件名和目录统计作为证据元数据保留。路径证据采用稳定、有实际"
-        "含义的语义词。"
-        if embedding_type in _PATH_AWARE_EMBEDDING_TYPES
-        else ""
-    )
+    payload["member_metadata_context"] = cluster_source_context(member_source_paths)
     return [
         {
             "role": "system",
             "content": (
-                "你正在总结一个由单一 Feature 向量维度聚类得到的资产簇。你的任务不是为这个"
-                "簇撰写完整介绍，而是尽可能准确、完整且简洁地提取簇内成员共同具备的当前维度"
-                "特征。embedding_type 和 dimension_policy 共同定义当前任务的正向语义范围。"
-                "cluster_assets 中全部成员的资产描述和当前维度描述共同构成证据。"
-                "第一步生成 common_features：提取 description_focus 指定的当前维度共同特征；"
-                "优先保留在多个簇内资产中重复出现或语义一致的特征。每项表达一个独立事实，"
-                "表达结构服从当前维度；局部属性"
-                "确实需要明确归属时才使用主体锚点。按证据支持度和区分度排列；相近、同义或"
-                "包含关系的特征合并。在证据允许范围内尽可能完整提取；如果只能"
-                "确认一个共同特征，就只输出一个。common_features 必须有 1 到 3 项。"
-                "第二步生成 description：概括 common_features 已出现的内容，使用 30 到 80 "
-                "个中文字符，以能够覆盖共同特征的最短自然表达为准，直接陈述当前维度的共同"
-                "语义。成员差异通过 "
+                "你正在为一个由单一 Feature 向量维度聚类得到的资产簇生成簇名和描述。"
+                "cluster_assets 包含全部成员的内容证据和文件元数据；member_metadata_context "
+                "汇总了簇内真实相对路径、目录和文件名。先判断这些元数据能否可靠体现用户组织"
+                "素材的意图，例如项目、作品、角色、系列、主题或资产类别。有效元数据必须具备"
+                "实际语义，并由多个成员重复支持，或能与多个成员的内容证据互相印证。文件扩展"
+                "名、编号、日期、UUID、通用目录、临时/导出标记和孤立的单个命名都不是有效意图"
+                "证据；不得机械截取共同字符串，也不得臆造专名或归属。"
+                "如果能够提取可信的用户意图，就以该意图为核心锚点，同时生成彼此一致的 name "
+                "和 description：name 优先使用用户元数据中的具体称谓，并结合簇内资产范围形成"
+                "紧凑自然的名称；description 说明该意图下本簇汇集了哪些共同内容，以及当前"
+                "embedding_type 所体现的组织范围。比如多个文件名分别表达“风不觉-武器”、"
+                "“风不觉-角色设定”和“风不觉-时装”时，应理解为用户在组织“风不觉”相关资产，"
+                "簇名与描述都应围绕“风不觉”生成，而不是只取某个视觉共同点。"
+                "如果根据现有元数据无法提取可信意图，则完全回退到原有按聚类维度总结的路径："
+                "embedding_type 和 dimension_policy 共同定义正向语义范围，从全部成员的资产"
+                "描述和 current_dimension_description 中提取共同特征，并据此同时生成 name 和 "
+                "description。name 使用最有区分度的 1 到 2 个共同特征；description 使用 30 到 "
+                "80 个中文字符，以覆盖共同语义的最短自然表达为准。"
+                "无论采用哪条路径，name 和 description 都必须作为同一次判断的整体直接生成，"
+                "不能先生成其中一个再用另一个二次改写。common_features 记录支撑该命名和描述"
+                "的 1 到 3 项事实，按证据支持度和区分度排列并合并同义项；成员差异通过 "
                 "internal_variance 表达。"
-                "第三步生成 name：从 common_features 和 description 中提炼最有区分度的 "
-                "1 到 2 个共同特征，使用具体、紧凑的语义名称。"
-                f"{path_instruction}"
                 "只返回合法 JSON，不要输出 keywords，也不要输出其他字段："
                 '{"description":"...","name":"...","common_features":["..."],'
                 '"internal_variance":"low|medium|high"}。'
@@ -262,18 +218,13 @@ def _cluster_asset_evidence(
             embedding_type=embedding_type,
         ),
     }
-    if embedding_type in _PATH_AWARE_EMBEDDING_TYPES:
-        source_relative_path = asset.source_relative_path
-        if embedding_type == "asset_usage":
-            raw_usage = asset.asset_features.get("asset_usage")
-            if isinstance(raw_usage, dict):
-                source_path = raw_usage.get("source_path")
-                if isinstance(source_path, str) and source_path.strip():
-                    source_relative_path = source_path.strip()
-        normalized_path = _normalized_source_path(source_relative_path)
-        if normalized_path is not None:
-            evidence["source_relative_path"] = normalized_path
-            evidence["source_file_name"] = PurePosixPath(normalized_path).name
+    normalized_path = _normalized_source_path(asset.source_relative_path)
+    if normalized_path is not None:
+        evidence["source_relative_path"] = normalized_path
+        evidence["source_file_name"] = PurePosixPath(normalized_path).name
+    file_tree_context = [part.strip() for part in asset.file_tree_context if part.strip()]
+    if file_tree_context:
+        evidence["file_tree_context"] = file_tree_context
     return evidence
 
 
@@ -334,42 +285,6 @@ def cluster_source_context(source_paths: Sequence[str]) -> dict[str, object]:
 def asset_usage_path_context(source_paths: Sequence[str]) -> dict[str, object]:
     """Backward-compatible alias for the shared path context."""
     return cluster_source_context(source_paths)
-
-
-def ensure_path_aware_cluster_summary(
-    summary: ClusterSummary,
-    source_paths: Sequence[str],
-    *,
-    embedding_type: str,
-) -> ClusterSummary:
-    """Preserve only a shared semantic path entity in the generated name."""
-    if embedding_type not in _PATH_AWARE_EMBEDDING_TYPES:
-        return summary
-    context = cluster_source_context(source_paths)
-    name = _ensure_cluster_path_name(summary.name, context)
-    if name == summary.name:
-        return summary
-    return summary.model_copy(update={"name": name})
-
-
-def _ensure_cluster_path_name(name: str, context: dict[str, object]) -> str:
-    raw_terms = context["semantic_path_terms"]
-    semantic_terms = (
-        [item for item in raw_terms if isinstance(item, dict)]
-        if isinstance(raw_terms, list)
-        else []
-    )
-    if not semantic_terms:
-        return name
-    primary_term = str(semantic_terms[0].get("term", "")).strip()
-    if not primary_term or primary_term in name:
-        return name
-    primary_count = int(semantic_terms[0].get("member_count", 0))
-    raw_member_count = context.get("member_count_with_path", 0)
-    member_count = raw_member_count if isinstance(raw_member_count, int) else 0
-    if primary_count < member_count:
-        return f"{primary_term}及其他{name}"
-    return f"{primary_term}{name}"
 
 
 def _semantic_path_terms(parts: Sequence[str]) -> list[str]:

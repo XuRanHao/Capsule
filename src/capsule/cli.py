@@ -19,7 +19,8 @@ from capsule.db.repositories import (
     EmbeddingRepository,
 )
 from capsule.db.session import Database
-from capsule.enums import EmbeddingType
+from capsule.enums import ClusterAlgorithm, EmbeddingType
+from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.media.model_image import ModelImageCache
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.parsers import discover_files
@@ -27,9 +28,15 @@ from capsule.parsers.video import VideoParser
 from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeClusterResult
 from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.import_service import AssetEnrichmentResult, enrich_assets
+from capsule.pipeline.processing_task_service import (
+    CpuProcessingTaskScheduler,
+    CpuProcessingTaskWorker,
+    ProcessingTaskSubmissionService,
+)
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.search_vector_index import SearchVectorMaterializationResult
 from capsule.pipeline.understanding import AssetUnderstandingService
+from capsule.pipeline.video_task_runtime import ProcessingTaskKind
 from capsule.pipeline.video_task_service import (
     VideoTaskScheduler,
     VideoTaskSubmissionService,
@@ -215,6 +222,57 @@ async def _run_video_scheduler_once(scheduler: VideoTaskScheduler) -> int:
         await scheduler.close()
 
 
+@app.command(name="submit-processing-task")
+def submit_processing_task_command(
+    input_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
+) -> None:
+    """Create and publish one durable image or text assetization task."""
+    result = asyncio.run(
+        ProcessingTaskSubmissionService().submit(
+            input_path=input_path,
+            workspace_id=workspace,
+        )
+    )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2, default=str))
+
+
+@app.command(name="cpu-task-worker")
+def cpu_task_worker_command(
+    task_kind: Annotated[ProcessingTaskKind, typer.Option("--kind")],
+    worker_id: Annotated[str | None, typer.Option("--worker-id")] = None,
+    once: Annotated[bool, typer.Option("--once")] = False,
+) -> None:
+    """Run one trusted image or text CPU task worker pool."""
+    if task_kind is ProcessingTaskKind.VIDEO:
+        raise typer.BadParameter("use video-worker for video tasks")
+    worker = CpuProcessingTaskWorker.for_kind(
+        task_kind=task_kind,
+        worker_id=worker_id,
+    )
+    if once:
+        outcome = asyncio.run(_run_video_worker_once(worker))
+        typer.echo(json.dumps({"outcome": outcome}, ensure_ascii=False))
+        return
+    asyncio.run(worker.run_forever())
+
+
+@app.command(name="cpu-task-scheduler")
+def cpu_task_scheduler_command(
+    task_kind: Annotated[ProcessingTaskKind, typer.Option("--kind")],
+    once: Annotated[bool, typer.Option("--once")] = False,
+) -> None:
+    """Recover and redispatch one image or text CPU task route."""
+    if task_kind is ProcessingTaskKind.VIDEO:
+        raise typer.BadParameter("use video-scheduler for video tasks")
+    scheduler = CpuProcessingTaskScheduler.for_kind(task_kind=task_kind)
+    if once:
+        published = asyncio.run(_run_video_scheduler_once(scheduler))
+        typer.echo(json.dumps({"published": published}, ensure_ascii=False))
+        return
+    asyncio.run(scheduler.run_forever())
+
+
 @app.command(name="embed")
 def embed_command(
     workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
@@ -260,6 +318,28 @@ def cluster_command(
             help="Embedding Type to cluster; each invocation runs exactly one Type.",
         ),
     ] = EmbeddingType.NATIVE_MULTIMODAL,
+    algorithm: Annotated[
+        ClusterAlgorithm,
+        typer.Option("--algorithm", help="Clustering algorithm."),
+    ] = ClusterAlgorithm.COMPLETE_LINK,
+    distance_threshold: Annotated[
+        float,
+        typer.Option(
+            "--distance-threshold",
+            min=0.01,
+            max=2.0,
+            help="Complete-link cutoff on L2-normalized vectors.",
+        ),
+    ] = 0.5,
+    min_cluster_size: Annotated[
+        int,
+        typer.Option(
+            "--min-cluster-size",
+            min=2,
+            max=10_000,
+            help="Minimum retained cluster size; Complete-link defaults to two assets.",
+        ),
+    ] = 2,
     optimize_parameters: Annotated[
         bool,
         typer.Option(
@@ -268,7 +348,9 @@ def cluster_command(
         ),
     ] = False,
 ) -> None:
-    """Cluster one Embedding Type into its own PCA, HDBSCAN, and ClusterRun."""
+    """Cluster one Embedding Type into its own PCA and ClusterRun."""
+    if optimize_parameters and algorithm is not ClusterAlgorithm.HDBSCAN:
+        raise typer.BadParameter("--optimize-parameters is only available with --algorithm hdbscan")
     settings = get_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -278,6 +360,9 @@ def cluster_command(
         _cluster_assets(
             workspace_id=workspace,
             embedding_type=embedding_type,
+            algorithm=algorithm,
+            distance_threshold=distance_threshold,
+            min_cluster_size=min_cluster_size,
             optimize_parameters=optimize_parameters,
         )
     )
@@ -351,9 +436,7 @@ def materialize_search_vectors_command(
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
 
 
-async def _materialize_search_vectors(
-    *, workspace_id: str
-) -> SearchVectorMaterializationResult:
+async def _materialize_search_vectors(*, workspace_id: str) -> SearchVectorMaterializationResult:
     settings = get_settings()
     database = Database(settings)
     model_client = DoubaoClient(settings)
@@ -369,7 +452,7 @@ async def _materialize_search_vectors(
             workspace_id=workspace_id,
             embedding_types=[
                 embedding_type
-                for embedding_type in EmbeddingType
+                for embedding_type in ACTIVE_EMBEDDING_TYPES
                 if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
             ],
         )
@@ -410,6 +493,9 @@ async def _cluster_assets(
     *,
     workspace_id: str,
     embedding_type: EmbeddingType,
+    algorithm: ClusterAlgorithm = ClusterAlgorithm.COMPLETE_LINK,
+    distance_threshold: float = 0.5,
+    min_cluster_size: int = 2,
     optimize_parameters: bool = False,
 ) -> EmbeddingTypeClusterResult:
     settings = get_settings()
@@ -427,6 +513,9 @@ async def _cluster_assets(
             return await service.run(
                 workspace_id=workspace_id,
                 embedding_type=embedding_type,
+                algorithm=algorithm,
+                distance_threshold=distance_threshold,
+                min_cluster_size=min_cluster_size,
                 optimize_parameters=optimize_parameters,
             )
     finally:
@@ -454,7 +543,13 @@ async def _enrich_assets(
         if not selected_asset_ids:
             raise ValueError("no Assets matched the enrichment request")
         async with DoubaoClient(settings) as model_client:
-            model_image_cache = ModelImageCache(
+            understanding_image_cache = ModelImageCache(
+                target_bytes=settings.model_image_target_bytes,
+                max_edge=settings.model_image_max_edge,
+                fixed_size=settings.understanding_image_size,
+                max_entries=settings.model_image_cache_entries,
+            )
+            embedding_image_cache = ModelImageCache(
                 target_bytes=settings.model_image_target_bytes,
                 max_edge=settings.model_image_max_edge,
                 max_entries=settings.model_image_cache_entries,
@@ -470,7 +565,7 @@ async def _enrich_assets(
                     asset_repository=asset_repository,
                     model_client=model_client,
                     artifact_reader=storage,
-                    image_cache=model_image_cache,
+                    image_cache=understanding_image_cache,
                 ),
                 embedding_service=AssetEmbeddingService(
                     settings=settings,
@@ -478,7 +573,7 @@ async def _enrich_assets(
                     model_client=model_client,
                     vector_store=MilvusVectorStore(settings),
                     artifact_reader=storage,
-                    image_cache=model_image_cache,
+                    image_cache=embedding_image_cache,
                 ),
                 force_understanding=force_understanding,
             )

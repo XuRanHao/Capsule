@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Sequence
 
 from capsule.config import Settings
-from capsule.enums import EmbeddingType
+from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.search.models import QueryEmbeddingPlan, QueryVector, SearchFilters, VectorSearchHit
 from capsule.search.recall import MultiChannelRecall
 
@@ -39,7 +39,7 @@ async def test_recall_channels_run_concurrently() -> None:
                 vector=[1.0],
                 weight=1.0,
             )
-            for embedding_type in EmbeddingType
+                for embedding_type in ACTIVE_EMBEDDING_TYPES
         )
     )
 
@@ -50,5 +50,5 @@ async def test_recall_channels_run_concurrently() -> None:
         top_k=20,
     )
 
-    assert len(result.channels) == 12
-    assert repository.max_observed == 12
+    assert len(result.channels) == 4
+    assert repository.max_observed == 4

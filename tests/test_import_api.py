@@ -140,3 +140,37 @@ async def test_import_api_cancels_active_jobs_then_clears_every_job() -> None:
     assert response.json() == {"deleted_count": 4, "cancelled_count": 1}
     assert repository.cleared_workspaces == ["workspace_import_api"]
     assert import_service.cancelled_workspaces == ["workspace_import_api"]
+
+
+@pytest.mark.asyncio
+async def test_import_api_does_not_defer_durable_dispatch_to_background_task() -> None:
+    class DurableImportService(FakeImportService):
+        async def complete_job(self, **values: object) -> ImportCompletion:
+            self.completions.append(values)
+            return ImportCompletion(
+                job_id="job_api_import",
+                staged_path=Path("/tmp/import-api-test"),
+                file_count=1,
+                durable_dispatched=True,
+            )
+
+    import_service = DurableImportService()
+    app = create_app(
+        settings=Settings(),
+        import_service=import_service,  # type: ignore[arg-type]
+        asset_repository=FakeAssetRepository(),  # type: ignore[arg-type]
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/import-jobs/job_api_import/complete",
+                json={"workspace_id": "workspace_import_api"},
+            )
+
+    assert response.status_code == 202
+    assert import_service.completions == [
+        {"job_id": "job_api_import", "workspace_id": "workspace_import_api"}
+    ]
+    assert import_service.executions == []

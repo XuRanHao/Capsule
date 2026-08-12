@@ -93,7 +93,7 @@ class FakeVectorRepository:
                 "limit": limit,
             }
         )
-        if self.fail_all or embedding_type == "visual_style":
+        if self.fail_all or embedding_type == "visual_presentation":
             raise RuntimeError("simulated channel outage")
         return [
             VectorSearchHit(
@@ -248,7 +248,7 @@ def asset_record(
         asset_name=f"Asset {asset_id}",
         asset_name_source="model",
         asset_description="黄昏动画场景",
-        asset_features={"visual_style": {"value": "动画"}},
+        asset_features={"visual_presentation": {"value": "动画"}},
         file_tree_context=["references"],
         source_contexts=[{"text": "午后-黄昏", "relation_type": "preceding_text"}],
         file_info={"width": 1200, "height": 800},
@@ -439,12 +439,10 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
                 "query_type": "text",
                 "query_text": "蓝紫色黄昏动画场景",
                 "embedding_types": [
-                    "asset_description",
                     "native_multimodal",
                     "subject_content",
                     "scene_theme",
-                    "visual_style",
-                    "mood_atmosphere",
+                    "visual_presentation",
                 ],
                 "filters": {"asset_type": ["image"]},
                 "top_k": 4,
@@ -462,7 +460,7 @@ async def test_search_degrades_one_channel_and_caps_same_source() -> None:
     ]
     assert all(item.source_contexts for item in response.results)
     assert assets.calls == 1
-    assert len(vectors.calls) == 6
+    assert len(vectors.calls) == 4
     assert all(call["limit"] == 12 for call in vectors.calls)
     assert all(call["workspace_id"] == "workspace_demo" for call in vectors.calls)
     assert response.asset_total == 4
@@ -635,13 +633,13 @@ async def test_search_api_rejects_visual_dimensions_for_text_only_targets() -> N
                     "workspace_id": "workspace_demo",
                     "query_type": "text",
                     "query_text": "蓝紫色黄昏",
-                    "embedding_types": ["visual_style"],
+                    "embedding_types": ["visual_presentation"],
                     "filters": {"asset_type": ["markdown_block", "text_block"]},
                 },
             )
 
     assert response.status_code == 422
-    assert "visual_style" in response.text
+    assert "visual_presentation" in response.text
 
 
 async def test_search_api_allows_visual_dimensions_for_mixed_targets() -> None:
@@ -657,7 +655,7 @@ async def test_search_api_allows_visual_dimensions_for_mixed_targets() -> None:
                     "workspace_id": "workspace_demo",
                     "query_type": "text",
                     "query_text": "蓝紫色黄昏",
-                    "embedding_types": ["color_composition"],
+                    "embedding_types": ["native_multimodal", "visual_presentation"],
                     "filters": {"asset_type": ["image", "markdown_block"]},
                     "top_k": 2,
                 },

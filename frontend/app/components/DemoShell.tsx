@@ -6,6 +6,7 @@ export type DemoSection =
   | "tasks"
   | "assets"
   | "clusters"
+  | "graph"
   | "search"
   | "capsules";
 
@@ -19,8 +20,9 @@ const NAV_ITEMS: Array<{
   { id: "tasks", href: "/tasks", label: "处理任务", marker: "02" },
   { id: "assets", href: "/assets", label: "Assets", marker: "03" },
   { id: "clusters", href: "/clusters", label: "Cluster", marker: "04" },
-  { id: "search", href: "/search", label: "搜索", marker: "05" },
-  { id: "capsules", href: "/capsules", label: "Capsule", marker: "06" },
+  { id: "graph", href: "/graph", label: "关系图谱", marker: "05" },
+  { id: "search", href: "/search", label: "搜索", marker: "06" },
+  { id: "capsules", href: "/capsules", label: "Capsule", marker: "07" },
 ];
 
 export function AppNavigation({

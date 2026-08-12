@@ -246,6 +246,10 @@ class CapsuleVideoTaskProcessor:
             or message.source_file_id != lease.source_file_id
             or message.generation != lease.source_generation
             or message.result_version != lease.result_version
+            or message.task_kind != lease.task_kind
+            or message.resource_class != lease.resource_class
+            or message.route_key != lease.route_key
+            or message.processor_version != lease.processor_version
         ):
             raise LeaseLostError("video task message does not match its database lease")
 

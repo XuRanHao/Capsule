@@ -10,8 +10,15 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from capsule.pipeline.video_task_runtime import (
+    ProcessingTaskKind,
+    ProcessingTaskLease,
+    ProcessingTaskMessage,
+    ProcessingTaskProcessor,
     RedisVideoTaskQueue,
+    ResourceClass,
     RetryPolicy,
     VideoTaskDelivery,
     VideoTaskLease,
@@ -21,6 +28,121 @@ from capsule.pipeline.video_task_runtime import (
     VideoTaskResult,
     VideoTaskRuntime,
 )
+
+_LEGACY_VIDEO_FIELDS = {
+    "task_id": "video-dd2bf748b62ebf2b995c870f",
+    "job_id": "job-1",
+    "workspace_id": "workspace-1",
+    "source_file_id": "source-1",
+    "generation": "3",
+    "attempt": "0",
+    "result_version": "2",
+    "source_uri": "file:///imports/demo.mp4",
+}
+
+
+def _legacy_video_decoder(fields: dict[str, str]) -> dict[str, str]:
+    """Frozen pre-generalization decoder: ignore every unrecognized field."""
+    return {key: fields[key] for key in _LEGACY_VIDEO_FIELDS}
+
+
+def test_generic_message_serializes_routing_and_keeps_legacy_video_defaults() -> None:
+    legacy = ProcessingTaskMessage.from_fields(_LEGACY_VIDEO_FIELDS)
+    legacy_fields = legacy.to_fields()
+    restored = ProcessingTaskMessage.from_fields(_LEGACY_VIDEO_FIELDS)
+    text = ProcessingTaskMessage(
+        job_id="job-1",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=3,
+        task_kind=ProcessingTaskKind.TEXT,
+        processor_version=4,
+    )
+
+    assert legacy.task_kind is ProcessingTaskKind.VIDEO
+    assert legacy.processor_version == 1
+    assert legacy.resource_class is ResourceClass.MPS_VIDEO
+    assert restored == legacy
+    assert legacy.task_id == _LEGACY_VIDEO_FIELDS["task_id"]
+    assert _legacy_video_decoder(legacy_fields) == _LEGACY_VIDEO_FIELDS
+    assert legacy_fields["message_schema_version"] == "1"
+    assert legacy_fields["dispatch_version"] == "0"
+    assert legacy_fields["route_key"] == "mps_video"
+    assert text.resource_class is ResourceClass.CPU
+    assert text.task_id != legacy.task_id
+    assert text.to_fields()["task_kind"] == "text"
+    assert text.to_fields()["processor_version"] == "4"
+    assert text.to_fields()["resource_class"] == "cpu"
+    assert VideoTaskMessage is ProcessingTaskMessage
+    assert VideoTaskProgress.__name__ == "ProcessingTaskProgress"
+    assert ProcessingTaskProcessor is not None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "task_kind",
+        "processor_version",
+        "resource_class",
+        "message_schema_version",
+        "dispatch_version",
+        "route_key",
+    ],
+)
+def test_partial_contract_payload_is_not_treated_as_legacy(field: str) -> None:
+    partial = dict(_LEGACY_VIDEO_FIELDS)
+    partial[field] = "video" if field == "task_kind" else "1"
+
+    with pytest.raises(ValueError, match="partial routing contract"):
+        ProcessingTaskMessage.from_fields(partial)
+
+
+def test_nonlegacy_task_id_matches_source_generation_kind_and_result_version() -> None:
+    first = ProcessingTaskMessage(
+        job_id="job-a",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=3,
+        task_kind=ProcessingTaskKind.TEXT,
+        result_version=2,
+    )
+    retried_job = ProcessingTaskMessage(
+        job_id="job-b",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=3,
+        task_kind=ProcessingTaskKind.TEXT,
+        result_version=2,
+    )
+    new_result = ProcessingTaskMessage(
+        job_id="job-a",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=3,
+        task_kind=ProcessingTaskKind.TEXT,
+        result_version=3,
+    )
+    lease = ProcessingTaskLease(
+        task_id=first.task_id or "",
+        source_file_id="source-1",
+        source_generation=3,
+        attempt=1,
+        worker_id="worker-a",
+        result_version=2,
+        task_kind=ProcessingTaskKind.TEXT,
+        resource_class=ResourceClass.CPU,
+        route_key="text_cpu",
+        processor_version=2,
+        lease_token="database-fence",
+    )
+
+    assert first.task_id == retried_job.task_id
+    assert first.task_id != new_result.task_id
+    assert lease.task_kind is ProcessingTaskKind.TEXT
+    assert lease.resource_class is ResourceClass.CPU
+    assert lease.route_key == "text_cpu"
+    assert lease.processor_version == 2
+    assert lease.lease_token == "database-fence"
 
 
 def _message(*, attempt: int = 0) -> VideoTaskMessage:
@@ -40,6 +162,7 @@ class _FakeRedis:
         self.claimed: list[tuple[str, dict[str, str]]] = []
         self.added: list[tuple[str, dict[str, str]]] = []
         self.acked: list[tuple[str, str, str]] = []
+        self.new_messages: list[tuple[str, dict[str, str]]] = []
         self.closed = False
 
     async def xgroup_create(self, *_args: Any, **_kwargs: Any) -> None:
@@ -54,7 +177,8 @@ class _FakeRedis:
         return ("0-0", claimed, [])
 
     async def xreadgroup(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-        raise AssertionError("pending entries must be claimed before reading new work")
+        messages, self.new_messages = self.new_messages, []
+        return [("capsule:video:tasks", messages)] if messages else []
 
     async def zrangebyscore(self, *_args: Any, **_kwargs: Any) -> list[str]:
         return []
@@ -74,8 +198,17 @@ class _FakeRepository:
     complete_result: bool = True
     progress_result: bool = True
     ack_unclaimed: bool = True
+    contract_state: bool | None = True
+    inspect_error: Exception | None = None
+    inspected: list[VideoTaskMessage] = field(default_factory=list)
     retries: list[tuple[VideoTaskLease, str, float]] = field(default_factory=list)
     failures: list[tuple[VideoTaskLease, str]] = field(default_factory=list)
+
+    async def inspect_message_contract(self, message: VideoTaskMessage) -> bool | None:
+        self.inspected.append(message)
+        if self.inspect_error is not None:
+            raise self.inspect_error
+        return self.contract_state
 
     async def claim_attempt(
         self,
@@ -129,6 +262,8 @@ class _FakeQueue:
     acknowledgements: list[VideoTaskDelivery] = field(default_factory=list)
     retried: list[VideoTaskDelivery] = field(default_factory=list)
     dlq: list[tuple[VideoTaskDelivery, str]] = field(default_factory=list)
+    quarantined: list[tuple[VideoTaskDelivery, str]] = field(default_factory=list)
+    quarantine_error: Exception | None = None
 
     async def acknowledge(self, delivery: VideoTaskDelivery) -> None:
         self.events.append("ack")
@@ -149,6 +284,13 @@ class _FakeQueue:
     async def route_dlq(self, delivery: VideoTaskDelivery, *, error: str) -> None:
         self.events.append("dlq")
         self.dlq.append((delivery, error))
+
+    async def quarantine(self, delivery: VideoTaskDelivery, *, error: str) -> None:
+        self.events.append("quarantine")
+        if self.quarantine_error is not None:
+            raise self.quarantine_error
+        self.quarantined.append((delivery, error))
+        await self.acknowledge(delivery)
 
 
 class _SuccessfulProcessor:
@@ -188,6 +330,7 @@ def _lease(*, attempt: int = 1) -> VideoTaskLease:
         attempt=attempt,
         worker_id="worker-a",
         result_version=2,
+        lease_token="test-claim-token",
     )
 
 
@@ -217,6 +360,40 @@ async def test_queue_message_contract_and_pel_recovery_precede_new_reads() -> No
     assert client.closed
 
 
+async def test_malformed_pel_entry_is_quarantined_before_later_valid_delivery() -> None:
+    client = _FakeRedis()
+    client.claimed = [
+        (
+            "10-0",
+            {
+                "task_id": "invalid",
+                "source_uri": "file:///private/imports/secret.mp4",
+                "route_key": "mps_video",
+            },
+        )
+    ]
+    client.new_messages = [("11-0", _message().to_fields())]
+    queue = RedisVideoTaskQueue(
+        redis_url="redis://unused",
+        stream="capsule:video:tasks",
+        group="video-workers",
+        consumer="worker-b",
+        dlq_stream="capsule:video:dlq",
+        client=client,
+    )
+
+    await queue.start()
+    delivery = await asyncio.wait_for(queue.receive(), timeout=0.5)
+
+    assert delivery == _delivery()
+    assert client.acked == [("capsule:video:tasks", "video-workers", "10-0")]
+    quarantine_stream, quarantined = client.added[0]
+    assert quarantine_stream == "capsule:video:tasks:quarantine"
+    assert quarantined["source_receipt"] == "10-0"
+    assert quarantined["quarantine_reason"] == "invalid_task_contract"
+    assert "source_uri" not in quarantined
+
+
 async def test_runtime_commits_database_before_acknowledging_stream_delivery() -> None:
     events: list[str] = []
     queue = _FakeQueue(events)
@@ -240,6 +417,163 @@ async def test_runtime_commits_database_before_acknowledging_stream_delivery() -
         "ack",
     ]
     assert queue.acknowledgements == [delivery]
+
+
+async def test_spoofed_route_is_quarantined_without_claiming_or_failing_task() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events)
+    repository = _FakeRepository(events, claim=_lease())
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    delivery = VideoTaskDelivery(
+        message=VideoTaskMessage(
+            job_id="job-1",
+            workspace_id="workspace-1",
+            source_file_id="source-1",
+            generation=3,
+            result_version=2,
+            source_uri="file:///imports/demo.mp4",
+            route_key="untrusted-route",
+        ),
+        receipt="11-0",
+    )
+
+    outcome = await runtime.handle_delivery(delivery)
+
+    assert outcome == "quarantined"
+    assert events == ["quarantine", "ack"]
+    assert repository.failures == []
+    assert queue.acknowledgements == [delivery]
+    assert queue.quarantined[0][1] == (
+        "processing task contract rejected: ProcessingTaskContractError"
+    )
+
+
+async def test_quarantine_write_failure_leaves_spoofed_delivery_pending() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events, quarantine_error=RuntimeError("quarantine unavailable"))
+    repository = _FakeRepository(events, claim=_lease())
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    delivery = VideoTaskDelivery(
+        message=VideoTaskMessage(
+            job_id="job-1",
+            workspace_id="workspace-1",
+            source_file_id="source-1",
+            generation=3,
+            route_key="untrusted-route",
+        ),
+        receipt="11-0",
+    )
+
+    with pytest.raises(RuntimeError, match="quarantine unavailable"):
+        await runtime.handle_delivery(delivery)
+
+    assert events == ["quarantine"]
+    assert repository.failures == []
+    assert queue.acknowledgements == []
+
+
+async def test_durable_workspace_or_source_spoof_is_quarantined_before_claim() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events)
+    repository = _FakeRepository(events, claim=_lease(), contract_state=False)
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    delivery = VideoTaskDelivery(
+        message=VideoTaskMessage(
+            job_id="job-foreign",
+            workspace_id="workspace-foreign",
+            source_file_id="source-foreign",
+            generation=3,
+        ),
+        receipt="11-0",
+    )
+
+    outcome = await runtime.handle_delivery(delivery)
+
+    assert outcome == "quarantined"
+    assert repository.inspected == [delivery.message]
+    assert events == ["quarantine", "ack"]
+    assert queue.quarantined == [(delivery, "durable_contract_mismatch")]
+    assert repository.failures == []
+
+
+async def test_orphan_task_is_quarantined_before_claim() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events)
+    repository = _FakeRepository(events, claim=_lease(), contract_state=None)
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    delivery = _delivery()
+
+    outcome = await runtime.handle_delivery(delivery)
+
+    assert outcome == "quarantined"
+    assert repository.inspected == [delivery.message]
+    assert events == ["quarantine", "ack"]
+    assert queue.quarantined == [(delivery, "orphan_task")]
+    assert repository.failures == []
+
+
+async def test_inspect_failure_propagates_without_quarantining_or_acknowledging() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events)
+    repository = _FakeRepository(
+        events,
+        claim=_lease(),
+        inspect_error=RuntimeError("database unavailable"),
+    )
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    delivery = _delivery()
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await runtime.handle_delivery(delivery)
+
+    assert repository.inspected == [delivery.message]
+    assert events == []
+    assert queue.acknowledgements == []
+
+
+async def test_normalized_legacy_delivery_passes_durable_contract_inspection() -> None:
+    events: list[str] = []
+    queue = _FakeQueue(events)
+    repository = _FakeRepository(events, claim=_lease())
+    runtime = VideoTaskRuntime(
+        queue=queue,
+        repository=repository,
+        processor=_SuccessfulProcessor(),
+        worker_id="worker-a",
+    )
+    legacy = VideoTaskMessage.from_fields(_LEGACY_VIDEO_FIELDS)
+    delivery = VideoTaskDelivery(message=legacy, receipt="11-0")
+
+    outcome = await runtime.handle_delivery(delivery)
+
+    assert legacy.legacy_wire
+    assert outcome == "completed"
+    assert repository.inspected == [legacy]
 
 
 async def test_duplicate_or_fenced_attempt_is_acked_without_reprocessing_video() -> None:

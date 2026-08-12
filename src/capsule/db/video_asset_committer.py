@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, false, func, or_, select, update
 
 from capsule.db.models import Asset, SourceFile
 from capsule.db.repositories import (
@@ -42,7 +42,7 @@ class PostgresFencedVideoAssetCommitter:
         message: VideoTaskMessage,
         lease: VideoTaskLease,
     ) -> bool:
-        if not _message_matches_lease(message, lease):
+        if not lease.lease_token or not _message_matches_lease(message, lease):
             return False
         async with self._database.session() as session:
             task = await session.scalar(
@@ -66,6 +66,8 @@ class PostgresFencedVideoAssetCommitter:
         expected_asset_count: int,
     ) -> str:
         """Fenced Asset upsert and generation publication in one transaction."""
+        if not lease.lease_token:
+            raise LeaseLostError("video task lease is missing its claim token")
         if expected_asset_count < 1:
             raise ValueError("expected_asset_count must be positive")
         if not _message_matches_lease(message, lease):
@@ -242,6 +244,10 @@ def _message_matches_lease(message: VideoTaskMessage, lease: VideoTaskLease) -> 
         and message.source_file_id == lease.source_file_id
         and message.generation == lease.source_generation
         and message.result_version == lease.result_version
+        and message.task_kind == lease.task_kind
+        and message.resource_class == lease.resource_class
+        and message.route_key == lease.route_key
+        and message.processor_version == lease.processor_version
     )
 
 
@@ -255,13 +261,23 @@ def _live_lease_clauses(lease: VideoTaskLease) -> tuple[Any, ...]:
 
 def _owned_live_lease_clauses(lease: VideoTaskLease) -> tuple[Any, ...]:
     """The live owner fence shared by writes and exact result replays."""
+    token_clauses: tuple[Any, ...] = (
+        (VideoProcessingTask.lease_token == lease.lease_token,)
+        if lease.lease_token
+        else (false(),)
+    )
     return (
         VideoProcessingTask.task_id == lease.task_id,
         VideoProcessingTask.source_file_id == lease.source_file_id,
         VideoProcessingTask.source_generation == lease.source_generation,
         VideoProcessingTask.result_version == lease.result_version,
+        VideoProcessingTask.task_kind == lease.task_kind.value,
+        VideoProcessingTask.resource_class == lease.resource_class.value,
+        VideoProcessingTask.route_key == lease.route_key,
+        VideoProcessingTask.processor_version == lease.processor_version,
         VideoProcessingTask.attempt == lease.attempt,
         VideoProcessingTask.owner_id == lease.worker_id,
+        *token_clauses,
         VideoProcessingTask.status.in_(("processing", "result_committed")),
         VideoProcessingTask.lease_deadline_at.is_not(None),
         VideoProcessingTask.lease_deadline_at > func.now(),

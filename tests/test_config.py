@@ -77,6 +77,8 @@ def test_video_adaptive_segmentation_defaults_replace_legacy_settings() -> None:
     assert settings.video_output_mode == "logical"
     assert settings.video_activity_sample_fps == 6.0
     assert settings.video_keyframe_jpeg_quality == 85
+    assert settings.understanding_image_size == 768
+    assert settings.api_embedded_cpu_tasks_enabled
     assert "video_scene_threshold" not in Settings.model_fields
     assert "video_max_candidate_frames" not in Settings.model_fields
 
@@ -96,5 +98,7 @@ def test_incremental_cluster_defaults_balance_recall_and_precision() -> None:
     assert settings.cluster_incremental_assignment_threshold == 0.88
     assert settings.cluster_bootstrap_minimum_count == 50
     assert settings.cluster_bootstrap_concurrency == 1
+    assert settings.cluster_auto_recluster_new_ratio == 0.3
+    assert settings.cluster_auto_recluster_minimum_new_count == 20
     assert "cluster_recluster_ratio_threshold" not in Settings.model_fields
     assert "cluster_recluster_minimum_count" not in Settings.model_fields

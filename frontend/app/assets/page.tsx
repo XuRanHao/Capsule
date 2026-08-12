@@ -12,6 +12,11 @@ import { useWorkspaceSelection, WorkspaceSelect } from "../lib/workspaces";
 
 type AssetFilter = AssetRecord["asset_type"] | "all";
 
+function salienceRank(value: number | "high" | "medium" | "low") {
+  if (typeof value === "number") return -value;
+  return { high: 0, medium: 1, low: 2 }[value];
+}
+
 const TYPE_LABELS: Record<AssetFilter, string> = {
   all: "全部",
   image: "图片",
@@ -22,9 +27,19 @@ const TYPE_LABELS: Record<AssetFilter, string> = {
 
 function featureValues(asset: AssetRecord) {
   return Object.values(asset.asset_features)
-    .map((feature) =>
-      typeof feature === "string" ? feature : feature?.value,
-    )
+    .flatMap((feature) => {
+      if (typeof feature === "string") return [feature];
+      if (feature?.items?.length) {
+        return feature.items
+          .slice()
+          .sort(
+            (left, right) =>
+              salienceRank(left.salience) - salienceRank(right.salience),
+          )
+          .map((item) => item.description);
+      }
+      return feature?.value ? [feature.value] : [];
+    })
     .filter((value): value is string => Boolean(value))
     .slice(0, 2);
 }

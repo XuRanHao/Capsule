@@ -57,7 +57,13 @@ def _strip_annotations(node: Any) -> None:
     if isinstance(node, dict):
         for key in ("title", "description", "default", "examples"):
             node.pop(key, None)
-        for value in node.values():
+        for key, value in node.items():
+            if key == "properties" and isinstance(value, dict):
+                # Property names are user data. A field named ``description`` or
+                # ``title`` must not be mistaken for a JSON Schema annotation.
+                for property_schema in value.values():
+                    _strip_annotations(property_schema)
+                continue
             _strip_annotations(value)
     elif isinstance(node, list):
         for value in node:

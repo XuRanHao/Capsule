@@ -1,9 +1,7 @@
-import math
-
 import pytest
 from pydantic import ValidationError
 
-from capsule.enums import FeatureStatus
+from capsule.enums import FeatureApplicability, FeatureSalience, FeatureStatus
 from capsule.schemas import AssetUnderstanding, FeatureValue
 
 
@@ -34,59 +32,121 @@ def test_asset_understanding_normalizes_unambiguous_feature_array() -> None:
                 "evidence": ["背景为夜间城市", "第二条证据会被现有规则截断"],
             },
             {
-                "embedding_type": "visual_style",
-                "confidence": "not-a-number",
-                "evidence": None,
-            },
-            {
-                "key": "color_composition",
-                "name": "color_composition",
+                "key": "visual_presentation",
+                "name": "visual_presentation",
                 "value": "蓝紫色",
             },
         ]
     )
 
-    assert understanding.features.subject_content.confidence == 0.75
-    assert understanding.features.subject_content.evidence == ["画面中央可见圆形角色"]
-    assert understanding.features.scene_theme.status is FeatureStatus.INFERRED
-    assert understanding.features.scene_theme.confidence == 1.0
-    assert understanding.features.scene_theme.evidence == ["背景为夜间城市"]
-    assert understanding.features.visual_style.value is None
-    assert understanding.features.visual_style.status is FeatureStatus.UNKNOWN
-    assert understanding.features.visual_style.confidence == 0.0
-    assert understanding.features.color_composition.status is FeatureStatus.INFERRED
-    assert understanding.features.target_audience.status is FeatureStatus.UNKNOWN
+    subject = understanding.features.subject_content
+    assert subject.applicability is FeatureApplicability.APPLICABLE
+    assert subject.items[0].subject == "圆形角色"
+    assert subject.items[0].description == "圆形角色"
+    assert subject.items[0].status is FeatureStatus.OBSERVED
+    assert subject.items[0].evidence == ["画面中央可见圆形角色"]
+    scene = understanding.features.scene_theme
+    assert scene.items[0].status is FeatureStatus.INFERRED
+    assert scene.items[0].evidence == ["背景为夜间城市"]
+    assert (
+        understanding.features.visual_presentation.items[0].status
+        is FeatureStatus.INFERRED
+    )
 
 
-@pytest.mark.parametrize(
-    ("raw_confidence", "expected"),
-    [
-        ("0.25", 0.25),
-        ("-0.25", 0.0),
-        ("1.25", 1.0),
-        ("NaN", 0.0),
-        (float("inf"), 0.0),
-        (float("-inf"), 0.0),
-        ("invalid", 0.0),
-        (None, 0.0),
-        (True, 0.0),
-    ],
-)
-def test_feature_value_normalizes_confidence(
-    raw_confidence: object,
-    expected: float,
-) -> None:
-    feature = FeatureValue.model_validate(
+def test_subject_content_preserves_subject_separately_from_description() -> None:
+    understanding = _understanding(
         {
-            "value": "测试值",
-            "status": "observed",
-            "confidence": raw_confidence,
+            "subject_content": {
+                "applicability": "applicable",
+                "items": [
+                    {
+                        "subject": "枉叹之",
+                        "description": "黑发男性角色，手持长剑并面向前方站立",
+                        "salience": "high",
+                        "status": "metadata",
+                        "evidence": ["文件名与画面中的角色一致"],
+                        "ocr_confidence": None,
+                    }
+                ],
+            }
         }
     )
 
-    assert math.isfinite(feature.confidence)
-    assert feature.confidence == expected
-    assert feature.evidence == []
+    item = understanding.features.subject_content.items[0]
+    assert item.subject == "枉叹之"
+    assert item.description == "黑发男性角色，手持长剑并面向前方站立"
+
+
+def test_subject_content_sorts_by_relative_salience() -> None:
+    understanding = _understanding(
+        {
+            "subject_content": {
+                "applicability": "applicable",
+                "items": [
+                    {
+                        "subject": "封不觉",
+                        "description": "黑发红眼男性角色",
+                        "salience": 0.92,
+                    },
+                    {
+                        "subject": "活动管钳",
+                        "description": "角色手持的红色管钳",
+                        "salience": 0.48,
+                    },
+                ],
+            }
+        }
+    )
+
+    items = understanding.features.subject_content.items
+    assert [item.salience for item in items] == [0.92, 0.48]
+
+
+def test_asset_understanding_merges_legacy_visual_fields() -> None:
+    understanding = _understanding(
+        {
+            "visual_style": {"value": "数字插画；写实质感", "status": "observed"},
+            "color_composition": {"value": "冷蓝色；中心构图", "status": "observed"},
+        }
+    )
+
+    assert understanding.features.visual_presentation.value == (
+        "数字插画；冷蓝色；写实质感；中心构图"
+    )
+
+
+def test_feature_value_normalizes_salience_items_and_drops_feature_confidence() -> None:
+    feature = FeatureValue.model_validate(
+        {
+            "applicability": "applicable",
+            "items": [
+                {
+                    "description": "背景车辆",
+                    "salience": "low",
+                    "status": "observed",
+                    "evidence": "画面后方可见车辆",
+                    "ocr_confidence": "invalid",
+                },
+                {
+                    "description": "中央角色",
+                    "salience": "high",
+                    "status": "observed",
+                    "evidence": ["角色位于中央", "多余证据"],
+                    "ocr_confidence": 0.92,
+                },
+            ],
+        }
+    )
+
+    assert [item.description for item in feature.items] == ["中央角色", "背景车辆"]
+    assert feature.items[0].salience is FeatureSalience.HIGH
+    assert feature.items[0].evidence == ["角色位于中央"]
+    assert feature.items[0].ocr_confidence == 0.92
+    assert feature.items[1].ocr_confidence is None
+    dumped = feature.model_dump(mode="json")
+    assert "confidence" not in dumped
+    assert "value" not in dumped
 
 
 @pytest.mark.parametrize(

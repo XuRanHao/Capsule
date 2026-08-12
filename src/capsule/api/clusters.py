@@ -1,20 +1,22 @@
 """Asynchronous front-end API for one Embedding Type clustering run."""
 
 import logging
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from capsule.db.repositories import ClusterRepository, NewAssetClusterStatusRecord
 from capsule.enums import (
+    ClusterAlgorithm,
     ClusterMemberSource,
     ClusterMode,
     ClusterRunStatus,
     EmbeddingType,
     NewAssetClusterStatus,
 )
+from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.vector_fusion import DEFAULT_NATIVE_CONTENT_WEIGHT
 from capsule.schemas import (
@@ -52,9 +54,24 @@ class ClusterRunCreate(BaseModel):
         ),
     )
     pca_dimension: int = Field(default=8, ge=2, le=1024)
+    algorithm: ClusterAlgorithm = ClusterAlgorithm.COMPLETE_LINK
     min_samples: int = Field(default=3, ge=1, le=10_000)
-    min_cluster_size: int = Field(default=3, ge=2, le=10_000)
+    min_cluster_size: int = Field(default=2, ge=2, le=10_000)
+    distance_threshold: float = Field(default=0.5, gt=0.0, le=2.0)
     optimize_parameters: bool = False
+
+    @field_validator("embedding_type")
+    @classmethod
+    def require_active_embedding_type(cls, value: EmbeddingType) -> EmbeddingType:
+        if value not in ACTIVE_EMBEDDING_TYPES:
+            raise ValueError(f"{value.value} is no longer an active clustering dimension")
+        return value
+
+    @model_validator(mode="after")
+    def validate_algorithm_parameters(self) -> "ClusterRunCreate":
+        if self.algorithm is ClusterAlgorithm.COMPLETE_LINK and self.optimize_parameters:
+            raise ValueError("optimize_parameters is only available for HDBSCAN")
+        return self
 
 
 class ClusterRunSubmission(BaseModel):
@@ -156,6 +173,15 @@ class CurrentClusterProcessorProtocol(Protocol):
     ) -> object: ...
 
 
+class RelationGraphRebuilder(Protocol):
+    async def build(
+        self,
+        *,
+        workspace_id: str,
+        force_rebuild: bool = False,
+    ) -> dict[str, Any]: ...
+
+
 def _cluster_service(request: Request) -> ClusterService:
     service = getattr(request.app.state, "cluster_service", None)
     if service is None:
@@ -227,12 +253,9 @@ async def get_new_asset_cluster_status(
         milvus_collection=settings.milvus_collection,
     )
     incrementally_clustered_count = sum(
-        item.status is NewAssetClusterStatus.INCREMENTALLY_CLUSTERED
-        for item in result.items
+        item.status is NewAssetClusterStatus.INCREMENTALLY_CLUSTERED for item in result.items
     )
-    pending_count = sum(
-        item.status is NewAssetClusterStatus.PENDING for item in result.items
-    )
+    pending_count = sum(item.status is NewAssetClusterStatus.PENDING for item in result.items)
     manual_management_count = sum(
         item.status is NewAssetClusterStatus.MANUAL_MANAGEMENT for item in result.items
     )
@@ -403,6 +426,7 @@ async def submit_cluster_run(
             embedding_type=payload.embedding_type.value,
             preprocessing={
                 "trigger": "user",
+                "algorithm": payload.algorithm.value,
                 "vector_fusion": {
                     "requested_native_content_weight": payload.native_content_weight,
                     "effective_native_content_weight": (
@@ -429,8 +453,20 @@ async def submit_cluster_run(
                 ),
             },
             parameters={
-                "min_samples": payload.min_samples,
-                "min_cluster_size": payload.min_cluster_size,
+                "algorithm": payload.algorithm.value,
+                **(
+                    {
+                        "min_samples": payload.min_samples,
+                        "min_cluster_size": payload.min_cluster_size,
+                    }
+                    if payload.algorithm is ClusterAlgorithm.HDBSCAN
+                    else {
+                        "distance_threshold": payload.distance_threshold,
+                        "min_cluster_size": payload.min_cluster_size,
+                        "metric": "euclidean",
+                        "linkage": "complete",
+                    }
+                ),
             },
         )
     except ValueError as exc:
@@ -448,8 +484,25 @@ async def submit_cluster_run(
         min_samples=payload.min_samples,
         min_cluster_size=payload.min_cluster_size,
         optimize_parameters=payload.optimize_parameters,
+        algorithm=payload.algorithm,
+        distance_threshold=payload.distance_threshold,
         native_content_weight=payload.native_content_weight,
     )
+    relation_graph_rebuilder = cast(
+        RelationGraphRebuilder | None,
+        getattr(request.app.state, "relation_graph_service", None),
+    )
+    if (
+        payload.embedding_type is EmbeddingType.SUBJECT_CONTENT
+        and relation_graph_rebuilder is not None
+    ):
+        background_tasks.add_task(
+            _rebuild_relation_graph_after_cluster_run,
+            repository=repository,
+            rebuilder=relation_graph_rebuilder,
+            cluster_run_id=cluster_run_id,
+            workspace_id=payload.workspace_id,
+        )
     return ClusterRunSubmission(cluster_run_id=cluster_run_id)
 
 
@@ -593,6 +646,8 @@ async def _execute_cluster_run(
     min_samples: int,
     min_cluster_size: int,
     optimize_parameters: bool,
+    algorithm: ClusterAlgorithm,
+    distance_threshold: float,
     native_content_weight: float,
 ) -> None:
     await service.run(
@@ -603,8 +658,32 @@ async def _execute_cluster_run(
         min_samples=min_samples,
         min_cluster_size=min_cluster_size,
         optimize_parameters=optimize_parameters,
+        algorithm=algorithm,
+        distance_threshold=distance_threshold,
         native_content_weight=native_content_weight,
     )
+
+
+async def _rebuild_relation_graph_after_cluster_run(
+    *,
+    repository: ClusterRepository,
+    rebuilder: RelationGraphRebuilder,
+    cluster_run_id: str,
+    workspace_id: str,
+) -> None:
+    """Run after clustering has published data and exposed its terminal status."""
+    run = await repository.get_run(
+        cluster_run_id=cluster_run_id,
+        workspace_id=workspace_id,
+    )
+    if run.status in {
+        ClusterRunStatus.COMPLETED,
+        ClusterRunStatus.INSUFFICIENT_DATA,
+    }:
+        await rebuilder.build(
+            workspace_id=workspace_id,
+            force_rebuild=True,
+        )
 
 
 def _run_not_found(cluster_run_id: str) -> HTTPException:
@@ -631,8 +710,7 @@ def _current_cluster_mutation_error(cluster_id: str, exc: ValueError) -> HTTPExc
     message = str(exc)
     normalized = message.lower()
     if "cluster" in normalized and any(
-        marker in normalized
-        for marker in ("not found", "does not exist", "another workspace")
+        marker in normalized for marker in ("not found", "does not exist", "another workspace")
     ):
         return _current_cluster_not_found(cluster_id)
     if any(

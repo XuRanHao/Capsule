@@ -109,22 +109,18 @@ async def test_image_text_uses_joint_vector_and_semantic_text_channels() -> None
             query_image_url="https://example.com/query.png",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
-                EmbeddingType.ASSET_DESCRIPTION,
                 EmbeddingType.SUBJECT_CONTENT,
-                EmbeddingType.VISUAL_STYLE,
-                EmbeddingType.MOOD_ATMOSPHERE,
-                EmbeddingType.TARGET_AUDIENCE,
+                EmbeddingType.SCENE_THEME,
+                EmbeddingType.VISUAL_PRESENTATION,
             ],
         )
     )
 
     assert [item.channel for item in plan.vectors] == [
         "native_multimodal",
-        "asset_description",
         "subject_content",
-        "visual_style",
-        "mood_atmosphere",
-        "target_audience",
+        "scene_theme",
+        "visual_presentation",
     ]
     assert plan.degraded is False
     assert sorted(client.calls) == [
@@ -150,7 +146,7 @@ async def test_image_text_falls_back_to_separate_vectors() -> None:
             query_image_url="https://example.com/query.png",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
-                EmbeddingType.VISUAL_STYLE,
+                EmbeddingType.VISUAL_PRESENTATION,
             ],
         )
     )
@@ -178,7 +174,7 @@ async def test_image_text_embeddings_run_concurrently() -> None:
             query_image_url="https://example.com/query.png",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
-                EmbeddingType.ASSET_DESCRIPTION,
+                EmbeddingType.SUBJECT_CONTENT,
             ],
         )
     )
@@ -195,12 +191,12 @@ class DistinctQueryEnhancementClient:
     ) -> QueryEnhancement:
         return QueryEnhancement(
             queries={
-                EmbeddingType.VISUAL_STYLE: "动画视觉风格",
-                EmbeddingType.COLOR_COMPOSITION: "蓝紫色调与黄昏光影",
+                EmbeddingType.VISUAL_PRESENTATION: "动画视觉风格",
+                EmbeddingType.SCENE_THEME: "黄昏城市场景",
             },
             weights={
-                EmbeddingType.VISUAL_STYLE: 0.6,
-                EmbeddingType.COLOR_COMPOSITION: 0.4,
+                EmbeddingType.VISUAL_PRESENTATION: 0.6,
+                EmbeddingType.SCENE_THEME: 0.4,
             },
         )
 
@@ -214,16 +210,16 @@ class NativeAndStyleEnhancementClient:
     ) -> QueryEnhancement:
         assert embedding_types == [
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ]
         return QueryEnhancement(
             queries={
                 EmbeddingType.NATIVE_MULTIMODAL: "模型改写的原始内容",
-                EmbeddingType.VISUAL_STYLE: "强化后的视觉风格",
+                EmbeddingType.VISUAL_PRESENTATION: "强化后的视觉风格",
             },
             weights={
                 EmbeddingType.NATIVE_MULTIMODAL: 0.5,
-                EmbeddingType.VISUAL_STYLE: 0.5,
+                EmbeddingType.VISUAL_PRESENTATION: 0.5,
             },
         )
 
@@ -239,10 +235,10 @@ class SingleDimensionEnhancementClient:
         embedding_types: Sequence[EmbeddingType],
     ) -> QueryEnhancement:
         self.calls += 1
-        assert embedding_types == [EmbeddingType.VISUAL_STYLE]
+        assert embedding_types == [EmbeddingType.VISUAL_PRESENTATION]
         return QueryEnhancement(
-            queries={EmbeddingType.VISUAL_STYLE: "单维度强化视觉风格"},
-            weights={EmbeddingType.VISUAL_STYLE: 1.0},
+            queries={EmbeddingType.VISUAL_PRESENTATION: "单维度强化视觉风格"},
+            weights={EmbeddingType.VISUAL_PRESENTATION: 1.0},
         )
 
 
@@ -252,7 +248,7 @@ class ProjectionEmbeddingClient(FakeEmbeddingClient):
         vectors = {
             "蓝紫色黄昏动画场景": [1.0, 0.0, 0.0],
             "动画视觉风格": [0.0, 1.0, 0.0],
-            "蓝紫色调与黄昏光影": [0.0, 0.0, 1.0],
+            "黄昏城市场景": [0.0, 0.0, 1.0],
         }
         return EmbeddingResult(vector=vectors[text], model="fake")
 
@@ -290,8 +286,8 @@ async def test_enhanced_queries_flow_to_independent_embedding_and_recall_routes(
         query_type=QueryType.TEXT,
         query_text="蓝紫色黄昏动画场景",
         embedding_types=[
-            EmbeddingType.VISUAL_STYLE,
-            EmbeddingType.COLOR_COMPOSITION,
+            EmbeddingType.VISUAL_PRESENTATION,
+            EmbeddingType.SCENE_THEME,
         ],
     )
     parsed, reasons = await QueryParser(DistinctQueryEnhancementClient()).parse(
@@ -314,14 +310,14 @@ async def test_enhanced_queries_flow_to_independent_embedding_and_recall_routes(
     assert set(client.calls) == {
         "text:蓝紫色黄昏动画场景",
         "text:动画视觉风格",
-        "text:蓝紫色调与黄昏光影",
+        "text:黄昏城市场景",
     }
     assert [vector.weight for vector in plan.vectors] == [0.6, 0.4]
-    assert recall_repository.calls[0][0] == "visual_style"
+    assert recall_repository.calls[0][0] == "visual_presentation"
     assert recall_repository.calls[0][1] == pytest.approx(
         [0.3939193, 0.91914503, 0.0]
     )
-    assert recall_repository.calls[1][0] == "color_composition"
+    assert recall_repository.calls[1][0] == "scene_theme"
     assert recall_repository.calls[1][1] == pytest.approx(
         [0.3939193, 0.0, 0.91914503]
     )
@@ -334,7 +330,7 @@ async def test_native_query_stays_original_and_non_native_query_is_fused() -> No
         query_text="原始查询",
         embedding_types=[
             EmbeddingType.NATIVE_MULTIMODAL,
-            EmbeddingType.VISUAL_STYLE,
+            EmbeddingType.VISUAL_PRESENTATION,
         ],
     )
     parsed, reasons = await QueryParser(NativeAndStyleEnhancementClient()).parse(
@@ -366,7 +362,7 @@ async def test_single_non_native_dimension_is_enhanced() -> None:
         workspace_id="workspace_demo",
         query_type=QueryType.TEXT,
         query_text="原始查询",
-        embedding_types=[EmbeddingType.VISUAL_STYLE],
+        embedding_types=[EmbeddingType.VISUAL_PRESENTATION],
     )
 
     parsed, reasons = await QueryParser(client).parse(request, image_url=None)
@@ -387,14 +383,14 @@ async def test_image_query_reuses_image_vector_for_selected_semantic_channels() 
             query_image_url="https://example.com/query.png",
             embedding_types=[
                 EmbeddingType.NATIVE_MULTIMODAL,
-                EmbeddingType.VISUAL_STYLE,
+                EmbeddingType.VISUAL_PRESENTATION,
             ],
         )
     )
 
     assert [item.embedding_type for item in plan.vectors] == [
         EmbeddingType.NATIVE_MULTIMODAL,
-        EmbeddingType.VISUAL_STYLE,
+        EmbeddingType.VISUAL_PRESENTATION,
     ]
     assert client.calls == ["image:https://example.com/query.png"]
     assert [item.weight for item in plan.vectors] == [0.5, 0.5]

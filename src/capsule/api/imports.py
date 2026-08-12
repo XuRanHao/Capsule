@@ -189,12 +189,13 @@ async def complete_import_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "import_job_not_found", "message": str(exc)},
         ) from exc
-    background_tasks.add_task(
-        _execute_import,
-        service=service,
-        completion=completion,
-        workspace_id=payload.workspace_id,
-    )
+    if not completion.durable_dispatched:
+        background_tasks.add_task(
+            _execute_import,
+            service=service,
+            completion=completion,
+            workspace_id=payload.workspace_id,
+        )
     return ImportJobStarted(
         job_id=completion.job_id,
         status="running",

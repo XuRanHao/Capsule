@@ -61,11 +61,12 @@ test("server-renders the Capsule search workspace", async () => {
   const dimensionInputs = [
     ...html.matchAll(/<input[^>]*name="embedding_types"[^>]*>/g),
   ].map((match) => match[0]);
-  assert.equal(dimensionInputs.length, 12);
+  assert.equal(dimensionInputs.length, 4);
   assert.match(
     dimensionInputs.find((input) => /value="native_multimodal"/.test(input)) ?? "",
     /checked=""/,
   );
+  assert.match(html, /视觉表现/);
   assert.match(html, /开始检索/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
@@ -77,6 +78,7 @@ test("server-renders every POC workspace page", async () => {
     ["/assets", /所有素材，都有语义/],
     ["/assets/asset_twilight_01", /ASSET DETAIL/],
     ["/clusters", /从相似中，看见结构/],
+    ["/graph", /元数据与内容，分路提取后合并/],
     ["/search", /搜到你记得的/],
     ["/capsules", /把一次发现，变成可复用的入口/],
   ];
@@ -91,6 +93,7 @@ test("server-renders every POC workspace page", async () => {
     assert.match(html, /处理任务/);
     assert.match(html, /Assets/);
     assert.match(html, /Cluster/);
+    assert.match(html, /关系图谱/);
     assert.match(html, /搜索/);
     assert.match(html, /Capsule/);
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
@@ -107,17 +110,9 @@ test("cluster selector renders every searchable embedding dimension", async () =
 
   assert.deepEqual(optionValues, [
     "native_multimodal",
-    "asset_description",
     "subject_content",
     "scene_theme",
-    "visual_style",
-    "color_composition",
-    "mood_atmosphere",
-    "character_state_or_psychology",
-    "asset_usage",
-    "target_audience",
-    "provenance",
-    "rights_version_authorship",
+    "visual_presentation",
   ]);
 });
 
@@ -133,14 +128,8 @@ test("cluster workspace keeps history and exposes current resident controls", as
   assert.match(html, /原始内容权重/);
   assert.match(html, /原始内容模式无需融合/);
   assert.match(html, /只有点击/);
-  assert.match(html, /首次达到/);
-  assert.match(html, /只增量归簇/);
-  assert.match(html, /基线样本数/);
-  assert.match(html, /当前 eligible/);
-  assert.match(html, /新增 Asset/);
-  assert.match(html, /已增量归簇/);
-  assert.match(html, /待聚类/);
-  assert.match(html, /手动管理/);
+  assert.match(html, /簇发布完成后页面立即刷新/);
+  assert.doesNotMatch(html, /新增 Asset/);
 });
 
 test("workspace-aware pages render a shared workspace switcher", async () => {
@@ -152,7 +141,7 @@ test("workspace-aware pages render a shared workspace switcher", async () => {
 });
 
 test("removes all disposable starter-preview references", async () => {
-  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, segmentPlayer, clustersPage, capsulesPage, api, worker] = await Promise.all([
+  const [page, layout, packageJson, shell, importPage, tasksPage, assetsPage, detailPage, segmentPlayer, clustersPage, graphPage, capsulesPage, api, worker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -163,6 +152,7 @@ test("removes all disposable starter-preview references", async () => {
     readFile(new URL("../app/assets/[id]/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/SegmentVideoPlayer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/clusters/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/graph/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/capsules/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
@@ -187,6 +177,9 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(page, /workspaceReady/);
   assert.match(page, /AbortController/);
   assert.match(page, /requestWorkspaceId/);
+  assert.match(graphPage, /GRAPH_READ_TIMEOUT_MS/);
+  assert.match(graphPage, /Promise\.race/);
+  assert.match(graphPage, /重新读取图谱/);
   assert.match(page, /\/assets\/\$\{encodeURIComponent\(result\.asset_id\)\}/);
   assert.doesNotMatch(page, /useState\("workspace_demo"\)/);
   assert.match(shell, /ProductTopbar/);
@@ -228,7 +221,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /管理当前簇/);
   assert.match(clustersPage, /currentClusterWorkspaceRef/);
   assert.match(clustersPage, /current_cluster_not_found/);
-  assert.match(clustersPage, /\/api\/v1\/clusters\/assets\/status\?/);
+  assert.doesNotMatch(clustersPage, /\/api\/v1\/clusters\/assets\/status\?/);
   assert.match(clustersPage, /refreshClusterDimension/);
   assert.match(clustersPage, /RUN_POLL_INTERVAL_MS/);
   assert.match(clustersPage, /完成后会自动展示结果/);
@@ -239,7 +232,7 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(clustersPage, /当前维度权重/);
   assert.match(clustersPage, /原始内容模式无需融合/);
   assert.doesNotMatch(clustersPage, /setInterval\(/);
-  assert.match(clustersPage, /assetStatus\?\.items/);
+  assert.doesNotMatch(clustersPage, /assetStatus\?\.items/);
   assert.match(clustersPage, /representative-asset-link/);
   assert.match(clustersPage, /\/assets\/\$\{encodeURIComponent\(asset\.asset_id\)\}/);
   assert.match(api, /type ClusterAssetStatus =/);
@@ -251,6 +244,19 @@ test("removes all disposable starter-preview references", async () => {
   assert.match(worker, /127\.0\.0\.1/);
   assert.match(worker, /proxyRequest\.duplex = "half"/);
   assert.match(clustersPage, /setMinSamples\] = useState\("3"\)/);
+  assert.match(clustersPage, /setMinClusterSize\] = useState\("2"\)/);
+  assert.match(clustersPage, /HDBSCAN/);
+  assert.match(clustersPage, /Complete-link/);
+  assert.match(
+    clustersPage,
+    /useState<ClusterAlgorithm>\("complete_link"\)/,
+  );
+  assert.match(
+    clustersPage,
+    /onClick=\{\(\) => setAlgorithm\("complete_link"\)\}[\s\S]*Complete-link[\s\S]*onClick=\{\(\) => setAlgorithm\("hdbscan"\)\}[\s\S]*HDBSCAN/,
+  );
+  assert.match(clustersPage, /Distance Threshold/);
+  assert.match(clustersPage, /distance_threshold/);
   assert.match(clustersPage, /开放常驻/);
   assert.match(clustersPage, /手动管理/);
   assert.match(clustersPage, /簇内成员由用户手动管理/);

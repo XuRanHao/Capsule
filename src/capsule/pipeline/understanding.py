@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -12,8 +13,8 @@ from pydantic import BaseModel, Field
 
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository, EmbeddingAsset, EmbeddingRepository
-from capsule.enums import AssetType, FeatureStatus
-from capsule.features import feature_dimension_scope_prompt
+from capsule.enums import AssetType
+from capsule.features import FEATURE_DIMENSION_DISAMBIGUATION_PROMPT
 from capsule.media.model_image import ModelImageCache
 from capsule.media.video_frames import (
     FFmpegVideoFrameExtractor,
@@ -26,28 +27,40 @@ from capsule.video_output import is_logical_video_asset
 logger = logging.getLogger(__name__)
 
 _DESCRIPTION_CONTEXT_RULES = (
-    "asset_name 与 asset_description 必须以素材本身可见或可读内容为主体。"
-    "文件名、相对路径、目录层级、文档标题、标题路径和关联段落只作为语义上下文："
-    "其中与素材内容一致且有实际语义的信息必须自然融入描述，不得写成元数据说明；"
-    "路径或文字与素材内容冲突时，以素材本身为准。忽略纯编号、序号、通用词组成的"
-    "文件名。禁止在结果中机械复述文件名、扩展名、目录、路径、来源路径或"
-    "“位于某文件夹”等措辞。以上限制不适用于 asset_usage.description；素材用途说明"
-    "必须明确写出 metadata.context.source_path。"
+    "asset_name 与 asset_description 聚焦素材本身可见或可读的内容。"
+    "描述直接呈现可观察或可阅读的事实。文件名、目录等元数据由独立路径处理，"
+    "无需在内容描述中解释其来源。"
 )
 
-_USAGE_PATH_HINTS = (
-    ("海报", "海报制作"),
-    ("宣传", "宣传推广"),
-    ("广告", "广告投放"),
-    ("预告", "预告宣传"),
-    ("封面", "封面设计"),
-    ("头像", "头像制作"),
-    ("壁纸", "壁纸使用"),
-    ("电商", "电商展示"),
-    ("社交媒体", "社交媒体发布"),
-    ("社媒", "社交媒体发布"),
-    ("参考", "创作参考"),
-    ("插画", "插画创作"),
+_SUBJECT_OUTPUT_RULES = (
+    "subject_content 走内容提取路径，聚焦画面、正文或视频中最显著的具体人物、物体和场景对象。"
+    "subject 写简短稳定的实体名称，description 写身份、类别、外观、动作或关系等区分信息。"
+    "这里无需采用文件名或目录给主体命名；元数据实体会由独立路径提取，并在随后合并去重。"
+    "salience 使用 0 到 1 的相对数值，体现各实体在当前素材中的重要程度。"
+)
+
+_GENERIC_SUBJECT_HINTS = frozenset(
+    {
+        "asset",
+        "file",
+        "image",
+        "img",
+        "photo",
+        "picture",
+        "screenshot",
+        "untitled",
+        "素材",
+        "图片",
+        "图像",
+        "照片",
+        "截图",
+        "未命名",
+        "场景",
+        "参考",
+        "参考图",
+        "三视图",
+        "四视图",
+    }
 )
 
 
@@ -96,6 +109,7 @@ class AssetUnderstandingService:
         self._image_cache = image_cache or ModelImageCache(
             target_bytes=settings.model_image_target_bytes,
             max_edge=settings.model_image_max_edge,
+            fixed_size=settings.understanding_image_size,
             max_entries=settings.model_image_cache_entries,
         )
         self._video_frame_extractor = video_frame_extractor or FFmpegVideoFrameExtractor(
@@ -161,7 +175,7 @@ class AssetUnderstandingService:
                     )
                     # Drop transient video-frame data URIs before the database write.
                     del messages
-                    _attach_asset_usage_path_context(understanding, asset)
+                    _attach_ocr_confidence(understanding, asset)
                 finally:
                     model_ms = (time.perf_counter() - phase_started) * 1000
                 phase_started = time.perf_counter()
@@ -183,43 +197,26 @@ class AssetUnderstandingService:
             "role": "system",
             "content": (
                 "你是多模态 Asset 特征提取器，只描述当前 Asset；上下文仅用于消歧。"
-                "十个 Feature 彼此独立，每个 Feature 围绕自己的正向语义范围组织事实。"
-                "asset_name 不超过 20 字；"
-                "asset_description 用 40 到 120 字客观描述可检索内容。每个 Feature 的 value "
-                "只含该维度 0 到 5 条最具表现力和区分度的中文短语，按重要性排序并以分号连接。"
-                "描述局部属性且需要明确归属时，可以使用“具体对象 + 维度事实”，例如 "
-                "color_composition 写“桌子 红色；星空 深蓝”。"
-                "所有事实必须来自素材或可靠上下文，不得虚构；用途、受众、来源、权利等素材级"
-                "维度可以使用“素材 + 维度事实”。evidence 最多一条且不超过 40 字。"
+                "asset_name 不超过 20 字；asset_description 用 40 到 120 字客观描述可检索"
+                "内容。三个 Feature 彼此独立，各自描述范围以 JSON Schema 中对应字段的说明"
+                f"为准。{FEATURE_DIMENSION_DISAMBIGUATION_PROMPT}"
+                "根据当前维度相关信息在素材中的占比、显著性和丰富程度自适应调整信息"
+                "密度：信息丰富时保留更多有区分度的事实，信息有限时只输出少量可靠内容，不为"
+                "填满数量而扩写。主体维度把不同实体拆成不同 item。事实来自素材或可靠上下文。"
+                "使用本地 OCR 内容时，evidence 以“OCR：”开头，真实"
+                "OCR 置信度由后端附加。"
+                f"{_SUBJECT_OUTPUT_RULES}"
                 f"{_DESCRIPTION_CONTEXT_RULES}"
-                f"十个 Feature 的正向语义范围如下：{feature_dimension_scope_prompt()}。"
-                "unknown 表示该维度适用但"
-                "当前证据不足；not_applicable 表示当前 Asset 不存在该维度所需对象或该维度"
-                "不适用。status 为 unknown 或 not_applicable 时 value 必须为 null。"
-                "scene_theme 在素材具有可辨识的整体环境、时间、事件或叙事情境时适用；角色"
-                "三视图、产品白底陈列或孤立元素展示对应 null/not_applicable。"
-                "mood_atmosphere 依据画面或文本中可核验的光线、色彩、空间、天气、动作、"
-                "声音和叙事表现概括整体氛围；人物内心、动机或性格只有在素材明确呈现时才可"
-                "作为依据，线索不足时对应 null/unknown。"
-                "character_state_or_psychology 在图像或视频中出现清晰可见的人物或拟人角色，"
-                "或文本明确描述人物状态时适用；中性陈列视角没有可区分的表情、姿态、身体或"
-                "心理状态时对应 null/not_applicable。"
-                "asset_usage 使用 metadata.context.source_path 和 file_tree_context 中能够明确"
-                "回答具体交付物、载体、制作任务、工作流环节或参考目的的语义；只有文件组织"
-                "信息时对应 unknown。status 使用 metadata，value 写规范化用途语义；description "
-                "自然说明完整相对路径及其对应用途，source_path 原样返回该相对路径。"
-                "target_audience、provenance 和 rights_version_authorship 使用素材或上下文中"
-                "明确陈述的信息，当前证据不足时对应 unknown。"
-                "无证据不得虚构。只输出约定 JSON，不要 Markdown。"
+                "以有证据、可复用的表达为主。"
             ),
         }
-        metadata = _asset_context_payload(asset)
+        content_context = _content_context_payload(asset)
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
                 "text": (
                     "请理解以下素材并输出约定 JSON。\n"
-                    f"metadata={json.dumps(metadata, ensure_ascii=False)}"
+                    f"content_context={json.dumps(content_context, ensure_ascii=False)}"
                 ),
             }
         ]
@@ -375,6 +372,11 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
         ),
         None,
     )
+    entity_hints = _entity_hints(
+        asset=asset,
+        document_title=document_title,
+        heading_path=normalized_heading_path,
+    )
     return {
         "asset": {
             "asset_type": asset.asset_type,
@@ -396,80 +398,94 @@ def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
             ],
             "file_tree_context": asset.file_tree_context[-12:],
         },
+        "entity_hints": entity_hints,
     }
 
 
-def _attach_asset_usage_path_context(
+def _content_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:
+    """Return technical context only, keeping entity metadata on its own path."""
+
+    return {
+        "asset_type": asset.asset_type,
+        "file_info": _compact_file_info(asset.file_info),
+    }
+
+
+def _entity_hints(
+    *,
+    asset: EmbeddingAsset,
+    document_title: str | None,
+    heading_path: Sequence[str],
+) -> list[dict[str, str]]:
+    """Return stable context candidates before asset-local naming hints."""
+
+    raw_candidates: list[tuple[str, str, str]] = []
+    if asset.source_relative_path:
+        relative_path = PurePosixPath(asset.source_relative_path)
+        raw_candidates.extend(
+            ("directory", part, "collection") for part in reversed(relative_path.parts[:-1])
+        )
+    if document_title:
+        raw_candidates.append(("document_title", document_title, "document"))
+    raw_candidates.extend(("heading", item, "section") for item in reversed(heading_path))
+    raw_candidates.extend(
+        ("file_tree", item, "collection") for item in reversed(asset.file_tree_context[-12:])
+    )
+    if asset.file_name:
+        raw_candidates.append(("file_name", PurePosixPath(asset.file_name).stem, "asset"))
+
+    hints: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source, raw_value, scope in raw_candidates:
+        value = _normalize_subject_hint(raw_value)
+        if value is None or value.casefold() in seen:
+            continue
+        seen.add(value.casefold())
+        hints.append({"source": source, "value": value, "scope": scope})
+        if len(hints) == 8:
+            break
+    return hints
+
+
+def _normalize_subject_hint(value: str) -> str | None:
+    normalized = value.strip().strip("/\\").strip()
+    if not normalized or len(normalized) > 80:
+        return None
+    if PurePosixPath(normalized).suffix:
+        normalized = PurePosixPath(normalized).stem.strip()
+    if not normalized or normalized.casefold() in _GENERIC_SUBJECT_HINTS:
+        return None
+    if re.fullmatch(r"[\W_]*\d[\d\W_]*", normalized):
+        return None
+    if re.fullmatch(
+        r"(?i)(?:img|image|photo|screenshot|jimeng)[-_ ]?\d[\w\-. ]*",
+        normalized,
+    ):
+        return None
+    return normalized
+
+
+def _attach_ocr_confidence(
     understanding: AssetUnderstanding,
     asset: EmbeddingAsset,
 ) -> None:
-    """Make Asset usage path evidence deterministic instead of model-optional."""
-    source_path = _normalized_relative_path(asset.source_relative_path)
-    if source_path is None:
+    ocr = asset.file_info.get("ocr")
+    if not isinstance(ocr, Mapping) or ocr.get("status") != "accepted":
         return
-
-    usage = understanding.features.asset_usage
-    usage.source_path = source_path
-    path_hint = _usage_hint_from_path(
-        source_path=source_path,
-        file_tree_context=asset.file_tree_context,
-    )
-    if path_hint is not None:
-        if not usage.value:
-            usage.value = path_hint
-        if usage.status in {
-            FeatureStatus.UNKNOWN,
-            FeatureStatus.NOT_APPLICABLE,
-            FeatureStatus.INFERRED,
-        }:
-            usage.status = FeatureStatus.METADATA
-        usage.confidence = max(usage.confidence, 0.9)
-
-    directory = _source_directory(source_path)
-    if usage.value:
-        normalized_usage = usage.value.replace("；", "、")
-        directory_clause = f"，所属目录为「{directory}」" if directory else ""
-        usage.description = (
-            f"该素材对应相对文件路径「{source_path}」{directory_clause}，"
-            f"路径语义与素材信息表明其用途为{normalized_usage}。"
-        )
-    else:
-        usage.description = (
-            f"该素材对应相对文件路径「{source_path}」，当前路径和素材内容尚未提供可确认的具体用途。"
-        )
-    usage.evidence = [f"相对文件路径：{source_path}"]
-
-
-def _normalized_relative_path(value: str) -> str | None:
-    normalized = value.strip().replace("\\", "/")
-    if not normalized:
-        return None
-    path = PurePosixPath(normalized)
-    if path.is_absolute() or ".." in path.parts:
-        return None
-    return path.as_posix()
-
-
-def _source_directory(source_path: str) -> str:
-    directory = PurePosixPath(source_path).parent.as_posix()
-    return "" if directory == "." else directory
-
-
-def _usage_hint_from_path(
-    *,
-    source_path: str,
-    file_tree_context: Sequence[str],
-) -> str | None:
-    directory = _source_directory(source_path)
-    context_parts = [
-        item.strip() for item in file_tree_context if isinstance(item, str) and item.strip()
-    ]
-    combined = "/".join([directory, *context_parts])
-    for token, usage in _USAGE_PATH_HINTS:
-        if token in combined:
-            return usage
-
-    return None
+    raw_confidence = ocr.get("confidence")
+    if raw_confidence is None or isinstance(raw_confidence, bool):
+        return
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not 0.0 <= confidence <= 1.0:
+        return
+    for feature_name in type(understanding.features).model_fields:
+        feature = getattr(understanding.features, feature_name)
+        for item in feature.items:
+            if any(evidence.lstrip().lower().startswith("ocr：") for evidence in item.evidence):
+                item.ocr_confidence = confidence
 
 
 def _compact_file_info(file_info: Mapping[str, Any]) -> dict[str, Any]:

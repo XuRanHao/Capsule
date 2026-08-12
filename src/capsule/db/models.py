@@ -200,6 +200,16 @@ class ProcessingJob(Base, TimestampMixin):
         default=dict,
         nullable=False,
     )
+    post_asset_action: Mapped[str] = mapped_column(String(32), default="none", nullable=False)
+    dispatch_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assetization_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    workflow_owner_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    workflow_lease_token: Mapped[str | None] = mapped_column(String(64))
+    workflow_lease_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -472,6 +482,13 @@ class CurrentCluster(Base, TimestampMixin):
         ForeignKey("cluster_runs.cluster_run_id", ondelete="SET NULL"),
         index=True,
     )
+    embedding_vector: Mapped[list[float]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+    )
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    embedding_source_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
 
 class CurrentClusterMember(Base):
@@ -507,6 +524,135 @@ class CurrentClusterMember(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+
+class RelationGraphBuild(Base, TimestampMixin):
+    """Latest durable relationship build state for one workspace."""
+
+    __tablename__ = "relation_graph_builds"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    input_revision: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
+    subject_cluster_status: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, nullable=False
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class RelationEntity(Base, TimestampMixin):
+    """A persisted virtual Entity node produced by candidate merging."""
+
+    __tablename__ = "relation_entities"
+
+    entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    semantic: Mapped[str] = mapped_column(Text, nullable=False)
+    origins: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    descriptions: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    candidate_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    merge_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    embedding_vector: Mapped[list[float]] = mapped_column(JSONB, default=list, nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class RelationEntitySource(Base):
+    """Metadata or subject-cluster candidate that formed one Entity."""
+
+    __tablename__ = "relation_entity_sources"
+
+    entity_id: Mapped[str] = mapped_column(
+        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    candidate_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    origin: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    semantic: Mapped[str] = mapped_column(Text, nullable=False)
+    asset_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+
+
+class RelationAssetState(Base, TimestampMixin):
+    """Per-Asset revision cursor used by incremental relationship updates."""
+
+    __tablename__ = "relation_asset_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "asset_id",
+            name="uq_relation_asset_state",
+        ),
+    )
+
+    state_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("relstate")
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class AssetEntityRelation(Base, TimestampMixin):
+    """A durable Agent-approved relationship between one Asset and Entity."""
+
+    __tablename__ = "asset_entity_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "asset_id",
+            "entity_id",
+            name="uq_asset_entity_relation",
+        ),
+    )
+
+    relation_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("rel")
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    entity_id: Mapped[str] = mapped_column(
+        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    establishes_relation: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    relation: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    content_subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class ClusterExclusion(Base):

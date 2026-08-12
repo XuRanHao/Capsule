@@ -5,7 +5,12 @@ from httpx import ASGITransport, AsyncClient
 
 from capsule.api.app import create_app
 from capsule.config import Settings
-from capsule.enums import ClusterInternalVariance, ClusterRunStatus, EmbeddingType
+from capsule.enums import (
+    ClusterAlgorithm,
+    ClusterInternalVariance,
+    ClusterRunStatus,
+    EmbeddingType,
+)
 from capsule.schemas import ClusterCapsuleRecord, ClusterRunRecord
 
 
@@ -107,7 +112,16 @@ class FakeClusterService:
     async def run(self, **values: object) -> SimpleNamespace:
         self.calls.append(values)
         self.repository.run.status = ClusterRunStatus.COMPLETED.value
-        return SimpleNamespace()
+        return SimpleNamespace(status=ClusterRunStatus.COMPLETED)
+
+
+class FakeRelationGraphRebuilder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def build(self, **values: object) -> dict[str, object]:
+        self.calls.append(values)
+        return {}
 
 
 @pytest.mark.asyncio
@@ -150,8 +164,9 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
         "native_content_weight": 1.0,
         "dimension_weight": 0.0,
     }
-    assert repository.run.parameters["min_samples"] == 3
-    assert repository.run.parameters["min_cluster_size"] == 3
+    assert repository.run.parameters["algorithm"] == "complete_link"
+    assert repository.run.parameters["distance_threshold"] == 0.5
+    assert repository.run.parameters["min_cluster_size"] == 2
     assert service.calls == [
         {
             "workspace_id": "workspace_api_test",
@@ -159,8 +174,10 @@ async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes()
             "cluster_run_id": "run_api_test",
             "pca_dimension": 8,
             "min_samples": 3,
-            "min_cluster_size": 3,
+            "min_cluster_size": 2,
             "optimize_parameters": False,
+            "algorithm": ClusterAlgorithm.COMPLETE_LINK,
+            "distance_threshold": 0.5,
             "native_content_weight": 0.3,
         }
     ]
@@ -189,7 +206,8 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
                 "/api/v1/cluster-runs",
                 json={
                     "workspace_id": "workspace_api_test",
-                    "embedding_type": "visual_style",
+                    "embedding_type": "visual_presentation",
+                    "algorithm": "hdbscan",
                     "pca_dimension": 12,
                     "min_samples": 2,
                     "min_cluster_size": 5,
@@ -211,15 +229,56 @@ async def test_cluster_api_forwards_optional_parameter_optimization() -> None:
     assert service.calls == [
         {
             "workspace_id": "workspace_api_test",
-            "embedding_type": EmbeddingType.VISUAL_STYLE,
+            "embedding_type": EmbeddingType.VISUAL_PRESENTATION,
             "cluster_run_id": "run_api_test",
             "pca_dimension": 12,
             "min_samples": 2,
             "min_cluster_size": 5,
             "optimize_parameters": True,
+            "algorithm": ClusterAlgorithm.HDBSCAN,
+            "distance_threshold": 0.5,
             "native_content_weight": 0.25,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_cluster_api_forwards_complete_link_parameters() -> None:
+    repository = FakeClusterRepository()
+    service = FakeClusterService(repository)
+    app = create_app(
+        settings=Settings(),
+        cluster_service=service,  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/cluster-runs",
+                json={
+                    "workspace_id": "workspace_api_test",
+                    "embedding_type": "visual_presentation",
+                    "algorithm": "complete_link",
+                    "pca_dimension": 8,
+                    "distance_threshold": 0.35,
+                    "min_cluster_size": 4,
+                },
+            )
+
+    assert response.status_code == 202
+    assert repository.run.parameters == {
+        "algorithm": "complete_link",
+        "distance_threshold": 0.35,
+        "min_cluster_size": 4,
+        "metric": "euclidean",
+        "linkage": "complete",
+    }
+    assert service.calls[0]["algorithm"] is ClusterAlgorithm.COMPLETE_LINK
+    assert service.calls[0]["distance_threshold"] == 0.35
 
 
 @pytest.mark.asyncio
@@ -242,10 +301,41 @@ async def test_cluster_api_accepts_fusion_weight_endpoints(native_content_weight
                 "/api/v1/cluster-runs",
                 json={
                     "workspace_id": "workspace_api_test",
-                    "embedding_type": "visual_style",
+                    "embedding_type": "visual_presentation",
                     "native_content_weight": native_content_weight,
                 },
             )
 
     assert response.status_code == 202
     assert service.calls[0]["native_content_weight"] == native_content_weight
+
+
+@pytest.mark.asyncio
+async def test_user_subject_clustering_rebuilds_relation_graph_after_completion() -> None:
+    repository = FakeClusterRepository()
+    service = FakeClusterService(repository)
+    rebuilder = FakeRelationGraphRebuilder()
+    app = create_app(
+        settings=Settings(),
+        cluster_service=service,  # type: ignore[arg-type]
+        cluster_repository=repository,  # type: ignore[arg-type]
+        relation_graph_service=rebuilder,  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/cluster-runs",
+                json={
+                    "workspace_id": "workspace_api_test",
+                    "embedding_type": "subject_content",
+                },
+            )
+
+    assert response.status_code == 202
+    assert rebuilder.calls == [
+        {"workspace_id": "workspace_api_test", "force_rebuild": True}
+    ]

@@ -17,7 +17,7 @@ fi
 docker compose up -d --wait
 uv run capsule bootstrap --workspace workspace_demo --workspace-name "Capsule Demo"
 
-uv run uvicorn capsule.api.app:app \
+CAPSULE_API_EMBEDDED_CPU_TASKS_ENABLED=false uv run uvicorn capsule.api.app:app \
   --host 0.0.0.0 \
   --port 8010 \
   --reload &
@@ -26,12 +26,35 @@ backend_pid=$!
 npm --prefix frontend run dev &
 frontend_pid=$!
 
+# Browser imports commit durable PostgreSQL tasks. Run every matching recovery
+# scheduler and worker locally so a task cannot remain queued after `complete`.
+uv run capsule video-scheduler &
+video_scheduler_pid=$!
+uv run capsule video-worker --worker-id dev-video-worker &
+video_worker_pid=$!
+uv run capsule cpu-task-scheduler --kind image &
+image_scheduler_pid=$!
+uv run capsule cpu-task-worker --kind image --worker-id dev-image-worker &
+image_worker_pid=$!
+uv run capsule cpu-task-scheduler --kind text &
+text_scheduler_pid=$!
+uv run capsule cpu-task-worker --kind text --worker-id dev-text-worker &
+text_worker_pid=$!
+
+pids=(
+  "$backend_pid" "$frontend_pid"
+  "$video_scheduler_pid" "$video_worker_pid"
+  "$image_scheduler_pid" "$image_worker_pid"
+  "$text_scheduler_pid" "$text_worker_pid"
+)
+
 cleanup() {
-  kill "$backend_pid" "$frontend_pid" 2>/dev/null || true
-  wait "$backend_pid" "$frontend_pid" 2>/dev/null || true
+  kill "${pids[@]}" 2>/dev/null || true
+  wait "${pids[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 echo "Capsule API: http://localhost:8010"
 echo "Capsule Web: http://localhost:3000"
-wait
+echo "Durable workers: video, image, text (with recovery schedulers)"
+wait -n "${pids[@]}"

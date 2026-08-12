@@ -1,11 +1,12 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from capsule.db.base import id_factory
 from capsule.db.models import (
     Asset,
+    AssetEntityRelation,
     ClusterCapsule,
     ClusterExclusion,
     ClusterMembership,
@@ -24,6 +26,10 @@ from capsule.db.models import (
     ModelCallLog,
     ProcessingJob,
     QueryImageUpload,
+    RelationAssetState,
+    RelationEntity,
+    RelationEntitySource,
+    RelationGraphBuild,
     SourceFile,
     Workspace,
 )
@@ -76,6 +82,311 @@ class AssetMediaTarget:
     derived_file_uri: str | None
 
 
+class RelationGraphRepository:
+    """Persist and load Entity nodes and approved Asset→Entity relations."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def load(
+        self,
+        *,
+        workspace_id: str,
+        input_revision: str,
+    ) -> dict[str, Any] | None:
+        async with self._database.session() as session:
+            build = await session.get(RelationGraphBuild, workspace_id)
+            if build is None or build.status != "ready" or build.input_revision != input_revision:
+                return None
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity)
+                    .where(RelationEntity.workspace_id == workspace_id)
+                    .order_by(RelationEntity.entity_id)
+                )
+            )
+            relations = list(
+                await session.scalars(
+                    select(AssetEntityRelation)
+                    .where(AssetEntityRelation.workspace_id == workspace_id)
+                    .order_by(AssetEntityRelation.relation_id)
+                )
+            )
+            asset_states = list(
+                await session.scalars(
+                    select(RelationAssetState).where(
+                        RelationAssetState.workspace_id == workspace_id
+                    )
+                )
+            )
+            return {
+                "build_version": build.build_version,
+                "subject_cluster_status": build.subject_cluster_status,
+                "asset_revisions": {state.asset_id: state.asset_revision for state in asset_states},
+                "entities": [
+                    {
+                        "entity_id": entity.entity_id,
+                        "name": entity.name,
+                        "semantic": entity.semantic,
+                        "origins": entity.origins,
+                        "asset_ids": [],
+                        "descriptions": entity.descriptions,
+                        "candidate_ids": entity.candidate_ids,
+                        "merge_reason": entity.merge_reason,
+                        "embedding_vector": entity.embedding_vector,
+                        "embedding_model": entity.embedding_model,
+                    }
+                    for entity in entities
+                ],
+                "edges": [
+                    {
+                        "source": relation.asset_id,
+                        "target": relation.entity_id,
+                        "relation": relation.relation,
+                        "description": relation.description,
+                        "reason": relation.reason,
+                        "content_subject": relation.content_subject,
+                    }
+                    for relation in relations
+                    if relation.establishes_relation
+                ],
+                "rejected_relations": [
+                    {
+                        "source_id": relation.asset_id,
+                        "target_id": relation.entity_id,
+                        "establishes_relation": False,
+                        "relation": relation.relation,
+                        "description": relation.description,
+                        "reason": relation.reason,
+                    }
+                    for relation in relations
+                    if not relation.establishes_relation
+                ],
+            }
+
+    async def load_current(self, *, workspace_id: str) -> dict[str, Any] | None:
+        async with self._database.session() as session:
+            build = await session.get(RelationGraphBuild, workspace_id)
+            if build is None or build.status != "ready":
+                return None
+            input_revision = build.input_revision
+        return await self.load(
+            workspace_id=workspace_id,
+            input_revision=input_revision,
+        )
+
+    async def update_assets(
+        self,
+        *,
+        workspace_id: str,
+        input_revision: str,
+        asset_ids: Sequence[str],
+        resolution: Any,
+        subject_cluster_status: Mapping[str, Any],
+        affected_source_members: Mapping[str, Sequence[str]],
+        asset_revisions: Mapping[str, str],
+    ) -> int | None:
+        requested_ids = list(dict.fromkeys(asset_ids))
+        if not requested_ids:
+            return None
+        async with self._database.session() as session, session.begin():
+            build = await session.get(RelationGraphBuild, workspace_id, with_for_update=True)
+            if build is None or build.status != "ready":
+                return None
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity).where(RelationEntity.workspace_id == workspace_id)
+                )
+            )
+            entity_ids = {entity.entity_id for entity in entities}
+            build_version = build.build_version + 1
+            decision_target_ids = {
+                decision.target_id
+                for decision in resolution.relations
+                if decision.source_id in requested_ids and decision.target_id in entity_ids
+            }
+            if decision_target_ids:
+                await session.execute(
+                    delete(AssetEntityRelation).where(
+                        AssetEntityRelation.workspace_id == workspace_id,
+                        AssetEntityRelation.asset_id.in_(requested_ids),
+                        AssetEntityRelation.entity_id.in_(decision_target_ids),
+                    )
+                )
+            for decision in resolution.relations:
+                if decision.source_id not in requested_ids or decision.target_id not in entity_ids:
+                    continue
+                session.add(
+                    AssetEntityRelation(
+                        workspace_id=workspace_id,
+                        asset_id=decision.source_id,
+                        entity_id=decision.target_id,
+                        establishes_relation=decision.establishes_relation,
+                        relation=decision.relation,
+                        description=decision.description,
+                        reason=decision.reason,
+                        content_subject="",
+                        build_version=build_version,
+                    )
+                )
+            existing_states = list(
+                await session.scalars(
+                    select(RelationAssetState)
+                    .where(
+                        RelationAssetState.workspace_id == workspace_id,
+                        RelationAssetState.asset_id.in_(requested_ids),
+                    )
+                    .with_for_update()
+                )
+            )
+            states_by_asset = {state.asset_id: state for state in existing_states}
+            for asset_id in requested_ids:
+                revision = asset_revisions.get(asset_id)
+                if revision is None:
+                    continue
+                state = states_by_asset.get(asset_id)
+                if state is None:
+                    session.add(
+                        RelationAssetState(
+                            workspace_id=workspace_id,
+                            asset_id=asset_id,
+                            asset_revision=revision,
+                            build_version=build_version,
+                        )
+                    )
+                else:
+                    state.asset_revision = revision
+                    state.build_version = build_version
+            for candidate_id, member_ids in affected_source_members.items():
+                sources = list(
+                    await session.scalars(
+                        select(RelationEntitySource).where(
+                            RelationEntitySource.workspace_id == workspace_id,
+                            RelationEntitySource.candidate_id == candidate_id,
+                        )
+                    )
+                )
+                for source in sources:
+                    source.asset_ids = list(dict.fromkeys(member_ids))
+            build.input_revision = input_revision
+            build.build_version = build_version
+            build.subject_cluster_status = dict(subject_cluster_status)
+            build.error_message = None
+            return build_version
+
+    async def replace(
+        self,
+        *,
+        workspace_id: str,
+        input_revision: str,
+        graph: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+        subject_cluster_status: Mapping[str, Any],
+        asset_revisions: Mapping[str, str],
+    ) -> int:
+        candidates_by_id = {str(item["candidate_id"]): item for item in candidates}
+        async with self._database.session() as session, session.begin():
+            current = await session.get(RelationGraphBuild, workspace_id, with_for_update=True)
+            build_version = (current.build_version + 1) if current is not None else 1
+            await session.execute(
+                delete(RelationEntity).where(RelationEntity.workspace_id == workspace_id)
+            )
+            await session.execute(
+                delete(RelationAssetState).where(RelationAssetState.workspace_id == workspace_id)
+            )
+            for entity in graph["entities"]:
+                session.add(
+                    RelationEntity(
+                        entity_id=entity["entity_id"],
+                        workspace_id=workspace_id,
+                        name=entity["name"],
+                        semantic=entity["semantic"],
+                        origins=list(entity.get("origins", [])),
+                        descriptions=list(entity.get("descriptions", [])),
+                        candidate_ids=list(entity.get("candidate_ids", [])),
+                        merge_reason=str(entity.get("merge_reason", "")),
+                        embedding_vector=list(entity.get("embedding_vector", [])),
+                        embedding_model=str(entity.get("embedding_model", "")),
+                        build_version=build_version,
+                    )
+                )
+            await session.flush()
+            for entity in graph["entities"]:
+                for candidate_id in entity.get("candidate_ids", []):
+                    candidate = candidates_by_id.get(str(candidate_id))
+                    if candidate is None:
+                        continue
+                    session.add(
+                        RelationEntitySource(
+                            entity_id=entity["entity_id"],
+                            candidate_id=str(candidate_id),
+                            workspace_id=workspace_id,
+                            origin=str(candidate.get("origin", "candidate")),
+                            name=str(candidate.get("name", "")),
+                            semantic=str(candidate.get("semantic", "")),
+                            asset_ids=list(candidate.get("asset_ids", [])),
+                        )
+                    )
+            await session.flush()
+            for edge in graph["edges"]:
+                session.add(
+                    AssetEntityRelation(
+                        workspace_id=workspace_id,
+                        asset_id=edge["source"],
+                        entity_id=edge["target"],
+                        establishes_relation=True,
+                        relation=edge["relation"],
+                        description=edge.get("description", ""),
+                        reason=edge.get("reason", ""),
+                        content_subject=edge.get("content_subject", ""),
+                        build_version=build_version,
+                    )
+                )
+            for asset_id, asset_revision in asset_revisions.items():
+                session.add(
+                    RelationAssetState(
+                        workspace_id=workspace_id,
+                        asset_id=asset_id,
+                        asset_revision=asset_revision,
+                        build_version=build_version,
+                    )
+                )
+            entity_ids = {entity["entity_id"] for entity in graph["entities"]}
+            for rejected in graph.get("rejected_relations", []):
+                if rejected["target_id"] not in entity_ids:
+                    continue
+                session.add(
+                    AssetEntityRelation(
+                        workspace_id=workspace_id,
+                        asset_id=rejected["source_id"],
+                        entity_id=rejected["target_id"],
+                        establishes_relation=False,
+                        relation=rejected.get("relation", ""),
+                        description=rejected.get("description", ""),
+                        reason=rejected.get("reason", ""),
+                        content_subject="",
+                        build_version=build_version,
+                    )
+                )
+            if current is None:
+                session.add(
+                    RelationGraphBuild(
+                        workspace_id=workspace_id,
+                        input_revision=input_revision,
+                        build_version=build_version,
+                        status="ready",
+                        subject_cluster_status=dict(subject_cluster_status),
+                    )
+                )
+            else:
+                current.input_revision = input_revision
+                current.build_version = build_version
+                current.status = "ready"
+                current.subject_cluster_status = dict(subject_cluster_status)
+                current.error_message = None
+            return build_version
+
+
 @dataclass(slots=True, frozen=True)
 class PreparedSourceFile:
     source_file_id: str
@@ -98,6 +409,47 @@ class PreparedVideoTaskSubmission:
     generation: int
     task_id: str | None
     already_processed: bool
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedProcessingTaskSubmission:
+    """Atomic image/text CPU task submission and its trusted route identity."""
+
+    job_id: str
+    source_file_id: str
+    generation: int
+    task_id: str | None
+    task_kind: str
+    resource_class: str
+    route_key: str
+    processor_version: int
+    already_processed: bool
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedJobProcessingTask:
+    """One file attached to an existing multi-file browser import job."""
+
+    job_id: str
+    source_file_id: str
+    generation: int
+    task_id: str | None
+    task_kind: str
+    resource_class: str
+    route_key: str
+    processor_version: int
+    already_processed: bool
+    source_uri: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class ProcessingTaskSourceInput:
+    source_file: DiscoveredFile
+    source_uri: str
+    sha256: str
+    mime_type: str
+    processing_fingerprint: str
+    source_contexts: tuple[dict[str, Any], ...] = ()
 
 
 class StaleAssetGenerationError(ValueError):
@@ -316,9 +668,7 @@ class AssetRepository:
             JobStatus.RETRYING.value,
         )
         async with self._database.session() as session, session.begin():
-            workspaces = list(
-                await session.scalars(select(Workspace).with_for_update())
-            )
+            workspaces = list(await session.scalars(select(Workspace).with_for_update()))
 
             active_job_count = int(
                 await session.scalar(
@@ -333,18 +683,13 @@ class AssetRepository:
                     f"asset library has {active_job_count} active import job(s)"
                 )
 
-            asset_count = int(
-                await session.scalar(select(func.count(Asset.asset_id))) or 0
-            )
+            asset_count = int(await session.scalar(select(func.count(Asset.asset_id))) or 0)
             source_file_count = int(
                 await session.scalar(select(func.count(SourceFile.source_file_id))) or 0
             )
-            job_count = int(
-                await session.scalar(select(func.count(ProcessingJob.job_id))) or 0
-            )
+            job_count = int(await session.scalar(select(func.count(ProcessingJob.job_id))) or 0)
             embedding_count = int(
-                await session.scalar(select(func.count(EmbeddingRecord.embedding_id)))
-                or 0
+                await session.scalar(select(func.count(EmbeddingRecord.embedding_id))) or 0
             )
             await session.execute(delete(ModelCallLog))
             for workspace in workspaces:
@@ -358,7 +703,13 @@ class AssetRepository:
                 job_count=job_count,
             )
 
-    async def start_import_job(self, *, job_id: str, total_count: int) -> None:
+    async def start_import_job(
+        self,
+        *,
+        job_id: str,
+        total_count: int,
+        post_asset_action: str = "none",
+    ) -> None:
         """Freeze an upload session and make it available to ``PipelineRunner``."""
         if total_count < 1:
             raise ValueError("an import job must contain at least one file")
@@ -372,6 +723,119 @@ class AssetRepository:
             job.status = JobStatus.RUNNING.value
             job.current_stage = PipelineStage.PARSING.value
             job.started_at = datetime.now(UTC)
+            if post_asset_action not in {"none", "enrich"}:
+                raise ValueError("post_asset_action must be none or enrich")
+            job.post_asset_action = post_asset_action
+
+    async def mark_import_dispatch_complete(self, *, job_id: str) -> None:
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            job.dispatch_completed_at = datetime.now(UTC)
+
+    async def claim_ready_import_workflow(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: float = 60.0,
+    ) -> tuple[str, str, str] | None:
+        if not worker_id or lease_seconds <= 0:
+            raise ValueError("workflow worker and positive lease are required")
+        now = datetime.now(UTC)
+        async with self._database.session() as session, session.begin():
+            job = await session.scalar(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.post_asset_action == "enrich",
+                    ProcessingJob.dispatch_completed_at.is_not(None),
+                    ProcessingJob.assetization_completed_at.is_not(None),
+                    ProcessingJob.status == JobStatus.RUNNING.value,
+                    ProcessingJob.current_stage == PipelineStage.ASSET_STORED.value,
+                    or_(
+                        ProcessingJob.workflow_owner_id.is_(None),
+                        ProcessingJob.workflow_lease_deadline_at <= now,
+                    ),
+                )
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if job is None:
+                return None
+            token = uuid4().hex
+            job.workflow_owner_id = worker_id
+            job.workflow_lease_token = token
+            job.workflow_lease_deadline_at = now + timedelta(seconds=lease_seconds)
+            return job.job_id, job.workspace_id, token
+
+    async def heartbeat_import_workflow(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        lease_seconds: float = 60.0,
+    ) -> bool:
+        now = datetime.now(UTC)
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if (
+                job is None
+                or job.workflow_owner_id != worker_id
+                or job.workflow_lease_token != lease_token
+                or job.workflow_lease_deadline_at is None
+                or job.workflow_lease_deadline_at <= now
+            ):
+                return False
+            job.workflow_lease_deadline_at = now + timedelta(seconds=lease_seconds)
+            return True
+
+    async def release_import_workflow(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        error: str,
+    ) -> bool:
+        async with self._database.session() as session, session.begin():
+            job = await session.get(ProcessingJob, job_id, with_for_update=True)
+            if (
+                job is None
+                or job.workflow_owner_id != worker_id
+                or job.workflow_lease_token != lease_token
+            ):
+                return False
+            job.current_stage = PipelineStage.ASSET_STORED.value
+            job.workflow_owner_id = None
+            job.workflow_lease_token = None
+            job.workflow_lease_deadline_at = None
+            job.error_info = [
+                *job.error_info,
+                {"stage": "enrichment_workflow", "error": error[:2000]},
+            ]
+            return True
+
+    async def list_import_job_asset_ids(self, *, job_id: str) -> list[str]:
+        from capsule.db.video_tasks import VideoProcessingTask
+
+        async with self._database.session() as session:
+            return list(
+                await session.scalars(
+                    select(Asset.asset_id)
+                    .join(
+                        VideoProcessingTask,
+                        (VideoProcessingTask.source_file_id == Asset.source_file_id)
+                        & (VideoProcessingTask.source_generation == Asset.generation),
+                    )
+                    .where(
+                        VideoProcessingTask.parent_job_id == job_id,
+                        VideoProcessingTask.status.in_(("result_committed", "completed")),
+                        Asset.index_role != AssetIndexRole.PARENT.value,
+                    )
+                    .order_by(Asset.asset_id)
+                )
+            )
 
     async def mark_import_upload_activity(
         self,
@@ -530,6 +994,341 @@ class AssetRepository:
                 task_id=task.task_id,
                 already_processed=False,
             )
+
+    async def create_cpu_processing_task_submission(
+        self,
+        *,
+        workspace_id: str,
+        input_path: Path,
+        source_file: DiscoveredFile,
+        sha256: str,
+        mime_type: str,
+        processing_fingerprint: str,
+        result_version: int = 1,
+        processor_version: int = 1,
+    ) -> PreparedProcessingTaskSubmission:
+        """Atomically create a CPU image/text job, source generation and task.
+
+        The source extension selects its trusted kind; callers cannot provide a
+        route, worker pool, or arbitrary processor implementation.
+        """
+        if result_version < 1 or processor_version < 1:
+            raise ValueError("processing task result and processor versions must be positive")
+        from capsule.db.processing_task_persistence import cpu_contract_for_extension
+        from capsule.db.video_tasks import VideoProcessingTask
+
+        contract = cpu_contract_for_extension(source_file.extension)
+        async with self._database.session() as session, session.begin():
+            await self._ensure_workspace(session, workspace_id)
+            job = ProcessingJob(
+                workspace_id=workspace_id,
+                input_path=str(_resolve_path(input_path)),
+                total_count=1,
+                status=JobStatus.RUNNING.value,
+                current_stage=PipelineStage.PARSING.value,
+                started_at=datetime.now(UTC),
+            )
+            session.add(job)
+            await session.flush()
+            prepared = await self._prepare_source_file_in_session(
+                session,
+                workspace_id=workspace_id,
+                source_file=source_file,
+                sha256=sha256,
+                mime_type=mime_type,
+                processing_fingerprint=processing_fingerprint,
+            )
+            if prepared.already_processed:
+                job.completed_count = 1
+                job.status = JobStatus.COMPLETED.value
+                job.current_stage = PipelineStage.COMPLETED.value
+                job.completed_at = datetime.now(UTC)
+                return PreparedProcessingTaskSubmission(
+                    job_id=job.job_id,
+                    source_file_id=prepared.source_file_id,
+                    generation=prepared.generation,
+                    task_id=None,
+                    task_kind=contract.task_kind.value,
+                    resource_class=contract.resource_class.value,
+                    route_key=contract.route_key,
+                    processor_version=processor_version,
+                    already_processed=True,
+                )
+            task = VideoProcessingTask(
+                parent_job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                source_generation=prepared.generation,
+                result_version=result_version,
+                task_kind=contract.task_kind.value,
+                resource_class=contract.resource_class.value,
+                route_key=contract.route_key,
+                processor_version=processor_version,
+                status="queued",
+                stage="queued",
+                attempt=0,
+                progress={},
+            )
+            session.add(task)
+            await session.flush()
+            return PreparedProcessingTaskSubmission(
+                job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                generation=prepared.generation,
+                task_id=task.task_id,
+                task_kind=contract.task_kind.value,
+                resource_class=contract.resource_class.value,
+                route_key=contract.route_key,
+                processor_version=processor_version,
+                already_processed=False,
+            )
+
+    async def create_job_processing_task(
+        self,
+        *,
+        job_id: str,
+        workspace_id: str,
+        source_file: DiscoveredFile,
+        sha256: str,
+        mime_type: str,
+        processing_fingerprint: str,
+        source_contexts: list[dict[str, Any]] | None = None,
+        result_version: int = 1,
+        processor_version: int = 1,
+    ) -> PreparedJobProcessingTask:
+        """Attach one trusted file task to an existing browser import job.
+
+        The browser job remains the only parent visible to the frontend. Every
+        file task accounts exactly one of its ``total_count`` slots.
+        """
+        if result_version < 1 or processor_version < 1:
+            raise ValueError("processing task result and processor versions must be positive")
+        from capsule.db.processing_task_persistence import cpu_contract_for_extension
+        from capsule.db.video_tasks import VideoProcessingTask
+        from capsule.pipeline.video_task_runtime import ProcessingTaskKind, ResourceClass
+
+        extension = source_file.extension.lower()
+        if extension in {".mp4", ".mov"}:
+            task_kind = ProcessingTaskKind.VIDEO.value
+            resource_class = ResourceClass.MPS_VIDEO.value
+            route_key = "mps_video"
+        else:
+            contract = cpu_contract_for_extension(extension)
+            task_kind = contract.task_kind.value
+            resource_class = contract.resource_class.value
+            route_key = contract.route_key
+
+        async with self._database.session() as session, session.begin():
+            job = await session.scalar(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.job_id == job_id,
+                    ProcessingJob.workspace_id == workspace_id,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            if job.status != JobStatus.RUNNING.value:
+                raise ValueError(f"processing job cannot accept tasks from status {job.status}")
+            if job.completed_count + job.failed_count >= job.total_count:
+                raise ValueError("processing job already accounted every source file")
+
+            prepared = await self._prepare_source_file_in_session(
+                session,
+                workspace_id=workspace_id,
+                source_file=source_file,
+                sha256=sha256,
+                mime_type=mime_type,
+                processing_fingerprint=processing_fingerprint,
+            )
+            if prepared.already_processed:
+                job.completed_count += 1
+                if job.completed_count + job.failed_count == job.total_count:
+                    job.status = JobStatus.COMPLETED.value
+                    job.current_stage = PipelineStage.COMPLETED.value
+                    job.completed_at = datetime.now(UTC)
+                return PreparedJobProcessingTask(
+                    job_id=job.job_id,
+                    source_file_id=prepared.source_file_id,
+                    generation=prepared.generation,
+                    task_id=None,
+                    task_kind=task_kind,
+                    resource_class=resource_class,
+                    route_key=route_key,
+                    processor_version=processor_version,
+                    already_processed=True,
+                    source_uri=_resolve_path(Path(source_file.path)).as_uri(),
+                )
+
+            task = VideoProcessingTask(
+                parent_job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                source_generation=prepared.generation,
+                result_version=result_version,
+                task_kind=task_kind,
+                resource_class=resource_class,
+                route_key=route_key,
+                processor_version=processor_version,
+                status="queued",
+                stage="queued",
+                attempt=0,
+                progress={},
+                input_payload={
+                    "source_sha256": sha256,
+                    "processing_fingerprint": processing_fingerprint,
+                    "source_contexts": source_contexts or [],
+                },
+            )
+            session.add(task)
+            await session.flush()
+            return PreparedJobProcessingTask(
+                job_id=job.job_id,
+                source_file_id=prepared.source_file_id,
+                generation=prepared.generation,
+                task_id=task.task_id,
+                task_kind=task_kind,
+                resource_class=resource_class,
+                route_key=route_key,
+                processor_version=processor_version,
+                already_processed=False,
+                source_uri=_resolve_path(Path(source_file.path)).as_uri(),
+            )
+
+    async def prepare_import_task_batch(
+        self,
+        *,
+        job_id: str,
+        workspace_id: str,
+        items: Sequence[ProcessingTaskSourceInput],
+        post_asset_action: str = "none",
+    ) -> list[PreparedJobProcessingTask]:
+        """Atomically start a browser job and register its complete task batch."""
+        from capsule.db.processing_task_persistence import cpu_contract_for_extension
+        from capsule.db.video_tasks import VideoProcessingTask
+        from capsule.pipeline.video_task_runtime import ProcessingTaskKind, ResourceClass
+
+        if not items:
+            raise ValueError("browser processing task batch cannot be empty")
+        if post_asset_action not in {"none", "enrich"}:
+            raise ValueError("post_asset_action must be none or enrich")
+        async with self._database.session() as session, session.begin():
+            job = await session.scalar(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.job_id == job_id,
+                    ProcessingJob.workspace_id == workspace_id,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                raise ValueError(f"processing job does not exist: {job_id}")
+            if job.status not in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}:
+                raise ValueError(f"processing job cannot accept tasks from status {job.status}")
+            if job.status == JobStatus.RUNNING.value and len(items) != job.total_count:
+                raise ValueError("browser task batch does not match job total_count")
+
+            existing = list(
+                await session.execute(
+                    select(VideoProcessingTask, SourceFile.storage_uri)
+                    .join(
+                        SourceFile,
+                        SourceFile.source_file_id == VideoProcessingTask.source_file_id,
+                    )
+                    .where(VideoProcessingTask.parent_job_id == job_id)
+                    .order_by(VideoProcessingTask.task_id)
+                )
+            )
+            if existing:
+                if len(existing) != job.total_count:
+                    raise RuntimeError("browser job contains an incomplete durable task batch")
+                job.dispatch_completed_at = job.dispatch_completed_at or datetime.now(UTC)
+                return [
+                    PreparedJobProcessingTask(
+                        job_id=job_id,
+                        source_file_id=task.source_file_id,
+                        generation=task.source_generation,
+                        task_id=task.task_id,
+                        task_kind=task.task_kind,
+                        resource_class=task.resource_class,
+                        route_key=task.route_key,
+                        processor_version=task.processor_version,
+                        already_processed=False,
+                        source_uri=source_uri,
+                    )
+                    for task, source_uri in existing
+                ]
+
+            if job.status != JobStatus.QUEUED.value:
+                raise RuntimeError("running browser job is missing its durable task batch")
+            job.total_count = len(items)
+            job.status = JobStatus.RUNNING.value
+            job.current_stage = PipelineStage.PARSING.value
+            job.started_at = datetime.now(UTC)
+            job.post_asset_action = post_asset_action
+            prepared_tasks: list[PreparedJobProcessingTask] = []
+            for item in items:
+                # The browser-side URI is only a convenience for the first
+                # Redis delivery.  Persist and return the same canonical URI
+                # as SourceFile so a forged/stale caller value cannot create
+                # a task contract that workers subsequently reject.
+                source_uri = _resolve_path(Path(item.source_file.path)).as_uri()
+                extension = item.source_file.extension.lower()
+                if extension in {".mp4", ".mov"}:
+                    task_kind = ProcessingTaskKind.VIDEO.value
+                    resource_class = ResourceClass.MPS_VIDEO.value
+                    route_key = "mps_video"
+                else:
+                    contract = cpu_contract_for_extension(extension)
+                    task_kind = contract.task_kind.value
+                    resource_class = contract.resource_class.value
+                    route_key = contract.route_key
+                prepared = await self._prepare_source_file_in_session(
+                    session,
+                    workspace_id=workspace_id,
+                    source_file=item.source_file,
+                    sha256=item.sha256,
+                    mime_type=item.mime_type,
+                    processing_fingerprint=item.processing_fingerprint,
+                    force_reprocess=True,
+                )
+                task = VideoProcessingTask(
+                    parent_job_id=job_id,
+                    source_file_id=prepared.source_file_id,
+                    source_generation=prepared.generation,
+                    result_version=1,
+                    task_kind=task_kind,
+                    resource_class=resource_class,
+                    route_key=route_key,
+                    processor_version=1,
+                    status="queued",
+                    stage="queued",
+                    attempt=0,
+                    progress={},
+                    input_payload={
+                        "source_sha256": item.sha256,
+                        "source_uri": source_uri,
+                        "processing_fingerprint": item.processing_fingerprint,
+                        "source_contexts": list(item.source_contexts),
+                    },
+                )
+                session.add(task)
+                await session.flush()
+                prepared_tasks.append(
+                    PreparedJobProcessingTask(
+                        job_id=job_id,
+                        source_file_id=prepared.source_file_id,
+                        generation=prepared.generation,
+                        task_id=task.task_id,
+                        task_kind=task_kind,
+                        resource_class=resource_class,
+                        route_key=route_key,
+                        processor_version=1,
+                        already_processed=False,
+                        source_uri=source_uri,
+                    )
+                )
+            job.dispatch_completed_at = datetime.now(UTC)
+            return prepared_tasks
 
     async def replace_assets(
         self,
@@ -1095,6 +1894,7 @@ class AssetRepository:
         job_id: str,
         asset_ids: Sequence[str],
         errors: Sequence[dict[str, str]],
+        workflow_lease_token: str | None = None,
     ) -> None:
         errors_by_asset: dict[str, list[str]] = {}
         for error in errors:
@@ -1106,6 +1906,12 @@ class AssetRepository:
             job = await session.get(ProcessingJob, job_id, with_for_update=True)
             if job is None:
                 raise ValueError(f"processing job does not exist: {job_id}")
+            if workflow_lease_token is not None and (
+                job.workflow_lease_token != workflow_lease_token
+                or job.workflow_lease_deadline_at is None
+                or job.workflow_lease_deadline_at <= datetime.now(UTC)
+            ):
+                raise ValueError("import enrichment workflow lease was lost")
             rows = list(
                 await session.scalars(
                     select(Asset).where(Asset.asset_id.in_(asset_ids)).with_for_update()
@@ -1179,6 +1985,9 @@ class AssetRepository:
                 job.status = JobStatus.COMPLETED.value
             job.current_stage = PipelineStage.COMPLETED.value
             job.completed_at = datetime.now(UTC)
+            job.workflow_owner_id = None
+            job.workflow_lease_token = None
+            job.workflow_lease_deadline_at = None
 
     async def _prepare_source_file_in_session(
         self,
@@ -1189,6 +1998,7 @@ class AssetRepository:
         sha256: str,
         mime_type: str,
         processing_fingerprint: str,
+        force_reprocess: bool = False,
     ) -> PreparedSourceFile:
         """Implement ``prepare_source_file`` inside an existing transaction."""
         await self._ensure_workspace(session, workspace_id)
@@ -1211,7 +2021,8 @@ class AssetRepository:
             "file_size_bytes": source_file.size_bytes,
         }
         if (
-            source is not None
+            not force_reprocess
+            and source is not None
             and source.sha256 == sha256
             and source.processing_fingerprint == processing_fingerprint
             and source.processing_status == ProcessingStatus.COMPLETED.value
@@ -1747,6 +2558,9 @@ class CurrentClusterRecord:
     # Legacy/manual clusters have no source-run fusion metadata and therefore
     # retain the pre-fusion, selected-dimension-only behavior.
     native_content_weight: float = 0.0
+    embedding_vector: tuple[float, ...] = ()
+    embedding_model: str = ""
+    embedding_source_hash: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -1780,6 +2594,7 @@ class ClusterBootstrapState:
     has_baseline: bool
     run_in_progress: bool
     eligible_asset_count: int
+    new_asset_count: int
     latest_run_id: str | None
     latest_sample_count: int | None
 
@@ -1827,6 +2642,9 @@ class CurrentClusterPublish:
     representative_asset_id: str | None
     members: Sequence[CurrentClusterMemberWrite]
     cluster_id: str | None = None
+    embedding_vector: Sequence[float] = ()
+    embedding_model: str = ""
+    embedding_source_hash: str = ""
 
 
 class CurrentClusterRepository:
@@ -1908,10 +2726,16 @@ class CurrentClusterRepository:
                 dimension=dimension,
                 milvus_collection=milvus_collection,
             )
+        baseline_embedding_ids = (
+            set(latest_run.input_embedding_ids) if latest_run is not None else set()
+        )
         return ClusterBootstrapState(
             has_baseline=latest_run is not None,
             run_in_progress=run_in_progress,
             eligible_asset_count=len(eligible_assets),
+            new_asset_count=sum(
+                item.embedding_id not in baseline_embedding_ids for item in eligible_assets
+            ),
             latest_run_id=(latest_run.cluster_run_id if latest_run is not None else None),
             latest_sample_count=(latest_run.sample_count if latest_run is not None else None),
         )
@@ -1944,9 +2768,7 @@ class CurrentClusterRepository:
                 set(latest_run.input_embedding_ids) if latest_run is not None else set()
             )
             new_assets = [
-                item
-                for item in eligible_assets
-                if item.embedding_id not in baseline_embedding_ids
+                item for item in eligible_assets if item.embedding_id not in baseline_embedding_ids
             ]
             new_asset_ids = [item.asset.asset_id for item in new_assets]
             member_rows = (
@@ -2004,12 +2826,8 @@ class CurrentClusterRepository:
             )
         return NewAssetClusterStatusRecord(
             has_baseline=latest_run is not None,
-            baseline_cluster_run_id=(
-                latest_run.cluster_run_id if latest_run is not None else None
-            ),
-            baseline_sample_count=(
-                latest_run.sample_count if latest_run is not None else None
-            ),
+            baseline_cluster_run_id=(latest_run.cluster_run_id if latest_run is not None else None),
+            baseline_sample_count=(latest_run.sample_count if latest_run is not None else None),
             eligible_asset_count=len(eligible_assets),
             items=tuple(items),
         )
@@ -2108,9 +2926,34 @@ class CurrentClusterRepository:
                 for_update=True,
             )
             cluster.name = normalized_name
+            cluster.embedding_vector = []
+            cluster.embedding_model = ""
+            cluster.embedding_source_hash = ""
             await session.flush()
             await session.refresh(cluster)
             return _current_cluster_record(cluster)
+
+    async def set_embedding(
+        self,
+        *,
+        cluster_id: str,
+        workspace_id: str,
+        vector: Sequence[float],
+        model: str,
+        source_hash: str,
+    ) -> None:
+        """Persist a cluster Entity embedding produced by clustering or legacy backfill."""
+        async with self._database.session() as session, session.begin():
+            cluster = await _load_current_cluster(
+                session,
+                cluster_id=cluster_id,
+                workspace_id=workspace_id,
+                for_update=True,
+            )
+            cluster.embedding_vector = [float(value) for value in vector]
+            cluster.embedding_model = model
+            cluster.embedding_source_hash = source_hash
+            await session.flush()
 
     async def attach_members(
         self,
@@ -2282,9 +3125,7 @@ class CurrentClusterRepository:
                 cluster_id=cluster_id,
                 workspace_id=workspace_id,
             )
-            statement = select(ClusterExclusion).where(
-                ClusterExclusion.cluster_id == cluster_id
-            )
+            statement = select(ClusterExclusion).where(ClusterExclusion.cluster_id == cluster_id)
             if asset_ids is not None:
                 requested_ids = list(dict.fromkeys(asset_ids))
                 if not requested_ids:
@@ -2406,9 +3247,7 @@ class CurrentClusterRepository:
             )
             overlap = sorted(resident_asset_ids.intersection(all_asset_ids))
             if overlap:
-                raise ValueError(
-                    "dynamic publish contains resident Assets: " + ", ".join(overlap)
-                )
+                raise ValueError("dynamic publish contains resident Assets: " + ", ".join(overlap))
 
             await session.execute(
                 delete(CurrentCluster).where(
@@ -2429,6 +3268,9 @@ class CurrentClusterRepository:
                     description=item.description,
                     representative_asset_id=item.representative_asset_id,
                     source_run_id=run_id,
+                    embedding_vector=[float(value) for value in item.embedding_vector],
+                    embedding_model=item.embedding_model,
+                    embedding_source_hash=item.embedding_source_hash,
                 )
                 session.add(cluster)
                 stored.append(cluster)
@@ -2948,6 +3790,9 @@ def _current_cluster_record(
         created_at=cluster.created_at,
         updated_at=cluster.updated_at,
         native_content_weight=native_content_weight,
+        embedding_vector=tuple(cluster.embedding_vector or ()),
+        embedding_model=cluster.embedding_model,
+        embedding_source_hash=cluster.embedding_source_hash,
     )
 
 

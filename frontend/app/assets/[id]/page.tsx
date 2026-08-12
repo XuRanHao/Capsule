@@ -17,14 +17,7 @@ import { useWorkspaceSelection, WorkspaceSelect } from "../../lib/workspaces";
 const FEATURE_LABELS: Record<string, string> = {
   subject_content: "主体内容",
   scene_theme: "场景主题",
-  visual_style: "视觉风格",
-  color_composition: "色彩构图",
-  mood_atmosphere: "情绪氛围",
-  character_state_or_psychology: "人物状态",
-  asset_usage: "素材用途",
-  target_audience: "目标受众",
-  provenance: "来源",
-  rights_version_authorship: "版权版本",
+  visual_presentation: "视觉表现",
 };
 
 export default function AssetDetailPage() {
@@ -88,22 +81,45 @@ export default function AssetDetailPage() {
     );
   }
 
-  const features = Object.entries(asset.asset_features).map(([key, raw]) => {
-    const feature =
-      typeof raw === "string"
-        ? { value: raw, status: "observed", confidence: 1, evidence: [] }
-        : raw;
-    return {
-      key,
-      label: FEATURE_LABELS[key] || key,
-      value: feature.value || "暂无",
-      status: feature.status || "unknown",
-      confidence: feature.confidence ?? 0,
-      evidence: feature.evidence || [],
-      description: feature.description || null,
-      sourcePath: feature.source_path || null,
-    };
-  });
+  const salienceRank = (value: number | "high" | "medium" | "low") =>
+    typeof value === "number"
+      ? -value
+      : ({ high: 0, medium: 1, low: 2 } as const)[value];
+  const features = Object.entries(asset.asset_features)
+    .filter(([key]) => key in FEATURE_LABELS)
+    .map(([key, raw]) => {
+      const feature = typeof raw === "string" ? { value: raw } : raw;
+      const legacyDescriptions = feature?.value
+        ? feature.value
+            .replaceAll(";", "；")
+            .split("；")
+            .map((description) => description.trim())
+            .filter(Boolean)
+        : [];
+      const items = feature?.items?.length
+        ? feature.items.slice().sort(
+            (left, right) =>
+              salienceRank(left.salience) - salienceRank(right.salience),
+          )
+        : legacyDescriptions.map((description, index) => ({
+            description,
+            salience: index === 0 ? ("high" as const) : ("medium" as const),
+            status: (feature?.status || "inferred") as
+              | "observed"
+              | "inferred"
+              | "metadata"
+              | "user_supplied",
+            evidence: index === 0 ? feature?.evidence || [] : [],
+            ocr_confidence: null,
+          }));
+      return {
+        key,
+        label: FEATURE_LABELS[key] || key,
+        applicability:
+          feature?.applicability || (items.length ? "applicable" : "unknown"),
+        items,
+      };
+    });
   const locator = Object.entries(asset.source_locator)
     .map(([key, value]) => `${key}=${String(value)}`)
     .join(" · ");
@@ -233,37 +249,57 @@ export default function AssetDetailPage() {
             <span className="eyebrow">ASSET FEATURES</span>
             <h2>多维语义特征</h2>
           </div>
-          <span>{features.length} / 10 DIMENSIONS</span>
+          <span>{features.length} / 3 DIMENSIONS</span>
         </header>
         <div className="feature-table">
           <div className="feature-row feature-head">
             <span>维度</span>
-            <span>Effective Value</span>
-            <span>状态</span>
-            <span>Confidence</span>
-            <span>Evidence</span>
+            <span>描述条目</span>
+            <span>适用性</span>
+            <span>证据</span>
           </div>
           {features.map((feature) => (
             <div className="feature-row" key={feature.key}>
               <strong>{feature.label}</strong>
               <span className="feature-value-cell">
-                <b>{feature.value}</b>
-                {feature.description && <small>{feature.description}</small>}
-                {feature.sourcePath && (
-                  <code title={feature.sourcePath}>{feature.sourcePath}</code>
-                )}
+                {feature.items.map((item) => (
+                  <span className="feature-item-line" key={`${item.salience}:${item.description}`}>
+                    <em
+                      className={
+                        typeof item.salience === "number"
+                          ? "salience-relative"
+                          : `salience-${item.salience}`
+                      }
+                    >
+                      {typeof item.salience === "number"
+                        ? item.salience.toFixed(2)
+                        : item.salience}
+                    </em>
+                    <b>
+                      {item.subject ? `${item.subject} · ` : ""}
+                      {item.description}
+                    </b>
+                    <small>{item.status}</small>
+                  </span>
+                ))}
+                {!feature.items.length && <small>暂无可用描述</small>}
               </span>
-              <StatusBadge status={feature.status} />
-              <span className="confidence-cell">
-                <i style={{ width: `${feature.confidence * 100}%` }} />
-                <b>{feature.confidence.toFixed(2)}</b>
-              </span>
+              <StatusBadge status={feature.applicability} />
               <details>
-                <summary>{feature.evidence.length} 条证据</summary>
+                <summary>
+                  {feature.items.reduce((count, item) => count + item.evidence.length, 0)} 条证据
+                </summary>
                 <ul>
-                  {feature.evidence.map((evidence) => (
-                    <li key={evidence}>{evidence}</li>
-                  ))}
+                  {feature.items.flatMap((item) =>
+                    item.evidence.map((evidence) => (
+                      <li key={`${item.description}:${evidence}`}>
+                        {evidence}
+                        {item.ocr_confidence != null && (
+                          <small> · OCR {item.ocr_confidence.toFixed(2)}</small>
+                        )}
+                      </li>
+                    )),
+                  )}
                 </ul>
               </details>
             </div>

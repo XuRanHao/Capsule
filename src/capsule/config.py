@@ -27,9 +27,7 @@ class Settings(BaseSettings):
     milvus_uri: str = "http://localhost:19530"
     milvus_token: SecretStr | None = None
     milvus_collection: str = "asset_embeddings_seed16_1024"
-    milvus_fused_search_collection: str = (
-        "asset_embeddings_seed16_1024_fused_n03_v1"
-    )
+    milvus_fused_search_collection: str = "asset_embeddings_seed16_1024_fused_n03_v1"
 
     object_storage_endpoint: str = "http://localhost:9000"
     object_storage_public_endpoint: str | None = None
@@ -85,6 +83,7 @@ class Settings(BaseSettings):
     http_max_keepalive_connections: int = Field(default=128, ge=1)
     model_image_target_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
     model_image_max_edge: int = Field(default=1536, ge=1)
+    understanding_image_size: int = Field(default=768, ge=224, le=1536)
     model_image_cache_entries: int = Field(default=128, ge=1)
     file_parse_concurrency: int = Field(default=4, ge=1)
     ffmpeg_concurrency: int = Field(default=2, ge=1)
@@ -116,6 +115,24 @@ class Settings(BaseSettings):
         min_length=1,
     )
     video_task_scheduler_poll_seconds: float = Field(default=5.0, gt=0)
+    # Durable CPU image/text task routes. Each kind owns an independent stream
+    # and consumer group so a worker can only receive work its repository is
+    # authorized to claim.
+    cpu_image_task_stream: str = "capsule:image:tasks"
+    cpu_image_task_group: str = "capsule-image-workers"
+    cpu_image_task_dlq_stream: str = "capsule:image:dlq"
+    cpu_image_task_concurrency: int = Field(default=16, ge=1)
+    cpu_text_task_stream: str = "capsule:text:tasks"
+    cpu_text_task_group: str = "capsule-text-workers"
+    cpu_text_task_dlq_stream: str = "capsule:text:dlq"
+    cpu_text_task_concurrency: int = Field(default=4, ge=1)
+    cpu_source_roots: list[Path] = Field(default_factory=list)
+    # A single-process/local API must be able to consume the durable tasks it
+    # creates. Production deployments with dedicated worker services can turn
+    # this off and run the worker/scheduler CLI commands independently.
+    api_embedded_cpu_tasks_enabled: bool = True
+    api_embedded_cpu_tasks_restart_seconds: float = Field(default=2.0, gt=0)
+    api_embedded_cpu_tasks_startup_timeout_seconds: float = Field(default=30.0, gt=0)
     # ``materialized`` preserves the legacy playable MP4/keyframe artifacts.
     # ``logical`` stores only content-aware ranges and representative timestamps;
     # Assets still run through understanding, vectorization, and clustering.
@@ -161,22 +178,6 @@ class Settings(BaseSettings):
     milvus_batch_size: int = Field(default=100, ge=1)
 
     cluster_selection_epsilon: float = Field(default=0.5, ge=0.0, le=2.0)
-    cluster_semantic_merge_enabled: bool = True
-    cluster_merge_centroid_cosine_threshold: float = Field(
-        default=0.92,
-        ge=-1.0,
-        le=1.0,
-    )
-    cluster_merge_cross_mean_cosine_threshold: float = Field(
-        default=0.84,
-        ge=-1.0,
-        le=1.0,
-    )
-    cluster_merge_member_min_cosine_threshold: float = Field(
-        default=0.92,
-        ge=-1.0,
-        le=1.0,
-    )
     cluster_incremental_assignment_threshold: float = Field(
         default=0.88,
         ge=-1.0,
@@ -184,6 +185,21 @@ class Settings(BaseSettings):
     )
     cluster_bootstrap_minimum_count: int = Field(default=50, ge=1)
     cluster_bootstrap_concurrency: int = Field(default=1, ge=1)
+    cluster_auto_recluster_new_ratio: float = Field(default=0.3, gt=0.0, le=1.0)
+    cluster_auto_recluster_minimum_new_count: int = Field(default=20, ge=1)
+
+    relation_entity_merge_similarity_threshold: float = Field(
+        default=0.67,
+        ge=-1.0,
+        le=1.0,
+    )
+    relation_asset_recall_similarity_threshold: float = Field(
+        default=0.55,
+        ge=-1.0,
+        le=1.0,
+    )
+    relation_asset_recall_top_k: int = Field(default=20, ge=1, le=100)
+    relation_asset_recall_path_boost: float = Field(default=0.25, ge=0.0, le=1.0)
 
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)
@@ -205,6 +221,8 @@ class Settings(BaseSettings):
     search_cors_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:3000",
+            "http://localhost:3101",
+            "http://127.0.0.1:3101",
             "https://capsule-search-workspace.ranhaoxu212.chatgpt.site",
         ]
     )

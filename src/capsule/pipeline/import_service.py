@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -15,8 +16,10 @@ from pydantic import BaseModel, Field
 from capsule.config import Settings
 from capsule.db.repositories import AssetRepository
 from capsule.enums import EmbeddingType, JobStatus, PipelineStage
+from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.parsers.discovery import SUPPORTED_EXTENSIONS, discover_files
 from capsule.pipeline.embedding import AssetEmbeddingService
+from capsule.pipeline.processing_task_service import BrowserProcessingTaskSubmissionService
 from capsule.pipeline.runner import PipelineRunner, PipelineRunResult
 from capsule.pipeline.understanding import AssetUnderstandingService
 
@@ -42,6 +45,7 @@ class ImportCompletion:
     job_id: str
     staged_path: Path
     file_count: int
+    durable_dispatched: bool = False
 
 
 class AssetEnrichmentResult(BaseModel):
@@ -79,6 +83,7 @@ async def enrich_assets(
     embedding_service: AssetEmbeddingService,
     incremental_cluster_processor: IncrementalClusterProcessor | None = None,
     force_understanding: bool = False,
+    workflow_lease_token: str | None = None,
 ) -> AssetEnrichmentResult:
     """Overlap native embedding with understanding, then fan out text channels."""
     await repository.begin_asset_enrichment(asset_ids=asset_ids)
@@ -110,11 +115,19 @@ async def enrich_assets(
         job_id=job_id,
         durations_ms=batch.stage_durations_ms,
     )
-    await repository.finalize_enrichment(
-        job_id=job_id,
-        asset_ids=asset_ids,
-        errors=batch.errors,
-    )
+    if workflow_lease_token is None:
+        await repository.finalize_enrichment(
+            job_id=job_id,
+            asset_ids=asset_ids,
+            errors=batch.errors,
+        )
+    else:
+        await repository.finalize_enrichment(
+            job_id=job_id,
+            asset_ids=asset_ids,
+            errors=batch.errors,
+            workflow_lease_token=workflow_lease_token,
+        )
     failed_asset_ids = {error["asset_id"] for error in batch.errors}
     return AssetEnrichmentResult(
         job_id=job_id,
@@ -170,7 +183,7 @@ async def _run_enrichment_batch(
     )
     text_embedding_types = [
         embedding_type
-        for embedding_type in EmbeddingType
+        for embedding_type in ACTIVE_EMBEDDING_TYPES
         if embedding_type is not EmbeddingType.NATIVE_MULTIMODAL
     ]
     embedding_wait_started = time.perf_counter()
@@ -326,7 +339,7 @@ class AssetEnrichmentPipeline:
             await _process_incremental_clusters(
                 processor=self._incremental_cluster_processor,
                 workspace_id=self._workspace_id,
-                embedding_types=list(EmbeddingType),
+                embedding_types=list(ACTIVE_EMBEDDING_TYPES),
                 asset_ids=list(self._asset_ids),
             )
 
@@ -445,6 +458,182 @@ class AssetEnrichmentPipeline:
         }
 
 
+class ImportWorkflowCoordinator:
+    """Resume durable browser jobs after task-based assetization completes."""
+
+    def __init__(
+        self,
+        *,
+        repository: AssetRepository,
+        understanding_service: AssetUnderstandingService,
+        embedding_service: AssetEmbeddingService,
+        incremental_cluster_processor: IncrementalClusterProcessor | None = None,
+        worker_id: str | None = None,
+        poll_seconds: float = 2.0,
+        lease_seconds: float = 60.0,
+    ) -> None:
+        self._repository = repository
+        self._understanding_service = understanding_service
+        self._embedding_service = embedding_service
+        self._incremental_cluster_processor = incremental_cluster_processor
+        self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+        self._poll_seconds = poll_seconds
+        self._lease_seconds = lease_seconds
+        self._closed = asyncio.Event()
+
+    async def run_forever(self) -> None:
+        while not self._closed.is_set():
+            try:
+                handled = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                handled = False
+                logger.exception("durable import workflow coordinator iteration failed")
+            if handled:
+                continue
+            try:
+                await asyncio.wait_for(self._closed.wait(), timeout=self._poll_seconds)
+            except TimeoutError:
+                pass
+
+    async def run_once(self) -> bool:
+        claimed = await self._repository.claim_ready_import_workflow(
+            worker_id=self._worker_id,
+            lease_seconds=self._lease_seconds,
+        )
+        if claimed is None:
+            return False
+        job_id, workspace_id, lease_token = claimed
+        failed = False
+        enrichment: asyncio.Task[AssetEnrichmentResult] | None = None
+        heartbeat = asyncio.create_task(
+            self._heartbeat(job_id=job_id, lease_token=lease_token)
+        )
+        try:
+            asset_ids = await self._repository.list_import_job_asset_ids(job_id=job_id)
+            await self._raise_if_heartbeat_ended(heartbeat)
+            enrichment = asyncio.create_task(
+                enrich_assets(
+                    job_id=job_id,
+                    workspace_id=workspace_id,
+                    asset_ids=asset_ids,
+                    repository=self._repository,
+                    understanding_service=self._understanding_service,
+                    embedding_service=self._embedding_service,
+                    incremental_cluster_processor=self._incremental_cluster_processor,
+                    workflow_lease_token=lease_token,
+                )
+            )
+            await self._await_enrichment_or_lease_loss(enrichment, heartbeat)
+        except asyncio.CancelledError:
+            await self._cancel_enrichment(enrichment)
+            await self._release_lease_after_cancellation(
+                job_id=job_id,
+                lease_token=lease_token,
+            )
+            raise
+        except Exception as exc:
+            failed = True
+            await self._repository.release_import_workflow(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                lease_token=lease_token,
+                error=str(exc) or type(exc).__name__,
+            )
+            logger.exception("durable import enrichment failed for job=%s", job_id)
+        finally:
+            await self._cancel_enrichment(enrichment)
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        return not failed
+
+    @staticmethod
+    async def _cancel_enrichment(
+        enrichment: asyncio.Task[AssetEnrichmentResult] | None,
+    ) -> None:
+        if enrichment is None:
+            return
+        if not enrichment.done():
+            enrichment.cancel()
+        await asyncio.gather(enrichment, return_exceptions=True)
+
+    async def _release_lease_after_cancellation(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+    ) -> None:
+        """Release the lease before the lifespan can dispose the database."""
+        release = asyncio.create_task(
+            self._repository.release_import_workflow(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                lease_token=lease_token,
+                error="import workflow coordinator cancelled",
+            )
+        )
+        while not release.done():
+            try:
+                await asyncio.shield(release)
+            except asyncio.CancelledError:
+                # Preserve cleanup across repeated cancellation; the caller
+                # re-raises its original cancellation once this returns.
+                pass
+            except Exception:
+                break
+        if release.cancelled():
+            return
+        try:
+            release.result()
+        except Exception:
+            logger.exception(
+                "failed to release durable import workflow lease after cancellation job=%s",
+                job_id,
+            )
+
+    async def _raise_if_heartbeat_ended(self, heartbeat: asyncio.Task[None]) -> None:
+        """Ensure the first lease renewal succeeded before enriching any assets."""
+        await asyncio.sleep(0)
+        if heartbeat.done():
+            await heartbeat
+
+    async def _await_enrichment_or_lease_loss(
+        self,
+        enrichment: asyncio.Task[AssetEnrichmentResult],
+        heartbeat: asyncio.Task[None],
+    ) -> AssetEnrichmentResult:
+        """Fail closed if the durable lease ends before enrichment is terminal."""
+        done, _ = await asyncio.wait(
+            {enrichment, heartbeat},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat in done:
+            try:
+                await heartbeat
+            except BaseException:
+                enrichment.cancel()
+                await asyncio.gather(enrichment, return_exceptions=True)
+                raise
+            raise RuntimeError("durable import workflow heartbeat stopped unexpectedly")
+        return await enrichment
+
+    async def close(self) -> None:
+        self._closed.set()
+
+    async def _heartbeat(self, *, job_id: str, lease_token: str) -> None:
+        while True:
+            renewed = await self._repository.heartbeat_import_workflow(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                lease_token=lease_token,
+                lease_seconds=self._lease_seconds,
+            )
+            if not renewed:
+                raise RuntimeError("durable import workflow lease was lost")
+            await asyncio.sleep(self._lease_seconds / 3)
+
+
 class BrowserImportService:
     """Own the browser upload lifecycle before delegating to ``PipelineRunner``.
 
@@ -462,6 +651,7 @@ class BrowserImportService:
         understanding_service: AssetUnderstandingService | None = None,
         embedding_service: AssetEmbeddingService | None = None,
         incremental_cluster_processor: IncrementalClusterProcessor | None = None,
+        durable_task_submitter: BrowserProcessingTaskSubmissionService | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
@@ -469,6 +659,7 @@ class BrowserImportService:
         self._understanding_service = understanding_service
         self._embedding_service = embedding_service
         self._incremental_cluster_processor = incremental_cluster_processor
+        self._durable_task_submitter = durable_task_submitter
         self._active_executions: dict[str, tuple[str, asyncio.Task[Any]]] = {}
 
     async def create_job(self, *, workspace_id: str) -> BrowserImportJob:
@@ -528,16 +719,36 @@ class BrowserImportService:
         if job.status != JobStatus.QUEUED.value:
             raise ImportSubmissionError("import job has already been started")
         staged_path = self._job_staging_path(job.input_path)
-        file_count = len(discover_files(staged_path))
+        source_files = await asyncio.to_thread(discover_files, staged_path)
+        file_count = len(source_files)
         if file_count == 0:
             raise ImportSubmissionError(
                 "at least one supported file must be uploaded before completion"
             )
-        await self._repository.start_import_job(job_id=job_id, total_count=file_count)
+        post_asset_action = (
+            "enrich"
+            if self._understanding_service is not None
+            and self._embedding_service is not None
+            else "none"
+        )
+        if self._durable_task_submitter is not None:
+            await self._durable_task_submitter.submit_batch(
+                job_id=job_id,
+                workspace_id=workspace_id,
+                source_files=source_files,
+                post_asset_action=post_asset_action,
+            )
+        else:
+            await self._repository.start_import_job(
+                job_id=job_id,
+                total_count=file_count,
+                post_asset_action=post_asset_action,
+            )
         return ImportCompletion(
             job_id=job_id,
             staged_path=staged_path,
             file_count=file_count,
+            durable_dispatched=self._durable_task_submitter is not None,
         )
 
     async def execute(
@@ -551,6 +762,15 @@ class BrowserImportService:
         if current_task is not None:
             self._active_executions[completion.job_id] = (workspace_id, current_task)
         try:
+            if completion.durable_dispatched:
+                return PipelineRunResult(
+                    job_id=completion.job_id,
+                    workspace_id=workspace_id,
+                    file_count=completion.file_count,
+                    succeeded_count=0,
+                    failed_count=0,
+                    asset_count=0,
+                )
             if self._understanding_service is not None and self._embedding_service is not None:
                 enrichment_pipeline = AssetEnrichmentPipeline(
                     settings=self._settings,

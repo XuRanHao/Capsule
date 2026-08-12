@@ -157,7 +157,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("/Users/gao/Downloads/惊悚乐园"),
+        required=True,
     )
     parser.add_argument("--sample-count", type=int, default=50)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4])

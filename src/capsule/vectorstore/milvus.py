@@ -304,6 +304,41 @@ class MilvusVectorStore:
         )
         return _parse_search_hits(raw)
 
+    async def search_raw(
+        self,
+        *,
+        vector: list[float],
+        workspace_id: str,
+        embedding_type: str,
+        filters: SearchFilters,
+        limit: int,
+    ) -> list[VectorSearchHit]:
+        """Search the unfused dimension vector used by clustering."""
+
+        self.validate_vector(vector)
+        expression = self.build_filter_expression(
+            workspace_id=workspace_id,
+            embedding_type=embedding_type,
+            filters=filters,
+        )
+        raw = await asyncio.to_thread(
+            self._client.search,
+            collection_name=self._collection,
+            data=[vector],
+            anns_field="vector",
+            filter=expression,
+            limit=limit,
+            search_params={"metric_type": "COSINE", "params": {"ef": self._search_ef}},
+            output_fields=[
+                "embedding_id",
+                "asset_id",
+                "source_file_id",
+                "asset_type",
+                "embedding_revision",
+            ],
+        )
+        return _parse_search_hits(raw)
+
     async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]:
         """Fetch exact vectors by embedding primary key for offline clustering."""
         if not embedding_ids:

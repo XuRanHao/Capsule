@@ -30,3 +30,8 @@ def test_video_range_headers_are_available_cross_origin() -> None:
     assert response.headers["access-control-expose-headers"] == (
         "Accept-Ranges, Content-Range, Content-Length, ETag"
     )
+    assert response.json()["processing_tasks"] == {
+        "mode": "external",
+        "ready": True,
+        "components": {},
+    }
