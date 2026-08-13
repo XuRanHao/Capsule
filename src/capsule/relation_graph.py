@@ -5,9 +5,9 @@ import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from capsule.db.repositories import EmbeddingAsset
 from capsule.schemas import AssetUnderstanding, SubjectFeatureItem
@@ -40,13 +40,6 @@ class AssetEntityRelationDecision(BaseModel):
     establishes_relation: bool
     relation: str
     description: str
-    reason: str
-
-    @field_validator("reason", mode="before")
-    @classmethod
-    def compact_reason(cls, value: object) -> str:
-        text = str(value or "").strip()
-        return text if len(text) <= 60 else f"{text[:59]}…"
 
 
 class MetadataContentDecision(BaseModel):
@@ -91,6 +84,179 @@ class MergedEntityResolution(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entities: list[MergedEntityDecision] = Field(default_factory=list)
+
+
+class EntityStructureNode(BaseModel):
+    """An Entity visible to one incremental structure-building round."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=200)
+    semantic: str = Field(min_length=1, max_length=1000)
+
+
+class EntityStructureEdge(BaseModel):
+    """An already accepted Entity-to-Entity edge in the current structure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_entity_id: str = Field(min_length=1, max_length=256)
+    target_entity_id: str = Field(min_length=1, max_length=256)
+    relation: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class CurrentEntityStructure(BaseModel):
+    """The complete structure maintained by the backend between Agent rounds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[EntityStructureNode] = Field(default_factory=list)
+    edges: list[EntityStructureEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "CurrentEntityStructure":
+        node_ids = [node.entity_id for node in self.nodes]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("current_graph contains duplicate entity_id values")
+        known_ids = set(node_ids)
+        for edge in self.edges:
+            if edge.source_entity_id not in known_ids or edge.target_entity_id not in known_ids:
+                raise ValueError("current_graph edge references an unknown entity_id")
+            if edge.source_entity_id == edge.target_entity_id:
+                raise ValueError("current_graph cannot contain a self edge")
+        return self
+
+
+class EntityStructureRequest(BaseModel):
+    """Stable input envelope sent to the Entity structure Agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_tree: str = Field(min_length=1)
+    current_graph: CurrentEntityStructure
+    incoming_entities: list[EntityStructureNode] = Field(min_length=1, max_length=15)
+
+    @model_validator(mode="after")
+    def validate_entity_ids(self) -> "EntityStructureRequest":
+        incoming_ids = [entity.entity_id for entity in self.incoming_entities]
+        if len(incoming_ids) != len(set(incoming_ids)):
+            raise ValueError("incoming_entities contains duplicate entity_id values")
+        return self
+
+
+class MergeEntityOperation(BaseModel):
+    """Merge Entity nodes that denote virtually the same real Entity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["merge"]
+    source_entity_ids: list[str] = Field(min_length=2)
+    canonical_entity_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=200)
+    semantic: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_source_ids(self) -> "MergeEntityOperation":
+        if len(self.source_entity_ids) != len(set(self.source_entity_ids)):
+            raise ValueError("merge source_entity_ids must be unique")
+        if self.canonical_entity_id not in self.source_entity_ids:
+            raise ValueError("canonical_entity_id must occur in source_entity_ids")
+        return self
+
+
+class SeparateEntityOperation(BaseModel):
+    """Keep unrelated Entity nodes independent in this round."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["separate"]
+    entity_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_entity_ids(self) -> "SeparateEntityOperation":
+        if len(self.entity_ids) != len(set(self.entity_ids)):
+            raise ValueError("separate entity_ids must be unique")
+        return self
+
+
+class ReusedGroupParent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["reuse"]
+    parent_entity_id: str = Field(min_length=1, max_length=256)
+
+
+class CreatedGroupParent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["create"]
+    temporary_parent_id: str = Field(pattern=r"^virtual:[^\s/]+$", max_length=256)
+    name: str = Field(min_length=1, max_length=200)
+    semantic: str = Field(min_length=1, max_length=1000)
+
+
+GroupParent = Annotated[
+    ReusedGroupParent | CreatedGroupParent,
+    Field(discriminator="mode"),
+]
+
+
+class GroupChildRelation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    child_entity_id: str = Field(min_length=1, max_length=256)
+    relation: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class GroupEntityOperation(BaseModel):
+    """Attach related-but-distinct Entities to a reused or newly created parent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["group"]
+    parent: GroupParent
+    children: list[GroupChildRelation] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_children(self) -> "GroupEntityOperation":
+        child_ids = [child.child_entity_id for child in self.children]
+        if len(child_ids) != len(set(child_ids)):
+            raise ValueError("group child_entity_id values must be unique")
+        if (
+            isinstance(self.parent, ReusedGroupParent)
+            and self.parent.parent_entity_id in child_ids
+        ):
+            raise ValueError("a reused parent cannot also be its own child")
+        return self
+
+
+EntityStructureOperation = Annotated[
+    MergeEntityOperation | SeparateEntityOperation | GroupEntityOperation,
+    Field(discriminator="type"),
+]
+
+
+class EntityStructureOperationResolution(BaseModel):
+    """Incremental operations only; the backend remains owner of the full graph."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operations: list[EntityStructureOperation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_operation_ids(self) -> "EntityStructureOperationResolution":
+        temporary_parent_ids: list[str] = []
+        for operation in self.operations:
+            if isinstance(operation, GroupEntityOperation) and isinstance(
+                operation.parent, CreatedGroupParent
+            ):
+                temporary_parent_ids.append(operation.parent.temporary_parent_id)
+        if len(temporary_parent_ids) != len(set(temporary_parent_ids)):
+            raise ValueError("temporary_parent_id values must be unique")
+        return self
 
 
 def _entity_key(subject: str) -> str:
@@ -181,8 +347,7 @@ def _main_entities(
                 metadata_key
                 for metadata_key in merged
                 if metadata_key == key
-                or _group_relation(metadata_content_relations.get(metadata_key))
-                == "same_entity"
+                or _group_relation(metadata_content_relations.get(metadata_key)) == "same_entity"
             ),
             None,
         )
@@ -212,9 +377,7 @@ def build_relation_graph(
     metadata_counts = Counter(
         _entity_key(name) for asset in assets for name in _metadata_names(asset)
     )
-    reusable_metadata_keys = {
-        key for key, count in metadata_counts.items() if count >= 2
-    }
+    reusable_metadata_keys = {key for key, count in metadata_counts.items() if count >= 2}
     resolved_relations = metadata_content_relations or {}
     asset_rows: list[dict[str, Any]] = []
     grouped_members: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
@@ -278,12 +441,8 @@ def build_relation_graph(
         subject = members[0][1]["subject"]
         entity_id = f"entity_{hashlib.sha256(entity_key.encode()).hexdigest()[:12]}"
         entity_id_by_key[entity_key] = entity_id
-        origins = sorted(
-            {origin for _, entity in members for origin in entity["origins"]}
-        )
-        descriptions = list(
-            dict.fromkeys(entity["description"] for _, entity in members)
-        )
+        origins = sorted({origin for _, entity in members for origin in entity["origins"]})
+        descriptions = list(dict.fromkeys(entity["description"] for _, entity in members))
         semantic = _entity_semantic(
             resolved_relations.get(entity_key),
             descriptions[0] if descriptions else subject,
@@ -321,11 +480,7 @@ def build_relation_graph(
                     ),
                 }
             )
-        shared_relation = (
-            "SHARES_METADATA_ENTITY"
-            if origins == ["metadata"]
-            else "SAME_ENTITY"
-        )
+        shared_relation = "SHARES_METADATA_ENTITY" if origins == ["metadata"] else "SAME_ENTITY"
         for left_index, (left, _) in enumerate(members):
             for right, _ in members[left_index + 1 :]:
                 edges.append(
@@ -358,9 +513,7 @@ def build_relation_graph(
                 if content_key not in virtual_entity_keys:
                     continue
                 graph_relation = (
-                    "CONTAINS"
-                    if resolved_relation == "contains_content"
-                    else "RELATED_TO"
+                    "CONTAINS" if resolved_relation == "contains_content" else "RELATED_TO"
                 )
                 edge_key = (metadata_key, content_key, graph_relation)
                 if edge_key in emitted_entity_relations:
@@ -372,8 +525,7 @@ def build_relation_graph(
                         "target": entity_id_by_key[content_key],
                         "relation": graph_relation,
                         "description": (
-                            f"{metadata_entity['subject']}包含内容实体"
-                            f"{content_entity['subject']}"
+                            f"{metadata_entity['subject']}包含内容实体{content_entity['subject']}"
                             if graph_relation == "CONTAINS"
                             else (
                                 f"{metadata_entity['subject']}与内容实体"
@@ -408,9 +560,7 @@ def build_merged_candidate_graph(
     assets_by_id = {row["asset_id"]: row for row in graph["assets"]}
     for row in graph["assets"]:
         row["main_entities"] = []
-    candidates_by_id = {
-        str(candidate["candidate_id"]): candidate for candidate in candidates
-    }
+    candidates_by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
 
     for decision in resolution.entities:
         if not decision.build_entity:
@@ -433,12 +583,7 @@ def build_merged_candidate_graph(
         entity_key = _entity_key(decision.name)
         identity = "|".join(sorted(decision.candidate_ids)) or entity_key
         entity_id = f"entity_{hashlib.sha256(identity.encode()).hexdigest()[:12]}"
-        origins = sorted(
-            {
-                str(candidate.get("origin", "candidate"))
-                for candidate in selected
-            }
-        )
+        origins = sorted({str(candidate.get("origin", "candidate")) for candidate in selected})
         descriptions = list(
             dict.fromkeys(
                 str(candidate.get("semantic", ""))
@@ -460,6 +605,11 @@ def build_merged_candidate_graph(
         )
         for asset_id in member_ids:
             row = assets_by_id[asset_id]
+            is_subject_cluster_member = any(
+                candidate.get("origin") == "subject_cluster"
+                and asset_id in candidate.get("asset_ids", [])
+                for candidate in selected
+            )
             row["main_entities"].append(
                 {
                     "subject": decision.name,
@@ -472,8 +622,10 @@ def build_merged_candidate_graph(
                 {
                     "source": asset_id,
                     "target": entity_id,
-                    "relation": "CANDIDATE_MEMBER",
-                    "description": "",
+                    "relation": (
+                        "CLUSTER_MEMBER" if is_subject_cluster_member else "CANDIDATE_MEMBER"
+                    ),
+                    "description": ("内容高度相似" if is_subject_cluster_member else ""),
                     "content_subject": (
                         row["primary_subject"]["subject"]
                         if row["primary_subject"] is not None
@@ -493,13 +645,11 @@ def apply_asset_entity_relations(
 ) -> None:
     """Apply independently generated two-node relationship judgments."""
 
-    decisions = {
-        (item.source_id, item.target_id): item for item in resolution.relations
-    }
+    decisions = {(item.source_id, item.target_id): item for item in resolution.relations}
     entity_ids = {entity["entity_id"] for entity in graph["entities"]}
     retained_edges: list[dict[str, Any]] = []
-    rejected_relations: list[dict[str, Any]] = []
-    for edge in graph["edges"]:
+    rejected_relations: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in _deduplicate_asset_entity_edges(graph["edges"]):
         if edge["source"] in entity_ids and edge["target"] in entity_ids:
             retained_edges.append(edge)
             continue
@@ -507,13 +657,16 @@ def apply_asset_entity_relations(
             continue
         decision = decisions.get((edge["source"], edge["target"]))
         if decision is None:
+            if edge["relation"] == "CLUSTER_MEMBER":
+                retained_edges.append(edge)
             continue
         if not decision.establishes_relation:
-            rejected_relations.append(decision.model_dump(mode="json"))
+            rejected_relations[(decision.source_id, decision.target_id)] = (
+                decision.model_dump(mode="json")
+            )
             continue
         edge["relation"] = decision.relation
         edge["description"] = decision.description
-        edge["reason"] = decision.reason
         retained_edges.append(edge)
 
     member_ids_by_entity: dict[str, set[str]] = defaultdict(set)
@@ -521,14 +674,10 @@ def apply_asset_entity_relations(
         if edge["target"] in entity_ids and edge["source"] not in entity_ids:
             member_ids_by_entity[edge["target"]].add(edge["source"])
     retained_entity_ids = {
-        entity_id
-        for entity_id, member_ids in member_ids_by_entity.items()
-        if len(member_ids) >= 2
+        entity_id for entity_id, member_ids in member_ids_by_entity.items() if len(member_ids) >= 2
     }
     graph["entities"] = [
-        entity
-        for entity in graph["entities"]
-        if entity["entity_id"] in retained_entity_ids
+        entity for entity in graph["entities"] if entity["entity_id"] in retained_entity_ids
     ]
     for entity in graph["entities"]:
         entity["asset_ids"] = sorted(member_ids_by_entity[entity["entity_id"]])
@@ -540,4 +689,189 @@ def apply_asset_entity_relations(
     ]
     graph["entity_count"] = len(graph["entities"])
     graph["edge_count"] = len(graph["edges"])
-    graph["rejected_relations"] = rejected_relations
+    graph["rejected_relations"] = list(rejected_relations.values())
+
+
+def apply_entity_structure_operations(
+    graph: dict[str, Any],
+    resolution: EntityStructureOperationResolution,
+) -> list[str]:
+    """Apply one validated Agent round and return newly created virtual Entity IDs."""
+
+    graph.setdefault("entity_edges", [])
+    created_ids: list[str] = []
+    for operation in resolution.operations:
+        if isinstance(operation, MergeEntityOperation):
+            _apply_entity_merge(graph, operation)
+        elif isinstance(operation, GroupEntityOperation):
+            if isinstance(operation.parent, CreatedGroupParent) and len(operation.children) < 2:
+                continue
+            existing_ids = {str(node["entity_id"]) for node in graph["entities"]}
+            parent_id = _resolve_group_parent(graph, operation.parent)
+            if (
+                isinstance(operation.parent, CreatedGroupParent)
+                and parent_id not in existing_ids
+            ):
+                created_ids.append(parent_id)
+            for child in operation.children:
+                if child.child_entity_id == parent_id:
+                    continue
+                _upsert_entity_edge(
+                    graph,
+                    source_entity_id=child.child_entity_id,
+                    target_entity_id=parent_id,
+                    relation=child.relation,
+                    description=child.description,
+                )
+        elif isinstance(operation, SeparateEntityOperation):
+            continue
+
+    graph["entity_count"] = len(graph["entities"])
+    graph["entity_edge_count"] = len(graph["entity_edges"])
+    graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
+    return list(dict.fromkeys(created_ids))
+
+
+def _apply_entity_merge(graph: dict[str, Any], operation: MergeEntityOperation) -> None:
+    nodes_by_id = {node["entity_id"]: node for node in graph["entities"]}
+    selected = [
+        nodes_by_id[entity_id]
+        for entity_id in operation.source_entity_ids
+        if entity_id in nodes_by_id
+    ]
+    if len(selected) < 2:
+        return
+    canonical = nodes_by_id.get(operation.canonical_entity_id)
+    if canonical is None:
+        return
+
+    canonical["name"] = operation.name
+    canonical["semantic"] = operation.semantic
+    for field in ("asset_ids", "origins", "descriptions", "candidate_ids"):
+        canonical[field] = list(
+            dict.fromkeys(
+                str(value)
+                for node in selected
+                for value in node.get(field, [])
+            )
+        )
+    canonical["embedding_vector"] = next(
+        (
+            list(node.get("embedding_vector", []))
+            for node in selected
+            if node.get("embedding_vector")
+        ),
+        [],
+    )
+    canonical["embedding_model"] = next(
+        (str(node.get("embedding_model", "")) for node in selected if node.get("embedding_model")),
+        "",
+    )
+
+    replaced_ids = set(operation.source_entity_ids) - {operation.canonical_entity_id}
+    graph["entities"] = [
+        node for node in graph["entities"] if node["entity_id"] not in replaced_ids
+    ]
+    for edge in graph["edges"]:
+        if edge.get("target") in replaced_ids:
+            edge["target"] = operation.canonical_entity_id
+    graph["edges"] = _deduplicate_asset_entity_edges(graph["edges"])
+
+    rewritten_entity_edges: list[dict[str, Any]] = []
+    for edge in graph["entity_edges"]:
+        source_id = edge["source_entity_id"]
+        target_id = edge["target_entity_id"]
+        if source_id in replaced_ids:
+            source_id = operation.canonical_entity_id
+        if target_id in replaced_ids:
+            target_id = operation.canonical_entity_id
+        if source_id == target_id:
+            continue
+        rewritten_entity_edges.append(
+            {
+                **edge,
+                "source_entity_id": source_id,
+                "target_entity_id": target_id,
+            }
+        )
+    graph["entity_edges"] = _deduplicate_entity_edges(rewritten_entity_edges)
+
+
+def _resolve_group_parent(
+    graph: dict[str, Any],
+    parent: GroupParent,
+) -> str:
+    if isinstance(parent, ReusedGroupParent):
+        return parent.parent_entity_id
+
+    identity = f"{_entity_key(parent.name)}\0{parent.semantic.strip()}"
+    parent_id = f"entity_virtual_{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+    existing = next(
+        (node for node in graph["entities"] if node["entity_id"] == parent_id),
+        None,
+    )
+    if existing is None:
+        graph["entities"].append(
+            {
+                "entity_id": parent_id,
+                "name": parent.name,
+                "semantic": parent.semantic,
+                "origins": ["agent_structure"],
+                "asset_ids": [],
+                "descriptions": [parent.semantic],
+                "candidate_ids": [],
+                "merge_reason": "",
+                "embedding_vector": [],
+                "embedding_model": "",
+            }
+        )
+    return parent_id
+
+
+def _upsert_entity_edge(
+    graph: dict[str, Any],
+    *,
+    source_entity_id: str,
+    target_entity_id: str,
+    relation: str,
+    description: str,
+) -> None:
+    for edge in graph["entity_edges"]:
+        if (
+            edge["source_entity_id"] == source_entity_id
+            and edge["target_entity_id"] == target_entity_id
+        ):
+            edge["relation"] = relation
+            edge["description"] = description
+            return
+    graph["entity_edges"].append(
+        {
+            "source_entity_id": source_entity_id,
+            "target_entity_id": target_entity_id,
+            "relation": relation,
+            "description": description,
+        }
+    )
+
+
+def _deduplicate_asset_entity_edges(
+    edges: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in edges:
+        key = (str(edge["source"]), str(edge["target"]))
+        current = selected.get(key)
+        if current is None or edge.get("relation") == "CLUSTER_MEMBER":
+            selected[key] = edge
+    return list(selected.values())
+
+
+def _deduplicate_entity_edges(
+    edges: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in edges:
+        selected[
+            (str(edge["source_entity_id"]), str(edge["target_entity_id"]))
+        ] = edge
+    return list(selected.values())

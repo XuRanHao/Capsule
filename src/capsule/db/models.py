@@ -587,6 +587,42 @@ class RelationEntitySource(Base):
     asset_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
 
 
+class EntityEntityRelation(Base, TimestampMixin):
+    """A durable semantic relationship between two virtual Entity nodes."""
+
+    __tablename__ = "entity_entity_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "source_entity_id",
+            "target_entity_id",
+            name="uq_entity_entity_relation",
+        ),
+    )
+
+    relation_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("entityrel")
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_entity_id: Mapped[str] = mapped_column(
+        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    target_entity_id: Mapped[str] = mapped_column(
+        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relation: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class RelationAssetState(Base, TimestampMixin):
     """Per-Asset revision cursor used by incremental relationship updates."""
 

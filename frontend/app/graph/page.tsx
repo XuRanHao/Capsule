@@ -1,6 +1,10 @@
 "use client";
 
-import cytoscape, { Core, ElementDefinition } from "cytoscape";
+import cytoscape, {
+  type Core,
+  type ElementDefinition,
+  type StylesheetJson,
+} from "cytoscape";
 import { useCallback, useEffect, useRef, useState } from "react";
 import DemoShell from "../components/DemoShell";
 import { apiFetch, endpoint } from "../lib/api";
@@ -32,8 +36,14 @@ type GraphEdge = {
   target: string;
   relation: string;
   description: string;
-  reason?: string;
   content_subject?: string;
+  edge_kind?: "asset_entity" | "entity_entity";
+};
+type GraphEntityEdge = {
+  source_entity_id: string;
+  target_entity_id: string;
+  relation: string;
+  description: string;
 };
 type GraphData = {
   workspace_id: string;
@@ -46,6 +56,7 @@ type GraphData = {
   assets: GraphAsset[];
   entities: GraphEntity[];
   edges: GraphEdge[];
+  entity_edges?: GraphEntityEdge[];
 };
 type Selection =
   | { kind: "entity"; value: GraphEntity }
@@ -54,6 +65,72 @@ type Selection =
 
 const GRAPH_READ_TIMEOUT_MS = 60_000;
 const GRAPH_REBUILD_TIMEOUT_MS = 120_000;
+const EMPTY_VISIBLE_GRAPH = {
+  memberships: [] as GraphEdge[],
+  entityRelations: [] as GraphEdge[],
+  entityIds: new Set<string>(),
+  assetIds: new Set<string>(),
+};
+
+const GRAPH_STYLES: StylesheetJson = [
+  {
+    selector: "node[kind = 'entity']",
+    style: {
+      "background-color": "#6557ef",
+      "border-color": "#fff",
+      "border-width": 4,
+      color: "#17151f",
+      label: "data(label)",
+      "font-size": 15,
+      "font-weight": 700,
+      "text-valign": "bottom",
+      "text-margin-y": 12,
+      width: 70,
+      height: 70,
+    },
+  },
+  {
+    selector: "node[kind = 'asset']",
+    style: {
+      "background-image": "data(image)",
+      "background-fit": "cover",
+      "background-color": "#e8e5df",
+      "border-color": "#fff",
+      "border-width": 3,
+      color: "#38333f",
+      label: "data(label)",
+      "font-size": 9,
+      "text-valign": "bottom",
+      "text-margin-y": 7,
+      width: 54,
+      height: 54,
+    },
+  },
+  {
+    selector: "edge",
+    style: {
+      width: 1.8,
+      "line-color": "#a59ee5",
+      "target-arrow-color": "#a59ee5",
+      "target-arrow-shape": "triangle",
+      "curve-style": "bezier",
+      opacity: 0.78,
+    },
+  },
+  {
+    selector: "edge:selected",
+    style: {
+      width: 5,
+      "line-color": "#f2643f",
+      "target-arrow-color": "#f2643f",
+      opacity: 1,
+    },
+  },
+  {
+    selector: ":selected",
+    style: { "border-color": "#f2643f", "border-width": 6 },
+  },
+];
 
 function assetImage(asset: GraphAsset, workspaceId: string) {
   return endpoint(
@@ -85,9 +162,26 @@ function visibleGraph(graph: GraphData, hiddenNodeIds: Set<string>) {
       .filter(([, count]) => count >= 2)
       .map(([entityId]) => entityId),
   );
+  const entityRelations = (graph.entity_edges ?? [])
+    .filter(
+      (edge) =>
+        !hiddenNodeIds.has(edge.source_entity_id) &&
+        !hiddenNodeIds.has(edge.target_entity_id),
+    )
+    .map((edge) => ({
+      source: edge.source_entity_id,
+      target: edge.target_entity_id,
+      relation: edge.relation,
+      description: edge.description,
+      edge_kind: "entity_entity" as const,
+    }));
+  for (const edge of entityRelations) {
+    entityIds.add(edge.source);
+    entityIds.add(edge.target);
+  }
   const memberships = candidates.filter((edge) => entityIds.has(edge.target));
   const assetIds = new Set(memberships.map((edge) => edge.source));
-  return { memberships, entityIds, assetIds };
+  return { memberships, entityRelations, entityIds, assetIds };
 }
 
 function graphElements(
@@ -95,7 +189,7 @@ function graphElements(
   workspaceId: string,
   hiddenNodeIds: Set<string>,
 ): ElementDefinition[] {
-  const { memberships, entityIds, assetIds } = visibleGraph(
+  const { memberships, entityRelations, entityIds, assetIds } = visibleGraph(
     graph,
     hiddenNodeIds,
   );
@@ -114,17 +208,156 @@ function graphElements(
         image: assetImage(asset, workspaceId),
       },
     }));
-  const edges = memberships.map((edge, index) => ({
+  const membershipElements = memberships.map((edge, index) => ({
     data: {
       id: `membership-${index}`,
       source: edge.source,
       target: edge.target,
       relation: edge.relation,
       description: edge.description,
-      reason: edge.reason,
+      edgeKind: "asset_entity",
     },
   }));
-  return [...entities, ...assets, ...edges];
+  const entityRelationElements = entityRelations.map((edge, index) => ({
+    data: {
+      id: `entity-relation-${index}`,
+      source: edge.source,
+      target: edge.target,
+      relation: edge.relation,
+      description: edge.description,
+      edgeKind: "entity_entity",
+    },
+  }));
+  return [...entities, ...assets, ...membershipElements, ...entityRelationElements];
+}
+
+function GraphMetrics({
+  assetCount,
+  entityCount,
+  membershipCount,
+}: {
+  assetCount: number;
+  entityCount: number;
+  membershipCount: number;
+}) {
+  return (
+    <section className="graph-metrics" aria-label="图谱统计">
+      <article>
+        <small>ASSETS</small>
+        <strong>{assetCount}</strong>
+        <span>当前可见</span>
+      </article>
+      <article>
+        <small>SHARED ENTITIES</small>
+        <strong>{entityCount}</strong>
+        <span>至少连接 2 个 Asset</span>
+      </article>
+      <article>
+        <small>MEMBERSHIPS</small>
+        <strong>{membershipCount}</strong>
+        <span>Asset → Entity</span>
+      </article>
+    </section>
+  );
+}
+
+function RelationInspector({
+  selection,
+  graph,
+  workspaceId,
+  visibleAssetIds,
+  onHideNode,
+  onSelectAsset,
+}: {
+  selection: Selection | null;
+  graph: GraphData | null;
+  workspaceId: string;
+  visibleAssetIds: Set<string>;
+  onHideNode: () => void;
+  onSelectAsset: (assetId: string) => void;
+}) {
+  const findAsset = (assetId: string) =>
+    graph?.assets.find((asset) => asset.asset_id === assetId);
+  const findEntity = (entityId: string) =>
+    graph?.entities.find((entity) => entity.entity_id === entityId);
+
+  return (
+    <aside className="relation-inspector">
+      <span className="eyebrow">NODE INSPECTOR</span>
+      {!selection && <p>点击节点或连线查看详情。</p>}
+      {selection?.kind === "entity" && (
+        <>
+          <small>SHARED ENTITY</small>
+          <h2>{selection.value.name}</h2>
+          <button
+            className="secondary-action relation-hide-node"
+            onClick={onHideNode}
+          >
+            隐藏节点
+          </button>
+          <p>{selection.value.semantic}</p>
+          <p>连接 {selection.value.asset_ids.length} 个 Asset。</p>
+          <div className="relation-inspector-list">
+            {selection.value.asset_ids
+              .filter((assetId) => visibleAssetIds.has(assetId))
+              .map((assetId) => (
+                <button key={assetId} onClick={() => onSelectAsset(assetId)}>
+                  <span>{findAsset(assetId)?.source_path}</span>
+                </button>
+              ))}
+          </div>
+        </>
+      )}
+      {selection?.kind === "asset" && (
+        <>
+          <small>ASSET</small>
+          <h2>{selection.value.asset_name}</h2>
+          <button
+            className="secondary-action relation-hide-node"
+            onClick={onHideNode}
+          >
+            隐藏节点
+          </button>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            className="inspector-preview"
+            src={assetImage(selection.value, workspaceId)}
+            alt={selection.value.source_path}
+          />
+          <p>{selection.value.asset_description}</p>
+          <div className="secondary-subjects">
+            {selection.value.main_entities.map((entity) => (
+              <span key={entity.subject}>{entity.subject}</span>
+            ))}
+          </div>
+        </>
+      )}
+      {selection?.kind === "edge" && (
+        <>
+          <small>AGENT RELATION</small>
+          <h2>{selection.value.relation}</h2>
+          <dl>
+            <div>
+              <dt>{selection.value.edge_kind === "entity_entity" ? "子实体" : "素材"}</dt>
+              <dd>
+                {findEntity(selection.value.source)?.name ??
+                  findAsset(selection.value.source)?.source_path ??
+                  selection.value.source}
+              </dd>
+            </div>
+            <div>
+              <dt>{selection.value.edge_kind === "entity_entity" ? "父实体" : "实体"}</dt>
+              <dd>
+                {findEntity(selection.value.target)?.name ??
+                  selection.value.target}
+              </dd>
+            </div>
+          </dl>
+          <p>{selection.value.description || "Agent 未返回关系描述。"}</p>
+        </>
+      )}
+    </aside>
+  );
 }
 
 export default function RelationGraphPage() {
@@ -217,13 +450,7 @@ export default function RelationGraphPage() {
         nodeRepulsion: () => 900_000,
         idealEdgeLength: () => 170,
       },
-      style: [
-        { selector: "node[kind = 'entity']", style: { "background-color": "#6557ef", "border-color": "#fff", "border-width": 4, color: "#17151f", label: "data(label)", "font-size": 15, "font-weight": 700, "text-valign": "bottom", "text-margin-y": 12, width: 70, height: 70 } },
-        { selector: "node[kind = 'asset']", style: { "background-image": "data(image)", "background-fit": "cover", "background-color": "#e8e5df", "border-color": "#fff", "border-width": 3, color: "#38333f", label: "data(label)", "font-size": 9, "text-valign": "bottom", "text-margin-y": 7, width: 54, height: 54 } },
-        { selector: "edge", style: { width: 1.8, "line-color": "#a59ee5", "target-arrow-color": "#a59ee5", "target-arrow-shape": "triangle", "curve-style": "bezier", opacity: 0.78 } },
-        { selector: "edge:selected", style: { width: 5, "line-color": "#f2643f", "target-arrow-color": "#f2643f", opacity: 1 } },
-        { selector: ":selected", style: { "border-color": "#f2643f", "border-width": 6 } },
-      ],
+      style: GRAPH_STYLES,
       minZoom: 0.35,
       maxZoom: 2.2,
     });
@@ -236,11 +463,20 @@ export default function RelationGraphPage() {
     });
     cy.on("tap", "edge", (event) => {
       const data = event.target.data();
-      const edge = graph.edges.find(
+      const edge = [
+        ...graph.edges.map((item) => ({ ...item, edge_kind: "asset_entity" as const })),
+        ...(graph.entity_edges ?? []).map((item) => ({
+          source: item.source_entity_id,
+          target: item.target_entity_id,
+          relation: item.relation,
+          description: item.description,
+          edge_kind: "entity_entity" as const,
+        })),
+      ].find(
         (item) =>
           item.source === data.source &&
           item.target === data.target &&
-          item.relation === data.relation,
+            item.relation === data.relation,
       );
       if (edge) setSelection({ kind: "edge", value: edge });
     });
@@ -261,7 +497,7 @@ export default function RelationGraphPage() {
 
   const visible = graph
     ? visibleGraph(graph, hiddenNodeIds)
-    : { memberships: [], entityIds: new Set<string>(), assetIds: new Set<string>() };
+    : EMPTY_VISIBLE_GRAPH;
   const memberships = visible.memberships;
   const visibleEntities = visible.entityIds.size;
   const visibleAssets = visible.assetIds.size;
@@ -314,11 +550,11 @@ export default function RelationGraphPage() {
         </button>
       }
     >
-      <section className="graph-metrics" aria-label="图谱统计">
-        <article><small>ASSETS</small><strong>{visibleAssets}</strong><span>当前可见</span></article>
-        <article><small>SHARED ENTITIES</small><strong>{visibleEntities}</strong><span>至少连接 2 个 Asset</span></article>
-        <article><small>MEMBERSHIPS</small><strong>{memberships.length}</strong><span>Asset → Entity</span></article>
-      </section>
+      <GraphMetrics
+        assetCount={visibleAssets}
+        entityCount={visibleEntities}
+        membershipCount={memberships.length}
+      />
       <section className="graph-finding-strip">
         <span>节点准入</span><strong>{visibleEntities} 个共享 Entity</strong><i /><strong>{unrelatedCount} 个无连接 Asset 已隐藏</strong><i /><strong>{hiddenNodeIds.size} 个节点手动隐藏</strong>
         <p>画布只显示参与关系的节点；点击连线可查看 Agent 生成的关系类型和描述。</p>
@@ -339,18 +575,21 @@ export default function RelationGraphPage() {
             {building && <div className="asset-empty"><strong>正在读取 Asset 并构建关系图谱…</strong></div>}
             {!building && graph && visibleEntities === 0 && <div className="asset-empty"><strong>没有可见的共享实体</strong><span>恢复隐藏节点，或切换包含更多关系的工作空间。</span></div>}
             <div ref={containerRef} className="cytoscape-canvas" />
-            <footer className="relation-legend"><span><i className="solid" />Asset → 共享 Entity</span></footer>
+            <footer className="relation-legend">
+              <span><i className="solid" />Asset → Entity</span>
+              <span><i className="solid" />Entity → 上层虚拟 Entity</span>
+            </footer>
           </div>
-          <aside className="relation-inspector">
-            <span className="eyebrow">NODE INSPECTOR</span>
-            {!selection && <p>点击节点或连线查看详情。</p>}
-            {selection?.kind === "entity" && <><small>SHARED ENTITY</small><h2>{selection.value.name}</h2><button className="secondary-action relation-hide-node" onClick={hideSelectedNode}>隐藏节点</button><p>{selection.value.semantic}</p><p>连接 {selection.value.asset_ids.length} 个 Asset。</p><div className="relation-inspector-list">{selection.value.asset_ids.filter((assetId) => visible.assetIds.has(assetId)).map((assetId) => <button key={assetId} onClick={() => cyRef.current?.getElementById(assetId).select()}><span>{graph?.assets.find((asset) => asset.asset_id === assetId)?.source_path}</span></button>)}</div></>}
-            {selection?.kind === "asset" && <><small>ASSET</small><h2>{selection.value.asset_name}</h2>
-              <button className="secondary-action relation-hide-node" onClick={hideSelectedNode}>隐藏节点</button>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img className="inspector-preview" src={assetImage(selection.value, workspaceId)} alt={selection.value.source_path} /><p>{selection.value.asset_description}</p><div className="secondary-subjects">{selection.value.main_entities.map((entity) => <span key={entity.subject}>{entity.subject}</span>)}</div></>}
-            {selection?.kind === "edge" && <><small>AGENT RELATION</small><h2>{selection.value.relation}</h2><dl><div><dt>素材</dt><dd>{graph?.assets.find((asset) => asset.asset_id === selection.value.source)?.source_path ?? selection.value.source}</dd></div><div><dt>内容主体</dt><dd>{selection.value.content_subject || "—"}</dd></div><div><dt>实体</dt><dd>{graph?.entities.find((entity) => entity.entity_id === selection.value.target)?.name ?? selection.value.target}</dd></div></dl><p>{selection.value.description || "Agent 未返回关系描述。"}</p>{selection.value.reason && <><small>判断依据</small><p>{selection.value.reason}</p></>}</>}
-          </aside>
+          <RelationInspector
+            selection={selection}
+            graph={graph}
+            workspaceId={workspaceId}
+            visibleAssetIds={visible.assetIds}
+            onHideNode={hideSelectedNode}
+            onSelectAsset={(assetId) =>
+              cyRef.current?.getElementById(assetId).select()
+            }
+          />
         </div>
       </section>
     </DemoShell>

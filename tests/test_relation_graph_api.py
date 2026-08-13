@@ -31,6 +31,14 @@ class FakeRelationGraphService:
             "assets": [],
             "entities": [],
             "edges": [],
+            "entity_edges": [
+                {
+                    "source_entity_id": "entity_a",
+                    "target_entity_id": "entity_b",
+                    "relation": "BELONGS_TO",
+                    "description": "A 属于 B。",
+                }
+            ],
         }
 
 
@@ -57,6 +65,14 @@ async def test_relation_graph_api_builds_selected_workspace() -> None:
 
     assert response.status_code == 200
     assert response.json()["workspace_id"] == "workspace_real"
+    assert response.json()["entity_edges"] == [
+        {
+            "source_entity_id": "entity_a",
+            "target_entity_id": "entity_b",
+            "relation": "BELONGS_TO",
+            "description": "A 属于 B。",
+        }
+    ]
     assert service.calls == [
         {
             "workspace_id": "workspace_real",

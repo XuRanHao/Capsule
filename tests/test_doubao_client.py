@@ -37,7 +37,6 @@ async def test_asset_entity_relations_use_parallel_batches_and_preserve_order() 
                 "establishes_relation": True,
                 "relation": "相关",
                 "description": "测试关系",
-                "reason": "测试依据",
             }
             for item in candidates
         ]

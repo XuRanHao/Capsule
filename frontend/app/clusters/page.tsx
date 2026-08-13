@@ -213,6 +213,23 @@ function isActiveRun(run: ClusterRun | undefined) {
   return Boolean(run && ACTIVE_RUN_STATUSES.has(run.status));
 }
 
+function runsForEmbeddingType(runs: ClusterRun[], embeddingType: string) {
+  return runs.filter((run) => run.embedding_type === embeddingType);
+}
+
+function selectRunId(
+  runs: ClusterRun[],
+  embeddingType: string,
+  selectedRunId: string,
+) {
+  const compatibleRuns = runsForEmbeddingType(runs, embeddingType);
+  return compatibleRuns.some(
+    (run) => run.cluster_run_id === selectedRunId,
+  )
+    ? selectedRunId
+    : compatibleRuns[0]?.cluster_run_id || "";
+}
+
 function placeMemberNodes(
   members: ClusterMember[],
   radius: number,
@@ -516,6 +533,7 @@ export default function ClustersPage() {
   const [runNotice, setRunNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const runRequestRef = useRef(0);
+  const runDimensionInitializedRef = useRef(false);
   const currentClusterRequestRef = useRef(0);
   const currentMemberRequestRef = useRef(0);
   const currentClusterWorkspaceRef = useRef<HTMLElement>(null);
@@ -545,19 +563,24 @@ export default function ClustersPage() {
       );
       if (requestId !== runRequestRef.current) return;
       setRuns(payload.items);
-      setSelectedRunId((current) => {
-        const deepLinkedRunId = deepLinkTargetRef.current.clusterRunId;
-        if (
+      const deepLinkedRun = payload.items.find(
+        (run) =>
           !deepLinkOpenedRef.current &&
-          deepLinkedRunId &&
-          payload.items.some((run) => run.cluster_run_id === deepLinkedRunId)
-        ) {
-          return deepLinkedRunId;
+          run.cluster_run_id === deepLinkTargetRef.current.clusterRunId,
+      );
+      const initialRun =
+        deepLinkedRun ??
+        (!runDimensionInitializedRef.current ? payload.items[0] : undefined);
+      const targetEmbeddingType = initialRun?.embedding_type ?? embeddingType;
+      if (initialRun) {
+        runDimensionInitializedRef.current = true;
+        if (targetEmbeddingType !== embeddingType) {
+          setEmbeddingType(targetEmbeddingType);
         }
-        return current &&
-          payload.items.some((run) => run.cluster_run_id === current)
-          ? current
-          : payload.items[0]?.cluster_run_id || "";
+      }
+      setSelectedRunId((current) => {
+        if (initialRun) return initialRun.cluster_run_id;
+        return selectRunId(payload.items, targetEmbeddingType, current);
       });
       setError(null);
     } catch (requestError) {
@@ -566,7 +589,7 @@ export default function ClustersPage() {
         requestError instanceof Error ? requestError.message : "聚类记录加载失败",
       );
     }
-  }, [workspaceId, workspaceReady]);
+  }, [embeddingType, workspaceId, workspaceReady]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void loadRuns(), 0);
@@ -674,8 +697,13 @@ export default function ClustersPage() {
     return () => window.clearTimeout(timer);
   }, [loadCurrentMembers]);
 
+  const runsForDimension = useMemo(
+    () => runsForEmbeddingType(runs, embeddingType),
+    [embeddingType, runs],
+  );
   const selectedRun =
-    runs.find((run) => run.cluster_run_id === selectedRunId) ?? runs[0];
+    runsForDimension.find((run) => run.cluster_run_id === selectedRunId) ??
+    runsForDimension[0];
 
   const activeRunForDimension = runs.find(
     (run) => run.embedding_type === embeddingType && isActiveRun(run),
@@ -1133,6 +1161,7 @@ export default function ClustersPage() {
           loading={workspacesLoading}
           onChange={(nextWorkspaceId) => {
             runRequestRef.current += 1;
+            runDimensionInitializedRef.current = false;
             currentClusterRequestRef.current += 1;
             currentMemberRequestRef.current += 1;
             setRuns([]);
@@ -1172,12 +1201,9 @@ export default function ClustersPage() {
               value={embeddingType}
               onChange={(event) => {
                 const nextEmbeddingType = event.target.value;
+                runDimensionInitializedRef.current = true;
                 setEmbeddingType(nextEmbeddingType);
-                setSelectedRunId(
-                  runs.find(
-                    (run) => run.embedding_type === nextEmbeddingType,
-                  )?.cluster_run_id || "",
-                );
+                setSelectedRunId(selectRunId(runs, nextEmbeddingType, ""));
                 setRunNotice(null);
               }}
             >
@@ -1194,8 +1220,8 @@ export default function ClustersPage() {
               value={selectedRunId}
               onChange={(event) => setSelectedRunId(event.target.value)}
             >
-              {!runs.length && <option value="">尚无 Run</option>}
-              {runs.map((run) => (
+              {!runsForDimension.length && <option value="">尚无 Run</option>}
+              {runsForDimension.map((run) => (
                 <option value={run.cluster_run_id} key={run.cluster_run_id}>
                   {runOptionLabel(run)}
                 </option>

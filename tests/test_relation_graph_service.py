@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -7,8 +8,8 @@ from capsule.enums import ClusterRunStatus, EmbeddingType
 from capsule.pipeline.cluster_service import EmbeddingTypeClusterResult
 from capsule.pipeline.relation_graph_service import RelationGraphService
 from capsule.relation_graph import (
-    AssetEntityRelationDecision,
     AssetEntityRelationResolution,
+    EntityStructureOperationResolution,
     MergedEntityResolution,
     MetadataContentResolution,
 )
@@ -38,20 +39,6 @@ def _understanding(subject: str, description: str) -> AssetUnderstanding:
             },
         }
     )
-
-
-def test_relation_reason_is_capped_for_persistence_and_display() -> None:
-    decision = AssetEntityRelationDecision(
-        source_id="asset_a",
-        target_id="entity_a",
-        establishes_relation=False,
-        relation="",
-        description="",
-        reason="依据" * 50,
-    )
-
-    assert len(decision.reason) == 60
-    assert decision.reason.endswith("…")
 
 
 def _asset(asset_id: str, path: str, understanding: AssetUnderstanding) -> EmbeddingAsset:
@@ -176,7 +163,6 @@ class FakeRelationModel:
                         "establishes_relation": True,
                         "relation": "SET_IN",
                         "description": "该素材的画面位于飞船内部。",
-                        "reason": "内容主体与实体语义一致。",
                     }
                     for item in candidates
                 ]
@@ -220,6 +206,65 @@ class FakeRelationVectorStore:
                 similarity=0.91,
             )
         ]
+
+
+class SeparatingStructureModel(FakeRelationModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.structure_calls: list[tuple[dict[str, Any], list[dict[str, Any]], str]] = []
+
+    async def generate_entity_structure_operations(
+        self,
+        *,
+        current_graph: dict[str, Any],
+        incoming_entities: list[dict[str, Any]],
+        workspace_tree: str,
+    ) -> EntityStructureOperationResolution:
+        self.structure_calls.append((current_graph, incoming_entities, workspace_tree))
+        return EntityStructureOperationResolution.model_validate(
+            {
+                "operations": [
+                    {
+                        "type": "separate",
+                        "entity_ids": [item["entity_id"] for item in incoming_entities],
+                    }
+                ]
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_entity_structure_uses_fifteen_item_incremental_batches() -> None:
+    model = SeparatingStructureModel()
+    service = RelationGraphService(
+        embedding_repository=object(),  # type: ignore[arg-type]
+        understanding_service=object(),  # type: ignore[arg-type]
+        model_client=model,  # type: ignore[arg-type]
+    )
+    graph: dict[str, Any] = {
+        "entities": [
+            {
+                "entity_id": f"entity_{index}",
+                "name": f"实体{index}",
+                "semantic": f"实体{index}的语义",
+            }
+            for index in range(31)
+        ],
+        "edges": [],
+        "entity_edges": [],
+    }
+
+    result = await service._structure_entities(graph=graph, assets=[])
+
+    assert [len(call[1]) for call in model.structure_calls] == [15, 15, 1]
+    assert [len(call[0]["nodes"]) for call in model.structure_calls] == [0, 15, 30]
+    assert all(call[2].startswith("./ [0 Assets]") for call in model.structure_calls)
+    assert result == {
+        "status": "completed",
+        "batch_size": 15,
+        "call_count": 3,
+        "virtual_round_count": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -291,6 +336,9 @@ async def test_service_generates_subject_clusters_when_none_exist() -> None:
     assert any(candidate["origin"] == "subject_cluster" for candidate in graph["entity_candidates"])
     assert {candidate["origin"] for candidate in graph["entity_candidates"]} == {"subject_cluster"}
     assert model.embed_calls == 0
+    assert model.edge_candidates == []
+    assert {edge["relation"] for edge in graph["edges"]} == {"CLUSTER_MEMBER"}
+    assert {edge["description"] for edge in graph["edges"]} == {"内容高度相似"}
 
 
 @pytest.mark.asyncio
@@ -319,6 +367,7 @@ async def test_service_recalls_assets_outside_original_subject_cluster() -> None
     graph = await service.build(workspace_id="workspace_real")
 
     assert graph["recalled_edge_candidate_count"] == 1
+    assert len(model.edge_candidates) == 1
     recalled = next(
         candidate for candidate in model.edge_candidates if candidate["source_id"] == "asset_c"
     )
@@ -328,3 +377,6 @@ async def test_service_recalls_assets_outside_original_subject_cluster() -> None
     assert graph["entity_count"] == 1
     assert graph["entities"][0]["asset_ids"] == ["asset_a", "asset_b", "asset_c"]
     assert graph["entities"][0]["embedding_model"] == "stored-embedding"
+    cluster_edges = [edge for edge in graph["edges"] if edge["source"] in {"asset_a", "asset_b"}]
+    assert {edge["relation"] for edge in cluster_edges} == {"CLUSTER_MEMBER"}
+    assert {edge["description"] for edge in cluster_edges} == {"内容高度相似"}

@@ -12,13 +12,17 @@ from typing import Any, Protocol
 from capsule.db.repositories import EmbeddingAsset, EmbeddingRepository
 from capsule.enums import ClusterMode, EmbeddingType
 from capsule.pipeline.understanding import AssetUnderstandingService
+from capsule.pipeline.workspace_tree import render_imported_workspace_tree
 from capsule.relation_graph import (
+    AssetEntityRelationDecision,
     AssetEntityRelationResolution,
+    EntityStructureOperationResolution,
     MergedEntityResolution,
     MetadataContentResolution,
     _entity_key,
     _metadata_names,
     apply_asset_entity_relations,
+    apply_entity_structure_operations,
     build_merged_candidate_graph,
     build_relation_graph,
 )
@@ -43,6 +47,14 @@ class RelationResolutionClient(Protocol):
         self,
         candidates: Sequence[Mapping[str, Any]],
     ) -> MergedEntityResolution: ...
+
+    async def generate_entity_structure_operations(
+        self,
+        *,
+        current_graph: Mapping[str, Any],
+        incoming_entities: Sequence[Mapping[str, Any]],
+        workspace_tree: str,
+    ) -> EntityStructureOperationResolution: ...
 
     async def embed_text(self, text: str) -> EmbeddingResult: ...
 
@@ -303,10 +315,7 @@ class RelationGraphService:
             workspace_id=workspace_id,
             candidates=entity_candidates,
         )
-        merged_entities = await self._merge_similar_entity_candidates(
-            entity_candidates,
-            candidate_vectors,
-        )
+        merged_entities = _direct_entity_resolution(entity_candidates)
         graph = build_merged_candidate_graph(
             usable_assets,
             understandings,
@@ -326,6 +335,8 @@ class RelationGraphService:
         if edge_candidates:
             edge_resolution = await self._generate_edge_relations(edge_candidates)
             apply_asset_entity_relations(graph, edge_resolution)
+        _refresh_asset_entity_memberships(graph)
+        structure_stats = await self._structure_entities(graph=graph, assets=assets)
         _refresh_asset_entity_memberships(graph)
         graph.update(
             {
@@ -348,6 +359,7 @@ class RelationGraphService:
                     for candidate in entity_candidates
                 ],
                 "merged_entity_decisions": merged_entities.model_dump(mode="json"),
+                "entity_structure": structure_stats,
                 "entity_merge_similarity_threshold": (self._entity_merge_similarity_threshold),
                 "asset_recall_similarity_threshold": (self._asset_recall_similarity_threshold),
                 "recalled_edge_candidate_count": recalled_edge_count,
@@ -420,15 +432,48 @@ class RelationGraphService:
             if entity["entity_id"] in previously_related
             or affected_candidate_ids.intersection(entity.get("candidate_ids", []))
         ]
-        candidates = _direct_asset_entity_candidates(
-            usable_assets,
-            understandings,
-            affected_entities,
-        )
-        resolution = (
+        auto_relations: list[AssetEntityRelationDecision] = []
+        auto_pairs: set[tuple[str, str]] = set()
+        member_ids_by_candidate = {
+            f"subject_cluster:{cluster.cluster_id}": {member.asset_id for member in members}
+            for cluster, members in zip(subject_clusters, member_groups, strict=True)
+            if cluster.cluster_id in set(affected_cluster_ids)
+        }
+        for entity in affected_entities:
+            entity_id = str(entity["entity_id"])
+            for candidate_id in entity.get("candidate_ids", []):
+                member_ids = member_ids_by_candidate.get(str(candidate_id), set())
+                for asset in usable_assets:
+                    pair = (asset.asset_id, entity_id)
+                    if asset.asset_id not in member_ids or pair in auto_pairs:
+                        continue
+                    auto_pairs.add(pair)
+                    auto_relations.append(
+                        AssetEntityRelationDecision(
+                            source_id=asset.asset_id,
+                            target_id=entity_id,
+                            establishes_relation=True,
+                            relation="CLUSTER_MEMBER",
+                            description="内容高度相似",
+                        )
+                    )
+
+        candidates = [
+            candidate
+            for candidate in _direct_asset_entity_candidates(
+                usable_assets,
+                understandings,
+                affected_entities,
+            )
+            if (str(candidate["source_id"]), str(candidate["target_id"])) not in auto_pairs
+        ]
+        agent_resolution = (
             await self._generate_edge_relations(candidates)
             if candidates
             else AssetEntityRelationResolution()
+        )
+        resolution = AssetEntityRelationResolution(
+            relations=[*auto_relations, *agent_resolution.relations]
         )
         input_revision = _input_revision(
             assets,
@@ -647,6 +692,71 @@ class RelationGraphService:
         candidates: list[dict[str, Any]],
     ) -> AssetEntityRelationResolution:
         return await self._model_client.generate_asset_entity_relations(candidates)
+
+    async def _structure_entities(
+        self,
+        *,
+        graph: dict[str, Any],
+        assets: Sequence[EmbeddingAsset],
+    ) -> dict[str, Any]:
+        """Build Entity hierarchy in Agent batches while the backend owns full state."""
+
+        graph.setdefault("entity_edges", [])
+        generate = getattr(
+            self._model_client,
+            "generate_entity_structure_operations",
+            None,
+        )
+        initial_ids = [str(entity["entity_id"]) for entity in graph["entities"]]
+        if not initial_ids or not callable(generate):
+            graph["entity_edge_count"] = len(graph["entity_edges"])
+            graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
+            return {"status": "unavailable" if initial_ids else "empty", "round_count": 0}
+
+        workspace_tree = render_imported_workspace_tree(assets)
+        accepted_ids: set[str] = set()
+        call_count = 0
+        new_virtual_ids: list[str] = []
+        for batch in _batches(initial_ids, 15):
+            resolution = await generate(
+                current_graph=_entity_structure_snapshot(graph, accepted_ids),
+                incoming_entities=_entity_structure_nodes(graph, batch),
+                workspace_tree=workspace_tree,
+            )
+            new_virtual_ids.extend(apply_entity_structure_operations(graph, resolution))
+            accepted_ids.update(batch)
+            accepted_ids.intersection_update(
+                str(entity["entity_id"]) for entity in graph["entities"]
+            )
+            accepted_ids.update(new_virtual_ids)
+            call_count += 1
+
+        pending_virtual_ids = list(dict.fromkeys(new_virtual_ids))
+        virtual_round_count = 0
+        while pending_virtual_ids and virtual_round_count < 4:
+            next_virtual_ids: list[str] = []
+            for batch in _batches(pending_virtual_ids, 15):
+                resolution = await generate(
+                    current_graph=_entity_structure_snapshot(
+                        graph,
+                        {str(entity["entity_id"]) for entity in graph["entities"]},
+                    ),
+                    incoming_entities=_entity_structure_nodes(graph, batch),
+                    workspace_tree=workspace_tree,
+                )
+                next_virtual_ids.extend(
+                    apply_entity_structure_operations(graph, resolution)
+                )
+                call_count += 1
+            pending_virtual_ids = list(dict.fromkeys(next_virtual_ids))
+            virtual_round_count += 1
+
+        return {
+            "status": "completed",
+            "batch_size": 15,
+            "call_count": call_count,
+            "virtual_round_count": virtual_round_count,
+        }
 
     async def _embed_entity_candidates(
         self,
@@ -884,12 +994,11 @@ class RelationGraphService:
         source_policy = (
             "metadata_and_subject_clusters_v2"
             if self._metadata_candidates_enabled
-            else "subject_clusters_only_v2"
+            else "subject_clusters_only_v3"
         )
-        merge_policy = "similarity_gated_merge_v1" if self._merge_candidates_enabled else "unmerged"
+        merge_policy = "agent_structure_v1"
         return (
             f"{source_policy}:{merge_policy}:"
-            f"{self._entity_merge_similarity_threshold:.4f}:"
             f"asset_recall_v1:{self._asset_recall_similarity_threshold:.4f}:"
             f"top{self._asset_recall_top_k}:pathboost{self._asset_recall_path_boost:.4f}"
         )
@@ -914,6 +1023,46 @@ def _direct_entity_resolution(
             ]
         }
     )
+
+
+def _batches(values: Sequence[str], size: int) -> list[list[str]]:
+    return [list(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _entity_structure_nodes(
+    graph: Mapping[str, Any],
+    entity_ids: Sequence[str],
+) -> list[dict[str, str]]:
+    wanted = set(entity_ids)
+    return [
+        {
+            "entity_id": str(entity["entity_id"]),
+            "name": str(entity["name"]),
+            "semantic": str(entity["semantic"]),
+        }
+        for entity in graph["entities"]
+        if str(entity["entity_id"]) in wanted
+    ]
+
+
+def _entity_structure_snapshot(
+    graph: Mapping[str, Any],
+    included_ids: set[str],
+) -> dict[str, list[dict[str, str]]]:
+    nodes = _entity_structure_nodes(graph, list(included_ids))
+    node_ids = {node["entity_id"] for node in nodes}
+    edges = [
+        {
+            "source_entity_id": str(edge["source_entity_id"]),
+            "target_entity_id": str(edge["target_entity_id"]),
+            "relation": str(edge["relation"]),
+            "description": str(edge["description"]),
+        }
+        for edge in graph.get("entity_edges", [])
+        if str(edge["source_entity_id"]) in node_ids
+        and str(edge["target_entity_id"]) in node_ids
+    ]
+    return {"nodes": nodes, "edges": edges}
 
 
 def _normalize_vector(vector: Sequence[float]) -> list[float] | None:
@@ -1094,6 +1243,8 @@ def _asset_entity_candidates(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
     entities_by_id = {item["entity_id"]: item for item in graph["entities"]}
     candidates: list[dict[str, Any]] = []
     for edge in graph["edges"]:
+        if edge.get("relation") == "CLUSTER_MEMBER":
+            continue
         source = assets_by_id.get(edge["source"])
         target = entities_by_id.get(edge["target"])
         if source is None or target is None:
@@ -1194,6 +1345,7 @@ def _hydrate_persisted_graph(
     usable_ids = {asset.asset_id for asset in usable_assets}
     graph["entities"] = list(persisted["entities"])
     graph["edges"] = [edge for edge in persisted["edges"] if edge["source"] in usable_ids]
+    graph["entity_edges"] = list(persisted.get("entity_edges", []))
     graph["rejected_relations"] = [
         relation
         for relation in persisted["rejected_relations"]
@@ -1202,13 +1354,26 @@ def _hydrate_persisted_graph(
     member_ids_by_entity: dict[str, list[str]] = defaultdict(list)
     for edge in graph["edges"]:
         member_ids_by_entity[edge["target"]].append(edge["source"])
+    retained_entity_ids = {
+        entity_id
+        for entity_id, member_ids in member_ids_by_entity.items()
+        if len(member_ids) >= 2
+    }
+    retained_entity_ids.update(
+        str(edge[key])
+        for edge in graph["entity_edges"]
+        for key in ("source_entity_id", "target_entity_id")
+    )
     graph["entities"] = [
-        entity
-        for entity in graph["entities"]
-        if len(member_ids_by_entity[entity["entity_id"]]) >= 2
+        entity for entity in graph["entities"] if entity["entity_id"] in retained_entity_ids
     ]
-    retained_entity_ids = {entity["entity_id"] for entity in graph["entities"]}
     graph["edges"] = [edge for edge in graph["edges"] if edge["target"] in retained_entity_ids]
+    graph["entity_edges"] = [
+        edge
+        for edge in graph["entity_edges"]
+        if edge["source_entity_id"] in retained_entity_ids
+        and edge["target_entity_id"] in retained_entity_ids
+    ]
     for entity in graph["entities"]:
         entity["asset_ids"] = member_ids_by_entity[entity["entity_id"]]
     _refresh_asset_entity_memberships(graph)
@@ -1228,7 +1393,8 @@ def _hydrate_persisted_graph(
         }
     )
     graph["entity_count"] = len(graph["entities"])
-    graph["edge_count"] = len(graph["edges"])
+    graph["entity_edge_count"] = len(graph["entity_edges"])
+    graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
     return graph
 
 
@@ -1241,8 +1407,10 @@ def _empty_graph(workspace_id: str) -> dict[str, Any]:
         "metadata_content_relations": {},
         "asset_count": 0,
         "entity_count": 0,
+        "entity_edge_count": 0,
         "edge_count": 0,
         "assets": [],
         "entities": [],
         "edges": [],
+        "entity_edges": [],
     }

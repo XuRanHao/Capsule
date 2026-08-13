@@ -72,9 +72,7 @@ def test_graph_merges_metadata_and_content_entities_then_links_assets() -> None:
 
     assert graph["asset_count"] == 3
     assert graph["entity_count"] == 1
-    same_entity_edges = [
-        edge for edge in graph["edges"] if edge["relation"] == "SAME_ENTITY"
-    ]
+    same_entity_edges = [edge for edge in graph["edges"] if edge["relation"] == "SAME_ENTITY"]
     assert same_entity_edges == [
         {
             "source": "asset_a",
@@ -97,7 +95,6 @@ def test_graph_merges_metadata_and_content_entities_then_links_assets() -> None:
                         "establishes_relation": True,
                         "relation": "DEPICTS",
                         "description": "画面描绘封不觉。",
-                        "reason": "主体特征与实体语义一致。",
                     },
                     {
                         "source_id": "asset_b",
@@ -105,8 +102,7 @@ def test_graph_merges_metadata_and_content_entities_then_links_assets() -> None:
                         "establishes_relation": True,
                         "relation": "DEPICTS",
                         "description": "近景描绘封不觉。",
-                        "reason": "主体特征与实体语义一致。",
-                    }
+                    },
                 ]
             }
         ),
@@ -135,9 +131,7 @@ def test_graph_keeps_single_asset_subjects_out_of_virtual_nodes() -> None:
         "飞船内部",
     ]
     assert graph["assets"][0]["primary_subject"]["subject"] == "中央雕塑"
-    shared = [
-        edge for edge in graph["edges"] if edge["relation"] == "SHARES_METADATA_ENTITY"
-    ]
+    shared = [edge for edge in graph["edges"] if edge["relation"] == "SHARES_METADATA_ENTITY"]
     assert len(shared) == 1
     assert shared[0]["description"] == "两项素材共同关联实体飞船内部"
     assert not [edge for edge in graph["edges"] if edge["relation"] == "CONTAINS"]
@@ -195,7 +189,6 @@ def test_agent_rejection_removes_edge_and_asset_pair_cliques() -> None:
                         "establishes_relation": True,
                         "relation": "位于",
                         "description": "大厅位于飞船内部",
-                        "reason": "内容和路径信息一致。",
                     },
                     {
                         "source_id": "asset_b",
@@ -203,7 +196,6 @@ def test_agent_rejection_removes_edge_and_asset_pair_cliques() -> None:
                         "establishes_relation": True,
                         "relation": "位于",
                         "description": "雕塑位于飞船内部",
-                        "reason": "内容和路径信息一致。",
                     },
                     {
                         "source_id": "asset_c",
@@ -211,7 +203,6 @@ def test_agent_rejection_removes_edge_and_asset_pair_cliques() -> None:
                         "establishes_relation": False,
                         "relation": "不相关",
                         "description": "神社与飞船内部无关",
-                        "reason": "画面内容与目标实体语义冲突。",
                     },
                 ]
             }
@@ -220,4 +211,50 @@ def test_agent_rejection_removes_edge_and_asset_pair_cliques() -> None:
 
     assert {edge["source"] for edge in graph["edges"]} == {"asset_a", "asset_b"}
     assert graph["edge_count"] == 2
-    assert graph["rejected_relations"][0]["reason"] == "画面内容与目标实体语义冲突。"
+    assert graph["rejected_relations"][0]["description"] == "神社与飞船内部无关"
+
+
+def test_asset_entity_candidate_pairs_are_deduplicated_before_persistence() -> None:
+    graph = {
+        "assets": [],
+        "entities": [
+            {
+                "entity_id": "entity_a",
+                "name": "实体A",
+                "semantic": "实体A",
+                "asset_ids": [],
+            }
+        ],
+        "edges": [
+            {"source": "asset_a", "target": "entity_a", "relation": "CANDIDATE"},
+            {"source": "asset_a", "target": "entity_a", "relation": "CANDIDATE"},
+        ],
+    }
+
+    apply_asset_entity_relations(
+        graph,
+        AssetEntityRelationResolution.model_validate(
+            {
+                "relations": [
+                    {
+                        "source_id": "asset_a",
+                        "target_id": "entity_a",
+                        "establishes_relation": False,
+                        "relation": "",
+                        "description": "语义不匹配",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert graph["edges"] == []
+    assert graph["rejected_relations"] == [
+        {
+            "source_id": "asset_a",
+            "target_id": "entity_a",
+            "establishes_relation": False,
+            "relation": "",
+            "description": "语义不匹配",
+        }
+    ]

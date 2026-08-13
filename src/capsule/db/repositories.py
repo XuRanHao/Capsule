@@ -23,6 +23,7 @@ from capsule.db.models import (
     CurrentCluster,
     CurrentClusterMember,
     EmbeddingRecord,
+    EntityEntityRelation,
     ModelCallLog,
     ProcessingJob,
     QueryImageUpload,
@@ -112,6 +113,13 @@ class RelationGraphRepository:
                     .order_by(AssetEntityRelation.relation_id)
                 )
             )
+            entity_relations = list(
+                await session.scalars(
+                    select(EntityEntityRelation)
+                    .where(EntityEntityRelation.workspace_id == workspace_id)
+                    .order_by(EntityEntityRelation.relation_id)
+                )
+            )
             asset_states = list(
                 await session.scalars(
                     select(RelationAssetState).where(
@@ -144,11 +152,19 @@ class RelationGraphRepository:
                         "target": relation.entity_id,
                         "relation": relation.relation,
                         "description": relation.description,
-                        "reason": relation.reason,
                         "content_subject": relation.content_subject,
                     }
                     for relation in relations
                     if relation.establishes_relation
+                ],
+                "entity_edges": [
+                    {
+                        "source_entity_id": relation.source_entity_id,
+                        "target_entity_id": relation.target_entity_id,
+                        "relation": relation.relation,
+                        "description": relation.description,
+                    }
+                    for relation in entity_relations
                 ],
                 "rejected_relations": [
                     {
@@ -157,7 +173,6 @@ class RelationGraphRepository:
                         "establishes_relation": False,
                         "relation": relation.relation,
                         "description": relation.description,
-                        "reason": relation.reason,
                     }
                     for relation in relations
                     if not relation.establishes_relation
@@ -224,7 +239,7 @@ class RelationGraphRepository:
                         establishes_relation=decision.establishes_relation,
                         relation=decision.relation,
                         description=decision.description,
-                        reason=decision.reason,
+                        reason="",
                         content_subject="",
                         build_version=build_version,
                     )
@@ -328,7 +343,12 @@ class RelationGraphRepository:
                         )
                     )
             await session.flush()
+            persisted_asset_entity_pairs: set[tuple[str, str]] = set()
             for edge in graph["edges"]:
+                pair = (str(edge["source"]), str(edge["target"]))
+                if pair in persisted_asset_entity_pairs:
+                    continue
+                persisted_asset_entity_pairs.add(pair)
                 session.add(
                     AssetEntityRelation(
                         workspace_id=workspace_id,
@@ -339,6 +359,17 @@ class RelationGraphRepository:
                         description=edge.get("description", ""),
                         reason=edge.get("reason", ""),
                         content_subject=edge.get("content_subject", ""),
+                        build_version=build_version,
+                    )
+                )
+            for edge in graph.get("entity_edges", []):
+                session.add(
+                    EntityEntityRelation(
+                        workspace_id=workspace_id,
+                        source_entity_id=edge["source_entity_id"],
+                        target_entity_id=edge["target_entity_id"],
+                        relation=edge["relation"],
+                        description=edge.get("description", ""),
                         build_version=build_version,
                     )
                 )
@@ -353,8 +384,13 @@ class RelationGraphRepository:
                 )
             entity_ids = {entity["entity_id"] for entity in graph["entities"]}
             for rejected in graph.get("rejected_relations", []):
-                if rejected["target_id"] not in entity_ids:
+                pair = (str(rejected["source_id"]), str(rejected["target_id"]))
+                if (
+                    rejected["target_id"] not in entity_ids
+                    or pair in persisted_asset_entity_pairs
+                ):
                     continue
+                persisted_asset_entity_pairs.add(pair)
                 session.add(
                     AssetEntityRelation(
                         workspace_id=workspace_id,
