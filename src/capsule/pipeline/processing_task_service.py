@@ -257,7 +257,7 @@ class BrowserProcessingTaskSubmissionService:
                 )
             if prepared.task_id is None:  # pragma: no cover - database invariant
                 raise RuntimeError("queued browser submission did not create a task id")
-            if task_kind is ProcessingTaskKind.VIDEO:
+            if task_kind in {ProcessingTaskKind.VIDEO, ProcessingTaskKind.AUDIO}:
                 from capsule.db.video_tasks import PostgresVideoTaskRepository
                 from capsule.pipeline.video_task_service import _new_queue
 
@@ -265,7 +265,12 @@ class BrowserProcessingTaskSubmissionService:
                     self._settings,
                     consumer=f"browser-submit-{_worker_identity()}",
                 )
-                task_repository = PostgresVideoTaskRepository(database.session_factory)
+                task_repository = PostgresVideoTaskRepository(
+                    database.session_factory,
+                    task_kind=task_kind,
+                    resource_class=ResourceClass.MPS_VIDEO,
+                    route_key="mps_video",
+                )
             else:
                 queue = _new_cpu_queue(
                     self._settings,
@@ -366,7 +371,7 @@ class BrowserProcessingTaskSubmissionService:
                     task_kind = ProcessingTaskKind(task.task_kind)
                     if task_kind not in queues:
                         owned_kinds.add(task_kind)
-                        if task_kind is ProcessingTaskKind.VIDEO:
+                        if task_kind in {ProcessingTaskKind.VIDEO, ProcessingTaskKind.AUDIO}:
                             from capsule.db.video_tasks import PostgresVideoTaskRepository
                             from capsule.pipeline.video_task_service import _new_queue
 
@@ -375,7 +380,10 @@ class BrowserProcessingTaskSubmissionService:
                                 consumer=f"browser-submit-{_worker_identity()}",
                             )
                             repositories[task_kind] = PostgresVideoTaskRepository(
-                                database.session_factory
+                                database.session_factory,
+                                task_kind=task_kind,
+                                resource_class=ResourceClass.MPS_VIDEO,
+                                route_key="mps_video",
                             )
                         else:
                             queues[task_kind] = _new_cpu_queue(

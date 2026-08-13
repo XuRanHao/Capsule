@@ -12,7 +12,16 @@ from capsule.model_clients.doubao import (
     DoubaoClient,
     DoubaoResponseError,
     _extract_embedding,
+    _responses_content,
 )
+
+
+def test_responses_content_converts_direct_audio_input() -> None:
+    assert _responses_content(
+        [{"type": "audio_url", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}]
+    ) == [
+        {"type": "input_audio", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}
+    ]
 
 
 @pytest.mark.asyncio
@@ -482,6 +491,7 @@ async def test_understand_asset_constrains_object_schema_and_repairs_invalid_sha
         "asset_name",
         "asset_description",
         "features",
+        "transcript",
     ]
     feature_item_schema = response_format["schema"]["$defs"]["FeatureItem"]
     assert "description" in feature_item_schema["properties"]

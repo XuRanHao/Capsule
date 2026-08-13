@@ -22,11 +22,11 @@ from typing import IO, Protocol, cast
 
 import cv2
 import numpy as np
-from scipy.sparse import diags  # type: ignore[import-untyped]
-from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
 from capsule.enums import AssetType
+from capsule.parsers.temporal_clustering import TemporalRegion, cluster_contiguous_windows
 from capsule.schemas import AssetDraft, DiscoveredFile
 from capsule.video_output import VideoOutputMode
 
@@ -191,23 +191,7 @@ class _VideoAnalysis:
     activity_envelope: np.ndarray
 
 
-@dataclass(frozen=True, slots=True)
-class _Region:
-    atom_indices: tuple[int, ...]
-    sample_indices: tuple[int, ...]
-    start_ms: int
-    end_ms: int
-
-    @property
-    def duration_seconds(self) -> float:
-        return (self.end_ms - self.start_ms) / 1000
-
-    def centroid(self, embeddings: np.ndarray) -> np.ndarray:
-        value = embeddings[list(self.sample_indices)].mean(axis=0)
-        return cast(
-            np.ndarray,
-            value / max(float(np.linalg.norm(value)), np.finfo(np.float32).eps),
-        )
+_Region = TemporalRegion
 
 
 class VideoParser:
@@ -616,48 +600,15 @@ def _content_atoms(
     metadata: VideoMetadata,
     config: VideoSegmentationConfig,
 ) -> tuple[list[_Region], float]:
-    embeddings = analysis.embeddings
-    if len(embeddings) == 1:
-        return [_Region((0,), (0,), 0, metadata.duration_ms)], config.min_distance_threshold
-    distances = 1.0 - np.sum(embeddings[:-1] * embeddings[1:], axis=1)
-    threshold = float(np.clip(
-        np.quantile(distances, config.distance_quantile),
-        config.min_distance_threshold,
-        config.max_distance_threshold,
-    ))
-    size = len(embeddings)
-    connectivity = diags([np.ones(size - 1), np.ones(size - 1)], [-1, 1], shape=(size, size))
-    labels = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=threshold,
-        metric="cosine",
-        linkage="average",
-        connectivity=connectivity,
-        compute_full_tree=True,
-    ).fit_predict(embeddings)
-    minimum_samples = max(1, round(config.min_segment_seconds / config.sample_interval_seconds))
-    labels = _merge_short_runs(labels, embeddings, minimum_samples)
-    starts, ends = _runs(labels)
-    boundaries = [0]
-    for start in starts[1:]:
-        left = analysis.candidates[int(start) - 1].timestamp_ms
-        right = analysis.candidates[int(start)].timestamp_ms
-        boundaries.append(round((left + right) / 2))
-    boundaries.append(metadata.duration_ms)
-    atoms = [
-        _Region(
-            atom_indices=(index,),
-            sample_indices=tuple(range(int(start), int(end))),
-            start_ms=boundaries[index],
-            end_ms=boundaries[index + 1],
-        )
-        for index, (start, end) in enumerate(zip(starts, ends, strict=True))
-    ]
-    atoms = _merge_short_regions(atoms, embeddings, config.min_segment_seconds)
-    return [
-        _Region((index,), atom.sample_indices, atom.start_ms, atom.end_ms)
-        for index, atom in enumerate(atoms)
-    ], threshold
+    return cluster_contiguous_windows(
+        analysis.embeddings,
+        sample_timestamps_ms=[item.timestamp_ms for item in analysis.candidates],
+        duration_ms=metadata.duration_ms,
+        minimum_segment_seconds=config.min_segment_seconds,
+        distance_quantile=config.distance_quantile,
+        minimum_distance_threshold=config.min_distance_threshold,
+        maximum_distance_threshold=config.max_distance_threshold,
+    )
 
 
 def _merge_atoms(

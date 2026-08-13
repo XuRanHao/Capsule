@@ -667,6 +667,10 @@ class AssetUnderstanding(BaseModel):
     asset_name: str = Field(description="不超过 20 字的素材名称")
     asset_description: str = Field(description="40 到 120 字的素材整体客观描述")
     features: AssetFeatures = Field(description="三个独立语义维度的结构化描述")
+    transcript: str | None = Field(
+        default=None,
+        description="仅音频素材填写的逐字转写；其他素材返回 null",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -680,6 +684,9 @@ class AssetUnderstanding(BaseModel):
         asset_description = normalized.get("asset_description")
         if isinstance(asset_description, str):
             normalized["asset_description"] = asset_description.strip()[:500]
+        transcript = normalized.get("transcript")
+        if isinstance(transcript, str):
+            normalized["transcript"] = transcript.strip()[:100_000]
         return normalized
 
 

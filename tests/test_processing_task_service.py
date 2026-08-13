@@ -256,7 +256,7 @@ async def test_browser_batch_uses_one_parent_job_and_three_trusted_routes(
         "cpu_text",
         "mps_video",
     ]
-    assert [len(queues[kind].messages) for kind in ProcessingTaskKind] == [1, 1, 1]
+    assert [len(queues[kind].messages) for kind in ProcessingTaskKind] == [1, 1, 1, 0]
     image_input = repository.items[0]
     assert image_input.source_contexts
     assert queues[ProcessingTaskKind.IMAGE].messages[0].source_uri == image.resolve().as_uri()

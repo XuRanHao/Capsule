@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from capsule.config import Settings
@@ -206,6 +207,54 @@ async def test_logical_video_understanding_extracts_frames_without_persistent_fi
     request = extractor.requests[0]
     assert request.source_uri == "file:///library/original.mp4"
     assert request.timestamps_ms == (12_000, 16_000)
+
+
+@pytest.mark.asyncio
+async def test_audio_understanding_sends_only_the_logical_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = EmbeddingAsset(
+        asset_id="asset_audio",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="source_audio",
+        asset_type=AssetType.AUDIO_SEGMENT.value,
+        file_type=".wav",
+        content_hash="f" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 8, 13, tzinfo=UTC),
+        raw_content=None,
+        asset_description=None,
+        asset_features={},
+        derived_file_uri=None,
+        source_storage_uri="file:///library/original.wav",
+        source_mime_type="audio/wav",
+        source_locator={"start_ms": 3000, "end_ms": 9000},
+    )
+    monkeypatch.setattr(
+        "capsule.pipeline.understanding._audio_segment_data_uri",
+        lambda supplied: (
+            "data:audio/wav;base64,ZmFrZQ=="
+            if supplied.asset_id == "asset_audio"
+            else ""
+        ),
+    )
+    service = AssetUnderstandingService(
+        settings=Settings(),
+        embedding_repository=None,  # type: ignore[arg-type]
+        asset_repository=None,  # type: ignore[arg-type]
+        model_client=None,  # type: ignore[arg-type]
+    )
+
+    messages = await service._messages(asset)
+    audio_items = [
+        item for item in messages[1]["content"] if item["type"] == "audio_url"
+    ]
+
+    assert audio_items == [
+        {"type": "audio_url", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}
+    ]
+    assert "transcript 填写完整转写" in messages[1]["content"][-1]["text"]
 
 
 async def test_document_image_understanding_uses_materialised_image(tmp_path: Path) -> None:

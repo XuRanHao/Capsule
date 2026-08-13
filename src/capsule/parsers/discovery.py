@@ -16,6 +16,12 @@ SUPPORTED_EXTENSIONS = frozenset(
         ".webp",
         ".mp4",
         ".mov",
+        ".mp3",
+        ".m4a",
+        ".wav",
+        ".aac",
+        ".flac",
+        ".ogg",
     }
 )
 

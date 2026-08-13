@@ -14,7 +14,7 @@ import { endpoint } from "./lib/api";
 import { useWorkspaceSelection, WorkspaceSelect } from "./lib/workspaces";
 
 type QueryType = "text" | "image" | "image_text";
-type AssetType = "image" | "video_segment" | "markdown_block" | "text_block";
+type AssetType = "image" | "video_segment" | "audio_segment" | "markdown_block" | "text_block";
 type FusionMethod = "weighted_rrf" | "normalized_weighted_similarity";
 type EmbeddingType =
   | "native_multimodal"
@@ -161,6 +161,7 @@ const SEARCH_DIMENSIONS = Object.entries(CHANNEL_LABELS).map(
 const ASSET_LABELS: Record<AssetType, string> = {
   image: "图片",
   video_segment: "视频片段",
+  audio_segment: "音频片段",
   markdown_block: "Markdown 段落",
   text_block: "纯文本块",
 };

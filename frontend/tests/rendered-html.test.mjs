@@ -47,6 +47,7 @@ test("server-renders the Capsule search workspace", async () => {
   assert.match(html, /目标素材类型/);
   assert.match(html, /Markdown 段落/);
   assert.match(html, /纯文本块/);
+  assert.match(html, /音频片段/);
   assert.match(html, /文本多维检索会按已选维度生成针对性 Query/);
   assert.match(html, /文本中的倾向可影响权重/);
   assert.match(html, /图片 \/ 视频内容不参与权重解析/);
@@ -57,7 +58,7 @@ test("server-renders the Capsule search workspace", async () => {
   const targetTypeInputs = [
     ...html.matchAll(/<input[^>]*name="target_asset_types"[^>]*>/g),
   ].map((match) => match[0]);
-  assert.equal(targetTypeInputs.length, 4);
+  assert.equal(targetTypeInputs.length, 5);
   const dimensionInputs = [
     ...html.matchAll(/<input[^>]*name="embedding_types"[^>]*>/g),
   ].map((match) => match[0]);

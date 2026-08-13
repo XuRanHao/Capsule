@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    understanding_model: str = "doubao-seed-2-0-lite-260215"
+    understanding_model: str = "doubao-seed-2-0-lite-260428"
     search_query_model: str = Field(
         default="deepseek-v4-flash",
         validation_alias=AliasChoices(
@@ -160,6 +160,15 @@ class Settings(BaseSettings):
     video_max_representative_frames: int = Field(default=3, ge=1, le=3)
     mobileclip_model_path: str = "data/models/mobileclip-s0/mobileclip_s0.pt"
     mobileclip_batch_size: int = Field(default=12, ge=1)
+    audio_window_seconds: float = Field(default=1.0, gt=0)
+    audio_min_segment_seconds: float = Field(default=3.0, gt=0)
+    audio_sample_rate: int = Field(default=32_000, ge=8_000, le=96_000)
+    audio_distance_quantile: float = Field(default=0.75, ge=0, le=1)
+    audio_min_distance_threshold: float = Field(default=0.002, ge=0, le=2)
+    audio_max_distance_threshold: float = Field(default=0.02, ge=0, le=2)
+    efficientat_source_path: Path = Path("data/models/EfficientAT")
+    efficientat_model_name: str = "mn10_as"
+    efficientat_batch_size: int = Field(default=16, ge=1)
     model_max_retries: int = Field(default=4, ge=1, le=10)
     understanding_timeout_seconds: float = Field(default=180.0, gt=0)
     understanding_max_output_tokens: int = Field(default=2048, ge=256)

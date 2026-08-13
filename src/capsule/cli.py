@@ -175,6 +175,7 @@ def submit_video_task_command(
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2))
 
 
+@app.command(name="media-worker")
 @app.command(name="video-worker")
 def video_worker_command(
     worker_id: Annotated[str | None, typer.Option("--worker-id")] = None,
@@ -183,7 +184,7 @@ def video_worker_command(
         typer.Option("--once", help="Process one Streams delivery and exit."),
     ] = False,
 ) -> None:
-    """Run the resident-MPS, PostgreSQL-fenced whole-video worker."""
+    """Run the resident-MPS, PostgreSQL-fenced video/audio media worker."""
     worker = VideoTaskWorker.from_settings(worker_id=worker_id)
     if once:
         outcome = asyncio.run(_run_video_worker_once(worker))
@@ -192,6 +193,7 @@ def video_worker_command(
     asyncio.run(worker.run_forever())
 
 
+@app.command(name="media-scheduler")
 @app.command(name="video-scheduler")
 def video_scheduler_command(
     once: Annotated[
@@ -199,7 +201,7 @@ def video_scheduler_command(
         typer.Option("--once", help="Recover and publish due tasks once, then exit."),
     ] = False,
 ) -> None:
-    """Recover expired leases and dispatch PostgreSQL-backed video retries."""
+    """Recover expired leases and dispatch PostgreSQL-backed media retries."""
     scheduler = VideoTaskScheduler.from_settings()
     if once:
         published = asyncio.run(_run_video_scheduler_once(scheduler))

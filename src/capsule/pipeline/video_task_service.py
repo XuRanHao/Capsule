@@ -20,14 +20,19 @@ from capsule.db.repositories import AssetRepository, PreparedVideoTaskSubmission
 from capsule.db.session import Database
 from capsule.db.video_asset_committer import PostgresFencedVideoAssetCommitter
 from capsule.db.video_tasks import PostgresVideoTaskRepository
+from capsule.model_clients.efficientat import ResidentEfficientAtWorker
 from capsule.model_clients.mobileclip import ResidentMobileClipWorker
+from capsule.parsers.audio import AudioParser, AudioSegmentationConfig
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig
 from capsule.pipeline.asset_factory import AssetFactory
+from capsule.pipeline.audio_task_processor import CapsuleAudioTaskProcessor
+from capsule.pipeline.media_task_dispatch import MediaTaskProcessor, MediaTaskRepository
 from capsule.pipeline.runner import _processing_fingerprint
 from capsule.pipeline.video_media import VideoDerivedMediaWriter
 from capsule.pipeline.video_task_processor import CapsuleVideoTaskProcessor
 from capsule.pipeline.video_task_runtime import (
+    ProcessingTaskKind,
     RedisVideoTaskQueue,
     RetryPolicy,
     VideoTaskMessage,
@@ -218,19 +223,46 @@ class VideoTaskWorker:
             committer=PostgresFencedVideoAssetCommitter(database),
             output_mode=runtime_settings.video_output_mode,
         )
+        audio_processor = CapsuleAudioTaskProcessor(
+            parser=AudioParser(
+                concurrency=runtime_settings.ffmpeg_concurrency,
+                config=AudioSegmentationConfig(
+                    window_seconds=runtime_settings.audio_window_seconds,
+                    minimum_segment_seconds=runtime_settings.audio_min_segment_seconds,
+                    sample_rate=runtime_settings.audio_sample_rate,
+                    distance_quantile=runtime_settings.audio_distance_quantile,
+                    minimum_distance_threshold=runtime_settings.audio_min_distance_threshold,
+                    maximum_distance_threshold=runtime_settings.audio_max_distance_threshold,
+                    embedding_batch_size=runtime_settings.efficientat_batch_size,
+                ),
+                embedder=ResidentEfficientAtWorker(
+                    source_path=runtime_settings.efficientat_source_path,
+                    model_name=runtime_settings.efficientat_model_name,
+                    batch_size=runtime_settings.efficientat_batch_size,
+                ),
+            ),
+            asset_factory=AssetFactory(),
+            committer=PostgresFencedVideoAssetCommitter(database),
+        )
+        repositories = MediaTaskRepository(
+            {
+                ProcessingTaskKind.VIDEO: _task_repository(
+                    database, runtime_settings, ProcessingTaskKind.VIDEO
+                ),
+                ProcessingTaskKind.AUDIO: _task_repository(
+                    database, runtime_settings, ProcessingTaskKind.AUDIO
+                ),
+            }
+        )
         runtime = VideoTaskRuntime(
             queue=queue,
-            repository=PostgresVideoTaskRepository(
-                database.session_factory,
-                lease_seconds=runtime_settings.video_task_lease_seconds,
-                progress_timeout_seconds=(
-                    runtime_settings.video_task_progress_timeout_seconds
-                ),
-                hard_timeout_seconds=runtime_settings.video_task_hard_timeout_seconds,
-                redispatch_seconds=runtime_settings.video_task_redispatch_seconds,
-                max_attempts=runtime_settings.video_task_max_attempts,
+            repository=repositories,
+            processor=MediaTaskProcessor(
+                {
+                    ProcessingTaskKind.VIDEO: processor,
+                    ProcessingTaskKind.AUDIO: audio_processor,
+                }
             ),
-            processor=processor,
             worker_id=worker_id or _worker_identity(),
             retry_policy=RetryPolicy(
                 max_attempts=runtime_settings.video_task_max_attempts,
@@ -314,15 +346,15 @@ class VideoTaskScheduler:
         return cls(
             scheduler=VideoTaskRecoveryScheduler(
                 queue=queue,
-                repository=PostgresVideoTaskRepository(
-                    database.session_factory,
-                    lease_seconds=runtime_settings.video_task_lease_seconds,
-                    progress_timeout_seconds=(
-                        runtime_settings.video_task_progress_timeout_seconds
-                    ),
-                    hard_timeout_seconds=runtime_settings.video_task_hard_timeout_seconds,
-                    redispatch_seconds=runtime_settings.video_task_redispatch_seconds,
-                    max_attempts=runtime_settings.video_task_max_attempts,
+                repository=MediaTaskRepository(
+                    {
+                        ProcessingTaskKind.VIDEO: _task_repository(
+                            database, runtime_settings, ProcessingTaskKind.VIDEO
+                        ),
+                        ProcessingTaskKind.AUDIO: _task_repository(
+                            database, runtime_settings, ProcessingTaskKind.AUDIO
+                        ),
+                    }
                 ),
             ),
             queue=queue,
@@ -363,6 +395,24 @@ def _new_queue(settings: Settings, *, consumer: str) -> RedisVideoTaskQueue:
         consumer=consumer,
         dlq_stream=settings.video_task_dlq_stream,
         claim_idle_ms=settings.video_task_claim_idle_ms,
+    )
+
+
+def _task_repository(
+    database: Database,
+    settings: Settings,
+    task_kind: ProcessingTaskKind,
+) -> PostgresVideoTaskRepository:
+    return PostgresVideoTaskRepository(
+        database.session_factory,
+        lease_seconds=settings.video_task_lease_seconds,
+        progress_timeout_seconds=settings.video_task_progress_timeout_seconds,
+        hard_timeout_seconds=settings.video_task_hard_timeout_seconds,
+        redispatch_seconds=settings.video_task_redispatch_seconds,
+        max_attempts=settings.video_task_max_attempts,
+        task_kind=task_kind,
+        resource_class="mps_video",
+        route_key="mps_video",
     )
 
 

@@ -6,6 +6,7 @@ class AssetType(StrEnum):
     TEXT_BLOCK = "text_block"
     IMAGE = "image"
     VIDEO_SEGMENT = "video_segment"
+    AUDIO_SEGMENT = "audio_segment"
 
 
 class AssetIndexRole(StrEnum):

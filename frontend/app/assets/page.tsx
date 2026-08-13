@@ -21,6 +21,7 @@ const TYPE_LABELS: Record<AssetFilter, string> = {
   all: "全部",
   image: "图片",
   video_segment: "视频片段",
+  audio_segment: "音频片段",
   markdown_block: "Markdown",
   text_block: "文字段落",
 };

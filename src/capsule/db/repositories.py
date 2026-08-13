@@ -1149,6 +1149,10 @@ class AssetRepository:
             task_kind = ProcessingTaskKind.VIDEO.value
             resource_class = ResourceClass.MPS_VIDEO.value
             route_key = "mps_video"
+        elif extension in {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}:
+            task_kind = ProcessingTaskKind.AUDIO.value
+            resource_class = ResourceClass.MPS_VIDEO.value
+            route_key = "mps_video"
         else:
             contract = cpu_contract_for_extension(extension)
             task_kind = contract.task_kind.value
@@ -1313,6 +1317,10 @@ class AssetRepository:
                 extension = item.source_file.extension.lower()
                 if extension in {".mp4", ".mov"}:
                     task_kind = ProcessingTaskKind.VIDEO.value
+                    resource_class = ResourceClass.MPS_VIDEO.value
+                    route_key = "mps_video"
+                elif extension in {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}:
+                    task_kind = ProcessingTaskKind.AUDIO.value
                     resource_class = ResourceClass.MPS_VIDEO.value
                     route_key = "mps_video"
                 else:
@@ -1905,6 +1913,8 @@ class AssetRepository:
         *,
         asset_id: str,
         understanding: AssetUnderstanding,
+        raw_content: str | None = None,
+        file_info_updates: Mapping[str, Any] | None = None,
     ) -> None:
         async with self._database.session() as session, session.begin():
             asset = await session.get(Asset, asset_id, with_for_update=True)
@@ -1915,11 +1925,17 @@ class AssetRepository:
                 None,
                 understanding.asset_description,
             } or (bool(asset.asset_features) and asset.asset_features != features)
+            if raw_content is not None and asset.raw_content not in {None, raw_content}:
+                semantic_changed = True
             if asset.asset_name_source != AssetNameSource.USER.value:
                 asset.asset_name = understanding.asset_name
                 asset.asset_name_source = AssetNameSource.MODEL.value
             asset.asset_description = understanding.asset_description
             asset.asset_features = features
+            if raw_content is not None:
+                asset.raw_content = raw_content
+            if file_info_updates:
+                asset.file_info = {**(asset.file_info or {}), **file_info_updates}
             asset.processing_status = ProcessingStatus.PROCESSING.value
             asset.error_message = None
             if semantic_changed:

@@ -607,6 +607,21 @@ def _playback_description(
     *,
     content_url: str,
 ) -> AssetPlayback | None:
+    if item.asset_type.value == "audio_segment":
+        start_ms, end_ms = _video_interval(item.source_locator)
+        mime_type = item.source_file.mime_type or _guessed_media_type(
+            item.file_name,
+            fallback="application/octet-stream",
+        )
+        return AssetPlayback(
+            mode="source_range",
+            url=content_url,
+            mime_type=mime_type,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            duration_ms=_duration_ms(start_ms, end_ms),
+            browser_compatible=_browser_compatible_audio_mime(mime_type),
+        )
     if item.asset_type.value != "video_segment":
         return None
     start_ms, end_ms = _video_interval(item.source_locator)
@@ -708,6 +723,18 @@ def _browser_compatible_video_mime(mime_type: str) -> bool:
         "video/mp4",
         "video/webm",
         "video/ogg",
+    }
+
+
+def _browser_compatible_audio_mime(mime_type: str) -> bool:
+    return mime_type.lower().split(";", maxsplit=1)[0] in {
+        "audio/mpeg",
+        "audio/mp4",
+        "audio/aac",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/ogg",
+        "audio/flac",
     }
 
 

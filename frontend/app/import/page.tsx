@@ -542,7 +542,7 @@ export default function ImportPage() {
             ref={fileInput}
             type="file"
             multiple
-            accept=".md,.jpg,.jpeg,.png,.webp,.mp4,.mov"
+            accept=".md,.jpg,.jpeg,.png,.webp,.mp4,.mov,.mp3,.m4a,.wav,.aac,.flac,.ogg"
             onChange={(event) => event.target.files && addFiles(event.target.files)}
             hidden
           />
@@ -578,6 +578,7 @@ export default function ImportPage() {
             <p>
               <strong>视频</strong>
               <small>.mp4 · .mov</small>
+              <small>.mp3 · .m4a · .wav · .aac · .flac · .ogg</small>
             </p>
           </div>
           <footer>

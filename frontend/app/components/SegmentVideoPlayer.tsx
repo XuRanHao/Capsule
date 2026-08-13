@@ -1,10 +1,10 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import type { VideoPlayback } from "../lib/api";
+import type { MediaPlayback } from "../lib/api";
 
 type SegmentVideoPlayerProps = {
-  playback: VideoPlayback | null;
+  playback: MediaPlayback | null;
   legacyContentUrl: string | null;
   posterUrl: string | null;
   fallbackMimeType: string;
@@ -25,7 +25,7 @@ export default function SegmentVideoPlayer({
   fallbackMimeType,
 }: SegmentVideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const effectivePlayback = useMemo<VideoPlayback | null>(() => {
+  const effectivePlayback = useMemo<MediaPlayback | null>(() => {
     if (playback) return playback;
     if (!legacyContentUrl) return null;
     return {

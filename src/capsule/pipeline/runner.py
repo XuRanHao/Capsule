@@ -19,10 +19,12 @@ from capsule.config import Settings, get_settings
 from capsule.db.repositories import AssetRepository, StaleAssetGenerationError
 from capsule.db.session import Database
 from capsule.enums import PipelineStage
+from capsule.model_clients.efficientat import ResidentEfficientAtWorker
 from capsule.model_clients.mobileclip import ResidentMobileClipWorker
 from capsule.model_clients.tokenization import LOCAL_TOKENIZER_ID, LocalTokenCounter, TokenCounter
 from capsule.parsers import discover_files
 from capsule.parsers.assetizer import Assetizer
+from capsule.parsers.audio import AudioParser, AudioSegmentationConfig
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.document import DocumentParser
 from capsule.parsers.document_media import DocumentMediaExtractor, RapidOcrEngine
@@ -533,6 +535,23 @@ def _build_assetizer(
         mobileclip_model_path=Path(settings.mobileclip_model_path),
         mobileclip_batch_size=settings.mobileclip_batch_size,
     )
+    audio = AudioParser(
+        concurrency=settings.ffmpeg_concurrency,
+        config=AudioSegmentationConfig(
+            window_seconds=settings.audio_window_seconds,
+            minimum_segment_seconds=settings.audio_min_segment_seconds,
+            sample_rate=settings.audio_sample_rate,
+            distance_quantile=settings.audio_distance_quantile,
+            minimum_distance_threshold=settings.audio_min_distance_threshold,
+            maximum_distance_threshold=settings.audio_max_distance_threshold,
+            embedding_batch_size=settings.efficientat_batch_size,
+        ),
+        embedder=ResidentEfficientAtWorker(
+            source_path=settings.efficientat_source_path,
+            model_name=settings.efficientat_model_name,
+            batch_size=settings.efficientat_batch_size,
+        ),
+    )
 
     async def document_handler(source_file: DiscoveredFile) -> list[AssetDraft]:
         if counter is None:
@@ -559,6 +578,12 @@ def _build_assetizer(
             ".webp": image.assetize,
             ".mp4": video.assetize,
             ".mov": video.assetize,
+            ".mp3": audio.assetize,
+            ".m4a": audio.assetize,
+            ".wav": audio.assetize,
+            ".aac": audio.assetize,
+            ".flac": audio.assetize,
+            ".ogg": audio.assetize,
         }
     )
 
@@ -634,6 +659,17 @@ def _processing_fingerprint(
             "keyframe_jpeg_quality": settings.video_keyframe_jpeg_quality,
             "max_representative_frames": settings.video_max_representative_frames,
             "mobileclip_model_path": settings.mobileclip_model_path,
+        }
+    elif source_file.extension in {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}:
+        payload["audio"] = {
+            "window_seconds": settings.audio_window_seconds,
+            "minimum_segment_seconds": settings.audio_min_segment_seconds,
+            "maximum_segment_seconds": None,
+            "sample_rate": settings.audio_sample_rate,
+            "distance_quantile": settings.audio_distance_quantile,
+            "minimum_distance_threshold": settings.audio_min_distance_threshold,
+            "maximum_distance_threshold": settings.audio_max_distance_threshold,
+            "efficientat_model_name": settings.efficientat_model_name,
         }
     if source_contexts:
         payload["source_contexts"] = [

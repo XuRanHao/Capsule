@@ -686,9 +686,27 @@ async def test_embedding_inputs_use_image_and_video_data_uris(
         source_storage_uri="file:///unused.mp4",
         source_mime_type="video/mp4",
     )
+    audio = EmbeddingAsset(
+        asset_id="asset_audio",
+        workspace_id="workspace",
+        project_id="project_default",
+        source_file_id="src_audio",
+        asset_type=AssetType.AUDIO_SEGMENT.value,
+        file_type=".wav",
+        content_hash="c" * 64,
+        embedding_revision=1,
+        created_at=datetime(2026, 8, 13, tzinfo=UTC),
+        raw_content="今天讨论音频的连续聚类方案。",
+        asset_description="一段产品讨论录音。",
+        asset_features={},
+        derived_file_uri=None,
+        source_storage_uri="file:///unused.wav",
+        source_mime_type="audio/wav",
+    )
 
     image_input = await service._build_input(image, EmbeddingType.NATIVE_MULTIMODAL)
     video_input = await service._build_input(video, EmbeddingType.NATIVE_MULTIMODAL)
+    audio_input = await service._build_input(audio, EmbeddingType.NATIVE_MULTIMODAL)
 
     assert image_input.input_items[0]["type"] == "image_url"
     assert image_input.input_items[0]["image_url"]["url"].startswith("data:image/png;base64,")
@@ -697,6 +715,9 @@ async def test_embedding_inputs_use_image_and_video_data_uris(
             "type": "video_url",
             "video_url": {"url": "data:video/mp4;base64,ZmFrZS1tcDQ="},
         }
+    ]
+    assert audio_input.input_items == [
+        {"type": "text", "text": "今天讨论音频的连续聚类方案。"}
     ]
 
 

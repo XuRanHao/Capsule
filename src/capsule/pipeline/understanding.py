@@ -3,6 +3,8 @@ import base64
 import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -180,10 +182,23 @@ class AssetUnderstandingService:
                     model_ms = (time.perf_counter() - phase_started) * 1000
                 phase_started = time.perf_counter()
                 try:
-                    await self._asset_repository.store_understanding(
-                        asset_id=asset.asset_id,
-                        understanding=understanding,
-                    )
+                    if asset.asset_type == AssetType.AUDIO_SEGMENT.value:
+                        await self._asset_repository.store_understanding(
+                            asset_id=asset.asset_id,
+                            understanding=understanding,
+                            raw_content=understanding.transcript or "",
+                            file_info_updates={
+                                "transcription": {
+                                    "status": "completed",
+                                    "model": self._settings.understanding_model,
+                                }
+                            },
+                        )
+                    else:
+                        await self._asset_repository.store_understanding(
+                            asset_id=asset.asset_id,
+                            understanding=understanding,
+                        )
                 finally:
                     storage_ms = (time.perf_counter() - phase_started) * 1000
                 return asset.asset_id, None, model_ms, storage_ms
@@ -205,6 +220,7 @@ class AssetUnderstandingService:
                 "填满数量而扩写。主体维度把不同实体拆成不同 item。事实来自素材或可靠上下文。"
                 "使用本地 OCR 内容时，evidence 以“OCR：”开头，真实"
                 "OCR 置信度由后端附加。"
+                "处理音频时完整转写 transcript，evidence 引用听到的内容时以“转写：”开头。"
                 f"{_SUBJECT_OUTPUT_RULES}"
                 f"{_DESCRIPTION_CONTEXT_RULES}"
                 "以有证据、可复用的表达为主。"
@@ -271,6 +287,22 @@ class AssetUnderstandingService:
                         "text": "视频关键帧暂不可读，请仅依据文件信息和关联上下文输出保守描述。",
                     }
                 )
+        elif asset.asset_type == AssetType.AUDIO_SEGMENT.value:
+            content.append(
+                {
+                    "type": "audio_url",
+                    "audio_url": await asyncio.to_thread(_audio_segment_data_uri, asset),
+                }
+            )
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "请直接听取当前音频片段。transcript 填写完整转写；若没有可辨识人声，"
+                        "填写空字符串。其余字段同时描述可听见的讲话、音乐、环境声和事件。"
+                    ),
+                }
+            )
         return [system, {"role": "user", "content": content}]
 
     async def _video_keyframe_data_uris(self, asset: EmbeddingAsset) -> list[str]:
@@ -334,6 +366,51 @@ def _image_mime_type(asset: EmbeddingAsset) -> str:
 def _data_uri(mime_type: str, content: bytes) -> str:
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _audio_segment_data_uri(asset: EmbeddingAsset) -> str:
+    parsed = urlparse(asset.source_storage_uri)
+    if parsed.scheme != "file":
+        raise ValueError("audio understanding currently requires a local source file")
+    source = Path(unquote(parsed.path))
+    start_ms = int(asset.source_locator.get("start_ms", 0))
+    end_ms = int(asset.source_locator.get("end_ms", 0))
+    if not source.is_file() or end_ms <= start_ms:
+        raise ValueError("audio segment source or time range is invalid")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise ValueError("ffmpeg is required for audio understanding")
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-nostdin",
+            "-ss",
+            f"{start_ms / 1000:.3f}",
+            "-to",
+            f"{end_ms / 1000:.3f}",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode or not completed.stdout:
+        detail = completed.stderr.decode(errors="replace").strip()
+        raise ValueError(detail or "audio extraction failed")
+    return _data_uri("audio/wav", completed.stdout)
 
 
 def _asset_context_payload(asset: EmbeddingAsset) -> dict[str, Any]:

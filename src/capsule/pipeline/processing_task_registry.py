@@ -42,6 +42,12 @@ def _frozen_routes() -> Mapping[
         route_key="mps_video",
         processor_version=1,
     )
+    audio = ProcessorRegistration(
+        task_kind=ProcessingTaskKind.AUDIO,
+        resource_class=ResourceClass.MPS_VIDEO,
+        route_key="mps_video",
+        processor_version=1,
+    )
     image = ProcessorRegistration(
         task_kind=ProcessingTaskKind.IMAGE,
         resource_class=ResourceClass.CPU,
@@ -60,6 +66,13 @@ def _frozen_routes() -> Mapping[
                 {
                     ResourceClass.MPS_VIDEO: MappingProxyType(
                         {"mps_video": MappingProxyType({1: video})}
+                    )
+                }
+            ),
+            ProcessingTaskKind.AUDIO: MappingProxyType(
+                {
+                    ResourceClass.MPS_VIDEO: MappingProxyType(
+                        {"mps_video": MappingProxyType({1: audio})}
                     )
                 }
             ),

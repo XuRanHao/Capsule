@@ -8,6 +8,7 @@ import DemoShell, {
   StatusBadge,
 } from "../../components/DemoShell";
 import SegmentVideoPlayer from "../../components/SegmentVideoPlayer";
+import SegmentAudioPlayer from "../../components/SegmentAudioPlayer";
 import {
   type AssetRecord,
   apiFetch,
@@ -130,6 +131,8 @@ export default function AssetDetailPage() {
   const playableVideo =
     asset.asset_type === "video_segment" &&
     Boolean(asset.playback || asset.content_url);
+  const playableAudio =
+    asset.asset_type === "audio_segment" && Boolean(asset.playback);
 
   return (
     <DemoShell
@@ -146,7 +149,9 @@ export default function AssetDetailPage() {
     >
       <div className="asset-detail-hero">
         <div className="asset-detail-preview">
-          {playableVideo ? (
+          {playableAudio && asset.playback ? (
+            <SegmentAudioPlayer playback={asset.playback} />
+          ) : playableVideo ? (
             <SegmentVideoPlayer
               playback={asset.playback}
               legacyContentUrl={asset.content_url}
@@ -214,6 +219,12 @@ export default function AssetDetailPage() {
             <blockquote>
               <span>关联段落</span>
               <p>{context}</p>
+            </blockquote>
+          )}
+          {asset.asset_type === "audio_segment" && asset.raw_content && (
+            <blockquote>
+              <span>音频转写</span>
+              <p>{asset.raw_content}</p>
             </blockquote>
           )}
         </section>

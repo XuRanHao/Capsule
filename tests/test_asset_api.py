@@ -444,6 +444,48 @@ def test_derived_video_clip_playback_keeps_current_interval_metadata(tmp_path: P
     }
 
 
+def test_logical_audio_segment_exposes_source_range_playback(tmp_path: Path) -> None:
+    import_root = tmp_path / "imports"
+    import_root.mkdir()
+    source = import_root / "recording.wav"
+    source.write_bytes(b"audio-container")
+    repository = FakeLogicalVideoAssetRepository(
+        source,
+        source_mime_type="audio/wav",
+        locator={"start_ms": 3_000, "end_ms": 9_500},
+    )
+    repository.asset = repository.asset.model_copy(
+        update={
+            "asset_id": "asset_audio",
+            "source_file_id": "source_audio",
+            "asset_type": AssetType.AUDIO_SEGMENT,
+            "raw_content": "这是音频片段的转写。",
+        }
+    )
+    app = create_app(
+        settings=Settings(import_root=import_root),
+        asset_repository=repository,  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        item = client.get("/api/v1/assets", params={"workspace_id": "workspace_test"}).json()[
+            "items"
+        ][0]
+
+    assert item["preview_url"] is None
+    assert item["raw_content"] == "这是音频片段的转写。"
+    assert item["playback"] == {
+        "mode": "source_range",
+        "url": "/api/v1/assets/asset_audio/content?workspace_id=workspace_test",
+        "fallback_url": None,
+        "mime_type": "audio/wav",
+        "start_ms": 3000,
+        "end_ms": 9500,
+        "duration_ms": 6500,
+        "browser_compatible": True,
+    }
+
+
 def test_h265_mp4_source_range_includes_trusted_transcode_fallback(tmp_path: Path) -> None:
     import_root = tmp_path / "imports"
     import_root.mkdir()

@@ -1256,6 +1256,12 @@ def _responses_content(items: Sequence[object]) -> list[dict[str, Any]]:
                 converted_image["detail"] = detail
             converted.append(converted_image)
             continue
+        if item_type == "audio_url":
+            audio_url = item.get("audio_url")
+            if not isinstance(audio_url, str):
+                raise DoubaoResponseError("Responses audio content must contain a URL")
+            converted.append({"type": "input_audio", "audio_url": audio_url})
+            continue
         raise DoubaoResponseError(f"unsupported Responses content type: {item_type}")
     return converted
 

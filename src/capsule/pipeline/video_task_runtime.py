@@ -28,6 +28,7 @@ class ProcessingTaskKind(StrEnum):
     TEXT = "text"
     IMAGE = "image"
     VIDEO = "video"
+    AUDIO = "audio"
 
 
 class ResourceClass(StrEnum):
@@ -39,7 +40,11 @@ class ResourceClass(StrEnum):
 
 
 def _resource_class_for(kind: ProcessingTaskKind) -> ResourceClass:
-    return ResourceClass.MPS_VIDEO if kind is ProcessingTaskKind.VIDEO else ResourceClass.CPU
+    return (
+        ResourceClass.MPS_VIDEO
+        if kind in {ProcessingTaskKind.VIDEO, ProcessingTaskKind.AUDIO}
+        else ResourceClass.CPU
+    )
 
 
 def _stable_task_id(

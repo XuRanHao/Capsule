@@ -11,7 +11,7 @@ export type AssetEmbeddingState = {
   embedding_revision: number | null;
 };
 
-export type VideoPlayback = {
+export type MediaPlayback = {
   mode: "derived_clip" | "source_range" | "transcoded_stream";
   url: string;
   mime_type: string;
@@ -27,7 +27,7 @@ export type AssetRecord = {
   workspace_id: string;
   project_id: string;
   source_file_id: string;
-  asset_type: "image" | "video_segment" | "markdown_block" | "text_block";
+  asset_type: "image" | "video_segment" | "audio_segment" | "markdown_block" | "text_block";
   file_name: string;
   file_type: string;
   asset_name: string | null;
@@ -69,7 +69,7 @@ export type AssetRecord = {
   error_message: string | null;
   preview_url: string | null;
   content_url: string | null;
-  playback: VideoPlayback | null;
+  playback: MediaPlayback | null;
   source_file: {
     source_file_id: string;
     original_file_name: string;
