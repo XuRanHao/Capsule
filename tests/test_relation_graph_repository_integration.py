@@ -57,6 +57,7 @@ async def test_relation_graph_repository_round_trips_entity_edges() -> None:
                     "target_entity_id": entity_b,
                     "relation": "WEAPON_OF",
                     "description": "该节点是A人物的武器设定。",
+                    "edge_type": "hierarchy",
                 }
             ],
         }
@@ -81,6 +82,7 @@ async def test_relation_graph_repository_round_trips_entity_edges() -> None:
                 "target_entity_id": entity_b,
                 "relation": "WEAPON_OF",
                 "description": "该节点是A人物的武器设定。",
+                "edge_type": "hierarchy",
             }
         ]
 

@@ -251,6 +251,12 @@ def create_app(
             asset_recall_path_boost=(
                 resolved_settings.relation_asset_recall_path_boost
             ),
+            incremental_entity_recall_similarity_threshold=(
+                resolved_settings.relation_incremental_entity_recall_similarity_threshold
+            ),
+            incremental_entity_recall_top_k=(
+                resolved_settings.relation_incremental_entity_recall_top_k
+            ),
         )
         app.state.relation_graph_service = relation_graph_service_instance
         assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold

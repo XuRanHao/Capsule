@@ -620,6 +620,7 @@ class EntityEntityRelation(Base, TimestampMixin):
     )
     relation: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    edge_type: Mapped[str] = mapped_column(String(32), nullable=False, default="hierarchy")
     build_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 

@@ -38,12 +38,14 @@ type GraphEdge = {
   description: string;
   content_subject?: string;
   edge_kind?: "asset_entity" | "entity_entity";
+  entity_relation_type?: "hierarchy" | "semantic";
 };
 type GraphEntityEdge = {
   source_entity_id: string;
   target_entity_id: string;
   relation: string;
   description: string;
+  edge_type?: "hierarchy" | "semantic";
 };
 type GraphData = {
   workspace_id: string;
@@ -127,6 +129,14 @@ const GRAPH_STYLES: StylesheetJson = [
     },
   },
   {
+    selector: "edge[entityRelationType = 'semantic']",
+    style: {
+      "line-style": "dashed",
+      "line-color": "#f08a62",
+      "target-arrow-color": "#f08a62",
+    },
+  },
+  {
     selector: ":selected",
     style: { "border-color": "#f2643f", "border-width": 6 },
   },
@@ -174,6 +184,7 @@ function visibleGraph(graph: GraphData, hiddenNodeIds: Set<string>) {
       relation: edge.relation,
       description: edge.description,
       edge_kind: "entity_entity" as const,
+      entity_relation_type: edge.edge_type ?? "hierarchy",
     }));
   for (const edge of entityRelations) {
     entityIds.add(edge.source);
@@ -226,6 +237,7 @@ function graphElements(
       relation: edge.relation,
       description: edge.description,
       edgeKind: "entity_entity",
+      entityRelationType: edge.entity_relation_type,
     },
   }));
   return [...entities, ...assets, ...membershipElements, ...entityRelationElements];
@@ -471,6 +483,7 @@ export default function RelationGraphPage() {
           relation: item.relation,
           description: item.description,
           edge_kind: "entity_entity" as const,
+          entity_relation_type: item.edge_type ?? "hierarchy",
         })),
       ].find(
         (item) =>

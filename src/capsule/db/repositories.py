@@ -163,6 +163,7 @@ class RelationGraphRepository:
                         "target_entity_id": relation.target_entity_id,
                         "relation": relation.relation,
                         "description": relation.description,
+                        "edge_type": relation.edge_type,
                     }
                     for relation in entity_relations
                 ],
@@ -370,6 +371,7 @@ class RelationGraphRepository:
                         target_entity_id=edge["target_entity_id"],
                         relation=edge["relation"],
                         description=edge.get("description", ""),
+                        edge_type=edge.get("edge_type", "hierarchy"),
                         build_version=build_version,
                     )
                 )

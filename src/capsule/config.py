@@ -200,6 +200,12 @@ class Settings(BaseSettings):
     )
     relation_asset_recall_top_k: int = Field(default=20, ge=1, le=100)
     relation_asset_recall_path_boost: float = Field(default=0.25, ge=0.0, le=1.0)
+    relation_incremental_entity_recall_similarity_threshold: float = Field(
+        default=0.72,
+        ge=-1.0,
+        le=1.0,
+    )
+    relation_incremental_entity_recall_top_k: int = Field(default=3, ge=1, le=20)
 
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)

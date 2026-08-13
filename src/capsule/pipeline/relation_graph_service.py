@@ -1,6 +1,7 @@
 """Build one workspace relationship graph from persisted Asset understanding."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -16,15 +17,19 @@ from capsule.pipeline.workspace_tree import render_imported_workspace_tree
 from capsule.relation_graph import (
     AssetEntityRelationDecision,
     AssetEntityRelationResolution,
+    CrossTreeRelationResolution,
     EntityStructureOperationResolution,
     MergedEntityResolution,
     MetadataContentResolution,
+    RelatedEntityPairResolution,
     _entity_key,
     _metadata_names,
     apply_asset_entity_relations,
+    apply_cross_tree_relations,
     apply_entity_structure_operations,
     build_merged_candidate_graph,
     build_relation_graph,
+    merge_entities_with_high_asset_overlap,
 )
 from capsule.schemas import AssetUnderstanding, EmbeddingResult
 from capsule.search.models import SearchFilters, VectorSearchHit
@@ -56,6 +61,22 @@ class RelationResolutionClient(Protocol):
         workspace_tree: str,
     ) -> EntityStructureOperationResolution: ...
 
+    async def select_related_entity_pairs(
+        self,
+        *,
+        current_entities: Sequence[Mapping[str, Any]],
+        incoming_entities: Sequence[Mapping[str, Any]],
+        workspace_tree: str,
+    ) -> RelatedEntityPairResolution: ...
+
+    async def generate_cross_tree_relations(
+        self,
+        *,
+        left_tree: Mapping[str, Any],
+        right_tree: Mapping[str, Any],
+        workspace_tree: str,
+    ) -> CrossTreeRelationResolution: ...
+
     async def embed_text(self, text: str) -> EmbeddingResult: ...
 
 
@@ -69,6 +90,11 @@ class AssetVectorSearch(Protocol):
         filters: SearchFilters,
         limit: int,
     ) -> list[VectorSearchHit]: ...
+
+    async def fetch_vectors(
+        self,
+        embedding_ids: Sequence[str],
+    ) -> dict[str, list[float]]: ...
 
 
 class SubjectClusterRepository(Protocol):
@@ -96,6 +122,14 @@ class SubjectClusterRepository(Protocol):
         model: str,
         source_hash: str,
     ) -> None: ...
+
+    async def list_indexed_asset_embeddings(
+        self,
+        *,
+        workspace_id: str,
+        embedding_type: str,
+        asset_ids: Sequence[str],
+    ) -> Sequence[Any]: ...
 
 
 class SubjectClusterRunner(Protocol):
@@ -159,6 +193,8 @@ class RelationGraphService:
         asset_recall_similarity_threshold: float = 0.55,
         asset_recall_top_k: int = 20,
         asset_recall_path_boost: float = 0.25,
+        incremental_entity_recall_similarity_threshold: float = 0.72,
+        incremental_entity_recall_top_k: int = 3,
     ) -> None:
         self._embedding_repository = embedding_repository
         self._understanding_service = understanding_service
@@ -173,6 +209,10 @@ class RelationGraphService:
         self._asset_recall_similarity_threshold = asset_recall_similarity_threshold
         self._asset_recall_top_k = asset_recall_top_k
         self._asset_recall_path_boost = asset_recall_path_boost
+        self._incremental_entity_recall_similarity_threshold = (
+            incremental_entity_recall_similarity_threshold
+        )
+        self._incremental_entity_recall_top_k = incremental_entity_recall_top_k
         self._build_tasks: dict[tuple[str, bool, str], asyncio.Task[dict[str, Any]]] = {}
         self._build_tasks_lock = asyncio.Lock()
 
@@ -332,11 +372,27 @@ class RelationGraphService:
             graph=graph,
         )
         edge_candidates = _asset_entity_candidates(graph)
-        if edge_candidates:
-            edge_resolution = await self._generate_edge_relations(edge_candidates)
+        structured_graph = copy.deepcopy(graph)
+        edge_task = asyncio.create_task(
+            self._generate_edge_relations(edge_candidates)
+        ) if edge_candidates else None
+        structure_task = asyncio.create_task(
+            self._structure_entities_and_relations(
+                graph=structured_graph,
+                assets=assets,
+            )
+        )
+        if edge_task is not None:
+            edge_resolution, structure_stats = await asyncio.gather(
+                edge_task,
+                structure_task,
+            )
             apply_asset_entity_relations(graph, edge_resolution)
-        _refresh_asset_entity_memberships(graph)
-        structure_stats = await self._structure_entities(graph=graph, assets=assets)
+        else:
+            structure_stats = await structure_task
+        _adopt_entity_structure(graph, structured_graph)
+        overlap_merge_count = merge_entities_with_high_asset_overlap(graph)
+        structure_stats["asset_overlap_merge_count"] = overlap_merge_count
         _refresh_asset_entity_memberships(graph)
         graph.update(
             {
@@ -411,27 +467,6 @@ class RelationGraphService:
         subject_clusters, member_groups, cluster_status = await self._load_subject_clusters(
             workspace_id=workspace_id
         )
-        affected_candidate_ids = {
-            f"subject_cluster:{cluster_id}" for cluster_id in affected_cluster_ids
-        }
-        if self._metadata_candidates_enabled:
-            for asset in usable_assets:
-                affected_candidate_ids.update(
-                    f"metadata:{_entity_key(name)}" for name in _metadata_names(asset)
-                )
-        previously_related = {
-            item["target"] for item in persisted["edges"] if item["source"] in requested_ids
-        } | {
-            item["target_id"]
-            for item in persisted["rejected_relations"]
-            if item["source_id"] in requested_ids
-        }
-        affected_entities = [
-            entity
-            for entity in persisted["entities"]
-            if entity["entity_id"] in previously_related
-            or affected_candidate_ids.intersection(entity.get("candidate_ids", []))
-        ]
         auto_relations: list[AssetEntityRelationDecision] = []
         auto_pairs: set[tuple[str, str]] = set()
         member_ids_by_candidate = {
@@ -439,7 +474,7 @@ class RelationGraphService:
             for cluster, members in zip(subject_clusters, member_groups, strict=True)
             if cluster.cluster_id in set(affected_cluster_ids)
         }
-        for entity in affected_entities:
+        for entity in persisted["entities"]:
             entity_id = str(entity["entity_id"])
             for candidate_id in entity.get("candidate_ids", []):
                 member_ids = member_ids_by_candidate.get(str(candidate_id), set())
@@ -458,15 +493,16 @@ class RelationGraphService:
                         )
                     )
 
-        candidates = [
-            candidate
-            for candidate in _direct_asset_entity_candidates(
-                usable_assets,
-                understandings,
-                affected_entities,
-            )
-            if (str(candidate["source_id"]), str(candidate["target_id"])) not in auto_pairs
+        cluster_linked_asset_ids = {source_id for source_id, _ in auto_pairs}
+        unmatched_assets = [
+            asset for asset in usable_assets if asset.asset_id not in cluster_linked_asset_ids
         ]
+        candidates = await self._recall_incremental_entity_candidates(
+            workspace_id=workspace_id,
+            assets=unmatched_assets,
+            understandings=understandings,
+            entities=persisted["entities"],
+        )
         agent_resolution = (
             await self._generate_edge_relations(candidates)
             if candidates
@@ -498,9 +534,76 @@ class RelationGraphService:
         return {
             "status": "updated" if build_version is not None else "deferred",
             "updated_asset_count": len(usable_assets),
-            "candidate_entity_count": len(affected_entities),
+            "cluster_linked_asset_count": len(cluster_linked_asset_ids),
+            "vector_recalled_asset_count": len(
+                {str(candidate["source_id"]) for candidate in candidates}
+            ),
+            "vector_recalled_candidate_count": len(candidates),
             "build_version": build_version,
         }
+
+    async def _recall_incremental_entity_candidates(
+        self,
+        *,
+        workspace_id: str,
+        assets: Sequence[EmbeddingAsset],
+        understandings: Mapping[str, AssetUnderstanding],
+        entities: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Recall existing Entities for new Assets that were not assigned to a cluster."""
+
+        repository = self._current_cluster_repository
+        vector_store = self._vector_store
+        if not assets or repository is None or vector_store is None:
+            return []
+        list_embeddings = getattr(repository, "list_indexed_asset_embeddings", None)
+        fetch_vectors = getattr(vector_store, "fetch_vectors", None)
+        if not callable(list_embeddings) or not callable(fetch_vectors):
+            return []
+
+        indexed = await list_embeddings(
+            workspace_id=workspace_id,
+            embedding_type=EmbeddingType.SUBJECT_CONTENT.value,
+            asset_ids=[asset.asset_id for asset in assets],
+        )
+        embedding_id_by_asset = {
+            str(item.asset_id): str(item.embedding_id) for item in indexed
+        }
+        vectors = await fetch_vectors(list(embedding_id_by_asset.values()))
+        normalized_entities = [
+            (entity, vector)
+            for entity in entities
+            if (vector := _normalize_vector(entity.get("embedding_vector", []))) is not None
+        ]
+        candidates: list[dict[str, Any]] = []
+        for asset in assets:
+            embedding_id = embedding_id_by_asset.get(asset.asset_id)
+            asset_vector = _normalize_vector(vectors.get(embedding_id, []))
+            if asset_vector is None:
+                continue
+            ranked = sorted(
+                (
+                    (_cosine_similarity(asset_vector, entity_vector), entity)
+                    for entity, entity_vector in normalized_entities
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            recalled_entities = [
+                entity
+                for similarity, entity in ranked[: self._incremental_entity_recall_top_k]
+                if similarity >= self._incremental_entity_recall_similarity_threshold
+            ]
+            if not recalled_entities:
+                continue
+            candidates.extend(
+                _direct_asset_entity_candidates(
+                    [asset],
+                    understandings,
+                    recalled_entities,
+                )
+            )
+        return candidates
 
     async def _load_subject_clusters(
         self,
@@ -758,6 +861,71 @@ class RelationGraphService:
             "virtual_round_count": virtual_round_count,
         }
 
+    async def _structure_entities_and_relations(
+        self,
+        *,
+        graph: dict[str, Any],
+        assets: Sequence[EmbeddingAsset],
+    ) -> dict[str, Any]:
+        hierarchy_stats = await self._structure_entities(graph=graph, assets=assets)
+        relation_stats = await self._connect_entity_trees(graph=graph, assets=assets)
+        return {**hierarchy_stats, "cross_tree_relations": relation_stats}
+
+    async def _connect_entity_trees(
+        self,
+        *,
+        graph: dict[str, Any],
+        assets: Sequence[EmbeddingAsset],
+    ) -> dict[str, Any]:
+        select_pairs = getattr(self._model_client, "select_related_entity_pairs", None)
+        generate_relations = getattr(
+            self._model_client,
+            "generate_cross_tree_relations",
+            None,
+        )
+        root_ids = _entity_tree_root_ids(graph)
+        if len(root_ids) < 2 or not callable(select_pairs) or not callable(generate_relations):
+            return {"status": "unavailable", "candidate_pair_count": 0, "edge_count": 0}
+
+        workspace_tree = render_imported_workspace_tree(assets)
+        accepted_ids: list[str] = []
+        candidate_pairs: set[tuple[str, str]] = set()
+        for batch in _batches(root_ids, 15):
+            resolution = await select_pairs(
+                current_entities=_entity_structure_nodes(graph, accepted_ids),
+                incoming_entities=_entity_structure_nodes(graph, batch),
+                workspace_tree=workspace_tree,
+            )
+            for pair in resolution.pairs:
+                candidate_pairs.add(
+                    tuple(sorted((pair.source_entity_id, pair.target_entity_id)))
+                )
+            accepted_ids.extend(batch)
+
+        trees = {root_id: _entity_tree_snapshot(graph, root_id) for root_id in root_ids}
+        outcomes = await asyncio.gather(
+            *(
+                generate_relations(
+                    left_tree=trees[left_id],
+                    right_tree=trees[right_id],
+                    workspace_tree=workspace_tree,
+                )
+                for left_id, right_id in sorted(candidate_pairs)
+            ),
+            return_exceptions=True,
+        )
+        resolutions = [
+            outcome
+            for outcome in outcomes
+            if isinstance(outcome, CrossTreeRelationResolution)
+        ]
+        apply_cross_tree_relations(graph, resolutions)
+        return {
+            "status": "completed",
+            "candidate_pair_count": len(candidate_pairs),
+            "edge_count": sum(len(resolution.relations) for resolution in resolutions),
+        }
+
     async def _embed_entity_candidates(
         self,
         *,
@@ -996,11 +1164,14 @@ class RelationGraphService:
             if self._metadata_candidates_enabled
             else "subject_clusters_only_v3"
         )
-        merge_policy = "agent_structure_v1"
+        merge_policy = "agent_structure_v3_cross_tree_asset_overlap"
         return (
             f"{source_policy}:{merge_policy}:"
             f"asset_recall_v1:{self._asset_recall_similarity_threshold:.4f}:"
-            f"top{self._asset_recall_top_k}:pathboost{self._asset_recall_path_boost:.4f}"
+            f"top{self._asset_recall_top_k}:pathboost{self._asset_recall_path_boost:.4f}:"
+            "incremental_entity_recall_v1:"
+            f"{self._incremental_entity_recall_similarity_threshold:.4f}:"
+            f"top{self._incremental_entity_recall_top_k}"
         )
 
 
@@ -1063,6 +1234,106 @@ def _entity_structure_snapshot(
         and str(edge["target_entity_id"]) in node_ids
     ]
     return {"nodes": nodes, "edges": edges}
+
+
+def _hierarchy_edges(graph: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [
+        edge
+        for edge in graph.get("entity_edges", [])
+        if edge.get("edge_type", "hierarchy") == "hierarchy"
+    ]
+
+
+def _entity_tree_root_ids(graph: Mapping[str, Any]) -> list[str]:
+    entity_ids = {str(entity["entity_id"]) for entity in graph["entities"]}
+    child_ids = {str(edge["source_entity_id"]) for edge in _hierarchy_edges(graph)}
+    return sorted(entity_ids - child_ids)
+
+
+def _entity_tree_snapshot(graph: Mapping[str, Any], root_id: str) -> dict[str, Any]:
+    hierarchy_edges = _hierarchy_edges(graph)
+    member_ids = {root_id}
+    changed = True
+    while changed:
+        changed = False
+        for edge in hierarchy_edges:
+            source_id = str(edge["source_entity_id"])
+            target_id = str(edge["target_entity_id"])
+            if target_id in member_ids and source_id not in member_ids:
+                member_ids.add(source_id)
+                changed = True
+    return {
+        "root_entity_id": root_id,
+        "nodes": _entity_structure_nodes(graph, sorted(member_ids)),
+        "edges": [
+            {
+                "source_entity_id": str(edge["source_entity_id"]),
+                "target_entity_id": str(edge["target_entity_id"]),
+                "relation": str(edge["relation"]),
+                "description": str(edge["description"]),
+            }
+            for edge in hierarchy_edges
+            if str(edge["source_entity_id"]) in member_ids
+            and str(edge["target_entity_id"]) in member_ids
+        ],
+    }
+
+
+def _adopt_entity_structure(
+    graph: dict[str, Any],
+    structured_graph: Mapping[str, Any],
+) -> None:
+    """Map concurrent Asset judgments onto the final merged Entity structure."""
+
+    final_by_candidate: dict[str, str] = {}
+    for entity in structured_graph["entities"]:
+        for candidate_id in entity.get("candidate_ids", []):
+            final_by_candidate[str(candidate_id)] = str(entity["entity_id"])
+    target_mapping: dict[str, str] = {}
+    for entity in graph["entities"]:
+        mapped_id = next(
+            (
+                final_by_candidate[str(candidate_id)]
+                for candidate_id in entity.get("candidate_ids", [])
+                if str(candidate_id) in final_by_candidate
+            ),
+            str(entity["entity_id"]),
+        )
+        target_mapping[str(entity["entity_id"])] = mapped_id
+
+    for edge in graph["edges"]:
+        edge["target"] = target_mapping.get(str(edge["target"]), str(edge["target"]))
+    graph["edges"] = _deduplicate_graph_asset_edges(graph["edges"])
+    rejected: dict[tuple[str, str], dict[str, Any]] = {}
+    for relation in graph.get("rejected_relations", []):
+        relation = dict(relation)
+        relation["target_id"] = target_mapping.get(
+            str(relation["target_id"]),
+            str(relation["target_id"]),
+        )
+        rejected[(str(relation["source_id"]), str(relation["target_id"]))] = relation
+    graph["rejected_relations"] = list(rejected.values())
+    graph["entities"] = copy.deepcopy(structured_graph["entities"])
+    graph["entity_edges"] = copy.deepcopy(structured_graph.get("entity_edges", []))
+    member_ids_by_entity: dict[str, list[str]] = defaultdict(list)
+    for edge in graph["edges"]:
+        member_ids_by_entity[str(edge["target"])].append(str(edge["source"]))
+    for entity in graph["entities"]:
+        entity["asset_ids"] = list(
+            dict.fromkeys(member_ids_by_entity[str(entity["entity_id"])])
+        )
+    graph["entity_count"] = len(graph["entities"])
+    graph["entity_edge_count"] = len(graph["entity_edges"])
+    graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
+
+
+def _deduplicate_graph_asset_edges(
+    edges: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in edges:
+        selected[(str(edge["source"]), str(edge["target"]))] = dict(edge)
+    return list(selected.values())
 
 
 def _normalize_vector(vector: Sequence[float]) -> list[float] | None:

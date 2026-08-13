@@ -1,4 +1,6 @@
+import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -207,6 +209,9 @@ class FakeRelationVectorStore:
             )
         ]
 
+    async def fetch_vectors(self, _: object) -> dict[str, list[float]]:
+        return {}
+
 
 class SeparatingStructureModel(FakeRelationModel):
     def __init__(self) -> None:
@@ -231,6 +236,66 @@ class SeparatingStructureModel(FakeRelationModel):
                 ]
             }
         )
+
+
+class ConcurrentAssetAndEntityModel(FakeRelationModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.asset_started = asyncio.Event()
+        self.structure_started = asyncio.Event()
+
+    async def generate_asset_entity_relations(
+        self,
+        candidates: list[dict[str, object]],
+    ) -> AssetEntityRelationResolution:
+        self.asset_started.set()
+        await asyncio.wait_for(self.structure_started.wait(), timeout=1)
+        return await super().generate_asset_entity_relations(candidates)
+
+    async def generate_entity_structure_operations(
+        self,
+        *,
+        current_graph: dict[str, object],
+        incoming_entities: list[dict[str, object]],
+        workspace_tree: str,
+    ) -> EntityStructureOperationResolution:
+        del current_graph, workspace_tree
+        self.structure_started.set()
+        await asyncio.wait_for(self.asset_started.wait(), timeout=1)
+        return EntityStructureOperationResolution.model_validate(
+            {
+                "operations": [
+                    {
+                        "type": "separate",
+                        "entity_ids": [item["entity_id"] for item in incoming_entities],
+                    }
+                ]
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_asset_judgment_and_entity_structure_run_concurrently() -> None:
+    first = _understanding("中央雕塑", "飞船大厅里的大型人面雕塑")
+    second = _understanding("宴会大厅", "飞船内部的宴会空间")
+    model = ConcurrentAssetAndEntityModel()
+    service = RelationGraphService(
+        embedding_repository=FakeEmbeddingRepository(
+            [
+                _asset("asset_a", "飞船内部/中央大厅.png", first),
+                _asset("asset_b", "飞船内部/宴会大厅.png", second),
+            ]
+        ),  # type: ignore[arg-type]
+        understanding_service=UnexpectedUnderstandingService(),  # type: ignore[arg-type]
+        model_client=model,  # type: ignore[arg-type]
+        metadata_candidates_enabled=True,
+    )
+
+    graph = await service.build(workspace_id="workspace_real")
+
+    assert model.asset_started.is_set()
+    assert model.structure_started.is_set()
+    assert graph["entity_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -359,7 +424,7 @@ async def test_service_recalls_assets_outside_original_subject_cluster() -> None
     service = RelationGraphService(
         embedding_repository=embedding_repository,  # type: ignore[arg-type]
         understanding_service=UnexpectedUnderstandingService(),  # type: ignore[arg-type]
-        model_client=model,
+        model_client=model,  # type: ignore[arg-type]
         current_cluster_repository=cluster_repository,  # type: ignore[arg-type]
         vector_store=FakeRelationVectorStore(),
     )
@@ -380,3 +445,178 @@ async def test_service_recalls_assets_outside_original_subject_cluster() -> None
     cluster_edges = [edge for edge in graph["edges"] if edge["source"] in {"asset_a", "asset_b"}]
     assert {edge["relation"] for edge in cluster_edges} == {"CLUSTER_MEMBER"}
     assert {edge["description"] for edge in cluster_edges} == {"内容高度相似"}
+
+
+class IncrementalSubjectClusterRepository:
+    def __init__(self, *, member_ids: list[str]) -> None:
+        self.member_ids = member_ids
+
+    async def list_clusters(self, **_: object) -> list[GeneratedSubjectCluster]:
+        return [GeneratedSubjectCluster()]
+
+    async def list_members(self, **_: object) -> list[GeneratedSubjectMember]:
+        return [GeneratedSubjectMember(asset_id) for asset_id in self.member_ids]
+
+    async def list_indexed_asset_embeddings(self, **_: object) -> list[object]:
+        return [SimpleNamespace(asset_id="asset_new", embedding_id="emb_asset_new")]
+
+
+class IncrementalEntityVectorStore:
+    def __init__(self, vector: list[float]) -> None:
+        self.vector = vector
+        self.fetch_calls: list[list[str]] = []
+
+    async def fetch_vectors(self, embedding_ids: list[str]) -> dict[str, list[float]]:
+        self.fetch_calls.append(embedding_ids)
+        return {"emb_asset_new": self.vector}
+
+
+class IncrementalRelationRepository:
+    def __init__(self) -> None:
+        self.update_call: dict[str, Any] | None = None
+
+    async def load_current(self, **_: object) -> dict[str, Any]:
+        return {
+            "entities": [
+                {
+                    "entity_id": "entity_ship",
+                    "name": "飞船大厅场景",
+                    "semantic": "飞船内部的大厅空间",
+                    "candidate_ids": ["subject_cluster:cluster_subject"],
+                    "embedding_vector": [1.0, 0.0],
+                },
+                {
+                    "entity_id": "entity_woody",
+                    "name": "伍迪角色素材",
+                    "semantic": "伍迪角色的外观素材",
+                    "candidate_ids": ["subject_cluster:cluster_woody"],
+                    "embedding_vector": [0.0, 1.0],
+                },
+                {
+                    "entity_id": "entity_virtual",
+                    "name": "场景",
+                    "semantic": "场景类父节点",
+                    "candidate_ids": [],
+                    "embedding_vector": [],
+                },
+            ],
+            "edges": [],
+            "rejected_relations": [],
+            "asset_revisions": {},
+        }
+
+    async def update_assets(self, **values: Any) -> int:
+        self.update_call = values
+        return 2
+
+
+def _incremental_service(
+    *,
+    cluster_repository: IncrementalSubjectClusterRepository,
+    relation_repository: IncrementalRelationRepository,
+    vector_store: IncrementalEntityVectorStore,
+    model: FakeRelationModel,
+    threshold: float = 0.8,
+) -> RelationGraphService:
+    understanding = _understanding("飞船大厅", "飞船内部的大厅画面")
+    return RelationGraphService(
+        embedding_repository=FakeEmbeddingRepository(
+            [_asset("asset_new", "飞船内部/新大厅.png", understanding)]
+        ),  # type: ignore[arg-type]
+        understanding_service=UnexpectedUnderstandingService(),  # type: ignore[arg-type]
+        model_client=model,  # type: ignore[arg-type]
+        current_cluster_repository=cluster_repository,  # type: ignore[arg-type]
+        relation_repository=relation_repository,  # type: ignore[arg-type]
+        vector_store=vector_store,  # type: ignore[arg-type]
+        incremental_entity_recall_similarity_threshold=threshold,
+        incremental_entity_recall_top_k=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_cluster_member_links_directly_without_agent() -> None:
+    clusters = IncrementalSubjectClusterRepository(member_ids=["asset_new"])
+    relations = IncrementalRelationRepository()
+    vectors = IncrementalEntityVectorStore([1.0, 0.0])
+    model = FakeRelationModel()
+    service = _incremental_service(
+        cluster_repository=clusters,
+        relation_repository=relations,
+        vector_store=vectors,
+        model=model,
+    )
+
+    result = await service.update_assets(
+        workspace_id="workspace_real",
+        asset_ids=["asset_new"],
+        affected_cluster_ids=["cluster_subject"],
+    )
+
+    assert result["cluster_linked_asset_count"] == 1
+    assert result["vector_recalled_candidate_count"] == 0
+    assert vectors.fetch_calls == []
+    assert model.edge_candidates == []
+    assert relations.update_call is not None
+    resolution = relations.update_call["resolution"]
+    assert resolution.relations[0].target_id == "entity_ship"
+    assert resolution.relations[0].relation == "CLUSTER_MEMBER"
+    assert resolution.relations[0].description == "内容高度相似"
+
+
+@pytest.mark.asyncio
+async def test_incremental_unclustered_asset_recalls_high_similarity_entity_for_agent() -> None:
+    clusters = IncrementalSubjectClusterRepository(member_ids=[])
+    relations = IncrementalRelationRepository()
+    vectors = IncrementalEntityVectorStore([0.99, 0.01])
+    model = FakeRelationModel()
+    service = _incremental_service(
+        cluster_repository=clusters,
+        relation_repository=relations,
+        vector_store=vectors,
+        model=model,
+    )
+
+    result = await service.update_assets(
+        workspace_id="workspace_real",
+        asset_ids=["asset_new"],
+        affected_cluster_ids=[],
+    )
+
+    assert result["cluster_linked_asset_count"] == 0
+    assert result["vector_recalled_asset_count"] == 1
+    assert result["vector_recalled_candidate_count"] == 1
+    assert [candidate["target_id"] for candidate in model.edge_candidates] == [
+        "entity_ship"
+    ]
+    assert "similarity" not in model.edge_candidates[0]
+    assert "recall_similarity" not in model.edge_candidates[0]
+    assert relations.update_call is not None
+    resolution = relations.update_call["resolution"]
+    assert resolution.relations[0].relation == "SET_IN"
+
+
+@pytest.mark.asyncio
+async def test_incremental_unclustered_asset_below_threshold_stays_unlinked() -> None:
+    clusters = IncrementalSubjectClusterRepository(member_ids=[])
+    relations = IncrementalRelationRepository()
+    vectors = IncrementalEntityVectorStore([0.7, 0.7])
+    model = FakeRelationModel()
+    service = _incremental_service(
+        cluster_repository=clusters,
+        relation_repository=relations,
+        vector_store=vectors,
+        model=model,
+        threshold=0.9,
+    )
+
+    result = await service.update_assets(
+        workspace_id="workspace_real",
+        asset_ids=["asset_new"],
+        affected_cluster_ids=[],
+    )
+
+    assert result["vector_recalled_asset_count"] == 0
+    assert result["vector_recalled_candidate_count"] == 0
+    assert model.edge_candidates == []
+    assert relations.update_call is not None
+    assert relations.update_call["resolution"].relations == []

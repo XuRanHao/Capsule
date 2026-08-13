@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -12,7 +13,103 @@ from capsule.relation_graph import (
     GroupEntityOperation,
     MergeEntityOperation,
     SeparateEntityOperation,
+    merge_entities_with_high_asset_overlap,
 )
+
+
+def _overlap_graph(*, second_asset_ids: list[str]) -> dict[str, Any]:
+    asset_ids = ["asset_1", "asset_2", "asset_3", "asset_4"]
+    return {
+        "assets": [{"asset_id": asset_id} for asset_id in asset_ids],
+        "entities": [
+            {
+                "entity_id": "entity_woody_material",
+                "name": "伍迪角色素材",
+                "semantic": "伍迪角色的素材",
+                "asset_ids": asset_ids,
+                "origins": ["subject_cluster"],
+                "descriptions": [],
+                "candidate_ids": ["candidate_1"],
+            },
+            {
+                "entity_id": "entity_woody_asset",
+                "name": "伍迪角色资产",
+                "semantic": "伍迪角色的资产",
+                "asset_ids": second_asset_ids,
+                "origins": ["subject_cluster"],
+                "descriptions": [],
+                "candidate_ids": ["candidate_2"],
+            },
+            {
+                "entity_id": "entity_woody",
+                "name": "伍迪",
+                "semantic": "伍迪角色",
+                "asset_ids": [],
+                "origins": ["agent_structure"],
+                "descriptions": [],
+                "candidate_ids": [],
+            },
+        ],
+        "edges": [
+            {
+                "source": asset_id,
+                "target": target,
+                "relation": "RELATED",
+                "description": "属于伍迪角色",
+            }
+            for asset_id in asset_ids
+            for target in ("entity_woody_material", "entity_woody_asset")
+            if target == "entity_woody_material" or asset_id in second_asset_ids
+        ],
+        "entity_edges": [
+            {
+                "source_entity_id": child_id,
+                "target_entity_id": "entity_woody",
+                "relation": "属于",
+                "description": "伍迪角色的素材",
+                "edge_type": "hierarchy",
+            }
+            for child_id in ("entity_woody_material", "entity_woody_asset")
+        ],
+        "rejected_relations": [
+            {
+                "source_id": "asset_other",
+                "target_id": "entity_woody_asset",
+                "establishes_relation": False,
+                "relation": "",
+                "description": "无关",
+            }
+        ],
+    }
+
+
+def test_high_asset_overlap_merges_entities_and_collapses_single_child_parent() -> None:
+    graph = _overlap_graph(
+        second_asset_ids=["asset_1", "asset_2", "asset_3", "asset_4"]
+    )
+
+    merged_count = merge_entities_with_high_asset_overlap(graph)
+
+    assert merged_count == 1
+    assert [entity["entity_id"] for entity in graph["entities"]] == [
+        "entity_woody_material"
+    ]
+    assert graph["entity_edges"] == []
+    assert len(graph["edges"]) == 4
+    assert {edge["target"] for edge in graph["edges"]} == {
+        "entity_woody_material"
+    }
+    assert graph["rejected_relations"][0]["target_id"] == "entity_woody_material"
+
+
+def test_asset_overlap_below_threshold_keeps_entities_separate() -> None:
+    graph = _overlap_graph(second_asset_ids=["asset_1", "asset_2"])
+
+    merged_count = merge_entities_with_high_asset_overlap(graph)
+
+    assert merged_count == 0
+    assert len(graph["entities"]) == 3
+    assert len(graph["entity_edges"]) == 2
 
 
 def test_entity_structure_operations_parse_strict_discriminated_protocol() -> None:

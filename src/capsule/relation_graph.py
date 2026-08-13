@@ -259,6 +259,83 @@ class EntityStructureOperationResolution(BaseModel):
         return self
 
 
+class RelatedEntityPair(BaseModel):
+    """A coarse pair whose two Entity trees may contain a concrete relation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_entity_id: str = Field(min_length=1, max_length=256)
+    target_entity_id: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def forbid_self_pair(self) -> "RelatedEntityPair":
+        if self.source_entity_id == self.target_entity_id:
+            raise ValueError("related Entity pair cannot reference itself")
+        return self
+
+
+class RelatedEntityPairResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pairs: list[RelatedEntityPair] = Field(default_factory=list)
+
+
+class RelatedEntityPairRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_tree: str = Field(min_length=1)
+    current_entities: list[EntityStructureNode] = Field(default_factory=list)
+    incoming_entities: list[EntityStructureNode] = Field(min_length=1, max_length=15)
+
+
+class EntityTree(BaseModel):
+    """One stable Entity hierarchy supplied for cross-tree relation judgment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    root_entity_id: str
+    nodes: list[EntityStructureNode] = Field(min_length=1)
+    edges: list[EntityStructureEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_tree(self) -> "EntityTree":
+        structure = CurrentEntityStructure(nodes=self.nodes, edges=self.edges)
+        if self.root_entity_id not in {node.entity_id for node in structure.nodes}:
+            raise ValueError("root_entity_id must reference a tree node")
+        return self
+
+
+class CrossTreeRelation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_entity_id: str = Field(min_length=1, max_length=256)
+    target_entity_id: str = Field(min_length=1, max_length=256)
+    relation: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class CrossTreeRelationResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    relations: list[CrossTreeRelation] = Field(default_factory=list)
+
+
+class CrossTreeRelationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_tree: str = Field(min_length=1)
+    left_tree: EntityTree
+    right_tree: EntityTree
+
+    @model_validator(mode="after")
+    def validate_distinct_trees(self) -> "CrossTreeRelationRequest":
+        left_ids = {node.entity_id for node in self.left_tree.nodes}
+        right_ids = {node.entity_id for node in self.right_tree.nodes}
+        if left_ids.intersection(right_ids):
+            raise ValueError("cross-tree relation request trees must be disjoint")
+        return self
+
+
 def _entity_key(subject: str) -> str:
     normalized = unicodedata.normalize("NFKC", subject).casefold()
     return "".join(character for character in normalized if character.isalnum())
@@ -722,6 +799,7 @@ def apply_entity_structure_operations(
                     target_entity_id=parent_id,
                     relation=child.relation,
                     description=child.description,
+                    edge_type="hierarchy",
                 )
         elif isinstance(operation, SeparateEntityOperation):
             continue
@@ -730,6 +808,147 @@ def apply_entity_structure_operations(
     graph["entity_edge_count"] = len(graph["entity_edges"])
     graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
     return list(dict.fromkeys(created_ids))
+
+
+def apply_cross_tree_relations(
+    graph: dict[str, Any],
+    resolutions: Sequence[CrossTreeRelationResolution],
+) -> None:
+    """Persist validated semantic edges produced for independent Entity-tree pairs."""
+
+    graph.setdefault("entity_edges", [])
+    for resolution in resolutions:
+        for relation in resolution.relations:
+            _upsert_entity_edge(
+                graph,
+                source_entity_id=relation.source_entity_id,
+                target_entity_id=relation.target_entity_id,
+                relation=relation.relation,
+                description=relation.description,
+                edge_type="semantic",
+            )
+    graph["entity_edge_count"] = len(graph["entity_edges"])
+    graph["edge_count"] = len(graph["edges"]) + len(graph["entity_edges"])
+
+
+def merge_entities_with_high_asset_overlap(
+    graph: dict[str, Any],
+    *,
+    threshold: float = 0.8,
+    min_shared_assets: int = 2,
+) -> int:
+    """Deterministically merge peer Entities backed by nearly identical Assets."""
+
+    candidates = [
+        entity
+        for entity in graph["entities"]
+        if len(set(entity.get("asset_ids", []))) >= min_shared_assets
+    ]
+    parent = {str(entity["entity_id"]): str(entity["entity_id"]) for entity in candidates}
+
+    def find(entity_id: str) -> str:
+        while parent[entity_id] != entity_id:
+            parent[entity_id] = parent[parent[entity_id]]
+            entity_id = parent[entity_id]
+        return entity_id
+
+    for index, left in enumerate(candidates):
+        left_id = str(left["entity_id"])
+        left_assets = set(left.get("asset_ids", []))
+        for right in candidates[index + 1 :]:
+            right_id = str(right["entity_id"])
+            right_assets = set(right.get("asset_ids", []))
+            shared = left_assets.intersection(right_assets)
+            union = left_assets.union(right_assets)
+            if len(shared) < min_shared_assets or len(shared) / len(union) < threshold:
+                continue
+            left_root = find(left_id)
+            right_root = find(right_id)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+    components: dict[str, list[str]] = defaultdict(list)
+    for entity_id in parent:
+        components[find(entity_id)].append(entity_id)
+    merge_count = 0
+    nodes_by_id = {str(node["entity_id"]): node for node in graph["entities"]}
+    for entity_ids in components.values():
+        if len(entity_ids) < 2:
+            continue
+        canonical_id = entity_ids[0]
+        canonical = nodes_by_id[canonical_id]
+        _apply_entity_merge(
+            graph,
+            MergeEntityOperation(
+                type="merge",
+                source_entity_ids=entity_ids,
+                canonical_entity_id=canonical_id,
+                name=str(canonical["name"]),
+                semantic=str(canonical["semantic"]),
+            ),
+        )
+        merge_count += len(entity_ids) - 1
+
+    if merge_count:
+        _collapse_single_child_virtual_entities(graph)
+    graph["entity_count"] = len(graph["entities"])
+    graph["entity_edge_count"] = len(graph.get("entity_edges", []))
+    graph["edge_count"] = len(graph["edges"]) + len(graph.get("entity_edges", []))
+    return merge_count
+
+
+def _collapse_single_child_virtual_entities(graph: dict[str, Any]) -> None:
+    while True:
+        virtual_ids = {
+            str(entity["entity_id"])
+            for entity in graph["entities"]
+            if "agent_structure" in entity.get("origins", [])
+            and not entity.get("asset_ids")
+        }
+        hierarchy_edges = [
+            edge
+            for edge in graph.get("entity_edges", [])
+            if edge.get("edge_type", "hierarchy") == "hierarchy"
+        ]
+        children_by_parent: dict[str, list[str]] = defaultdict(list)
+        for edge in hierarchy_edges:
+            children_by_parent[str(edge["target_entity_id"])].append(
+                str(edge["source_entity_id"])
+            )
+        collapsible = next(
+            (
+                (parent_id, children[0])
+                for parent_id, children in children_by_parent.items()
+                if parent_id in virtual_ids and len(set(children)) == 1
+            ),
+            None,
+        )
+        if collapsible is None:
+            return
+        parent_id, child_id = collapsible
+        graph["entities"] = [
+            entity for entity in graph["entities"] if entity["entity_id"] != parent_id
+        ]
+        rewritten: list[dict[str, Any]] = []
+        for edge in graph.get("entity_edges", []):
+            source_id = str(edge["source_entity_id"])
+            target_id = str(edge["target_entity_id"])
+            if source_id == child_id and target_id == parent_id:
+                continue
+            if source_id == parent_id:
+                source_id = child_id
+            if target_id == parent_id:
+                target_id = child_id
+            if source_id == target_id:
+                continue
+            rewritten.append(
+                {
+                    **edge,
+                    "source_entity_id": source_id,
+                    "target_entity_id": target_id,
+                }
+            )
+        graph["entity_edges"] = _deduplicate_entity_edges(rewritten)
 
 
 def _apply_entity_merge(graph: dict[str, Any], operation: MergeEntityOperation) -> None:
@@ -776,6 +995,16 @@ def _apply_entity_merge(graph: dict[str, Any], operation: MergeEntityOperation) 
         if edge.get("target") in replaced_ids:
             edge["target"] = operation.canonical_entity_id
     graph["edges"] = _deduplicate_asset_entity_edges(graph["edges"])
+
+    rejected_relations: dict[tuple[str, str], dict[str, Any]] = {}
+    for relation in graph.get("rejected_relations", []):
+        relation = dict(relation)
+        if relation.get("target_id") in replaced_ids:
+            relation["target_id"] = operation.canonical_entity_id
+        rejected_relations[
+            (str(relation["source_id"]), str(relation["target_id"]))
+        ] = relation
+    graph["rejected_relations"] = list(rejected_relations.values())
 
     rewritten_entity_edges: list[dict[str, Any]] = []
     for edge in graph["entity_edges"]:
@@ -835,6 +1064,7 @@ def _upsert_entity_edge(
     target_entity_id: str,
     relation: str,
     description: str,
+    edge_type: str = "semantic",
 ) -> None:
     for edge in graph["entity_edges"]:
         if (
@@ -843,6 +1073,7 @@ def _upsert_entity_edge(
         ):
             edge["relation"] = relation
             edge["description"] = description
+            edge["edge_type"] = edge_type
             return
     graph["entity_edges"].append(
         {
@@ -850,6 +1081,7 @@ def _upsert_entity_edge(
             "target_entity_id": target_entity_id,
             "relation": relation,
             "description": description,
+            "edge_type": edge_type,
         }
     )
 

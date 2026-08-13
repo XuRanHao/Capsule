@@ -27,12 +27,16 @@ from capsule.model_clients.structured_output import responses_json_schema_format
 from capsule.relation_graph import (
     AssetEntityRelationResolution,
     CreatedGroupParent,
+    CrossTreeRelationRequest,
+    CrossTreeRelationResolution,
     EntityStructureOperationResolution,
     EntityStructureRequest,
     GroupEntityOperation,
     MergedEntityResolution,
     MergeEntityOperation,
     MetadataContentResolution,
+    RelatedEntityPairRequest,
+    RelatedEntityPairResolution,
     ReusedGroupParent,
     SeparateEntityOperation,
 )
@@ -168,6 +172,37 @@ def _normalize_entity_structure_resolution(
             continue
         operations.append(operation)
     return EntityStructureOperationResolution(operations=operations)
+
+
+def _validate_related_entity_pairs(
+    request: RelatedEntityPairRequest,
+    resolution: RelatedEntityPairResolution,
+) -> None:
+    current_ids = {entity.entity_id for entity in request.current_entities}
+    incoming_ids = {entity.entity_id for entity in request.incoming_entities}
+    known_ids = current_ids | incoming_ids
+    for pair in resolution.pairs:
+        pair_ids = {pair.source_entity_id, pair.target_entity_id}
+        if not pair_ids.issubset(known_ids):
+            raise DoubaoResponseError("related Entity pair references an unknown Entity")
+        if not pair_ids.intersection(incoming_ids):
+            raise DoubaoResponseError("related Entity pair must include an incoming Entity")
+
+
+def _validate_cross_tree_relations(
+    request: CrossTreeRelationRequest,
+    resolution: CrossTreeRelationResolution,
+) -> None:
+    left_ids = {entity.entity_id for entity in request.left_tree.nodes}
+    right_ids = {entity.entity_id for entity in request.right_tree.nodes}
+    for relation in resolution.relations:
+        endpoints = {relation.source_entity_id, relation.target_entity_id}
+        if not (
+            endpoints.intersection(left_ids)
+            and endpoints.intersection(right_ids)
+            and endpoints.issubset(left_ids | right_ids)
+        ):
+            raise DoubaoResponseError("relation must connect one node from each Entity tree")
 
 
 class DoubaoClient:
@@ -529,8 +564,11 @@ class DoubaoClient:
             "content": (
                 "增量整理 Entity 结构。结合 Entity 的 name、semantic 与 workspace_tree 理解项目"
                 "语义；目录树提供上下文和归属线索，current_graph 是已接受结构，incoming_entities"
-                "是本轮节点。几乎指向同一实际对象时 merge；没有结构关系时 separate；共享明确的"
-                "实际主体或上位语义、同时又应保留各自差异时 group。group 可复用现有父节点或创建"
+                "是本轮节点。仅当两个节点的语义身份、抽象层级和用途都基本可互换时 merge；没有"
+                "结构关系时 separate；共享明确的实际主体或上位语义、同时又应保留各自差异时"
+                "group。共享主体不等于可合并：状态、时期、版本、组成部分或功能角色不同的节点"
+                "保留区别；地点与其内部物件、人物与其装备等不同语义层级也不合并。group 可复用"
+                "现有父节点或创建"
                 "新的虚拟父节点，并自然描述每个 child 与 parent 的关系。"
                 "正例：同一人物的不同状态、时期或版本可归入该人物；人物的服装、武器和动作设定可"
                 "围绕该人物组织；同一地点的不同区域可归入该地点；同一装置的不同部件或工作状态可"
@@ -602,6 +640,91 @@ class DoubaoClient:
             assert resolution is not None
             return resolution
         raise AssertionError("unreachable")
+
+    async def select_related_entity_pairs(
+        self,
+        *,
+        current_entities: Sequence[Mapping[str, Any]],
+        incoming_entities: Sequence[Mapping[str, Any]],
+        workspace_tree: str,
+    ) -> RelatedEntityPairResolution:
+        """Recall top-level Entity-tree pairs that may contain a concrete relation."""
+
+        request = RelatedEntityPairRequest.model_validate(
+            {
+                "workspace_tree": workspace_tree,
+                "current_entities": list(current_entities),
+                "incoming_entities": list(incoming_entities),
+            }
+        )
+        resolution = await self._deepseek_json(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "从顶层 Entity 中筛选可能存在具体语义关系的 Entity 树对。结合名称、语义"
+                        "和 workspace_tree 判断；这里只做候选召回，不生成关系，也不合并或分组。"
+                        "人物与场景、人物与物件、事件与地点、地点与设施、组织与人物等存在可具体"
+                        "描述关系时保留。仅同属项目、目录相邻、画风或题材相似、宽泛同类时不保留。"
+                        "检查 incoming_entities 内部以及它们与 current_entities 的组合；每个输出对"
+                        "至少包含一个 incoming Entity。只输出 JSON："
+                        '{"pairs":[{"source_entity_id":"","target_entity_id":""}]}。'
+                    ),
+                },
+                {"role": "user", "content": request.model_dump_json()},
+            ],
+            output_type=RelatedEntityPairResolution,
+            pool=self.capsule_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=max(self._settings.understanding_max_output_tokens, 4096),
+            model=self._settings.search_query_model,
+        )
+        _validate_related_entity_pairs(request, resolution)
+        return resolution
+
+    async def generate_cross_tree_relations(
+        self,
+        *,
+        left_tree: Mapping[str, Any],
+        right_tree: Mapping[str, Any],
+        workspace_tree: str,
+    ) -> CrossTreeRelationResolution:
+        """Create concrete semantic edges between arbitrary nodes of two Entity trees."""
+
+        request = CrossTreeRelationRequest.model_validate(
+            {
+                "workspace_tree": workspace_tree,
+                "left_tree": dict(left_tree),
+                "right_tree": dict(right_tree),
+            }
+        )
+        resolution = await self._deepseek_json(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "判断两棵 Entity 树之间的具体语义关系。关系端点可选择树中的任意节点，"
+                        "不限定顶层节点；选择语义最准确的层级，并自然生成有方向的 relation 和"
+                        "description。只建立由 Entity 语义或目录上下文明示的项目事实，不补充可能的"
+                        "用途、出现场景、创作参考或因果关系。仅同属项目、目录相近、画风或题材相似"
+                        "不构成关系；需要使用“可能”“可作为”“可供参考”“推测”或同时说明“无直接"
+                        "关联”时，返回空数组。可建立多条互不重复的关系，关系名和描述使用与输入"
+                        "一致的自然语言。不合并节点，不创建新节点。"
+                        "只输出 JSON："
+                        '{"relations":[{"source_entity_id":"","target_entity_id":"",'
+                        '"relation":"","description":""}]}。'
+                    ),
+                },
+                {"role": "user", "content": request.model_dump_json()},
+            ],
+            output_type=CrossTreeRelationResolution,
+            pool=self.capsule_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=max(self._settings.understanding_max_output_tokens, 4096),
+            model=self._settings.search_query_model,
+        )
+        _validate_cross_tree_relations(request, resolution)
+        return resolution
 
     async def enhance_search_query(
         self,
