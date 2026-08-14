@@ -12,7 +12,7 @@ _LOCAL_TEXT_CHANNEL = "local_text"
 
 
 class WeightedReciprocalRankFusion:
-    def __init__(self, *, rrf_k: int = 60, candidate_cap: int = 300) -> None:
+    def __init__(self, *, rrf_k: int = 20, candidate_cap: int = 300) -> None:
         if rrf_k < 1:
             raise ValueError("rrf_k must be positive")
         if candidate_cap < 1:
@@ -107,7 +107,7 @@ class NormalizedWeightedSimilarityFusion:
 
 
 class FusionEngine:
-    def __init__(self, *, rrf_k: int = 60, candidate_cap: int = 300) -> None:
+    def __init__(self, *, rrf_k: int = 20, candidate_cap: int = 300) -> None:
         self._rrf_k = rrf_k
         self._candidate_cap = candidate_cap
         self._rrf = WeightedReciprocalRankFusion(

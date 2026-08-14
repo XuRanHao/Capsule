@@ -2,7 +2,10 @@
 .env
 .idea/
 .vscode/
-.codex/
+.codex/*
+!.codex/MEMORY/
+!.codex/MEMORY/**
+!.codex/MEMORY.md
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -18,5 +21,6 @@ __pycache__/
 .venv/
 reports/
 data/
+frontend/public/demo/
 tmp/
 .env.local

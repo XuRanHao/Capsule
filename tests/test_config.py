@@ -19,6 +19,7 @@ def test_document_chunk_size_defaults_to_250_400_500_600_tokens() -> None:
     assert settings.deepseek_base_url == "https://api.deepseek.com"
     assert settings.search_query_model == "deepseek-v4-flash"
     assert settings.search_query_max_output_tokens == 500
+    assert settings.search_rrf_k == 20
     assert settings.document_tokenizer_path is None
     assert settings.document_chunk_min_tokens == 250
     assert settings.document_chunk_target_tokens == 400

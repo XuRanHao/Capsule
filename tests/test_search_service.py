@@ -490,7 +490,7 @@ async def test_search_removes_failed_lazy_index_dimension_and_keeps_native() -> 
     assert preparer.calls == [EmbeddingType.SUBJECT_CONTENT]
     assert [call["embedding_type"] for call in vectors.calls] == ["native_multimodal"]
     assert response.total == 2
-    assert response.results[0].score == pytest.approx(1 / 61)
+    assert response.results[0].score == pytest.approx(1 / 21)
     assert response.degraded is True
     assert "search vector index preparation for subject_content failed" in response.degraded_reasons
 

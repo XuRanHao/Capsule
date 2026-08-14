@@ -221,7 +221,7 @@ class Settings(BaseSettings):
     search_candidate_cap: int = Field(default=300, ge=1)
     search_same_source_limit: int = Field(default=3, ge=1)
     search_cluster_top_k: int = Field(default=12, ge=1, le=100)
-    search_rrf_k: int = Field(default=60, ge=1)
+    search_rrf_k: int = Field(default=20, ge=1)
     search_hnsw_ef: int = Field(default=128, ge=1)
     search_vector_visibility_timeout_seconds: float = Field(default=5.0, ge=0)
     search_vector_visibility_poll_initial_seconds: float = Field(default=0.05, gt=0)
