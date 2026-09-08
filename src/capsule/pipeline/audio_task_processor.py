@@ -10,7 +10,11 @@ from capsule.parsers.audio import AudioParser
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.video import VideoCancellationToken
 from capsule.pipeline.asset_factory import AssetFactory
-from capsule.pipeline.video_task_processor import FencedVideoAssetCommitter, _local_source_file
+from capsule.pipeline.video_task_processor import (
+    FencedVideoAssetCommitter,
+    SourceFileLoader,
+    _local_source_file,
+)
 from capsule.pipeline.video_task_runtime import (
     LeaseLostError,
     ProcessingTaskKind,
@@ -28,10 +32,12 @@ class CapsuleAudioTaskProcessor:
         parser: AudioParser,
         asset_factory: AssetFactory,
         committer: FencedVideoAssetCommitter,
+        source_file_loader: SourceFileLoader | None = None,
     ) -> None:
         self._parser = parser
         self._asset_factory = asset_factory
         self._committer = committer
+        self._source_file_loader = source_file_loader or _local_source_file
 
     async def process(
         self,
@@ -67,7 +73,8 @@ class CapsuleAudioTaskProcessor:
                 raise
 
         try:
-            source = await _local_source_file(message)
+            materialized = await self._source_file_loader(message)
+            source = materialized.source_file
             digest = await asyncio.to_thread(sha256_file, __import__("pathlib").Path(source.path))
             drafts = await self._parser.assetize(
                 source,
@@ -114,3 +121,5 @@ class CapsuleAudioTaskProcessor:
             )
         finally:
             token.cancel()
+            if "materialized" in locals():
+                await materialized.cleanup()

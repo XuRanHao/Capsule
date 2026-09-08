@@ -1,10 +1,7 @@
 import pytest
 
-from capsule.search.repositories import (
-    PostgresAssetSearchRepository,
-    _text_relevance,
-    _text_search_terms,
-)
+from capsule.search.models import SearchFilters
+from capsule.search.repositories import PostgresAssetSearchRepository
 
 
 class _Rows:
@@ -64,50 +61,20 @@ async def test_hydration_excludes_parent_assets() -> None:
     assert "parent" in compiled.params.values()
 
 
-def test_local_text_terms_support_chinese_without_external_tokenizer() -> None:
-    terms = _text_search_terms("想找小孩追着风筝跑的画面，最好是在空旷草地")
+@pytest.mark.asyncio
+async def test_local_text_recall_compiles_to_pg_search_bm25() -> None:
+    session = _Session()
+    repository = PostgresAssetSearchRepository(_Database(session))  # type: ignore[arg-type]
 
-    assert "小孩" in terms
-    assert "风筝" in terms
-    assert "草地" in terms
+    hits = await repository.search_text(
+        workspace_id="workspace_demo",
+        query_text="蓝紫色黄昏",
+        filters=SearchFilters(),
+        created_by="user_demo",
+        limit=10,
+    )
 
-
-def test_local_text_relevance_covers_filename_path_raw_text_and_description() -> None:
-    terms = _text_search_terms("蓝紫色黄昏")
-    scores = {
-        "filename": _text_relevance(
-            query_text="蓝紫色黄昏",
-            terms=terms,
-            file_name="蓝紫色黄昏.png",
-            relative_path=None,
-            raw_content=None,
-            asset_description=None,
-        ),
-        "path": _text_relevance(
-            query_text="蓝紫色黄昏",
-            terms=terms,
-            file_name=None,
-            relative_path="概念图/蓝紫色黄昏/reference.png",
-            raw_content=None,
-            asset_description=None,
-        ),
-        "raw": _text_relevance(
-            query_text="蓝紫色黄昏",
-            terms=terms,
-            file_name=None,
-            relative_path=None,
-            raw_content="场景发生在蓝紫色黄昏，远处城市灯光亮起。",
-            asset_description=None,
-        ),
-        "description": _text_relevance(
-            query_text="蓝紫色黄昏",
-            terms=terms,
-            file_name=None,
-            relative_path=None,
-            raw_content=None,
-            asset_description="一幅蓝紫色黄昏下的动画城市景观。",
-        ),
-    }
-
-    assert all(score > 0 for score in scores.values())
-    assert scores["filename"] > scores["path"] > scores["raw"] > scores["description"]
+    assert hits == []
+    compiled = session.statements[0].compile()  # type: ignore[union-attr]
+    assert "@@@" in str(compiled)
+    assert "pdb.score" in str(compiled)

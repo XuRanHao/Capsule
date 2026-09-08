@@ -198,7 +198,7 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
         assert record.embedding_revision == 3
         assert record.indexed_embedding_ids == frozenset({embedding_id})
 
-        for query_text in ("sunset", "references", "月湖", "黄昏图片"):
+        for query_text in ("sunset", "月湖", "黄昏"):
             text_hits = await repository.search_text(
                 workspace_id=workspace_id,
                 query_text=query_text,

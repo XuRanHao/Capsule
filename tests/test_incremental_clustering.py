@@ -682,6 +682,4 @@ async def test_coordinator_reclusters_when_new_subject_sample_ratio_is_large() -
             "affected_cluster_ids": (),
         }
     ]
-    assert graph_updater.rebuild_calls == [
-        {"workspace_id": "workspace_a", "force_rebuild": True}
-    ]
+    assert graph_updater.rebuild_calls == []

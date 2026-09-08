@@ -14,13 +14,11 @@ class FakeRelationGraphService:
         *,
         workspace_id: str,
         force_understanding: bool = False,
-        force_rebuild: bool = False,
     ) -> dict[str, object]:
         self.calls.append(
             {
                 "workspace_id": workspace_id,
                 "force_understanding": force_understanding,
-                "force_rebuild": force_rebuild,
             }
         )
         return {
@@ -77,7 +75,6 @@ async def test_relation_graph_api_builds_selected_workspace() -> None:
         {
             "workspace_id": "workspace_real",
             "force_understanding": True,
-            "force_rebuild": False,
         }
     ]
 

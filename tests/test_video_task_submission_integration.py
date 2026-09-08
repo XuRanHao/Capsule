@@ -20,14 +20,14 @@ async def _require_video_task_database(database: Database) -> None:
         async with database.session() as session:
             await session.execute(text("select 1"))
             task_table = await session.scalar(
-                text("select to_regclass('public.video_processing_tasks')")
+                text("select to_regclass('public.processing_tasks')")
             )
             input_payload_column = await session.scalar(
                 text(
                     "select exists ("
                     "select 1 from information_schema.columns "
                     "where table_schema = 'public' "
-                    "and table_name = 'video_processing_tasks' "
+                    "and table_name = 'processing_tasks' "
                     "and column_name = 'input_payload'"
                     ")"
                 )

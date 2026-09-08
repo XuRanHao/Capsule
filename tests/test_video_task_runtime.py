@@ -20,6 +20,8 @@ from capsule.pipeline.video_task_runtime import (
     RedisVideoTaskQueue,
     ResourceClass,
     RetryPolicy,
+    RetryEnqueueResult,
+    RetryWait,
     VideoTaskDelivery,
     VideoTaskLease,
     VideoTaskMessage,
@@ -163,6 +165,8 @@ class _FakeRedis:
         self.added: list[tuple[str, dict[str, str]]] = []
         self.acked: list[tuple[str, str, str]] = []
         self.new_messages: list[tuple[str, dict[str, str]]] = []
+        self.eval_calls: list[tuple[Any, ...]] = []
+        self.eval_result: list[int] = [0, 1]
         self.closed = False
 
     async def xgroup_create(self, *_args: Any, **_kwargs: Any) -> None:
@@ -183,12 +187,42 @@ class _FakeRedis:
     async def zrangebyscore(self, *_args: Any, **_kwargs: Any) -> list[str]:
         return []
 
+    async def eval(self, *args: Any) -> list[int]:
+        self.eval_calls.append(args)
+        return self.eval_result
+
     async def xack(self, stream: str, group: str, receipt: str) -> int:
         self.acked.append((stream, group, receipt))
         return 1
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_redis_retry_registers_one_failure_event_without_ack() -> None:
+    client = _FakeRedis()
+    queue = RedisVideoTaskQueue(
+        redis_url="redis://unused",
+        stream="capsule:video:tasks",
+        group="workers",
+        consumer="worker-a",
+        dlq_stream="capsule:video:dlq",
+        client=client,
+    )
+    delivery = VideoTaskDelivery(message=_message(), receipt="11-0")
+
+    result = await queue.retry(
+        delivery,
+        next_attempt=1,
+        delay_seconds=5.0,
+        failure_event_id="task:1:1",
+        max_failures=3,
+    )
+
+    assert not result.exhausted
+    assert len(client.eval_calls) == 1
+    assert client.acked == []
 
 
 @dataclass
@@ -242,9 +276,27 @@ class _FakeRepository:
         assert result.result_ref == "s3://capsule/video/manifest.json"
         return self.complete_result
 
-    async def schedule_retry(self, lease: VideoTaskLease, error: str, retry_at: float) -> bool:
+    async def schedule_retry(
+        self, lease: VideoTaskLease, error: str, retry_at: float
+    ) -> RetryWait:
         self.events.append("schedule_retry")
         self.retries.append((lease, error, retry_at))
+        return RetryWait(
+            failure_event_id=f"{lease.task_id}:{lease.dispatch_round}:{lease.attempt}",
+            delay_seconds=5.0,
+        )
+
+    async def pending_retry_wait(self, _message: VideoTaskMessage) -> RetryWait | None:
+        return None
+
+    async def advance_dispatch_round(
+        self,
+        _message: VideoTaskMessage,
+        *,
+        failure_event_id: str,
+        error: str,
+    ) -> bool:
+        self.events.append("advance_round")
         return True
 
     async def fail(self, lease: VideoTaskLease, error: str) -> bool:
@@ -275,11 +327,16 @@ class _FakeQueue:
         *,
         next_attempt: int,
         delay_seconds: float,
-    ) -> None:
+        failure_event_id: str,
+        max_failures: int,
+    ) -> RetryEnqueueResult:
         self.events.append("retry")
-        assert next_attempt == 2
+        assert next_attempt >= 2
         assert delay_seconds == 5.0
+        assert failure_event_id
+        assert max_failures > 0
         self.retried.append(delivery)
+        return RetryEnqueueResult(exhausted=False)
 
     async def route_dlq(self, delivery: VideoTaskDelivery, *, error: str) -> None:
         self.events.append("dlq")
@@ -595,10 +652,10 @@ async def test_duplicate_or_fenced_attempt_is_acked_without_reprocessing_video()
     assert queue.acknowledgements == [delivery]
 
 
-async def test_active_delivery_reclaimed_by_idle_time_is_not_acked_early() -> None:
+async def test_delivery_that_loses_the_database_claim_race_is_acked() -> None:
     events: list[str] = []
     queue = _FakeQueue(events)
-    repository = _FakeRepository(events, claim=None, ack_unclaimed=False)
+    repository = _FakeRepository(events, claim=None, ack_unclaimed=True)
     runtime = VideoTaskRuntime(
         queue=queue,
         repository=repository,
@@ -608,9 +665,9 @@ async def test_active_delivery_reclaimed_by_idle_time_is_not_acked_early() -> No
 
     outcome = await runtime.handle_delivery(_delivery())
 
-    assert outcome == "deferred"
-    assert events == ["claim"]
-    assert not queue.acknowledgements
+    assert outcome == "duplicate"
+    assert events == ["claim", "ack"]
+    assert queue.acknowledgements
 
 
 async def test_stale_completion_is_fenced_and_only_acks_duplicate_delivery() -> None:
@@ -646,7 +703,7 @@ async def test_failure_is_durably_scheduled_before_retry_ack_with_backoff() -> N
         repository=repository,
         processor=_FailingProcessor(),
         worker_id="worker-a",
-        retry_policy=RetryPolicy(max_attempts=2, retry_delays_seconds=(5.0,)),
+        retry_policy=RetryPolicy(max_failures=2, retry_delays_seconds=(5.0,)),
         clock=lambda: 100.0,
     )
     delivery = _delivery()
@@ -659,37 +716,45 @@ async def test_failure_is_durably_scheduled_before_retry_ack_with_backoff() -> N
         "claim",
         "schedule_retry",
         "retry",
+        "ack",
     ]
     assert queue.retried == [delivery]
-    assert not queue.acknowledgements
+    assert queue.acknowledgements == [delivery]
 
 
-async def test_max_attempt_failure_enters_dlq_only_after_database_failure_commit() -> None:
+async def test_redis_round_exhaustion_advances_the_durable_dispatch_round() -> None:
     events: list[str] = []
     queue = _FakeQueue(events)
+    original_retry = queue.retry
+
+    async def exhausted_retry(*args: Any, **kwargs: Any) -> RetryEnqueueResult:
+        await original_retry(*args, **kwargs)
+        return RetryEnqueueResult(exhausted=True)
+
+    queue.retry = exhausted_retry  # type: ignore[method-assign]
     repository = _FakeRepository(events, claim=_lease(attempt=2))
     runtime = VideoTaskRuntime(
         queue=queue,
         repository=repository,
         processor=_FailingProcessor(),
         worker_id="worker-a",
-        retry_policy=RetryPolicy(max_attempts=2, retry_delays_seconds=(5.0,)),
+        retry_policy=RetryPolicy(max_failures=2, retry_delays_seconds=(5.0,)),
         clock=lambda: 100.0,
     )
     delivery = _delivery(attempt=1)
 
     outcome = await runtime.handle_delivery(delivery)
 
-    assert outcome == "dlq"
-    assert repository.failures == [(_lease(attempt=2), "ffmpeg progress timeout")]
+    assert outcome == "retry_scheduled"
+    assert not repository.failures
     assert [event for event in events if event != "heartbeat"] == [
         "claim",
-        "fail",
-        "dlq",
-        "mark_dlq",
+        "schedule_retry",
+        "retry",
+        "advance_round",
         "ack",
     ]
-    assert queue.dlq == [(delivery, "ffmpeg progress timeout")]
+    assert not queue.dlq
     assert queue.acknowledgements == [delivery]
 
 

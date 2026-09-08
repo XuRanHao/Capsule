@@ -36,6 +36,7 @@ class DurableProcessingSource:
 
     source_file: DiscoveredFile
     sha256: str
+    cleanup: Callable[[], Awaitable[None]] | None = None
 
 
 SourceFileLoader = Callable[[ProcessingTaskMessage], Awaitable[DurableProcessingSource]]
@@ -90,6 +91,27 @@ class _CPUAssetProcessor:
         )
         await report_progress(ProcessingTaskProgress(detail={"stage": "parsing"}))
         durable_source = await self._source_file_loader(message)
+        try:
+            return await self._process_materialized_source(
+                message=message,
+                lease=lease,
+                report_progress=report_progress,
+                parse=parse,
+                durable_source=durable_source,
+            )
+        finally:
+            if durable_source.cleanup is not None:
+                await durable_source.cleanup()
+
+    async def _process_materialized_source(
+        self,
+        *,
+        message: ProcessingTaskMessage,
+        lease: ProcessingTaskLease,
+        report_progress: Callable[[ProcessingTaskProgress], Awaitable[None]],
+        parse: Callable[[DiscoveredFile], Awaitable[list[AssetDraft]]],
+        durable_source: DurableProcessingSource,
+    ) -> ProcessingTaskResult:
         source_file = durable_source.source_file
         expected_source_sha256 = durable_source.sha256
         source_sha256 = await asyncio.to_thread(sha256_file, Path(source_file.path))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from urllib.parse import unquote, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -88,7 +89,11 @@ async def _source_loader(message: ProcessingTaskMessage) -> DurableProcessingSou
 
 
 def _source_from_message(message: ProcessingTaskMessage) -> DurableProcessingSource:
-    path = Path(message.source_uri.removeprefix("file://"))
+    parsed = urlparse(message.source_uri)
+    raw_path = unquote(parsed.path if parsed.scheme else message.source_uri)
+    if len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
+        raw_path = raw_path[1:]
+    path = Path(raw_path)
     return DurableProcessingSource(
         source_file=DiscoveredFile(
             path=str(path),

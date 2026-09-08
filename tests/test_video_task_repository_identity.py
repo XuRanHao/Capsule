@@ -50,14 +50,14 @@ def test_task_table_keeps_video_defaults_and_kind_aware_identity() -> None:
         tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
-        and constraint.name == "uq_video_task_source_generation_result_version"
+        and constraint.name == "uq_processing_task_source_generation_result_version"
     }
     assert unique_columns == {
         ("source_file_id", "source_generation", "result_version")
     }
     indexes = {index.name for index in table.indexes}
-    assert "ix_video_processing_tasks_kind_status_next_retry" in indexes
-    assert "ix_video_processing_tasks_kind_identity" in indexes
+    assert "ix_processing_tasks_kind_status_next_retry" in indexes
+    assert "ix_processing_tasks_kind_identity" in indexes
 
 
 def test_video_repository_binds_every_fence_to_complete_default_identity() -> None:
@@ -65,10 +65,10 @@ def test_video_repository_binds_every_fence_to_complete_default_identity() -> No
 
     identity = " AND ".join(str(clause) for clause in repository._task_identity_clauses())
 
-    assert "video_processing_tasks.task_kind" in identity
-    assert "video_processing_tasks.resource_class" in identity
-    assert "video_processing_tasks.route_key" in identity
-    assert "video_processing_tasks.processor_version" in identity
+    assert "processing_tasks.task_kind" in identity
+    assert "processing_tasks.resource_class" in identity
+    assert "processing_tasks.route_key" in identity
+    assert "processing_tasks.processor_version" in identity
 
 
 def test_message_identity_guard_rejects_another_processing_kind() -> None:
@@ -152,7 +152,7 @@ async def test_inspect_message_contract_compares_the_full_persisted_identity() -
 
 
 @pytest.mark.asyncio
-async def test_can_ack_unclaimed_rejects_an_orphaned_task_message() -> None:
+async def test_can_ack_unclaimed_cleans_a_task_deleted_after_contract_validation() -> None:
     class _Result:
         def one_or_none(self) -> None:
             return None
@@ -178,7 +178,7 @@ async def test_can_ack_unclaimed_rejects_an_orphaned_task_message() -> None:
         generation=1,
     )
 
-    assert not await repository.can_ack_unclaimed(message)
+    assert await repository.can_ack_unclaimed(message)
 
 
 def test_video_repository_rejects_an_invalid_processor_identity() -> None:
@@ -222,17 +222,18 @@ def test_nonempty_lease_token_is_part_of_the_repository_write_fence() -> None:
 
     clauses = " AND ".join(str(clause) for clause in repository._fence_clauses(lease))
 
-    assert "video_processing_tasks.lease_token" in clauses
+    assert "processing_tasks.lease_token" in clauses
+    assert "processing_tasks.dispatch_round" not in clauses
     identity = " AND ".join(
         str(clause) for clause in repository._lease_identity_clauses(lease)
     )
     assert all(
         column in identity
         for column in (
-            "video_processing_tasks.task_kind",
-            "video_processing_tasks.resource_class",
-            "video_processing_tasks.route_key",
-            "video_processing_tasks.processor_version",
+            "processing_tasks.task_kind",
+            "processing_tasks.resource_class",
+            "processing_tasks.route_key",
+            "processing_tasks.processor_version",
         )
     )
 
@@ -269,8 +270,12 @@ async def test_claim_lease_uses_the_fenced_message_and_repository_identity() -> 
     )
 
     lease = await repository.claim_attempt(message, worker_id="worker-1", receipt="1-0")
+    reclaimed_lease = await repository.claim_attempt(
+        message, worker_id="worker-2", receipt="2-0"
+    )
 
     assert lease is not None
+    assert reclaimed_lease is not None
     assert lease.task_kind is ProcessingTaskKind.VIDEO
     assert lease.resource_class.value == "mps_video"
     assert lease.route_key == "mps_video"
@@ -278,6 +283,9 @@ async def test_claim_lease_uses_the_fenced_message_and_repository_identity() -> 
     assert lease.worker_id == "worker-1"
     assert lease.result_version == 1
     assert lease.lease_token
+    assert lease.lease_token.startswith("1:")
+    assert reclaimed_lease.lease_token
+    assert reclaimed_lease.lease_token != lease.lease_token
 
 
 def test_empty_lease_token_cannot_form_a_valid_repository_write_fence() -> None:
@@ -326,7 +334,7 @@ def test_recovery_fence_compares_a_persisted_null_token_exactly() -> None:
 
     clauses = " AND ".join(str(clause) for clause in repository._fence_clauses(recovered_row))
 
-    assert "video_processing_tasks.lease_token IS NULL" in clauses
+    assert "processing_tasks.lease_token IS NULL" in clauses
 
 
 def test_0013_upgrade_keeps_the_existing_unique_constraint_and_task_lifecycle_columns() -> None:

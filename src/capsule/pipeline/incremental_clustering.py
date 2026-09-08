@@ -129,7 +129,6 @@ class IncrementalRelationGraphUpdater(Protocol):
         self,
         *,
         workspace_id: str,
-        force_rebuild: bool = False,
     ) -> dict[str, Any]: ...
 
 
@@ -507,21 +506,11 @@ class IncrementalClusterCoordinator:
         workspace_id, embedding_type = key
         try:
             async with self._semaphore:
-                result = await self._cluster_runner.run(
+                await self._cluster_runner.run(
                     workspace_id=workspace_id,
                     embedding_type=embedding_type,
                     trigger=trigger,
                 )
-                status = getattr(getattr(result, "status", None), "value", None)
-                if (
-                    embedding_type is EmbeddingType.SUBJECT_CONTENT
-                    and self._relation_graph_updater is not None
-                    and status in {"completed", "insufficient_data"}
-                ):
-                    await self._relation_graph_updater.build(
-                        workspace_id=workspace_id,
-                        force_rebuild=True,
-                    )
         finally:
             self._running_keys.discard(key)
 

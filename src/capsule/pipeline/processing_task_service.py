@@ -37,6 +37,7 @@ from capsule.pipeline.processing_task_processor import (
     TextProcessingTaskProcessor,
 )
 from capsule.pipeline.runner import _collect_image_source_contexts, _processing_fingerprint
+from capsule.pipeline.source_materializer import load_postgres_object_source
 from capsule.pipeline.video_task_runtime import (
     ProcessingTaskKind,
     ProcessingTaskMessage,
@@ -50,6 +51,7 @@ from capsule.pipeline.video_task_runtime import (
 )
 from capsule.pipeline.video_task_service import VideoTaskScheduler, VideoTaskWorker
 from capsule.schemas import DiscoveredFile, SourceContext
+from capsule.storage.object_storage import ObjectStorage
 from capsule.video_sources import validate_video_source_root
 
 logger = logging.getLogger(__name__)
@@ -267,6 +269,7 @@ class BrowserProcessingTaskSubmissionService:
                 )
                 task_repository = PostgresVideoTaskRepository(
                     database.session_factory,
+                    max_dispatch_rounds=self._settings.video_task_max_dispatch_rounds,
                     task_kind=task_kind,
                     resource_class=ResourceClass.MPS_VIDEO,
                     route_key="mps_video",
@@ -381,6 +384,7 @@ class BrowserProcessingTaskSubmissionService:
                             )
                             repositories[task_kind] = PostgresVideoTaskRepository(
                                 database.session_factory,
+                                max_dispatch_rounds=self._settings.video_task_max_dispatch_rounds,
                                 task_kind=task_kind,
                                 resource_class=ResourceClass.MPS_VIDEO,
                                 route_key="mps_video",
@@ -471,7 +475,10 @@ class CpuProcessingTaskWorker(VideoTaskWorker):
             consumer=identity,
         )
         committer = PostgresFencedAssetBatchCommitter(database)
-        loader = postgres_source_file_loader(database.session_factory)
+        loader = postgres_source_file_loader(
+            database.session_factory,
+            ObjectStorage(runtime_settings),
+        )
         contexts_loader = source_contexts_loader or postgres_source_contexts_loader(
             database.session_factory
         )
@@ -502,7 +509,7 @@ class CpuProcessingTaskWorker(VideoTaskWorker):
             processor=processor,
             worker_id=identity,
             retry_policy=RetryPolicy(
-                max_attempts=runtime_settings.video_task_max_attempts,
+                max_failures=runtime_settings.video_task_redis_max_failures,
                 retry_delays_seconds=tuple(runtime_settings.video_task_retry_delays_seconds),
             ),
             heartbeat_seconds=runtime_settings.video_task_heartbeat_seconds,
@@ -563,32 +570,16 @@ class CpuProcessingTaskScheduler(VideoTaskScheduler):
 
 def postgres_source_file_loader(
     session_factory: Any,
+    storage: ObjectStorage,
 ) -> Callable[[ProcessingTaskMessage], Awaitable[DurableProcessingSource]]:
-    """Load canonical source metadata from PostgreSQL, never from Redis fields."""
-    from sqlalchemy import select
-
-    from capsule.db.models import SourceFile
+    """Materialize the canonical S3 source selected from PostgreSQL facts."""
 
     async def load(message: ProcessingTaskMessage) -> DurableProcessingSource:
-        async with session_factory() as session:
-            source = await session.scalar(
-                select(SourceFile).where(SourceFile.source_file_id == message.source_file_id)
-            )
-        if (
-            source is None
-            or source.workspace_id != message.workspace_id
-            or source.processing_generation != message.generation
-        ):
-            raise ValueError("CPU processing task source is not the current canonical generation")
-        path = _local_storage_path(source.storage_uri)
+        materialized = await load_postgres_object_source(session_factory, storage, message)
         return DurableProcessingSource(
-            source_file=DiscoveredFile(
-                path=str(path),
-                relative_path=source.relative_path,
-                extension=Path(source.relative_path).suffix.lower(),
-                size_bytes=source.file_size_bytes,
-            ),
-            sha256=source.sha256,
+            source_file=materialized.source_file,
+            sha256=materialized.sha256,
+            cleanup=materialized.cleanup,
         )
 
     return load
@@ -632,7 +623,7 @@ def _task_repository(
         progress_timeout_seconds=settings.video_task_progress_timeout_seconds,
         hard_timeout_seconds=settings.video_task_hard_timeout_seconds,
         redispatch_seconds=settings.video_task_redispatch_seconds,
-        max_attempts=settings.video_task_max_attempts,
+        max_dispatch_rounds=settings.video_task_max_dispatch_rounds,
     )
 
 
@@ -708,15 +699,6 @@ def _cpu_source(
 def _mime_type(source_file: DiscoveredFile) -> str:
     guessed, _ = mimetypes.guess_type(source_file.path)
     return guessed or "application/octet-stream"
-
-
-def _local_storage_path(storage_uri: str) -> Path:
-    from urllib.parse import unquote, urlparse
-
-    parsed = urlparse(storage_uri)
-    if parsed.scheme not in ("", "file"):
-        raise ValueError("CPU processing task source storage must be a local file URI")
-    return Path(unquote(parsed.path) if parsed.scheme else storage_uri)
 
 
 def _worker_identity() -> str:

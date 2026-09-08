@@ -27,6 +27,7 @@ from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
 from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeClusterResult
 from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
+from capsule.pipeline.cloud_source_dispatcher import CloudSourceTaskDispatcher
 from capsule.pipeline.import_service import AssetEnrichmentResult, enrich_assets
 from capsule.pipeline.processing_task_service import (
     CpuProcessingTaskScheduler,
@@ -273,6 +274,29 @@ def cpu_task_scheduler_command(
         typer.echo(json.dumps({"published": published}, ensure_ascii=False))
         return
     asyncio.run(scheduler.run_forever())
+
+
+@app.command(name="cloud-source-dispatcher")
+def cloud_source_dispatcher_command(
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Create durable tasks for pending S3/MinIO sources once."),
+    ] = False,
+) -> None:
+    """Turn externally registered ``source_files`` cloud objects into durable tasks."""
+    dispatcher = CloudSourceTaskDispatcher()
+    if once:
+        created = asyncio.run(_run_cloud_source_dispatcher_once(dispatcher))
+        typer.echo(json.dumps({"created": created}, ensure_ascii=False))
+        return
+    asyncio.run(dispatcher.run_forever())
+
+
+async def _run_cloud_source_dispatcher_once(dispatcher: CloudSourceTaskDispatcher) -> int:
+    try:
+        return await dispatcher.run_once()
+    finally:
+        await dispatcher.close()
 
 
 @app.command(name="embed")

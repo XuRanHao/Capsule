@@ -24,6 +24,7 @@ from capsule.parsers.video import (
     VideoParser,
 )
 from capsule.pipeline.asset_factory import AssetFactory
+from capsule.pipeline.source_materializer import MaterializedSource
 from capsule.pipeline.video_media import VideoDerivedMediaWriter
 from capsule.pipeline.video_task_runtime import (
     LeaseLostError,
@@ -61,7 +62,7 @@ class FencedVideoAssetCommitter(Protocol):
     ) -> str: ...
 
 
-SourceFileLoader = Callable[[VideoTaskMessage], Awaitable[DiscoveredFile]]
+SourceFileLoader = Callable[[VideoTaskMessage], Awaitable[MaterializedSource]]
 
 
 class CapsuleVideoTaskProcessor:
@@ -132,7 +133,8 @@ class CapsuleVideoTaskProcessor:
             )
 
         try:
-            source_file = await self._source_file_loader(message)
+            materialized = await self._source_file_loader(message)
+            source_file = materialized.source_file
             source_sha256 = await asyncio.to_thread(sha256_file, Path(source_file.path))
             drafts = await self._parser.assetize(
                 source_file,
@@ -238,6 +240,8 @@ class CapsuleVideoTaskProcessor:
             )
         finally:
             cancellation_token.cancel()
+            if "materialized" in locals():
+                await materialized.cleanup()
 
     @staticmethod
     def _assert_message_matches_lease(message: VideoTaskMessage, lease: VideoTaskLease) -> None:
@@ -254,7 +258,7 @@ class CapsuleVideoTaskProcessor:
             raise LeaseLostError("video task message does not match its database lease")
 
 
-async def _local_source_file(message: VideoTaskMessage) -> DiscoveredFile:
+async def _local_source_file(message: VideoTaskMessage) -> MaterializedSource:
     """Resolve the currently supported local-source task contract."""
     if not message.source_uri:
         raise ValueError("video task source_uri is required")
@@ -262,12 +266,21 @@ async def _local_source_file(message: VideoTaskMessage) -> DiscoveredFile:
     if parsed.scheme not in ("", "file"):
         raise ValueError("video task source_uri must be a local path or file URI")
     raw_path = unquote(parsed.path) if parsed.scheme else message.source_uri
+    if len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
+        raw_path = raw_path[1:]
     path, size_bytes = await asyncio.to_thread(_resolve_existing_local_source, raw_path)
-    return DiscoveredFile(
-        path=str(path),
-        relative_path=path.name,
-        extension=path.suffix.lower(),
-        size_bytes=size_bytes,
+    async def cleanup() -> None:
+        return None
+
+    return MaterializedSource(
+        source_file=DiscoveredFile(
+            path=str(path),
+            relative_path=path.name,
+            extension=path.suffix.lower(),
+            size_bytes=size_bytes,
+        ),
+        sha256="",
+        cleanup=cleanup,
     )
 
 

@@ -43,7 +43,7 @@ def test_asset_committer_includes_a_nonempty_lease_token_in_its_live_fence() -> 
 
     clauses = " AND ".join(str(clause) for clause in _owned_live_lease_clauses(lease))
 
-    assert "video_processing_tasks.lease_token" in clauses
+    assert "processing_tasks.lease_token" in clauses
 
 
 @pytest.mark.asyncio
@@ -128,10 +128,10 @@ def test_asset_committer_live_fence_includes_the_full_lease_identity() -> None:
     assert all(
         field in clauses
         for field in (
-            "video_processing_tasks.task_kind",
-            "video_processing_tasks.resource_class",
-            "video_processing_tasks.route_key",
-            "video_processing_tasks.processor_version",
+            "processing_tasks.task_kind",
+            "processing_tasks.resource_class",
+            "processing_tasks.route_key",
+            "processing_tasks.processor_version",
         )
     )
 
@@ -148,7 +148,7 @@ async def test_fenced_segment_commit_publishes_only_complete_generation_once(
             async with database.session() as session:
                 await session.execute(text("select 1"))
                 task_table = await session.scalar(
-                    text("select to_regclass('public.video_processing_tasks')")
+                    text("select to_regclass('public.processing_tasks')")
                 )
         except SQLAlchemyError:
             pytest.skip("PostgreSQL integration database is unavailable")

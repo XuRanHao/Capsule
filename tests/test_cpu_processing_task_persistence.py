@@ -105,11 +105,11 @@ def test_cpu_asset_committer_inherits_complete_identity_fencing() -> None:
     assert all(
         column in clauses
         for column in (
-            "video_processing_tasks.task_kind",
-            "video_processing_tasks.resource_class",
-            "video_processing_tasks.route_key",
-            "video_processing_tasks.processor_version",
-            "video_processing_tasks.lease_token",
+            "processing_tasks.task_kind",
+            "processing_tasks.resource_class",
+            "processing_tasks.route_key",
+            "processing_tasks.processor_version",
+            "processing_tasks.lease_token",
         )
     )
 
@@ -179,14 +179,14 @@ async def test_cpu_submission_atomically_creates_job_source_and_queued_task(
             async with database.session() as session:
                 await session.execute(text("select 1"))
                 task_table = await session.scalar(
-                    text("select to_regclass('public.video_processing_tasks')")
+                    text("select to_regclass('public.processing_tasks')")
                 )
                 input_payload_column = await session.scalar(
                     text(
                         "select exists ("
                         "select 1 from information_schema.columns "
                         "where table_schema = 'public' "
-                        "and table_name = 'video_processing_tasks' "
+                        "and table_name = 'processing_tasks' "
                         "and column_name = 'input_payload'"
                         ")"
                     )
@@ -254,14 +254,14 @@ async def test_cpu_batch_commit_is_fenced_and_accounts_parent_once(tmp_path: Pat
             async with database.session() as session:
                 await session.execute(text("select 1"))
                 task_table = await session.scalar(
-                    text("select to_regclass('public.video_processing_tasks')")
+                    text("select to_regclass('public.processing_tasks')")
                 )
                 input_payload_column = await session.scalar(
                     text(
                         "select exists ("
                         "select 1 from information_schema.columns "
                         "where table_schema = 'public' "
-                        "and table_name = 'video_processing_tasks' "
+                        "and table_name = 'processing_tasks' "
                         "and column_name = 'input_payload'"
                         ")"
                     )

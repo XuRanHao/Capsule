@@ -244,6 +244,7 @@ def _message_matches_lease(message: VideoTaskMessage, lease: VideoTaskLease) -> 
         and message.source_file_id == lease.source_file_id
         and message.generation == lease.source_generation
         and message.result_version == lease.result_version
+        and message.dispatch_round == lease.dispatch_round
         and message.task_kind == lease.task_kind
         and message.resource_class == lease.resource_class
         and message.route_key == lease.route_key

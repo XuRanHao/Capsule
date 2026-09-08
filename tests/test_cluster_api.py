@@ -336,6 +336,4 @@ async def test_user_subject_clustering_rebuilds_relation_graph_after_completion(
             )
 
     assert response.status_code == 202
-    assert rebuilder.calls == [
-        {"workspace_id": "workspace_api_test", "force_rebuild": True}
-    ]
+    assert rebuilder.calls == []

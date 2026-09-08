@@ -1,7 +1,6 @@
-import re
 from collections.abc import Mapping, Sequence
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, select
 
 from capsule.db.models import (
     Asset,
@@ -19,10 +18,6 @@ from capsule.search.models import (
     SearchFilters,
     TextSearchHit,
 )
-
-_TEXT_PART_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
-_CJK_RE = re.compile(r"[\u3400-\u9fff]")
-
 
 class PostgresAssetSearchRepository:
     def __init__(self, database: Database) -> None:
@@ -201,35 +196,24 @@ class PostgresAssetSearchRepository:
         created_by: str,
         limit: int,
     ) -> Sequence[TextSearchHit]:
-        """Recall filename, path, raw text and description as one local route."""
+        """Recall indexed Asset text through ParadeDB's pg_search BM25 index."""
 
-        if limit < 1:
+        normalized_query = query_text.strip()
+        if limit < 1 or not normalized_query:
             return []
-        terms = _text_search_terms(query_text)
-        if not terms:
-            return []
-        text_fields = (
-            Asset.file_name,
-            SourceFile.relative_path,
-            Asset.raw_content,
-            Asset.asset_description,
-        )
         statement = (
-            select(Asset, SourceFile)
+            select(
+                Asset,
+                func.pdb.score(Asset.asset_id).label("bm25_score"),
+            )
             .join(SourceFile, SourceFile.source_file_id == Asset.source_file_id)
             .where(
+                Asset.asset_id.op("@@@")(normalized_query),
                 Asset.workspace_id == workspace_id,
                 SourceFile.workspace_id == workspace_id,
                 Asset.generation == SourceFile.processing_generation,
                 Asset.index_role != "parent",
                 Asset.processing_status != ProcessingStatus.SKIPPED.value,
-                or_(
-                    *(
-                        field.ilike(_contains_pattern(term), escape="\\")
-                        for term in terms
-                        for field in text_fields
-                    )
-                ),
             )
         )
         if filters.project_id:
@@ -275,30 +259,22 @@ class PostgresAssetSearchRepository:
                     )
                 )
             )
-        candidate_limit = min(max(limit * 20, 200), 2_000)
-        statement = statement.order_by(Asset.updated_at.desc()).limit(candidate_limit)
+        statement = statement.order_by(
+            func.pdb.score(Asset.asset_id).desc(),
+            Asset.asset_id.asc(),
+        ).limit(limit)
         async with self._database.session() as session:
             rows = (await session.execute(statement)).all()
 
-        hits = [
+        return [
             TextSearchHit(
                 asset_id=asset.asset_id,
                 source_file_id=asset.source_file_id,
                 asset_type=asset.asset_type,
-                score=_text_relevance(
-                    query_text=query_text,
-                    terms=terms,
-                    file_name=asset.file_name,
-                    relative_path=source.relative_path,
-                    raw_content=asset.raw_content,
-                    asset_description=asset.asset_description,
-                ),
+                score=float(score),
             )
-            for asset, source in rows
+            for asset, score in rows
         ]
-        hits = [item for item in hits if item.score > 0]
-        hits.sort(key=lambda item: (-item.score, item.asset_id))
-        return hits[:limit]
 
     async def search_by_assets(
         self,
@@ -398,68 +374,3 @@ class PostgresAssetSearchRepository:
             )
         results.sort(key=lambda item: (-item.score, item.cluster_capsule_id))
         return results[:limit]
-
-
-def _text_search_terms(query_text: str, *, limit: int = 24) -> tuple[str, ...]:
-    normalized = " ".join(query_text.casefold().split())
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def add(term: str) -> bool:
-        if term not in seen:
-            seen.add(term)
-            candidates.append(term)
-        return len(candidates) >= limit
-
-    if 1 < len(normalized) <= 128 and add(normalized):
-        return tuple(candidates)
-    for part in _TEXT_PART_RE.findall(normalized[:2_000]):
-        if len(part) < 2:
-            continue
-        if _CJK_RE.search(part):
-            if len(part) <= 8 and add(part):
-                break
-            if any(add(part[index : index + 2]) for index in range(len(part) - 1)):
-                break
-        elif add(part):
-            break
-    return tuple(candidates)
-
-
-def _contains_pattern(term: str) -> str:
-    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
-
-
-def _text_relevance(
-    *,
-    query_text: str,
-    terms: Sequence[str],
-    file_name: str | None,
-    relative_path: str | None,
-    raw_content: str | None,
-    asset_description: str | None,
-) -> float:
-    normalized_query = " ".join(query_text.casefold().split())
-    best = 0.0
-    fields = (
-        (file_name, 1.0),
-        (relative_path, 0.9),
-        (raw_content, 0.8),
-        (asset_description, 0.75),
-    )
-    for value, weight in fields:
-        normalized = value.casefold() if value else ""
-        if not normalized:
-            continue
-        matched = sum(term in normalized for term in terms)
-        if not matched:
-            continue
-        coverage = matched / len(terms)
-        full_match = bool(normalized_query and normalized_query in normalized)
-        exact_match = bool(normalized_query and normalized.strip() == normalized_query)
-        field_score = weight * (
-            0.2 + 0.45 * coverage + 0.2 * full_match + 0.15 * exact_match
-        )
-        best = max(best, field_score)
-    return min(1.0, best)

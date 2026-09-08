@@ -76,6 +76,7 @@ class ProcessingTaskMessage:
     source_file_id: str
     generation: int
     attempt: int = 0
+    dispatch_round: int = 1
     task_id: str | None = None
     result_version: int = 1
     source_uri: str = ""
@@ -85,6 +86,7 @@ class ProcessingTaskMessage:
     message_schema_version: int = 1
     dispatch_version: int = 0
     route_key: str = "mps_video"
+    retry_event_id: str = ""
     legacy_wire: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -94,6 +96,8 @@ class ProcessingTaskMessage:
             raise ValueError("generation must be positive")
         if self.attempt < 0:
             raise ValueError("attempt cannot be negative")
+        if self.dispatch_round < 1:
+            raise ValueError("dispatch_round must be positive")
         if self.result_version < 1:
             raise ValueError("result_version must be positive")
         if self.processor_version < 1:
@@ -128,6 +132,7 @@ class ProcessingTaskMessage:
             "source_file_id": self.source_file_id,
             "generation": str(self.generation),
             "attempt": str(self.attempt),
+            "dispatch_round": str(self.dispatch_round),
             "result_version": str(self.result_version),
             "source_uri": self.source_uri,
             "task_kind": self.task_kind.value,
@@ -136,6 +141,7 @@ class ProcessingTaskMessage:
             "message_schema_version": str(self.message_schema_version),
             "dispatch_version": str(self.dispatch_version),
             "route_key": self.route_key,
+            "retry_event_id": self.retry_event_id,
         }
 
     @classmethod
@@ -169,6 +175,7 @@ class ProcessingTaskMessage:
             source_file_id=value("source_file_id"),
             generation=int(value("generation")),
             attempt=int(value("attempt", "0")),
+            dispatch_round=int(value("dispatch_round", "1")),
             result_version=int(value("result_version", "1")),
             source_uri=value("source_uri", ""),
             # Pre-generalization video entries omitted these fields.  Defaulting
@@ -181,6 +188,7 @@ class ProcessingTaskMessage:
             message_schema_version=int(value("message_schema_version", "1")),
             dispatch_version=int(value("dispatch_version", "0")),
             route_key=value("route_key", "mps_video"),
+            retry_event_id=value("retry_event_id", ""),
             legacy_wire=legacy_wire,
         )
 
@@ -201,6 +209,7 @@ class ProcessingTaskLease:
     attempt: int
     worker_id: str
     result_version: int
+    dispatch_round: int = 1
     task_kind: ProcessingTaskKind = ProcessingTaskKind.VIDEO
     resource_class: ResourceClass = ResourceClass.MPS_VIDEO
     route_key: str = "mps_video"
@@ -227,12 +236,12 @@ class ProcessingTaskResult:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    max_attempts: int = 4
+    max_failures: int = 4
     retry_delays_seconds: tuple[float, ...] = (5.0, 30.0, 300.0)
 
     def __post_init__(self) -> None:
-        if self.max_attempts < 1:
-            raise ValueError("max_attempts must be positive")
+        if self.max_failures < 1:
+            raise ValueError("max_failures must be positive")
         if not self.retry_delays_seconds or any(delay < 0 for delay in self.retry_delays_seconds):
             raise ValueError("retry_delays_seconds must contain non-negative delays")
 
@@ -255,7 +264,9 @@ class ProcessingTaskQueue(Protocol):
         *,
         next_attempt: int,
         delay_seconds: float,
-    ) -> None: ...
+        failure_event_id: str,
+        max_failures: int,
+    ) -> "RetryEnqueueResult": ...
 
     async def route_dlq(self, delivery: ProcessingTaskDelivery, *, error: str) -> None: ...
 
@@ -299,6 +310,16 @@ class ProcessingTaskRepository(Protocol):
         *,
         error: str,
         retry_at: float,
+    ) -> "RetryWait": ...
+
+    async def pending_retry_wait(self, message: ProcessingTaskMessage) -> "RetryWait | None": ...
+
+    async def advance_dispatch_round(
+        self,
+        message: ProcessingTaskMessage,
+        *,
+        failure_event_id: str,
+        error: str,
     ) -> bool: ...
 
     async def fail(self, lease: ProcessingTaskLease, *, error: str) -> bool: ...
@@ -330,6 +351,21 @@ VideoTaskProcessor = ProcessingTaskProcessor
 
 class LeaseLostError(RuntimeError):
     """Raised when a stale worker attempts to report progress or finish work."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetryWait:
+    """Durable retry event awaiting Redis-owned redelivery."""
+
+    failure_event_id: str
+    delay_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class RetryEnqueueResult:
+    """Outcome of idempotently registering one failure in Redis."""
+
+    exhausted: bool
 
 
 class VideoTaskRuntime:
@@ -389,6 +425,25 @@ class VideoTaskRuntime:
         if durable_contract is None:
             await self._queue.quarantine(delivery, error="orphan_task")
             return "quarantined"
+
+        pending_retry = await self._repository.pending_retry_wait(delivery.message)
+        if pending_retry is not None:
+            retry = await self._queue.retry(
+                delivery,
+                next_attempt=delivery.message.attempt + 1,
+                delay_seconds=pending_retry.delay_seconds,
+                failure_event_id=pending_retry.failure_event_id,
+                max_failures=self._retry_policy.max_failures,
+            )
+            if retry.exhausted:
+                if not await self._repository.advance_dispatch_round(
+                    delivery.message,
+                    failure_event_id=pending_retry.failure_event_id,
+                    error="Redis retry limit reached",
+                ):
+                    return "deferred"
+            await self._queue.acknowledge(delivery)
+            return "retry_registered"
 
         lease = await self._repository.claim_attempt(
             delivery.message,
@@ -485,32 +540,52 @@ class VideoTaskRuntime:
         error: str,
     ) -> str:
         bounded_error = error[:2_000] or "video processor failed"
-        if lease.attempt >= self._retry_policy.max_attempts:
-            if not await self._repository.fail(lease, error=bounded_error):
-                if await self._repository.can_ack_unclaimed(delivery.message):
-                    await self._queue.acknowledge(delivery)
-                    return "duplicate"
-                return "deferred"
-            await self._queue.route_dlq(delivery, error=bounded_error)
-            await self._repository.mark_dlq_published(delivery.message)
-            await self._queue.acknowledge(delivery)
-            return "dlq"
-
         delay = self._retry_policy.delay_for_attempt(lease.attempt)
         retry_at = self._clock() + delay
-        if not await self._repository.schedule_retry(
+        retry_wait = await self._repository.schedule_retry(
             lease,
             error=bounded_error,
             retry_at=retry_at,
-        ):
+        )
+        if retry_wait is None:
             await self._queue.acknowledge(delivery)
             return "duplicate"
-        await self._queue.retry(
+        retry = await self._queue.retry(
             delivery,
             next_attempt=lease.attempt + 1,
             delay_seconds=delay,
+            failure_event_id=retry_wait.failure_event_id,
+            max_failures=self._retry_policy.max_failures,
         )
+        if retry.exhausted:
+            if not await self._repository.advance_dispatch_round(
+                delivery.message,
+                failure_event_id=retry_wait.failure_event_id,
+                error=bounded_error,
+            ):
+                # A false conditional update means this execution lost its
+                # durable fence; it must not remain as a stale PEL delivery.
+                await self._queue.acknowledge(delivery)
+                return "duplicate"
+        await self._queue.acknowledge(delivery)
         return "retry_scheduled"
+
+
+_REGISTER_RETRY_LUA = """
+local counted = redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1])
+local count = tonumber(redis.call('GET', KEYS[2]) or '0')
+if counted then
+  count = redis.call('INCR', KEYS[2])
+  redis.call('EXPIRE', KEYS[2], ARGV[1])
+end
+if count >= tonumber(ARGV[2]) then
+  return {1, count}
+end
+if counted then
+  redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
+end
+return {0, count}
+"""
 
 
 class RedisVideoTaskQueue:
@@ -598,18 +673,41 @@ class RedisVideoTaskQueue:
         *,
         next_attempt: int,
         delay_seconds: float,
-    ) -> None:
+        failure_event_id: str,
+        max_failures: int,
+    ) -> RetryEnqueueResult:
         if delay_seconds < 0:
             raise ValueError("delay_seconds cannot be negative")
-        message = replace(delivery.message, attempt=next_attempt)
-        payload = json.dumps(message.to_fields(), sort_keys=True, separators=(",", ":"))
-        # ACK only after Redis has durably recorded the delayed delivery.  A crash
-        # before ACK leaves a harmless duplicate in the PEL, fenced by PostgreSQL.
-        await self._required_client().zadd(
-            self._delayed_key,
-            {payload: time.time() + delay_seconds},
+        if max_failures < 1:
+            raise ValueError("max_failures must be positive")
+        message = replace(
+            delivery.message,
+            attempt=next_attempt,
+            retry_event_id=failure_event_id,
         )
-        await self.acknowledge(delivery)
+        payload = json.dumps(message.to_fields(), sort_keys=True, separators=(",", ":"))
+        event_key = (
+            f"{self._delayed_key}:event:{delivery.message.task_id}:"
+            f"{delivery.message.dispatch_round}:{failure_event_id}"
+        )
+        count_key = (
+            f"{self._delayed_key}:failures:{delivery.message.task_id}:"
+            f"{delivery.message.dispatch_round}"
+        )
+        ttl_seconds = max(60, int(delay_seconds) + 3_600)
+        response = await self._required_client().eval(
+            _REGISTER_RETRY_LUA,
+            3,
+            event_key,
+            count_key,
+            self._delayed_key,
+            str(ttl_seconds),
+            str(max_failures),
+            str(time.time() + delay_seconds),
+            payload,
+        )
+        exhausted = int(response[0]) == 1
+        return RetryEnqueueResult(exhausted=exhausted)
 
     async def release_due_retries(self, *, limit: int = 100) -> int:
         """Return delayed entries to the stream; duplicates are intentional-safe."""

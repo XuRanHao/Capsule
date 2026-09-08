@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -544,6 +545,41 @@ class RelationGraphBuild(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text)
 
 
+class RelationHierarchyBatchCommit(Base, TimestampMixin):
+    """One idempotent hierarchy-workflow database commit.
+
+    A LangGraph checkpoint can replay a completed node after its database
+    transaction committed.  The ``workspace_id`` + ``operation_id`` key lets
+    the repository return that original outcome instead of applying the
+    hierarchy operation twice.
+    """
+
+    __tablename__ = "relation_hierarchy_batch_commits"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "operation_id",
+            name="uq_relation_hierarchy_batch_commit_operation",
+        ),
+    )
+
+    commit_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("relcommit")
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    operation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), default=dict, nullable=False
+    )
+
+
 class RelationEntity(Base, TimestampMixin):
     """A persisted virtual Entity node produced by candidate merging."""
 
@@ -585,6 +621,12 @@ class RelationEntitySource(Base):
     name: Mapped[str] = mapped_column(String(1024), nullable=False)
     semantic: Mapped[str] = mapped_column(Text, nullable=False)
     asset_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    # Candidate vectors are retained at source level so an Entity merged from
+    # several subject clusters can be recomputed without calling the model.
+    embedding_vector: Mapped[list[float]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), default=list, nullable=False
+    )
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
 class EntityEntityRelation(Base, TimestampMixin):

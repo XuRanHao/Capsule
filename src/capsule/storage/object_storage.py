@@ -117,6 +117,20 @@ class ObjectStorage:
     async def download_uri(self, uri: str) -> bytes:
         return (await self.download_uri_response(uri)).content
 
+    async def download_uri_to_file(self, uri: str, destination: Path) -> None:
+        """Download one private object directly to a temporary worker file."""
+        parsed = urlparse(uri)
+        if parsed.scheme != "s3" or parsed.netloc != self._bucket or not parsed.path.lstrip("/"):
+            raise ValueError(f"object URI does not belong to configured bucket: {uri!r}")
+        object_key = unquote(parsed.path.lstrip("/"))
+        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            self._client.download_file,
+            self._bucket,
+            object_key,
+            str(destination),
+        )
+
     async def download_uri_response(
         self,
         uri: str,

@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 import httpx
@@ -19,63 +18,7 @@ from capsule.model_clients.doubao import (
 def test_responses_content_converts_direct_audio_input() -> None:
     assert _responses_content(
         [{"type": "audio_url", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}]
-    ) == [
-        {"type": "input_audio", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}
-    ]
-
-
-@pytest.mark.asyncio
-async def test_asset_entity_relations_use_parallel_batches_and_preserve_order() -> None:
-    batch_sizes: list[int] = []
-    active = 0
-    max_active = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal active, max_active
-        payload = json.loads(request.content)
-        candidates = json.loads(payload["messages"][1]["content"])["candidates"]
-        batch_sizes.append(len(candidates))
-        active += 1
-        max_active = max(max_active, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-        relations = [
-            {
-                "source_id": item["source_id"],
-                "target_id": item["target_id"],
-                "establishes_relation": True,
-                "relation": "相关",
-                "description": "测试关系",
-            }
-            for item in candidates
-        ]
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps({"relations": relations})}}]},
-        )
-
-    client = DoubaoClient(
-        Settings(
-            ark_api_key=SecretStr("test-key"),
-            deepseek_api_key=SecretStr("deepseek-test-key"),
-        )
-    )
-    await client.close()
-    client._deepseek_client = httpx.AsyncClient(
-        base_url="https://example.test",
-        transport=httpx.MockTransport(handler),
-    )
-    candidates = [{"source_id": f"asset_{index}", "target_id": "entity_1"} for index in range(13)]
-    try:
-        resolution = await client.generate_asset_entity_relations(candidates)
-    finally:
-        await client.close()
-
-    assert sorted(batch_sizes) == [3, 10]
-    assert max_active == 2
-    assert [item.source_id for item in resolution.relations] == [
-        item["source_id"] for item in candidates
-    ]
+    ) == [{"type": "input_audio", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}]
 
 
 def test_extract_embedding_accepts_openai_list_shape() -> None:

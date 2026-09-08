@@ -1,8 +1,9 @@
 """PostgreSQL source of truth for reliable whole-video processing tasks.
 
 Redis deliveries are intentionally not authoritative.  A worker may only mutate
-its task while it owns the exact ``(task_id, attempt, owner_id,
-source_generation)`` fence carried in :class:`VideoTaskLease`.
+its task while it owns the exact ``(task_id, dispatch_round, attempt,
+owner_id, lease_token, source_generation)`` fence carried in
+:class:`VideoTaskLease`.
 """
 
 from __future__ import annotations
@@ -43,35 +44,36 @@ from capsule.pipeline.video_task_runtime import (
     VideoTaskMessage,
     VideoTaskProgress,
     VideoTaskResult,
+    RetryWait,
 )
 
 
 class VideoProcessingTask(Base):
     """Durable fact record for one source generation and result schema version."""
 
-    __tablename__ = "video_processing_tasks"
+    __tablename__ = "processing_tasks"
     __table_args__ = (
         UniqueConstraint(
             "source_file_id",
             "source_generation",
             "result_version",
-            name="uq_video_task_source_generation_result_version",
+            name="uq_processing_task_source_generation_result_version",
         ),
-        Index("ix_video_processing_tasks_status_next_retry", "status", "next_retry_at"),
+        Index("ix_processing_tasks_status_next_retry", "status", "next_retry_at"),
         Index(
-            "ix_video_processing_tasks_kind_status_next_retry",
+            "ix_processing_tasks_kind_status_next_retry",
             "task_kind",
             "status",
             "next_retry_at",
         ),
         Index(
-            "ix_video_processing_tasks_kind_identity",
+            "ix_processing_tasks_kind_identity",
             "source_file_id",
             "source_generation",
             "task_kind",
             "result_version",
         ),
-        Index("ix_video_processing_tasks_parent_status", "parent_job_id", "status"),
+        Index("ix_processing_tasks_parent_status", "parent_job_id", "status"),
     )
 
     task_id: Mapped[str] = mapped_column(
@@ -94,6 +96,7 @@ class VideoProcessingTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatch_round: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     owner_id: Mapped[str | None] = mapped_column(String(255), index=True)
     lease_token: Mapped[str | None] = mapped_column(String(64))
     message_id: Mapped[str | None] = mapped_column(String(128))
@@ -104,6 +107,7 @@ class VideoProcessingTask(Base):
     )
     hard_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    retry_event_id: Mapped[str | None] = mapped_column(String(160))
     last_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     dlq_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -134,7 +138,7 @@ class PostgresVideoTaskRepository:
         progress_timeout_seconds: float = 120.0,
         hard_timeout_seconds: float = 7_200.0,
         redispatch_seconds: float = 60.0,
-        max_attempts: int = 4,
+        max_dispatch_rounds: int = 4,
         task_kind: str = "video",
         resource_class: str = "mps_video",
         processor_version: int = 1,
@@ -150,8 +154,8 @@ class PostgresVideoTaskRepository:
             <= 0
         ):
             raise ValueError("video task lease and deadline durations must be positive")
-        if max_attempts < 1:
-            raise ValueError("video task max_attempts must be positive")
+        if max_dispatch_rounds < 1:
+            raise ValueError("video task max_dispatch_rounds must be positive")
         if not task_kind or not resource_class or not route_key:
             raise ValueError("video task kind, resource class, and route key are required")
         if processor_version < 1:
@@ -161,7 +165,7 @@ class PostgresVideoTaskRepository:
         self._progress_timeout = timedelta(seconds=progress_timeout_seconds)
         self._hard_timeout = timedelta(seconds=hard_timeout_seconds)
         self._redispatch_duration = timedelta(seconds=redispatch_seconds)
-        self._max_attempts = max_attempts
+        self._max_dispatch_rounds = max_dispatch_rounds
         self._task_kind = task_kind
         self._resource_class = resource_class
         self._processor_version = processor_version
@@ -189,6 +193,7 @@ class PostgresVideoTaskRepository:
             "status": "queued",
             "stage": "queued",
             "attempt": 0,
+            "dispatch_round": message.dispatch_round,
             "progress": {},
             "hard_deadline_at": hard_deadline_at,
         }
@@ -242,8 +247,9 @@ class PostgresVideoTaskRepository:
             return None
         if message.task_id is None:  # pragma: no cover - normalized in message construction.
             return None
-        previous_attempt = 0 if message.attempt == 0 else message.attempt - 1
-        lease_token = uuid4().hex
+        # The token carries the dispatch round that minted it.  Result writes
+        # therefore need not repeat a separate dispatch-round predicate.
+        lease_token = f"{message.dispatch_round}:{uuid4().hex}"
         stmt = (
             update(VideoProcessingTask)
             .where(
@@ -251,15 +257,10 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.source_file_id == message.source_file_id,
                 VideoProcessingTask.source_generation == message.generation,
                 VideoProcessingTask.result_version == message.result_version,
+                VideoProcessingTask.dispatch_round == message.dispatch_round,
                 *self._task_identity_clauses(),
-                VideoProcessingTask.attempt == previous_attempt,
                 VideoProcessingTask.owner_id.is_(None),
                 VideoProcessingTask.status.in_(("queued", "retry_wait")),
-                or_(
-                    VideoProcessingTask.status == "queued",
-                    VideoProcessingTask.next_retry_at.is_(None),
-                    VideoProcessingTask.next_retry_at <= func.now(),
-                ),
             )
             .values(
                 status="processing",
@@ -272,20 +273,29 @@ class PostgresVideoTaskRepository:
                 progress_deadline_at=func.now() + self._progress_timeout,
                 hard_deadline_at=func.now() + self._hard_timeout,
                 next_retry_at=None,
+                retry_event_id=None,
                 updated_at=func.now(),
             )
+            .returning(VideoProcessingTask.attempt)
         )
         async with self._session_factory() as session, session.begin():
             claim = await session.execute(stmt)
-        if getattr(claim, "rowcount", 0) != 1:
+        scalar_one_or_none = getattr(claim, "scalar_one_or_none", None)
+        claimed_attempt = (
+            scalar_one_or_none()
+            if scalar_one_or_none is not None
+            else (message.attempt + 1 if getattr(claim, "rowcount", 0) == 1 else None)
+        )
+        if claimed_attempt is None:
             return None
         return VideoTaskLease(
             task_id=message.task_id,
             source_file_id=message.source_file_id,
             source_generation=message.generation,
-            attempt=previous_attempt + 1,
+            attempt=claimed_attempt,
             worker_id=worker_id,
             result_version=message.result_version,
+            dispatch_round=message.dispatch_round,
             # The UPDATE predicate already fenced these four fields against
             # this repository's trusted processor contract. Reuse that exact
             # contract for the lease instead of trusting concurrently adapted
@@ -335,13 +345,16 @@ class PostgresVideoTaskRepository:
         )
 
     async def can_ack_unclaimed(self, message: VideoTaskMessage) -> bool:
-        """ACK only terminal or result-committed duplicates, never active work."""
+        """ACK a delivery once PostgreSQL conclusively rejects its claim.
+
+        A delivery that lost the atomic claim race cannot become executable by
+        waiting in the PEL: the winner owns the current lease, or the task has
+        already moved to another state.  Keep PEL entries only for an actual
+        database/Redis error, where this method is not reached.
+        """
         if not self._message_matches_identity(message):
             return False
-        stmt = select(
-            VideoProcessingTask.status,
-            VideoProcessingTask.dlq_published_at,
-        ).where(
+        stmt = select(VideoProcessingTask.task_id).where(
             VideoProcessingTask.task_id == message.task_id,
             VideoProcessingTask.source_file_id == message.source_file_id,
             VideoProcessingTask.source_generation == message.generation,
@@ -350,11 +363,10 @@ class PostgresVideoTaskRepository:
         )
         async with self._session_factory() as session:
             row = (await session.execute(stmt)).one_or_none()
-        if row is None:
-            return False
-        if row.status == "failed":
-            return row.dlq_published_at is not None
-        return row.status in {"result_committed", "completed", "invalidated", "cancelled"}
+        # The normal caller already verified the durable contract.  A row
+        # removed after that check is likewise a definitive non-claimable
+        # delivery, so it can be acknowledged instead of leaking in the PEL.
+        return True
 
     async def heartbeat(self, lease: VideoTaskLease) -> bool:
         return await self._fenced_update(
@@ -423,8 +435,9 @@ class PostgresVideoTaskRepository:
         *,
         error: str,
         retry_at: float,
-    ) -> bool:
-        return await self._fenced_update(
+    ) -> RetryWait | None:
+        failure_event_id = f"{lease.task_id}:{lease.dispatch_round}:{lease.attempt}"
+        scheduled = await self._fenced_update(
             lease,
             statuses=("processing",),
             require_live_deadline=True,
@@ -433,6 +446,7 @@ class PostgresVideoTaskRepository:
                 "stage": "retry_wait",
                 "error_message": error[:2_000],
                 "next_retry_at": _as_utc(retry_at),
+                "retry_event_id": failure_event_id,
                 "owner_id": None,
                 "lease_token": None,
                 "message_id": None,
@@ -440,6 +454,102 @@ class PostgresVideoTaskRepository:
                 "progress_deadline_at": None,
             },
         )
+        if not scheduled:
+            return None
+        return RetryWait(
+            failure_event_id=failure_event_id,
+            delay_seconds=max(0.0, retry_at - datetime.now(UTC).timestamp()),
+        )
+
+    async def pending_retry_wait(self, message: VideoTaskMessage) -> RetryWait | None:
+        stmt = select(
+            VideoProcessingTask.retry_event_id,
+            VideoProcessingTask.next_retry_at,
+        ).where(
+            VideoProcessingTask.task_id == message.task_id,
+            VideoProcessingTask.source_file_id == message.source_file_id,
+            VideoProcessingTask.source_generation == message.generation,
+            VideoProcessingTask.result_version == message.result_version,
+            VideoProcessingTask.dispatch_round == message.dispatch_round,
+            *self._task_identity_clauses(),
+            VideoProcessingTask.status == "retry_wait",
+        )
+        async with self._session_factory() as session:
+            await session.execute(stmt)
+        if row is None or not row.retry_event_id or row.retry_event_id == message.retry_event_id:
+            return None
+        retry_at = row.next_retry_at or datetime.now(UTC)
+        return RetryWait(
+            failure_event_id=row.retry_event_id,
+            delay_seconds=max(0.0, (retry_at - datetime.now(UTC)).total_seconds()),
+        )
+
+    async def advance_dispatch_round(
+        self,
+        message: VideoTaskMessage,
+        *,
+        failure_event_id: str,
+        error: str,
+    ) -> bool:
+        clauses = (
+            VideoProcessingTask.task_id == message.task_id,
+            VideoProcessingTask.source_file_id == message.source_file_id,
+            VideoProcessingTask.source_generation == message.generation,
+            VideoProcessingTask.result_version == message.result_version,
+            VideoProcessingTask.dispatch_round == message.dispatch_round,
+            *self._task_identity_clauses(),
+            VideoProcessingTask.status == "retry_wait",
+            VideoProcessingTask.retry_event_id == failure_event_id,
+        )
+        async with self._session_factory() as session, session.begin():
+            if message.dispatch_round >= self._max_dispatch_rounds:
+                transitioned = (
+                    await session.execute(
+                        update(VideoProcessingTask)
+                        .where(*clauses, VideoProcessingTask.parent_accounted_at.is_(None))
+                        .values(
+                            status="failed",
+                            stage="failed",
+                            error_message=error[:2_000],
+                            parent_accounted_at=func.now(),
+                            retry_event_id=None,
+                            next_retry_at=None,
+                            updated_at=func.now(),
+                        )
+                        .returning(
+                            VideoProcessingTask.parent_job_id,
+                            VideoProcessingTask.source_file_id,
+                            VideoProcessingTask.source_generation,
+                        )
+                    )
+                ).one_or_none()
+                if transitioned is None:
+                    return False
+                source = await session.get(
+                    SourceFile, transitioned.source_file_id, with_for_update=True
+                )
+                if source is not None and source.processing_generation == transitioned.source_generation:
+                    source.processing_status = "failed"
+                    source.error_message = error[:2_000]
+                await account_video_task_outcome(
+                    session, parent_job_id=transitioned.parent_job_id, outcome="failed"
+                )
+                return True
+            transitioned = await session.scalar(
+                update(VideoProcessingTask)
+                .where(*clauses)
+                .values(
+                    status="queued",
+                    stage="queued",
+                    dispatch_round=VideoProcessingTask.dispatch_round + 1,
+                    retry_event_id=None,
+                    next_retry_at=None,
+                    last_published_at=None,
+                    updated_at=func.now(),
+                )
+                .returning(VideoProcessingTask.task_id)
+            )
+            return transitioned is not None
 
     async def fail(self, lease: VideoTaskLease, *, error: str) -> bool:
         """Fail a live task and account both its source and parent exactly once."""
@@ -510,6 +620,7 @@ class PostgresVideoTaskRepository:
                 "lease_deadline_at": None,
                 "progress_deadline_at": None,
                 "next_retry_at": None,
+                "retry_event_id": None,
             },
         )
 
@@ -526,13 +637,6 @@ class PostgresVideoTaskRepository:
                 *self._task_identity_clauses(),
                 or_(
                     VideoProcessingTask.status == "queued",
-                    and_(
-                        VideoProcessingTask.status == "retry_wait",
-                        or_(
-                            VideoProcessingTask.next_retry_at.is_(None),
-                            VideoProcessingTask.next_retry_at <= current,
-                        ),
-                    ),
                     VideoProcessingTask.status == "result_committed",
                 ),
             )
@@ -578,21 +682,15 @@ class PostgresVideoTaskRepository:
                     "updated_at": func.now(),
                 }
                 if task.status == "processing":
-                    if task.attempt >= self._max_attempts:
-                        values.update(
-                            status="failed",
-                            stage="failed",
-                            next_retry_at=None,
-                            parent_accounted_at=func.now(),
-                            error_message=task.error_message or "worker deadline expired",
-                        )
-                    else:
-                        values.update(
-                            status="retry_wait",
-                            stage="retry_wait",
-                            next_retry_at=current,
-                            error_message=task.error_message or "worker lease expired",
-                        )
+                    values.update(
+                        status="retry_wait",
+                        stage="retry_wait",
+                        next_retry_at=current,
+                        retry_event_id=(
+                            f"{task.task_id}:{task.dispatch_round}:{task.attempt}"
+                        ),
+                        error_message=task.error_message or "worker lease expired",
+                    )
                 else:
                     values.update(status="completed", stage="completed")
                 recovered = await session.scalar(
@@ -603,23 +701,6 @@ class PostgresVideoTaskRepository:
                 )
                 if recovered is not None and recovered != task.task_id:  # pragma: no cover
                     raise RuntimeError("unexpected video task recovery fence result")
-                if recovered is not None and values.get("status") == "failed":
-                    source = await session.get(
-                        SourceFile,
-                        task.source_file_id,
-                        with_for_update=True,
-                    )
-                    if (
-                        source is not None
-                        and source.processing_generation == task.source_generation
-                    ):
-                        source.processing_status = "failed"
-                        source.error_message = str(values["error_message"])
-                    await account_video_task_outcome(
-                        session,
-                        parent_job_id=task.parent_job_id,
-                        outcome="failed",
-                    )
 
     async def dispatchable_messages(self, *, now: float) -> list[VideoTaskMessage]:
         """Rebuild initial and retry deliveries from PostgreSQL durable state."""
@@ -632,19 +713,10 @@ class PostgresVideoTaskRepository:
             .where(
                 *self._task_identity_clauses(),
                 VideoProcessingTask.owner_id.is_(None),
+                VideoProcessingTask.status == "queued",
                 or_(
-                    and_(
-                        VideoProcessingTask.status == "queued",
-                        or_(
-                            VideoProcessingTask.last_published_at.is_(None),
-                            VideoProcessingTask.last_published_at <= redispatch_before,
-                        ),
-                    ),
-                    and_(
-                        VideoProcessingTask.status == "retry_wait",
-                        VideoProcessingTask.next_retry_at.is_not(None),
-                        VideoProcessingTask.next_retry_at <= current,
-                    ),
+                    VideoProcessingTask.last_published_at.is_(None),
+                    VideoProcessingTask.last_published_at <= redispatch_before,
                 ),
             )
             .order_by(VideoProcessingTask.created_at, VideoProcessingTask.task_id)
@@ -659,6 +731,7 @@ class PostgresVideoTaskRepository:
                 source_file_id=task.source_file_id,
                 generation=task.source_generation,
                 attempt=(0 if task.attempt == 0 else task.attempt + 1),
+                dispatch_round=task.dispatch_round,
                 result_version=task.result_version,
                 source_uri=storage_uri,
                 task_kind=ProcessingTaskKind(task.task_kind),
@@ -673,7 +746,6 @@ class PostgresVideoTaskRepository:
         """Record publication after XADD; stale queued work remains redispatchable."""
         if not self._message_matches_identity(message):
             return
-        previous_attempt = 0 if message.attempt == 0 else message.attempt - 1
         stmt = (
             update(VideoProcessingTask)
             .where(
@@ -681,10 +753,10 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.source_file_id == message.source_file_id,
                 VideoProcessingTask.source_generation == message.generation,
                 VideoProcessingTask.result_version == message.result_version,
+                VideoProcessingTask.dispatch_round == message.dispatch_round,
                 *self._task_identity_clauses(),
-                VideoProcessingTask.attempt == previous_attempt,
                 VideoProcessingTask.owner_id.is_(None),
-                VideoProcessingTask.status.in_(("queued", "retry_wait")),
+                VideoProcessingTask.status == "queued",
             )
             .values(
                 status="queued",
@@ -728,6 +800,7 @@ class PostgresVideoTaskRepository:
                     attempt=task.attempt,
                     result_version=task.result_version,
                     source_uri=storage_uri,
+                    dispatch_round=task.dispatch_round,
                     task_kind=ProcessingTaskKind(task.task_kind),
                     processor_version=task.processor_version,
                     resource_class=ResourceClass(task.resource_class),

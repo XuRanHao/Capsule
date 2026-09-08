@@ -26,6 +26,7 @@ from capsule.parsers.audio import AudioParser, AudioSegmentationConfig
 from capsule.parsers.discovery import sha256_file
 from capsule.parsers.video import VideoParser, VideoSegmentationConfig
 from capsule.pipeline.asset_factory import AssetFactory
+from capsule.pipeline.source_materializer import load_postgres_object_source
 from capsule.pipeline.audio_task_processor import CapsuleAudioTaskProcessor
 from capsule.pipeline.media_task_dispatch import MediaTaskProcessor, MediaTaskRepository
 from capsule.pipeline.runner import _processing_fingerprint
@@ -109,7 +110,7 @@ class VideoTaskSubmissionService:
             progress_timeout_seconds=self._settings.video_task_progress_timeout_seconds,
             hard_timeout_seconds=self._settings.video_task_hard_timeout_seconds,
             redispatch_seconds=self._settings.video_task_redispatch_seconds,
-            max_attempts=self._settings.video_task_max_attempts,
+            max_dispatch_rounds=self._settings.video_task_max_dispatch_rounds,
         )
         queue = self._queue or _new_queue(self._settings, consumer=_submission_consumer())
         owns_queue = self._queue is None
@@ -216,11 +217,17 @@ class VideoTaskWorker:
                 max_upload_attempts=runtime_settings.video_upload_max_attempts,
                 retry_base_seconds=runtime_settings.video_upload_retry_base_seconds,
             )
+        storage = ObjectStorage(runtime_settings)
+
+        async def load_source(message: VideoTaskMessage):
+            return await load_postgres_object_source(database.session_factory, storage, message)
+
         processor = CapsuleVideoTaskProcessor(
             parser=parser,
             asset_factory=AssetFactory(),
             media_writer=writer,
             committer=PostgresFencedVideoAssetCommitter(database),
+            source_file_loader=load_source,
             output_mode=runtime_settings.video_output_mode,
         )
         audio_processor = CapsuleAudioTaskProcessor(
@@ -243,6 +250,7 @@ class VideoTaskWorker:
             ),
             asset_factory=AssetFactory(),
             committer=PostgresFencedVideoAssetCommitter(database),
+            source_file_loader=load_source,
         )
         repositories = MediaTaskRepository(
             {
@@ -265,7 +273,7 @@ class VideoTaskWorker:
             ),
             worker_id=worker_id or _worker_identity(),
             retry_policy=RetryPolicy(
-                max_attempts=runtime_settings.video_task_max_attempts,
+                max_failures=runtime_settings.video_task_redis_max_failures,
                 retry_delays_seconds=tuple(runtime_settings.video_task_retry_delays_seconds),
             ),
             heartbeat_seconds=runtime_settings.video_task_heartbeat_seconds,
@@ -409,7 +417,7 @@ def _task_repository(
         progress_timeout_seconds=settings.video_task_progress_timeout_seconds,
         hard_timeout_seconds=settings.video_task_hard_timeout_seconds,
         redispatch_seconds=settings.video_task_redispatch_seconds,
-        max_attempts=settings.video_task_max_attempts,
+        max_dispatch_rounds=settings.video_task_max_dispatch_rounds,
         task_kind=task_kind,
         resource_class="mps_video",
         route_key="mps_video",

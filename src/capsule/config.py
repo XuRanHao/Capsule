@@ -109,7 +109,8 @@ class Settings(BaseSettings):
     video_task_progress_timeout_seconds: float = Field(default=120.0, gt=0)
     video_task_hard_timeout_seconds: float = Field(default=7_200.0, gt=0)
     video_task_redispatch_seconds: float = Field(default=60.0, gt=0)
-    video_task_max_attempts: int = Field(default=4, ge=1, le=20)
+    video_task_redis_max_failures: int = Field(default=4, ge=1, le=20)
+    video_task_max_dispatch_rounds: int = Field(default=4, ge=1, le=20)
     video_task_retry_delays_seconds: list[float] = Field(
         default_factory=lambda: [5.0, 30.0, 300.0],
         min_length=1,
@@ -197,18 +198,6 @@ class Settings(BaseSettings):
     cluster_auto_recluster_new_ratio: float = Field(default=0.3, gt=0.0, le=1.0)
     cluster_auto_recluster_minimum_new_count: int = Field(default=20, ge=1)
 
-    relation_entity_merge_similarity_threshold: float = Field(
-        default=0.67,
-        ge=-1.0,
-        le=1.0,
-    )
-    relation_asset_recall_similarity_threshold: float = Field(
-        default=0.55,
-        ge=-1.0,
-        le=1.0,
-    )
-    relation_asset_recall_top_k: int = Field(default=20, ge=1, le=100)
-    relation_asset_recall_path_boost: float = Field(default=0.25, ge=0.0, le=1.0)
     relation_incremental_entity_recall_similarity_threshold: float = Field(
         default=0.72,
         ge=-1.0,

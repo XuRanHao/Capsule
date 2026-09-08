@@ -35,16 +35,22 @@ class _Session:
         return self._source
 
 
+class _ObjectStorage:
+    async def download_uri_to_file(self, uri: str, destination: Path) -> None:
+        assert uri == "s3://capsule/sources/image.png"
+        destination.write_bytes(b"remote source")
+
+
 async def test_postgres_source_loader_uses_canonical_source_metadata_not_stream_uri() -> None:
     source = SimpleNamespace(
         workspace_id="workspace-1",
         processing_generation=4,
-        storage_uri="file:///canonical/imports/nested/image.png",
+        storage_uri="s3://capsule/sources/image.png",
         relative_path="nested/image.png",
         file_size_bytes=123,
         sha256="a" * 64,
     )
-    loader = postgres_source_file_loader(lambda: _Session(source))
+    loader = postgres_source_file_loader(lambda: _Session(source), cast(object, _ObjectStorage()))
     message = ProcessingTaskMessage(
         task_id="image-task-1",
         job_id="job-1",
@@ -56,23 +62,24 @@ async def test_postgres_source_loader_uses_canonical_source_metadata_not_stream_
 
     loaded = await loader(message)
 
-    assert loaded.source_file.path == "/canonical/imports/nested/image.png"
+    assert Path(loaded.source_file.path).read_bytes() == b"remote source"
     assert loaded.source_file.relative_path == "nested/image.png"
     assert loaded.source_file.extension == ".png"
     assert loaded.source_file.size_bytes == 123
     assert loaded.sha256 == "a" * 64
+    await loaded.cleanup()
 
 
 async def test_postgres_source_loader_rejects_noncurrent_source_generation() -> None:
     source = SimpleNamespace(
         workspace_id="workspace-1",
         processing_generation=5,
-        storage_uri="file:///canonical/imports/nested/image.png",
+        storage_uri="s3://capsule/sources/image.png",
         relative_path="nested/image.png",
         file_size_bytes=123,
         sha256="a" * 64,
     )
-    loader = postgres_source_file_loader(lambda: _Session(source))
+    loader = postgres_source_file_loader(lambda: _Session(source), cast(object, _ObjectStorage()))
     message = ProcessingTaskMessage(
         task_id="image-task-1",
         job_id="job-1",

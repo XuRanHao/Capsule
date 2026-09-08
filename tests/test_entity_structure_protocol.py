@@ -10,6 +10,7 @@ from capsule.model_clients.doubao import DoubaoClient, DoubaoResponseError
 from capsule.relation_graph import (
     CreatedGroupParent,
     EntityStructureOperationResolution,
+    EntityStructureRequest,
     GroupEntityOperation,
     MergeEntityOperation,
     SeparateEntityOperation,
@@ -84,21 +85,15 @@ def _overlap_graph(*, second_asset_ids: list[str]) -> dict[str, Any]:
 
 
 def test_high_asset_overlap_merges_entities_and_collapses_single_child_parent() -> None:
-    graph = _overlap_graph(
-        second_asset_ids=["asset_1", "asset_2", "asset_3", "asset_4"]
-    )
+    graph = _overlap_graph(second_asset_ids=["asset_1", "asset_2", "asset_3", "asset_4"])
 
     merged_count = merge_entities_with_high_asset_overlap(graph)
 
     assert merged_count == 1
-    assert [entity["entity_id"] for entity in graph["entities"]] == [
-        "entity_woody_material"
-    ]
+    assert [entity["entity_id"] for entity in graph["entities"]] == ["entity_woody_material"]
     assert graph["entity_edges"] == []
     assert len(graph["edges"]) == 4
-    assert {edge["target"] for edge in graph["edges"]} == {
-        "entity_woody_material"
-    }
+    assert {edge["target"] for edge in graph["edges"]} == {"entity_woody_material"}
     assert graph["rejected_relations"][0]["target_id"] == "entity_woody_material"
 
 
@@ -173,27 +168,27 @@ def test_entity_structure_operations_forbid_reason_and_unknown_fields() -> None:
 
 def test_new_group_parent_with_one_child_can_be_parsed_for_client_normalization() -> None:
     resolution = EntityStructureOperationResolution.model_validate(
-            {
-                "operations": [
-                    {
-                        "type": "group",
-                        "parent": {
-                            "mode": "create",
-                            "temporary_parent_id": "virtual:a_settings",
-                            "name": "A人物设定",
-                            "semantic": "角色A相关设定",
-                        },
-                        "children": [
-                            {
-                                "child_entity_id": "entity_weapon",
-                                "relation": "角色武器",
-                                "description": "A人物的武器。",
-                            }
-                        ],
-                    }
-                ]
-            }
-        )
+        {
+            "operations": [
+                {
+                    "type": "group",
+                    "parent": {
+                        "mode": "create",
+                        "temporary_parent_id": "virtual:a_settings",
+                        "name": "A人物设定",
+                        "semantic": "角色A相关设定",
+                    },
+                    "children": [
+                        {
+                            "child_entity_id": "entity_weapon",
+                            "relation": "角色武器",
+                            "description": "A人物的武器。",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
     assert isinstance(resolution.operations[0], GroupEntityOperation)
 
 
@@ -244,9 +239,7 @@ async def test_entity_structure_client_sends_complete_context_and_returns_operat
         result = await client.generate_entity_structure_operations(
             workspace_tree="项目/\n└── A人物/",
             current_graph={
-                "nodes": [
-                    {"entity_id": "entity_a", "name": "A人物", "semantic": "角色A"}
-                ],
+                "nodes": [{"entity_id": "entity_a", "name": "A人物", "semantic": "角色A"}],
                 "edges": [],
             },
             incoming_entities=[
@@ -269,6 +262,7 @@ async def test_entity_structure_client_sends_complete_context_and_returns_operat
     assert captured["thinking"] == {"type": "disabled"}
     messages = captured["messages"]
     assert isinstance(messages, list)
+    assert "完整相关实体层级子图" in messages[0]["content"]
     sent = json.loads(messages[1]["content"])
     assert sent["workspace_tree"].startswith("项目/")
     assert sent["current_graph"]["nodes"][0]["entity_id"] == "entity_a"
@@ -277,6 +271,24 @@ async def test_entity_structure_client_sends_complete_context_and_returns_operat
         "entity_costume",
     ]
     assert "reason" not in result.model_dump_json()
+
+
+def test_entity_structure_request_limits_an_agent_round_to_ten_entities() -> None:
+    with pytest.raises(ValidationError, match="at most 10"):
+        EntityStructureRequest.model_validate(
+            {
+                "workspace_tree": "project/",
+                "current_graph": {"nodes": [], "edges": []},
+                "incoming_entities": [
+                    {
+                        "entity_id": f"entity_{index}",
+                        "name": f"Entity {index}",
+                        "semantic": f"Semantic {index}",
+                    }
+                    for index in range(11)
+                ],
+            }
+        )
 
 
 @pytest.mark.asyncio

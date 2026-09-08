@@ -64,6 +64,101 @@ class AssetEntityRelationResolution(BaseModel):
     relations: list[AssetEntityRelationDecision] = Field(default_factory=list)
 
 
+class AssetEntityAssignmentAsset(BaseModel):
+    """Evidence for assigning one unclustered Asset to an existing Entity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=256)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    content_description: str = Field(default="", max_length=4000)
+    content_subject: str = Field(default="", max_length=4000)
+
+
+class AssetEntityAssignmentCandidate(BaseModel):
+    """One Entity recalled for an Asset; the Agent cannot select outside this set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=200)
+    semantic: str = Field(min_length=1, max_length=1000)
+
+
+class AssetEntityAssignmentItem(BaseModel):
+    """An Asset and its TopK Entity candidates for one assignment decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset: AssetEntityAssignmentAsset
+    candidates: list[AssetEntityAssignmentCandidate] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_candidate_ids(self) -> "AssetEntityAssignmentItem":
+        candidate_ids = [candidate.entity_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("assignment candidates contain duplicate entity_id values")
+        return self
+
+
+class AssetEntityAssignmentDecision(BaseModel):
+    """The only permitted model decision for one Asset-to-Entity assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=256)
+    entity_id: str | None = Field(default=None, max_length=256)
+    reason: str = Field(min_length=1, max_length=500)
+    description: str = Field(default="", max_length=500)
+
+
+class AssetEntityAssignmentResolution(BaseModel):
+    """One Entity candidate or null for every input Asset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[AssetEntityAssignmentDecision] = Field(default_factory=list)
+
+
+class AssetEntityAssignmentRequest(BaseModel):
+    """Strict batch contract for TopK-constrained Asset-to-Entity assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[AssetEntityAssignmentItem] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_asset_ids(self) -> "AssetEntityAssignmentRequest":
+        asset_ids = [item.asset.asset_id for item in self.assignments]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("assignment request contains duplicate asset_id values")
+        return self
+
+    def validate_resolution(self, resolution: AssetEntityAssignmentResolution) -> None:
+        """Require exactly one in-candidate-or-null decision for each input Asset."""
+
+        expected = {
+            item.asset.asset_id: {candidate.entity_id for candidate in item.candidates}
+            for item in self.assignments
+        }
+        decisions = {decision.asset_id: decision for decision in resolution.assignments}
+        if len(decisions) != len(resolution.assignments):
+            raise ValueError("assignment resolution contains duplicate asset_id values")
+        if set(decisions) != set(expected):
+            missing = sorted(set(expected) - set(decisions))
+            unexpected = sorted(set(decisions) - set(expected))
+            raise ValueError(
+                "assignment resolution must cover each input asset exactly once; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        for asset_id, decision in decisions.items():
+            if decision.entity_id is not None and decision.entity_id not in expected[asset_id]:
+                raise ValueError(
+                    "assignment decision entity_id must be one of the Asset candidates: "
+                    f"asset_id={asset_id}, entity_id={decision.entity_id}"
+                )
+
+
 class MergedEntityDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -108,7 +203,7 @@ class EntityStructureEdge(BaseModel):
 
 
 class CurrentEntityStructure(BaseModel):
-    """The complete structure maintained by the backend between Agent rounds."""
+    """Complete Entity trees retrieved as the related hierarchy subgraph for one round."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -130,13 +225,21 @@ class CurrentEntityStructure(BaseModel):
 
 
 class EntityStructureRequest(BaseModel):
-    """Stable input envelope sent to the Entity structure Agent."""
+    """Stable input envelope sent to one related-subgraph structure Agent round."""
 
     model_config = ConfigDict(extra="forbid")
 
     workspace_tree: str = Field(min_length=1)
-    current_graph: CurrentEntityStructure
-    incoming_entities: list[EntityStructureNode] = Field(min_length=1, max_length=15)
+    current_graph: CurrentEntityStructure = Field(
+        description=(
+            "The complete retrieved related Entity hierarchy subgraph, never the whole graph."
+        )
+    )
+    incoming_entities: list[EntityStructureNode] = Field(
+        min_length=1,
+        max_length=10,
+        description="At most ten newly added or changed Entity nodes for this round.",
+    )
 
     @model_validator(mode="after")
     def validate_entity_ids(self) -> "EntityStructureRequest":

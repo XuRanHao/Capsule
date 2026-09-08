@@ -24,3 +24,5 @@ data/
 frontend/public/demo/
 tmp/
 .env.local
+.Agent/
+.codegraph/

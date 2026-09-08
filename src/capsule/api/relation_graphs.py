@@ -9,7 +9,6 @@ class RelationGraphBuilder(Protocol):
         *,
         workspace_id: str,
         force_understanding: bool = False,
-        force_rebuild: bool = False,
     ) -> dict[str, Any]: ...
 
 
@@ -34,10 +33,8 @@ async def build_relation_graph(
     request: Request,
     workspace_id: str = Query(min_length=1, max_length=64),
     force_understanding: bool = False,
-    force_rebuild: bool = False,
 ) -> dict[str, Any]:
     return await _service(request).build(
         workspace_id=workspace_id,
         force_understanding=force_understanding,
-        force_rebuild=force_rebuild,
     )

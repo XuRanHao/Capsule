@@ -25,18 +25,13 @@ from capsule.features import (
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.model_clients.structured_output import responses_json_schema_format
 from capsule.relation_graph import (
-    AssetEntityRelationResolution,
+    AssetEntityAssignmentRequest,
+    AssetEntityAssignmentResolution,
     CreatedGroupParent,
-    CrossTreeRelationRequest,
-    CrossTreeRelationResolution,
     EntityStructureOperationResolution,
     EntityStructureRequest,
     GroupEntityOperation,
-    MergedEntityResolution,
     MergeEntityOperation,
-    MetadataContentResolution,
-    RelatedEntityPairRequest,
-    RelatedEntityPairResolution,
     ReusedGroupParent,
     SeparateEntityOperation,
 )
@@ -50,19 +45,7 @@ _ASSET_UNDERSTANDING_RESPONSE_FORMAT = responses_json_schema_format(
     AssetUnderstanding,
     name="asset_understanding",
 )
-_METADATA_CONTENT_RESPONSE_FORMAT = responses_json_schema_format(
-    MetadataContentResolution,
-    name="metadata_content_resolution",
-)
-_MERGED_ENTITY_RESPONSE_FORMAT = responses_json_schema_format(
-    MergedEntityResolution,
-    name="merged_entity_resolution",
-)
-_ASSET_ENTITY_RELATION_RESPONSE_FORMAT = responses_json_schema_format(
-    AssetEntityRelationResolution,
-    name="asset_entity_relation_resolution",
-)
-_ASSET_ENTITY_RELATION_BATCH_SIZE = 10
+_ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE = 10
 _ASSET_FEATURE_NAMES = frozenset(item.value for item in FEATURE_DIMENSION_SCOPES)
 
 
@@ -172,37 +155,6 @@ def _normalize_entity_structure_resolution(
             continue
         operations.append(operation)
     return EntityStructureOperationResolution(operations=operations)
-
-
-def _validate_related_entity_pairs(
-    request: RelatedEntityPairRequest,
-    resolution: RelatedEntityPairResolution,
-) -> None:
-    current_ids = {entity.entity_id for entity in request.current_entities}
-    incoming_ids = {entity.entity_id for entity in request.incoming_entities}
-    known_ids = current_ids | incoming_ids
-    for pair in resolution.pairs:
-        pair_ids = {pair.source_entity_id, pair.target_entity_id}
-        if not pair_ids.issubset(known_ids):
-            raise DoubaoResponseError("related Entity pair references an unknown Entity")
-        if not pair_ids.intersection(incoming_ids):
-            raise DoubaoResponseError("related Entity pair must include an incoming Entity")
-
-
-def _validate_cross_tree_relations(
-    request: CrossTreeRelationRequest,
-    resolution: CrossTreeRelationResolution,
-) -> None:
-    left_ids = {entity.entity_id for entity in request.left_tree.nodes}
-    right_ids = {entity.entity_id for entity in request.right_tree.nodes}
-    for relation in resolution.relations:
-        endpoints = {relation.source_entity_id, relation.target_entity_id}
-        if not (
-            endpoints.intersection(left_ids)
-            and endpoints.intersection(right_ids)
-            and endpoints.issubset(left_ids | right_ids)
-        ):
-            raise DoubaoResponseError("relation must connect one node from each Entity tree")
 
 
 class DoubaoClient:
@@ -407,90 +359,51 @@ class DoubaoClient:
                 model=self._settings.search_query_model,
             )
 
-    async def resolve_metadata_content_entities(
+    async def assign_assets_to_entities(
         self,
-        groups: Sequence[Mapping[str, Any]],
-        *,
-        guidance: str | None = None,
-    ) -> MetadataContentResolution:
-        """Classify metadata/content relationships once per reusable metadata group."""
-
-        system = {
-            "role": "system",
-            "content": guidance
-            or (
-                "合并元数据实体和内容实体。same_entity 表示元数据名称就是内容主体的身份；"
-                "contains_content 表示元数据是容纳内容主体的场景或集合；其余为 related。"
-                "结合组内多项内容整体判断，并为形成后的 Entity 生成 entity_semantic，描述"
-                "该实体自身是谁或是什么。entity_semantic 保持实体名称对应的稳定语义层级，"
-                "不因当前成员里出现的局部人物、物体或陈设而缩窄。用 build_entity 表示该"
-                "元数据实体是否适合作为关系图谱节点。角色、地点、场景、组织、事件、道具等"
-                "具有实际语义的实体设为 true；如果它只是用于存放或整理文件的通用容器，"
-                "只呈现文件包含关系而不包含实际语义，设为 false，不参与关系构建。"
-            ),
-        }
-        async with self.asset_understanding_pool.reserve() as slot:
-            result, _ = await slot.run(
-                lambda: self._responses_json_request(
-                    messages=[
-                        system,
-                        {
-                            "role": "user",
-                            "content": json.dumps({"groups": list(groups)}, ensure_ascii=False),
-                        },
-                    ],
-                    output_type=MetadataContentResolution,
-                    timeout_seconds=self._settings.understanding_timeout_seconds,
-                    response_format=_METADATA_CONTENT_RESPONSE_FORMAT,
-                )
-            )
-        return result
-
-    async def generate_asset_entity_relations(
-        self,
-        candidates: Sequence[Mapping[str, Any]],
-    ) -> AssetEntityRelationResolution:
-        """Judge relations between an Asset's internal subject and an Entity subject."""
+        assignments: Sequence[Mapping[str, Any]],
+    ) -> AssetEntityAssignmentResolution:
+        """Assign each unclustered Asset to exactly one recalled Entity or to no Entity."""
 
         system = {
             "role": "system",
             "content": (
-                "判断每组 asset 与 entity 是否存在直接关系。依据包括 asset.metadata、"
-                "asset.content_description、asset.content_subject、entity.name 和 entity.semantic。"
-                "综合元数据与内容理解二者的实际语义；元数据明确揭示直接关系时优先采用。"
-                "目录路径按语义层级理解：越具体且与 Entity 语义对应的层级，越能支持直接关系；"
-                "共同上层路径通常只说明共享背景或归属范围，不自然扩展为同级节点之间的关系。"
-                "正例：路径中的人物与道具层级可支持该人物的道具 Entity；场景与具体区域层级可"
-                "支持该区域 Entity；物件与部件层级可支持该部件 Entity。"
-                "反例：共享同一人物上层路径，不表示服装素材属于武器 Entity；共享同一场景上层路径，"
-                "不表示一个区域的素材属于另一个同级区域 Entity；纯项目或整理目录也不直接证明"
-                "内容关系。自然生成 relation 和 description；不建立关系时用 description 简述"
-                "关键差异。每项独立判断并原样返回 source_id、target_id，不输出 reason。"
-                "输出 JSON 格式为"
-                '{"relations":[{"source_id":"","target_id":"",'
-                '"establishes_relation":true,"relation":"",'
-                '"description":""}]}。'
+                "为每个 asset 从其 candidates 中选择唯一可归属的 Entity，或明确返回 null。"
+                "依据包括 asset.metadata、asset.content_description、asset.content_subject，以及"
+                "候选 Entity 的 name 和 semantic。综合元数据与内容理解二者的实际语义；元数据"
+                "明确揭示直接归属时优先采用。目录路径按语义层级理解：越具体且与 Entity 语义"
+                "对应的层级，越能支持归属；共同上层路径通常只说明共享背景或归属范围，不能自然"
+                "推导为同级 Entity 的归属。正例：路径中的人物与道具层级可支持该人物的道具"
+                "Entity；场景与具体区域层级可支持该区域 Entity；物件与部件层级可支持该部件"
+                "Entity。反例：共享同一人物上层路径，不表示服装素材归属武器 Entity；共享同一"
+                "场景上层路径，不表示一个区域素材归属另一个同级区域 Entity；纯项目或整理目录"
+                "也不直接证明内容归属。每个 asset 只能输出一项 assignment，entity_id 只能取"
+                "该 asset.candidates 中的 entity_id，无法可靠判断时设为 null。reason 必须说明"
+                "选择或拒绝的关键证据；description 可简要描述该归属。输出 JSON："
+                '{"assignments":[{"asset_id":"","entity_id":"候选ID或null",'
+                '"reason":"","description":""}]}。'
             ),
         }
         batches = [
-            list(candidates[offset : offset + _ASSET_ENTITY_RELATION_BATCH_SIZE])
-            for offset in range(0, len(candidates), _ASSET_ENTITY_RELATION_BATCH_SIZE)
+            list(assignments[offset : offset + _ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE])
+            for offset in range(0, len(assignments), _ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE)
         ]
         if not batches:
-            return AssetEntityRelationResolution()
+            return AssetEntityAssignmentResolution()
 
         async def resolve_batch(
             batch: list[Mapping[str, Any]],
-        ) -> AssetEntityRelationResolution:
-            return await self._deepseek_json(
+        ) -> AssetEntityAssignmentResolution:
+            request = AssetEntityAssignmentRequest.model_validate({"assignments": batch})
+            resolution = await self._deepseek_json(
                 messages=[
                     system,
                     {
                         "role": "user",
-                        "content": json.dumps({"candidates": batch}, ensure_ascii=False),
+                        "content": request.model_dump_json(),
                     },
                 ],
-                output_type=AssetEntityRelationResolution,
+                output_type=AssetEntityAssignmentResolution,
                 pool=self.capsule_pool,
                 timeout_seconds=self._settings.understanding_timeout_seconds,
                 max_output_tokens=max(
@@ -499,48 +412,17 @@ class DoubaoClient:
                 ),
                 model=self._settings.search_query_model,
             )
+            try:
+                request.validate_resolution(resolution)
+            except ValueError as exc:
+                raise DoubaoResponseError(f"invalid Asset-to-Entity assignment: {exc}") from exc
+            return resolution
 
         resolutions = await asyncio.gather(*(resolve_batch(batch) for batch in batches))
-        return AssetEntityRelationResolution(
-            relations=[relation for resolution in resolutions for relation in resolution.relations]
-        )
-
-    async def merge_entity_candidates(
-        self,
-        candidates: Sequence[Mapping[str, Any]],
-    ) -> MergedEntityResolution:
-        """Merge metadata and subject-cluster candidates before edge judgment."""
-
-        system = {
-            "role": "system",
-            "content": (
-                "输入是来自元数据和主体聚类的实体候选。判断哪些候选指向同一个实际实体，"
-                "合并后生成统一的 name、semantic 和 candidate_ids。主体聚类只是候选发现结果，"
-                "相似主题、风格或类别不代表同一实体；元数据候选也不天然正确。角色、地点、场景、"
-                "组织、事件、道具等具有实际语义且能跨至少两个资产复用的实体可设 build_entity"
-                "为 true。只是用于存放或整理文件的通用容器，或不具备可复用实际意义的候选设为"
-                "false。不要在此判断 Asset 与 Entity 的最终关系。每个输入 candidate_id 在输出中"
-                "出现一次，保留未与其他候选合并的有效实体候选，并在 reason 中说明合并或拒绝依据。"
-                '只输出 JSON，格式为{"entities":[{"name":"","semantic":"",'
-                '"candidate_ids":[""],"build_entity":true,"reason":""}]}。'
-            ),
-        }
-        return await self._deepseek_json(
-            messages=[
-                system,
-                {
-                    "role": "user",
-                    "content": json.dumps({"candidates": list(candidates)}, ensure_ascii=False),
-                },
-            ],
-            output_type=MergedEntityResolution,
-            pool=self.capsule_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-            max_output_tokens=max(
-                self._settings.understanding_max_output_tokens,
-                4096,
-            ),
-            model=self._settings.search_query_model,
+        return AssetEntityAssignmentResolution(
+            assignments=[
+                assignment for resolution in resolutions for assignment in resolution.assignments
+            ]
         )
 
     async def generate_entity_structure_operations(
@@ -549,8 +431,9 @@ class DoubaoClient:
         current_graph: Mapping[str, Any],
         incoming_entities: Sequence[Mapping[str, Any]],
         workspace_tree: str,
+        repair_guidance: str | None = None,
     ) -> EntityStructureOperationResolution:
-        """Generate one validated round of incremental Entity structure operations."""
+        """Generate one validated round against a retrieved related hierarchy subgraph."""
 
         request = EntityStructureRequest.model_validate(
             {
@@ -563,12 +446,14 @@ class DoubaoClient:
             "role": "system",
             "content": (
                 "增量整理 Entity 结构。结合 Entity 的 name、semantic 与 workspace_tree 理解项目"
-                "语义；目录树提供上下文和归属线索，current_graph 是已接受结构，incoming_entities"
-                "是本轮节点。仅当两个节点的语义身份、抽象层级和用途都基本可互换时 merge；没有"
-                "结构关系时 separate；共享明确的实际主体或上位语义、同时又应保留各自差异时"
-                "group。共享主体不等于可合并：状态、时期、版本、组成部分或功能角色不同的节点"
-                "保留区别；地点与其内部物件、人物与其装备等不同语义层级也不合并。group 可复用"
-                "现有父节点或创建"
+                "语义；目录树提供上下文和归属线索。current_graph 不是全图，而是围绕本轮"
+                "incoming_entities 检索得到的完整相关实体层级子图：其中每棵命中的实体树均包含"
+                "全部节点和已接受的 hierarchy 边。只能依据此子图、本轮节点和目录上下文决策，"
+                "不能假设未提供的 Entity 或关系存在。incoming_entities 最多 10 个。仅当两个"
+                "节点的语义身份、抽象层级和用途都基本可互换时 merge；没有结构关系时 separate；"
+                "共享明确的实际主体或上位语义、同时又应保留各自差异时 group。共享主体不等于"
+                "可合并：状态、时期、版本、组成部分或功能角色不同的节点保留区别；地点与其"
+                "内部物件、人物与其装备等不同语义层级也不合并。group 可复用现有父节点或创建"
                 "新的虚拟父节点，并自然描述每个 child 与 parent 的关系。"
                 "正例：同一人物的不同状态、时期或版本可归入该人物；人物的服装、武器和动作设定可"
                 "围绕该人物组织；同一地点的不同区域可归入该地点；同一装置的不同部件或工作状态可"
@@ -599,6 +484,17 @@ class DoubaoClient:
                 "content": request.model_dump_json(),
             },
         ]
+        if repair_guidance:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "后端拒绝了上一轮结构操作。请依据以下校验错误重新决策，"
+                        "仍只输出完整 operations JSON：\n"
+                        f"{repair_guidance[:2000]}"
+                    ),
+                }
+            )
         for attempt in range(3):
             resolution: EntityStructureOperationResolution | None = None
             try:
@@ -640,91 +536,6 @@ class DoubaoClient:
             assert resolution is not None
             return resolution
         raise AssertionError("unreachable")
-
-    async def select_related_entity_pairs(
-        self,
-        *,
-        current_entities: Sequence[Mapping[str, Any]],
-        incoming_entities: Sequence[Mapping[str, Any]],
-        workspace_tree: str,
-    ) -> RelatedEntityPairResolution:
-        """Recall top-level Entity-tree pairs that may contain a concrete relation."""
-
-        request = RelatedEntityPairRequest.model_validate(
-            {
-                "workspace_tree": workspace_tree,
-                "current_entities": list(current_entities),
-                "incoming_entities": list(incoming_entities),
-            }
-        )
-        resolution = await self._deepseek_json(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "从顶层 Entity 中筛选可能存在具体语义关系的 Entity 树对。结合名称、语义"
-                        "和 workspace_tree 判断；这里只做候选召回，不生成关系，也不合并或分组。"
-                        "人物与场景、人物与物件、事件与地点、地点与设施、组织与人物等存在可具体"
-                        "描述关系时保留。仅同属项目、目录相邻、画风或题材相似、宽泛同类时不保留。"
-                        "检查 incoming_entities 内部以及它们与 current_entities 的组合；每个输出对"
-                        "至少包含一个 incoming Entity。只输出 JSON："
-                        '{"pairs":[{"source_entity_id":"","target_entity_id":""}]}。'
-                    ),
-                },
-                {"role": "user", "content": request.model_dump_json()},
-            ],
-            output_type=RelatedEntityPairResolution,
-            pool=self.capsule_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-            max_output_tokens=max(self._settings.understanding_max_output_tokens, 4096),
-            model=self._settings.search_query_model,
-        )
-        _validate_related_entity_pairs(request, resolution)
-        return resolution
-
-    async def generate_cross_tree_relations(
-        self,
-        *,
-        left_tree: Mapping[str, Any],
-        right_tree: Mapping[str, Any],
-        workspace_tree: str,
-    ) -> CrossTreeRelationResolution:
-        """Create concrete semantic edges between arbitrary nodes of two Entity trees."""
-
-        request = CrossTreeRelationRequest.model_validate(
-            {
-                "workspace_tree": workspace_tree,
-                "left_tree": dict(left_tree),
-                "right_tree": dict(right_tree),
-            }
-        )
-        resolution = await self._deepseek_json(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "判断两棵 Entity 树之间的具体语义关系。关系端点可选择树中的任意节点，"
-                        "不限定顶层节点；选择语义最准确的层级，并自然生成有方向的 relation 和"
-                        "description。只建立由 Entity 语义或目录上下文明示的项目事实，不补充可能的"
-                        "用途、出现场景、创作参考或因果关系。仅同属项目、目录相近、画风或题材相似"
-                        "不构成关系；需要使用“可能”“可作为”“可供参考”“推测”或同时说明“无直接"
-                        "关联”时，返回空数组。可建立多条互不重复的关系，关系名和描述使用与输入"
-                        "一致的自然语言。不合并节点，不创建新节点。"
-                        "只输出 JSON："
-                        '{"relations":[{"source_entity_id":"","target_entity_id":"",'
-                        '"relation":"","description":""}]}。'
-                    ),
-                },
-                {"role": "user", "content": request.model_dump_json()},
-            ],
-            output_type=CrossTreeRelationResolution,
-            pool=self.capsule_pool,
-            timeout_seconds=self._settings.understanding_timeout_seconds,
-            max_output_tokens=max(self._settings.understanding_max_output_tokens, 4096),
-            model=self._settings.search_query_model,
-        )
-        _validate_cross_tree_relations(request, resolution)
-        return resolution
 
     async def enhance_search_query(
         self,

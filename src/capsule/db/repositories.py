@@ -1,8 +1,10 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -31,6 +33,7 @@ from capsule.db.models import (
     RelationEntity,
     RelationEntitySource,
     RelationGraphBuild,
+    RelationHierarchyBatchCommit,
     SourceFile,
     Workspace,
 )
@@ -83,6 +86,138 @@ class AssetMediaTarget:
     derived_file_uri: str | None
 
 
+class RelationHierarchyConflictError(RuntimeError):
+    """A hierarchy workflow attempted to commit against a stale graph revision."""
+
+
+class RelationHierarchyValidationError(ValueError):
+    """A normalized hierarchy workflow payload violates persistence invariants."""
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyEntitySourceWrite:
+    """One durable candidate source of an Entity used by hierarchy maintenance."""
+
+    candidate_id: str
+    origin: str
+    name: str
+    semantic: str
+    asset_ids: Sequence[str] = ()
+    embedding_vector: Sequence[float] = ()
+    embedding_model: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyEntityWrite:
+    """An Entity's materialized fields supplied by the workflow backend.
+
+    ``temporary_parent_id`` maps the Agent's ``virtual:*`` parent reference to
+    this persisted Entity ID.  It is only used for a newly-created group
+    parent.  ``replace_sources`` is intentionally explicit so ordinary parent
+    upserts cannot accidentally clear a canonical Entity's candidate sources.
+    """
+
+    entity_id: str
+    name: str
+    semantic: str
+    origins: Sequence[str] = ()
+    descriptions: Sequence[str] = ()
+    candidate_ids: Sequence[str] = ()
+    merge_reason: str = ""
+    embedding_vector: Sequence[float] = ()
+    embedding_model: str = ""
+    sources: Sequence[HierarchyEntitySourceWrite] = ()
+    replace_sources: bool = False
+    temporary_parent_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyEntityCandidate:
+    """A governed subject-cluster candidate synchronized before Agent routing."""
+
+    candidate_id: str
+    origin: str
+    name: str
+    semantic: str
+    asset_ids: Sequence[str]
+    embedding_vector: Sequence[float]
+    embedding_model: str
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyAssetAssignment:
+    """The sole approved Entity assignment for one Asset; ``None`` unassigns it."""
+
+    asset_id: str
+    entity_id: str | None
+    relation: str = "AGENT_ASSIGNED"
+    description: str = ""
+    reason: str = ""
+    content_subject: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyBatchCommit:
+    """Normalized, validated payload for one hierarchy workflow transaction.
+
+    ``operations`` accepts JSON-compatible ``merge``, ``separate`` and
+    ``group`` objects.  It deliberately does not accept arbitrary edge types:
+    this persistence path only writes hierarchy edges.
+    """
+
+    operation_id: str
+    expected_build_version: int
+    expected_input_revision: str
+    input_revision: str
+    subject_cluster_status: Mapping[str, Any]
+    operations: Sequence[Mapping[str, Any]] = ()
+    entity_writes: Sequence[HierarchyEntityWrite] = ()
+    asset_assignments: Sequence[HierarchyAssetAssignment] = ()
+    asset_revisions: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyBatchCommitResult:
+    operation_id: str
+    build_version: int
+    input_revision: str
+    replayed: bool
+    created_entity_ids: tuple[str, ...] = ()
+    changed_entity_ids: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyCandidateSync:
+    """Authoritative candidate snapshot used to seed or update queue entities."""
+
+    operation_id: str
+    expected_build_version: int
+    expected_input_revision: str
+    input_revision: str
+    subject_cluster_status: Mapping[str, Any]
+    candidates: Sequence[HierarchyEntityCandidate]
+    governed_candidate_ids: Sequence[str]
+    asset_revisions: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyCandidateSyncResult:
+    operation_id: str
+    build_version: int
+    input_revision: str
+    replayed: bool
+    pending_entity_ids: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class HierarchyGraphInitializationResult:
+    """Outcome of hierarchy-only storage initialization."""
+
+    build_version: int
+    input_revision: str
+    initialized: bool
+
+
 class RelationGraphRepository:
     """Persist and load Entity nodes and approved Asset→Entity relations."""
 
@@ -129,6 +264,7 @@ class RelationGraphRepository:
             )
             return {
                 "build_version": build.build_version,
+                "input_revision": build.input_revision,
                 "subject_cluster_status": build.subject_cluster_status,
                 "asset_revisions": {state.asset_id: state.asset_revision for state in asset_states},
                 "entities": [
@@ -189,6 +325,732 @@ class RelationGraphRepository:
         return await self.load(
             workspace_id=workspace_id,
             input_revision=input_revision,
+        )
+
+    async def get_hierarchy_build_state(self, *, workspace_id: str) -> dict[str, Any] | None:
+        """Return the optimistic-concurrency cursor used by hierarchy workflow nodes."""
+
+        async with self._database.session() as session:
+            build = await session.get(RelationGraphBuild, workspace_id)
+            if build is None:
+                return None
+            return {
+                "build_version": build.build_version,
+                "input_revision": build.input_revision,
+                "status": build.status,
+                "subject_cluster_status": dict(build.subject_cluster_status),
+            }
+
+    async def initialize_hierarchy_graph(
+        self,
+        *,
+        workspace_id: str,
+        input_revision: str,
+        subject_cluster_status: Mapping[str, Any],
+        expected_build_version: int | None = None,
+        expected_input_revision: str | None = None,
+    ) -> HierarchyGraphInitializationResult:
+        """Initialize storage for the hierarchy-only graph policy.
+
+        This one-time storage initialization never participates in normal
+        incremental updates. It removes residual records that predate the
+        hierarchy-only policy.
+        """
+
+        if not input_revision:
+            raise RelationHierarchyValidationError("input_revision must be non-empty")
+        async with self._database.session() as session, session.begin():
+            build = await session.get(RelationGraphBuild, workspace_id, with_for_update=True)
+            if build is None:
+                if expected_build_version is not None or expected_input_revision is not None:
+                    raise RelationHierarchyConflictError(
+                        "cannot initialize a missing hierarchy build with an expected cursor"
+                    )
+                build_version = 1
+            else:
+                current_policy = str(build.subject_cluster_status.get("graph_policy", ""))
+                if current_policy == "entity_hierarchy_v1":
+                    return HierarchyGraphInitializationResult(
+                        build_version=build.build_version,
+                        input_revision=build.input_revision,
+                        initialized=False,
+                    )
+                if (
+                    expected_build_version is not None
+                    and build.build_version != expected_build_version
+                ):
+                    raise RelationHierarchyConflictError(
+                        "stale hierarchy build version for initialization"
+                    )
+                if (
+                    expected_input_revision is not None
+                    and build.input_revision != expected_input_revision
+                ):
+                    raise RelationHierarchyConflictError(
+                        "stale hierarchy input revision for initialization"
+                    )
+                build_version = build.build_version + 1
+
+            await session.execute(
+                delete(AssetEntityRelation).where(AssetEntityRelation.workspace_id == workspace_id)
+            )
+            await session.execute(
+                delete(EntityEntityRelation).where(
+                    EntityEntityRelation.workspace_id == workspace_id
+                )
+            )
+            await session.execute(
+                delete(RelationEntitySource).where(
+                    RelationEntitySource.workspace_id == workspace_id
+                )
+            )
+            await session.execute(
+                delete(RelationEntity).where(RelationEntity.workspace_id == workspace_id)
+            )
+            await session.execute(
+                delete(RelationAssetState).where(RelationAssetState.workspace_id == workspace_id)
+            )
+            # Earlier checkpoint replays must fail their expected cursor instead
+            # of returning a result for rows removed during initialization.
+            await session.execute(
+                delete(RelationHierarchyBatchCommit).where(
+                    RelationHierarchyBatchCommit.workspace_id == workspace_id
+                )
+            )
+            if build is None:
+                session.add(
+                    RelationGraphBuild(
+                        workspace_id=workspace_id,
+                        input_revision=input_revision,
+                        build_version=build_version,
+                        status="ready",
+                        subject_cluster_status=dict(subject_cluster_status),
+                    )
+                )
+            else:
+                build.input_revision = input_revision
+                build.build_version = build_version
+                build.status = "ready"
+                build.subject_cluster_status = dict(subject_cluster_status)
+                build.error_message = None
+            return HierarchyGraphInitializationResult(
+                build_version=build_version,
+                input_revision=input_revision,
+                initialized=True,
+            )
+
+    async def load_entity_nodes(
+        self,
+        *,
+        workspace_id: str,
+        entity_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Load durable Entity node context for workflow tools without Asset contents."""
+
+        requested_ids = _deduplicated_strings(entity_ids)
+        if not requested_ids:
+            return []
+        async with self._database.session() as session:
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity).where(
+                        RelationEntity.workspace_id == workspace_id,
+                        RelationEntity.entity_id.in_(requested_ids),
+                    )
+                )
+            )
+        by_id = {entity.entity_id: entity for entity in entities}
+        return [
+            _entity_node_payload(by_id[entity_id])
+            for entity_id in requested_ids
+            if entity_id in by_id
+        ]
+
+    async def search_similar_entity_nodes(
+        self,
+        *,
+        workspace_id: str,
+        incoming_entity_ids: Sequence[str],
+        exclude_entity_ids: Sequence[str] = (),
+        per_entity_limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return in-database cosine Top-K hits and their complete-tree roots.
+
+        Entity vectors are small JSON vectors at this layer.  The workflow
+        adapter can later replace this implementation with a dedicated Entity
+        vector index without changing the hierarchy Agent contract.
+        """
+
+        incoming_ids = _deduplicated_strings(incoming_entity_ids)
+        if not incoming_ids:
+            return []
+        if per_entity_limit < 1:
+            raise RelationHierarchyValidationError("per_entity_limit must be at least 1")
+        excluded_ids = set(_deduplicated_strings(exclude_entity_ids)).union(incoming_ids)
+        async with self._database.session() as session:
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity)
+                    .where(RelationEntity.workspace_id == workspace_id)
+                    .order_by(RelationEntity.entity_id)
+                )
+            )
+            hierarchy_edges = list(
+                await session.scalars(
+                    select(EntityEntityRelation).where(
+                        EntityEntityRelation.workspace_id == workspace_id,
+                        EntityEntityRelation.edge_type == "hierarchy",
+                    )
+                )
+            )
+        entities_by_id = {entity.entity_id: entity for entity in entities}
+        roots = _entity_tree_roots(hierarchy_edges)
+        results: list[dict[str, Any]] = []
+        for incoming_id in incoming_ids:
+            incoming = entities_by_id.get(incoming_id)
+            if incoming is None or not incoming.embedding_vector:
+                continue
+            scored = [
+                (
+                    _cosine_similarity(incoming.embedding_vector, candidate.embedding_vector),
+                    candidate,
+                    candidate_root_id,
+                )
+                for candidate in entities
+                if candidate.entity_id not in excluded_ids
+                and candidate.embedding_vector
+                and (candidate_root_id := _resolve_entity_tree_root(candidate.entity_id, roots))
+                not in excluded_ids
+            ]
+            for score, candidate, candidate_root_id in sorted(
+                scored,
+                key=lambda item: (-item[0], item[1].entity_id),
+            )[:per_entity_limit]:
+                results.append(
+                    {
+                        "incoming_entity_id": incoming_id,
+                        "entity_id": candidate.entity_id,
+                        "root_entity_id": candidate_root_id,
+                        "score": score,
+                    }
+                )
+        return results
+
+    async def load_complete_entity_trees(
+        self,
+        *,
+        workspace_id: str,
+        root_entity_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Load every node and hierarchy edge below each requested root Entity."""
+
+        requested_roots = _deduplicated_strings(root_entity_ids)
+        if not requested_roots:
+            return []
+        async with self._database.session() as session:
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity).where(RelationEntity.workspace_id == workspace_id)
+                )
+            )
+            hierarchy_edges = list(
+                await session.scalars(
+                    select(EntityEntityRelation).where(
+                        EntityEntityRelation.workspace_id == workspace_id,
+                        EntityEntityRelation.edge_type == "hierarchy",
+                    )
+                )
+            )
+        entities_by_id = {entity.entity_id: entity for entity in entities}
+        children_by_parent: dict[str, set[str]] = {}
+        for edge in hierarchy_edges:
+            children_by_parent.setdefault(edge.target_entity_id, set()).add(edge.source_entity_id)
+        trees: list[dict[str, Any]] = []
+        for root_id in requested_roots:
+            if root_id not in entities_by_id:
+                continue
+            member_ids = _descendant_entity_ids(root_id, children_by_parent)
+            trees.append(
+                {
+                    "root_entity_id": root_id,
+                    "nodes": [
+                        _entity_node_payload(entities_by_id[entity_id])
+                        for entity_id in sorted(member_ids)
+                    ],
+                    "edges": [
+                        {
+                            "source_entity_id": edge.source_entity_id,
+                            "target_entity_id": edge.target_entity_id,
+                            "relation": edge.relation,
+                            "description": edge.description,
+                            "edge_type": "hierarchy",
+                        }
+                        for edge in hierarchy_edges
+                        if edge.source_entity_id in member_ids
+                        and edge.target_entity_id in member_ids
+                    ],
+                }
+            )
+        return trees
+
+    async def load_workspace_tree(self, *, workspace_id: str) -> str:
+        """Render imported source paths as compact read-only Agent context."""
+
+        async with self._database.session() as session:
+            paths = list(
+                await session.scalars(
+                    select(SourceFile.relative_path)
+                    .where(SourceFile.workspace_id == workspace_id)
+                    .order_by(SourceFile.relative_path)
+                )
+            )
+        return _render_workspace_paths(paths)
+
+    async def sync_hierarchy_entity_candidates(
+        self,
+        *,
+        workspace_id: str,
+        sync: HierarchyCandidateSync,
+    ) -> HierarchyCandidateSyncResult:
+        """Synchronize governed-cluster candidates before hierarchy Agent routing.
+
+        Each candidate has one durable ``RelationEntitySource``.  A new source
+        creates a stable direct Entity; a source already merged into a
+        canonical Entity remains attached to that Entity.  Candidate member
+        lists are authoritative for the supplied sources, so Assets removed
+        from a source have their old direct membership cleared in the same
+        transaction.
+        """
+
+        _validate_candidate_sync(sync)
+        fingerprint = _request_fingerprint("candidate_sync", sync)
+        async with self._database.session() as session, session.begin():
+            replay = await _find_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=sync.operation_id,
+            )
+            if replay is not None:
+                return _candidate_sync_replay_result(replay, fingerprint)
+
+            build = await session.get(RelationGraphBuild, workspace_id, with_for_update=True)
+            _require_expected_hierarchy_build(
+                build,
+                expected_build_version=sync.expected_build_version,
+                expected_input_revision=sync.expected_input_revision,
+            )
+            # A competing operation may have committed while this transaction
+            # waited for the workspace build row lock.
+            replay = await _find_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=sync.operation_id,
+            )
+            if replay is not None:
+                return _candidate_sync_replay_result(replay, fingerprint)
+
+            assert build is not None
+            next_version = build.build_version + 1
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity)
+                    .where(RelationEntity.workspace_id == workspace_id)
+                    .with_for_update()
+                )
+            )
+            entities_by_id = {entity.entity_id: entity for entity in entities}
+            sources = list(
+                await session.scalars(
+                    select(RelationEntitySource)
+                    .where(RelationEntitySource.workspace_id == workspace_id)
+                    .with_for_update()
+                )
+            )
+            sources_by_candidate = {source.candidate_id: source for source in sources}
+            changed_entity_ids: set[str] = set()
+            affected_asset_ids: set[str] = set()
+
+            for candidate in sync.candidates:
+                source = sources_by_candidate.get(candidate.candidate_id)
+                candidate_asset_ids = _deduplicated_strings(candidate.asset_ids)
+                if source is None:
+                    entity_id = _candidate_entity_id(candidate.candidate_id)
+                    if entity_id in entities_by_id:
+                        raise RelationHierarchyValidationError(
+                            "candidate-derived entity_id collides with an Entity that has no source: "
+                            f"{entity_id}"
+                        )
+                    entity = RelationEntity(
+                        entity_id=entity_id,
+                        workspace_id=workspace_id,
+                        name=candidate.name,
+                        semantic=candidate.semantic,
+                        origins=[candidate.origin],
+                        descriptions=[candidate.semantic],
+                        candidate_ids=[candidate.candidate_id],
+                        merge_reason="主体聚类候选直接形成 Entity。",
+                        embedding_vector=_normalized_average([candidate.embedding_vector]),
+                        embedding_model=candidate.embedding_model,
+                        build_version=next_version,
+                    )
+                    source = RelationEntitySource(
+                        entity_id=entity_id,
+                        candidate_id=candidate.candidate_id,
+                        workspace_id=workspace_id,
+                        origin=candidate.origin,
+                        name=candidate.name,
+                        semantic=candidate.semantic,
+                        asset_ids=candidate_asset_ids,
+                        embedding_vector=list(candidate.embedding_vector),
+                        embedding_model=candidate.embedding_model,
+                    )
+                    session.add(entity)
+                    session.add(source)
+                    entities.append(entity)
+                    sources.append(source)
+                    entities_by_id[entity_id] = entity
+                    sources_by_candidate[candidate.candidate_id] = source
+                    changed_entity_ids.add(entity_id)
+                    affected_asset_ids.update(candidate_asset_ids)
+                    continue
+
+                old_asset_ids = set(source.asset_ids)
+                source_changed = (
+                    source.origin != candidate.origin
+                    or source.name != candidate.name
+                    or source.semantic != candidate.semantic
+                    or list(source.asset_ids) != candidate_asset_ids
+                    or list(source.embedding_vector) != list(candidate.embedding_vector)
+                    or source.embedding_model != candidate.embedding_model
+                )
+                if not source_changed:
+                    continue
+                source.origin = candidate.origin
+                source.name = candidate.name
+                source.semantic = candidate.semantic
+                source.asset_ids = candidate_asset_ids
+                source.embedding_vector = list(candidate.embedding_vector)
+                source.embedding_model = candidate.embedding_model
+                changed_entity_ids.add(source.entity_id)
+                affected_asset_ids.update(old_asset_ids)
+                affected_asset_ids.update(candidate_asset_ids)
+
+            governed_candidate_ids = set(sync.governed_candidate_ids)
+            stale_sources = [
+                source
+                for source in sources
+                if source.origin == "subject_cluster"
+                and source.candidate_id not in governed_candidate_ids
+            ]
+            for source in stale_sources:
+                changed_entity_ids.add(source.entity_id)
+                affected_asset_ids.update(source.asset_ids)
+                sources.remove(source)
+                sources_by_candidate.pop(source.candidate_id, None)
+                await session.delete(source)
+
+            sources_by_entity = _sources_by_entity(sources)
+            for entity_id in changed_entity_ids:
+                entity = entities_by_id.get(entity_id)
+                if entity is None:
+                    raise RelationHierarchyValidationError(
+                        f"candidate source references missing Entity: {entity_id}"
+                    )
+                _refresh_entity_from_sources(
+                    entity,
+                    sources_by_entity.get(entity_id, []),
+                    build_version=next_version,
+                    update_single_source_identity=True,
+                )
+
+            hierarchy_parent_ids = set(
+                await session.scalars(
+                    select(EntityEntityRelation.target_entity_id).where(
+                        EntityEntityRelation.workspace_id == workspace_id,
+                        EntityEntityRelation.edge_type == "hierarchy",
+                    )
+                )
+            )
+            for entity_id in sorted(changed_entity_ids):
+                if sources_by_entity.get(entity_id) or entity_id in hierarchy_parent_ids:
+                    continue
+                entity = entities_by_id.pop(entity_id, None)
+                if entity is None:
+                    continue
+                await session.delete(entity)
+                changed_entity_ids.discard(entity_id)
+
+            assignments = _cluster_member_assignments_for_assets(
+                sources=sources,
+                asset_ids=affected_asset_ids,
+            )
+            await _replace_asset_assignments(
+                session,
+                workspace_id=workspace_id,
+                assignments=assignments,
+                entity_ids=set(entities_by_id),
+                build_version=next_version,
+            )
+            await _upsert_relation_asset_states(
+                session,
+                workspace_id=workspace_id,
+                asset_ids=set(sync.asset_revisions).union(affected_asset_ids),
+                asset_revisions=sync.asset_revisions,
+                build_version=next_version,
+            )
+
+            build.input_revision = sync.input_revision
+            build.build_version = next_version
+            build.status = "ready"
+            build.subject_cluster_status = dict(sync.subject_cluster_status)
+            build.error_message = None
+            pending_entity_ids = tuple(sorted(changed_entity_ids))
+            _record_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=sync.operation_id,
+                request_fingerprint=fingerprint,
+                build_version=next_version,
+                input_revision=sync.input_revision,
+                result_payload={
+                    "kind": "candidate_sync",
+                    "pending_entity_ids": list(pending_entity_ids),
+                },
+            )
+            return HierarchyCandidateSyncResult(
+                operation_id=sync.operation_id,
+                build_version=next_version,
+                input_revision=sync.input_revision,
+                replayed=False,
+                pending_entity_ids=pending_entity_ids,
+            )
+
+    async def commit_hierarchy_batch(
+        self,
+        *,
+        workspace_id: str,
+        commit: HierarchyBatchCommit,
+    ) -> HierarchyBatchCommitResult:
+        """Apply one validated Entity hierarchy batch atomically and idempotently.
+
+        The workflow may replay this call after a checkpoint recovery.  An
+        existing operation ID returns its original result without checking the
+        current build version or touching graph rows.
+        """
+
+        _validate_hierarchy_batch(commit)
+        fingerprint = _request_fingerprint("hierarchy_batch", commit)
+        async with self._database.session() as session, session.begin():
+            replay = await _find_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=commit.operation_id,
+            )
+            if replay is not None:
+                return _hierarchy_batch_replay_result(replay, fingerprint)
+
+            build = await session.get(RelationGraphBuild, workspace_id, with_for_update=True)
+            _require_expected_hierarchy_build(
+                build,
+                expected_build_version=commit.expected_build_version,
+                expected_input_revision=commit.expected_input_revision,
+            )
+            replay = await _find_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=commit.operation_id,
+            )
+            if replay is not None:
+                return _hierarchy_batch_replay_result(replay, fingerprint)
+
+            assert build is not None
+            next_version = build.build_version + 1
+            entities = list(
+                await session.scalars(
+                    select(RelationEntity)
+                    .where(RelationEntity.workspace_id == workspace_id)
+                    .with_for_update()
+                )
+            )
+            entities_by_id = {entity.entity_id: entity for entity in entities}
+            sources = list(
+                await session.scalars(
+                    select(RelationEntitySource)
+                    .where(RelationEntitySource.workspace_id == workspace_id)
+                    .with_for_update()
+                )
+            )
+            hierarchy_relations = list(
+                await session.scalars(
+                    select(EntityEntityRelation)
+                    .where(
+                        EntityEntityRelation.workspace_id == workspace_id,
+                        EntityEntityRelation.edge_type == "hierarchy",
+                    )
+                    .with_for_update()
+                )
+            )
+            asset_relations = list(
+                await session.scalars(
+                    select(AssetEntityRelation)
+                    .where(AssetEntityRelation.workspace_id == workspace_id)
+                    .with_for_update()
+                )
+            )
+
+            created_entity_ids = await _apply_entity_writes(
+                session,
+                workspace_id=workspace_id,
+                entity_writes=commit.entity_writes,
+                entities=entities,
+                entities_by_id=entities_by_id,
+                sources=sources,
+                build_version=next_version,
+            )
+            normalized = _normalize_hierarchy_operations(
+                commit.operations,
+                entity_writes=commit.entity_writes,
+                available_entity_ids=set(entities_by_id),
+            )
+            replacement_map = normalized.replacement_map
+            canonical_ids = set(normalized.canonical_entity_ids)
+            replaced_ids = set(replacement_map) - canonical_ids
+
+            for canonical_id, operation in normalized.merges.items():
+                canonical = entities_by_id[canonical_id]
+                canonical.name = operation["name"]
+                canonical.semantic = operation["semantic"]
+                canonical.merge_reason = "实体层级 Agent 合并。"
+                canonical.build_version = next_version
+            for source in sources:
+                replacement = replacement_map.get(source.entity_id)
+                if replacement is not None:
+                    source.entity_id = replacement
+
+            sources_by_entity = _sources_by_entity(sources)
+            for canonical_id in canonical_ids:
+                _refresh_entity_from_sources(
+                    entities_by_id[canonical_id],
+                    sources_by_entity.get(canonical_id, []),
+                    build_version=next_version,
+                    update_single_source_identity=False,
+                )
+
+            final_entity_ids = set(entities_by_id) - replaced_ids
+            hierarchy_edges = _resolved_hierarchy_edges(
+                hierarchy_relations,
+                replacement_map=replacement_map,
+                group_edges=normalized.group_edges,
+                available_entity_ids=final_entity_ids,
+            )
+            _assert_hierarchy_is_acyclic(hierarchy_edges)
+            await session.execute(
+                delete(EntityEntityRelation).where(
+                    EntityEntityRelation.workspace_id == workspace_id,
+                    EntityEntityRelation.edge_type == "hierarchy",
+                )
+            )
+            await session.flush()
+            for child_id, edge in hierarchy_edges.items():
+                session.add(
+                    EntityEntityRelation(
+                        workspace_id=workspace_id,
+                        source_entity_id=child_id,
+                        target_entity_id=edge["parent_entity_id"],
+                        relation=edge["relation"],
+                        description=edge["description"],
+                        edge_type="hierarchy",
+                        build_version=next_version,
+                    )
+                )
+
+            assignments = _merge_batch_asset_assignments(
+                commit.asset_assignments,
+                sources=sources,
+                existing_relations=asset_relations,
+                replacement_map=replacement_map,
+                replaced_ids=replaced_ids,
+            )
+            await _replace_asset_assignments(
+                session,
+                workspace_id=workspace_id,
+                assignments=assignments,
+                entity_ids=final_entity_ids,
+                build_version=next_version,
+            )
+            await _upsert_relation_asset_states(
+                session,
+                workspace_id=workspace_id,
+                asset_ids=set(commit.asset_revisions).union(
+                    assignment.asset_id for assignment in assignments
+                ),
+                asset_revisions=commit.asset_revisions,
+                build_version=next_version,
+            )
+
+            for entity_id in replaced_ids:
+                entity = entities_by_id[entity_id]
+                await session.delete(entity)
+
+            changed_entity_ids = tuple(
+                sorted(
+                    set(created_entity_ids)
+                    .union(canonical_ids)
+                    .union(normalized.touched_entity_ids)
+                )
+            )
+            build.input_revision = commit.input_revision
+            build.build_version = next_version
+            build.status = "ready"
+            build.subject_cluster_status = dict(commit.subject_cluster_status)
+            build.error_message = None
+            _record_hierarchy_commit(
+                session,
+                workspace_id=workspace_id,
+                operation_id=commit.operation_id,
+                request_fingerprint=fingerprint,
+                build_version=next_version,
+                input_revision=commit.input_revision,
+                result_payload={
+                    "kind": "hierarchy_batch",
+                    "created_entity_ids": list(created_entity_ids),
+                    "changed_entity_ids": list(changed_entity_ids),
+                },
+            )
+            return HierarchyBatchCommitResult(
+                operation_id=commit.operation_id,
+                build_version=next_version,
+                input_revision=commit.input_revision,
+                replayed=False,
+                created_entity_ids=tuple(created_entity_ids),
+                changed_entity_ids=changed_entity_ids,
+            )
+
+    async def apply_asset_assignments(
+        self,
+        *,
+        workspace_id: str,
+        operation_id: str,
+        expected_build_version: int,
+        expected_input_revision: str,
+        input_revision: str,
+        subject_cluster_status: Mapping[str, Any],
+        assignments: Sequence[HierarchyAssetAssignment],
+        asset_revisions: Mapping[str, str] | None = None,
+    ) -> HierarchyBatchCommitResult:
+        """Atomically enforce one-or-none Entity membership for requested Assets."""
+
+        return await self.commit_hierarchy_batch(
+            workspace_id=workspace_id,
+            commit=HierarchyBatchCommit(
+                operation_id=operation_id,
+                expected_build_version=expected_build_version,
+                expected_input_revision=expected_input_revision,
+                input_revision=input_revision,
+                subject_cluster_status=subject_cluster_status,
+                asset_assignments=assignments,
+                asset_revisions=asset_revisions or {},
+            ),
         )
 
     async def update_assets(
@@ -387,10 +1249,7 @@ class RelationGraphRepository:
             entity_ids = {entity["entity_id"] for entity in graph["entities"]}
             for rejected in graph.get("rejected_relations", []):
                 pair = (str(rejected["source_id"]), str(rejected["target_id"]))
-                if (
-                    rejected["target_id"] not in entity_ids
-                    or pair in persisted_asset_entity_pairs
-                ):
+                if rejected["target_id"] not in entity_ids or pair in persisted_asset_entity_pairs:
                     continue
                 persisted_asset_entity_pairs.add(pair)
                 session.add(
@@ -423,6 +1282,877 @@ class RelationGraphRepository:
                 current.subject_cluster_status = dict(subject_cluster_status)
                 current.error_message = None
             return build_version
+
+
+@dataclass(slots=True, frozen=True)
+class _NormalizedHierarchyOperations:
+    merges: Mapping[str, Mapping[str, Any]]
+    replacement_map: Mapping[str, str]
+    canonical_entity_ids: tuple[str, ...]
+    group_edges: Mapping[str, Mapping[str, str]]
+    touched_entity_ids: frozenset[str]
+
+
+def _validate_candidate_sync(sync: HierarchyCandidateSync) -> None:
+    _validate_hierarchy_operation_id(sync.operation_id)
+    _validate_expected_hierarchy_revision(
+        expected_build_version=sync.expected_build_version,
+        expected_input_revision=sync.expected_input_revision,
+        input_revision=sync.input_revision,
+    )
+    seen_candidate_ids: set[str] = set()
+    for candidate in sync.candidates:
+        if not candidate.candidate_id or candidate.candidate_id in seen_candidate_ids:
+            raise RelationHierarchyValidationError(
+                "candidate sync requires unique, non-empty candidate_id values"
+            )
+        seen_candidate_ids.add(candidate.candidate_id)
+        if not candidate.origin or not candidate.name or not candidate.semantic:
+            raise RelationHierarchyValidationError(
+                "candidate sync requires non-empty origin, name, and semantic"
+            )
+        _validate_vector(candidate.embedding_vector, label=candidate.candidate_id)
+    governed_candidate_ids = list(sync.governed_candidate_ids)
+    if (
+        len(governed_candidate_ids) != len(set(governed_candidate_ids))
+        or any(not candidate_id for candidate_id in governed_candidate_ids)
+        or set(seen_candidate_ids) != set(governed_candidate_ids)
+    ):
+        raise RelationHierarchyValidationError(
+            "governed_candidate_ids must exactly match the synced candidates"
+        )
+
+
+def _validate_hierarchy_batch(commit: HierarchyBatchCommit) -> None:
+    _validate_hierarchy_operation_id(commit.operation_id)
+    _validate_expected_hierarchy_revision(
+        expected_build_version=commit.expected_build_version,
+        expected_input_revision=commit.expected_input_revision,
+        input_revision=commit.input_revision,
+    )
+    seen_entity_ids: set[str] = set()
+    seen_temporary_ids: set[str] = set()
+    seen_source_ids: set[str] = set()
+    for write in commit.entity_writes:
+        if not write.entity_id or write.entity_id in seen_entity_ids:
+            raise RelationHierarchyValidationError(
+                "entity_writes requires unique, non-empty entity_id values"
+            )
+        if not write.name or not write.semantic:
+            raise RelationHierarchyValidationError(
+                "entity_writes requires non-empty name and semantic"
+            )
+        seen_entity_ids.add(write.entity_id)
+        if write.temporary_parent_id is not None:
+            if (
+                not write.temporary_parent_id.startswith("virtual:")
+                or write.temporary_parent_id in seen_temporary_ids
+            ):
+                raise RelationHierarchyValidationError(
+                    "temporary_parent_id values must be unique virtual:* identifiers"
+                )
+            seen_temporary_ids.add(write.temporary_parent_id)
+        _validate_vector(write.embedding_vector, label=write.entity_id)
+        for source in write.sources:
+            if not source.candidate_id or source.candidate_id in seen_source_ids:
+                raise RelationHierarchyValidationError(
+                    "Entity source candidate_id values must be globally unique per batch"
+                )
+            if not source.origin or not source.name or not source.semantic:
+                raise RelationHierarchyValidationError(
+                    "Entity sources require non-empty origin, name, and semantic"
+                )
+            seen_source_ids.add(source.candidate_id)
+            _validate_vector(source.embedding_vector, label=source.candidate_id)
+    assignment_ids = [assignment.asset_id for assignment in commit.asset_assignments]
+    if len(assignment_ids) != len(set(assignment_ids)) or any(not item for item in assignment_ids):
+        raise RelationHierarchyValidationError(
+            "asset_assignments requires unique, non-empty asset_id values"
+        )
+    for operation in commit.operations:
+        if not isinstance(operation, Mapping):
+            raise RelationHierarchyValidationError("hierarchy operations must be mappings")
+        if "edge_type" in operation:
+            raise RelationHierarchyValidationError(
+                "hierarchy operations cannot provide arbitrary edge_type values"
+            )
+
+
+def _validate_hierarchy_operation_id(operation_id: str) -> None:
+    if not operation_id or len(operation_id) > 255:
+        raise RelationHierarchyValidationError(
+            "operation_id must be a non-empty string no longer than 255 characters"
+        )
+
+
+def _validate_expected_hierarchy_revision(
+    *,
+    expected_build_version: int,
+    expected_input_revision: str,
+    input_revision: str,
+) -> None:
+    if expected_build_version < 1:
+        raise RelationHierarchyValidationError("expected_build_version must be at least 1")
+    if not expected_input_revision or not input_revision:
+        raise RelationHierarchyValidationError(
+            "expected_input_revision and input_revision must be non-empty"
+        )
+
+
+def _validate_vector(values: Sequence[float], *, label: str) -> None:
+    if not all(math.isfinite(float(value)) for value in values):
+        raise RelationHierarchyValidationError(f"embedding_vector for {label} is not finite")
+
+
+def _request_fingerprint(kind: str, payload: Any) -> str:
+    canonical = json.dumps(
+        {"kind": kind, "payload": asdict(payload)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _find_hierarchy_commit(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    operation_id: str,
+) -> RelationHierarchyBatchCommit | None:
+    return await session.scalar(
+        select(RelationHierarchyBatchCommit).where(
+            RelationHierarchyBatchCommit.workspace_id == workspace_id,
+            RelationHierarchyBatchCommit.operation_id == operation_id,
+        )
+    )
+
+
+def _require_expected_hierarchy_build(
+    build: RelationGraphBuild | None,
+    *,
+    expected_build_version: int,
+    expected_input_revision: str,
+) -> None:
+    if build is None:
+        raise RelationHierarchyConflictError(
+            "relation hierarchy build does not exist; perform the explicit rebuild reset first"
+        )
+    if build.status != "ready":
+        raise RelationHierarchyConflictError(
+            f"relation hierarchy build is not ready: {build.status}"
+        )
+    if build.build_version != expected_build_version:
+        raise RelationHierarchyConflictError(
+            "stale hierarchy build version: "
+            f"expected {expected_build_version}, current {build.build_version}"
+        )
+    if build.input_revision != expected_input_revision:
+        raise RelationHierarchyConflictError(
+            "stale hierarchy input revision: "
+            f"expected {expected_input_revision}, current {build.input_revision}"
+        )
+
+
+def _candidate_sync_replay_result(
+    record: RelationHierarchyBatchCommit,
+    request_fingerprint: str,
+) -> HierarchyCandidateSyncResult:
+    payload = _validated_replay_payload(
+        record,
+        request_fingerprint=request_fingerprint,
+        expected_kind="candidate_sync",
+    )
+    return HierarchyCandidateSyncResult(
+        operation_id=record.operation_id,
+        build_version=record.build_version,
+        input_revision=record.input_revision,
+        replayed=True,
+        pending_entity_ids=tuple(str(item) for item in payload["pending_entity_ids"]),
+    )
+
+
+def _hierarchy_batch_replay_result(
+    record: RelationHierarchyBatchCommit,
+    request_fingerprint: str,
+) -> HierarchyBatchCommitResult:
+    payload = _validated_replay_payload(
+        record,
+        request_fingerprint=request_fingerprint,
+        expected_kind="hierarchy_batch",
+    )
+    return HierarchyBatchCommitResult(
+        operation_id=record.operation_id,
+        build_version=record.build_version,
+        input_revision=record.input_revision,
+        replayed=True,
+        created_entity_ids=tuple(str(item) for item in payload["created_entity_ids"]),
+        changed_entity_ids=tuple(str(item) for item in payload["changed_entity_ids"]),
+    )
+
+
+def _validated_replay_payload(
+    record: RelationHierarchyBatchCommit,
+    *,
+    request_fingerprint: str,
+    expected_kind: str,
+) -> Mapping[str, Any]:
+    if record.request_fingerprint != request_fingerprint:
+        raise RelationHierarchyValidationError(
+            "operation_id was already committed with a different hierarchy payload"
+        )
+    payload = record.result_payload
+    if payload.get("kind") != expected_kind:
+        raise RelationHierarchyValidationError(
+            "operation_id was already used by a different hierarchy operation type"
+        )
+    return payload
+
+
+def _record_hierarchy_commit(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    operation_id: str,
+    request_fingerprint: str,
+    build_version: int,
+    input_revision: str,
+    result_payload: Mapping[str, Any],
+) -> None:
+    session.add(
+        RelationHierarchyBatchCommit(
+            workspace_id=workspace_id,
+            operation_id=operation_id,
+            request_fingerprint=request_fingerprint,
+            build_version=build_version,
+            input_revision=input_revision,
+            result_payload=dict(result_payload),
+        )
+    )
+
+
+def _candidate_entity_id(candidate_id: str) -> str:
+    digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:16]
+    return f"entity_candidate_{digest}"
+
+
+def _deduplicated_strings(values: Sequence[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise RelationHierarchyValidationError(
+                "Entity and Asset identifiers must be non-empty strings"
+            )
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _normalized_average(vectors: Sequence[Sequence[float]]) -> list[float]:
+    non_empty = [list(vector) for vector in vectors if vector]
+    if not non_empty:
+        return []
+    dimension = len(non_empty[0])
+    if any(len(vector) != dimension for vector in non_empty):
+        raise RelationHierarchyValidationError(
+            "Entity sources with different embedding dimensions cannot be averaged"
+        )
+    average = [
+        sum(vector[index] for vector in non_empty) / len(non_empty) for index in range(dimension)
+    ]
+    norm = math.sqrt(sum(value * value for value in average))
+    if norm == 0:
+        return []
+    return [value / norm for value in average]
+
+
+def _sources_by_entity(
+    sources: Sequence[RelationEntitySource],
+) -> dict[str, list[RelationEntitySource]]:
+    result: dict[str, list[RelationEntitySource]] = {}
+    for source in sources:
+        result.setdefault(source.entity_id, []).append(source)
+    return result
+
+
+def _refresh_entity_from_sources(
+    entity: RelationEntity,
+    sources: Sequence[RelationEntitySource],
+    *,
+    build_version: int,
+    update_single_source_identity: bool,
+) -> None:
+    if not sources:
+        entity.build_version = build_version
+        return
+    entity.origins = sorted({source.origin for source in sources})
+    entity.descriptions = list(
+        dict.fromkeys(source.semantic for source in sources if source.semantic)
+    )
+    entity.candidate_ids = list(dict.fromkeys(source.candidate_id for source in sources))
+    if update_single_source_identity and len(sources) == 1:
+        entity.name = sources[0].name
+        entity.semantic = sources[0].semantic
+    entity.embedding_vector = _normalized_average([source.embedding_vector for source in sources])
+    model_names = {source.embedding_model for source in sources if source.embedding_model}
+    entity.embedding_model = next(iter(model_names)) if len(model_names) == 1 else ""
+    entity.build_version = build_version
+
+
+def _cluster_member_assignments_for_assets(
+    *,
+    sources: Sequence[RelationEntitySource],
+    asset_ids: set[str],
+) -> list[HierarchyAssetAssignment]:
+    owners: dict[str, set[str]] = {asset_id: set() for asset_id in asset_ids}
+    for source in sources:
+        for asset_id in source.asset_ids:
+            if asset_id in owners:
+                owners[asset_id].add(source.entity_id)
+    assignments: list[HierarchyAssetAssignment] = []
+    for asset_id in sorted(asset_ids):
+        entity_ids = owners[asset_id]
+        if len(entity_ids) > 1:
+            raise RelationHierarchyValidationError(
+                "governed subject candidates cannot assign one Asset to multiple Entities: "
+                f"{asset_id}"
+            )
+        assignments.append(
+            HierarchyAssetAssignment(
+                asset_id=asset_id,
+                entity_id=next(iter(entity_ids), None),
+                relation="CLUSTER_MEMBER",
+                description="受治理主体簇成员。",
+            )
+        )
+    return assignments
+
+
+async def _apply_entity_writes(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_writes: Sequence[HierarchyEntityWrite],
+    entities: list[RelationEntity],
+    entities_by_id: dict[str, RelationEntity],
+    sources: list[RelationEntitySource],
+    build_version: int,
+) -> tuple[str, ...]:
+    created_entity_ids: list[str] = []
+    sources_by_key = {(source.entity_id, source.candidate_id): source for source in sources}
+    candidate_owners = {source.candidate_id: source.entity_id for source in sources}
+    for write in entity_writes:
+        entity = entities_by_id.get(write.entity_id)
+        if entity is None:
+            entity = RelationEntity(
+                entity_id=write.entity_id,
+                workspace_id=workspace_id,
+                name=write.name,
+                semantic=write.semantic,
+                origins=list(write.origins),
+                descriptions=list(write.descriptions),
+                candidate_ids=list(write.candidate_ids),
+                merge_reason=write.merge_reason,
+                embedding_vector=list(write.embedding_vector),
+                embedding_model=write.embedding_model,
+                build_version=build_version,
+            )
+            session.add(entity)
+            entities.append(entity)
+            entities_by_id[entity.entity_id] = entity
+            created_entity_ids.append(entity.entity_id)
+        else:
+            entity.name = write.name
+            entity.semantic = write.semantic
+            entity.origins = list(write.origins)
+            entity.descriptions = list(write.descriptions)
+            entity.candidate_ids = list(write.candidate_ids)
+            entity.merge_reason = write.merge_reason
+            entity.embedding_vector = list(write.embedding_vector)
+            entity.embedding_model = write.embedding_model
+            entity.build_version = build_version
+
+        incoming_source_ids = {source.candidate_id for source in write.sources}
+        if write.replace_sources:
+            removed_sources = [
+                source
+                for source in sources
+                if source.entity_id == write.entity_id
+                and source.candidate_id not in incoming_source_ids
+            ]
+            for source in removed_sources:
+                await session.delete(source)
+                sources.remove(source)
+                sources_by_key.pop((source.entity_id, source.candidate_id), None)
+                candidate_owners.pop(source.candidate_id, None)
+
+        for source_write in write.sources:
+            owner = candidate_owners.get(source_write.candidate_id)
+            if owner is not None and owner != write.entity_id:
+                raise RelationHierarchyValidationError(
+                    "a candidate source cannot be attached to multiple Entities: "
+                    f"{source_write.candidate_id}"
+                )
+            source = sources_by_key.get((write.entity_id, source_write.candidate_id))
+            if source is None:
+                source = RelationEntitySource(
+                    entity_id=write.entity_id,
+                    candidate_id=source_write.candidate_id,
+                    workspace_id=workspace_id,
+                    origin=source_write.origin,
+                    name=source_write.name,
+                    semantic=source_write.semantic,
+                    asset_ids=_deduplicated_strings(source_write.asset_ids),
+                    embedding_vector=list(source_write.embedding_vector),
+                    embedding_model=source_write.embedding_model,
+                )
+                session.add(source)
+                sources.append(source)
+                sources_by_key[(source.entity_id, source.candidate_id)] = source
+                candidate_owners[source.candidate_id] = source.entity_id
+            else:
+                source.origin = source_write.origin
+                source.name = source_write.name
+                source.semantic = source_write.semantic
+                source.asset_ids = _deduplicated_strings(source_write.asset_ids)
+                source.embedding_vector = list(source_write.embedding_vector)
+                source.embedding_model = source_write.embedding_model
+    return tuple(created_entity_ids)
+
+
+def _normalize_hierarchy_operations(
+    operations: Sequence[Mapping[str, Any]],
+    *,
+    entity_writes: Sequence[HierarchyEntityWrite],
+    available_entity_ids: set[str],
+) -> _NormalizedHierarchyOperations:
+    temporary_parent_ids = {
+        write.temporary_parent_id: write.entity_id
+        for write in entity_writes
+        if write.temporary_parent_id is not None
+    }
+    merges: dict[str, Mapping[str, Any]] = {}
+    replacement_map: dict[str, str] = {}
+    touched_entity_ids: set[str] = set()
+    group_operations: list[Mapping[str, Any]] = []
+    for operation in operations:
+        operation_type = operation.get("type")
+        if operation_type == "merge":
+            source_ids = _mapping_string_list(operation, "source_entity_ids", minimum=2)
+            canonical_id = _mapping_nonempty_string(operation, "canonical_entity_id")
+            if canonical_id not in source_ids:
+                raise RelationHierarchyValidationError(
+                    "merge canonical_entity_id must occur in source_entity_ids"
+                )
+            if any(entity_id not in available_entity_ids for entity_id in source_ids):
+                raise RelationHierarchyValidationError("merge references an unknown Entity")
+            if any(entity_id in replacement_map for entity_id in source_ids):
+                raise RelationHierarchyValidationError(
+                    "an Entity can participate in only one merge per batch"
+                )
+            merges[canonical_id] = {
+                "name": _mapping_nonempty_string(operation, "name"),
+                "semantic": _mapping_nonempty_string(operation, "semantic"),
+            }
+            for source_id in source_ids:
+                replacement_map[source_id] = canonical_id
+            touched_entity_ids.update(source_ids)
+        elif operation_type == "separate":
+            entity_ids = _mapping_string_list(operation, "entity_ids", minimum=1)
+            if any(entity_id not in available_entity_ids for entity_id in entity_ids):
+                raise RelationHierarchyValidationError("separate references an unknown Entity")
+            touched_entity_ids.update(entity_ids)
+        elif operation_type == "group":
+            group_operations.append(operation)
+        else:
+            raise RelationHierarchyValidationError(
+                "hierarchy operations only support merge, separate, and group"
+            )
+
+    group_edges: dict[str, Mapping[str, str]] = {}
+    for operation in group_operations:
+        parent = operation.get("parent")
+        if not isinstance(parent, Mapping):
+            raise RelationHierarchyValidationError("group parent must be a mapping")
+        parent_mode = parent.get("mode")
+        if parent_mode == "reuse":
+            parent_id = _mapping_nonempty_string(parent, "parent_entity_id")
+        elif parent_mode == "create":
+            temporary_id = _mapping_nonempty_string(parent, "temporary_parent_id")
+            parent_id = temporary_parent_ids.get(temporary_id, "")
+            if not parent_id:
+                raise RelationHierarchyValidationError(
+                    "a created group parent requires a matching Entity write with temporary_parent_id"
+                )
+        else:
+            raise RelationHierarchyValidationError("group parent mode must be create or reuse")
+        parent_id = replacement_map.get(parent_id, parent_id)
+        if parent_id not in available_entity_ids:
+            raise RelationHierarchyValidationError("group references an unknown parent Entity")
+        children = operation.get("children")
+        if not isinstance(children, Sequence) or isinstance(children, (str, bytes)) or not children:
+            raise RelationHierarchyValidationError("group requires at least one child")
+        seen_children: set[str] = set()
+        for child in children:
+            if not isinstance(child, Mapping):
+                raise RelationHierarchyValidationError("group children must be mappings")
+            child_id = _mapping_nonempty_string(child, "child_entity_id")
+            child_id = replacement_map.get(child_id, child_id)
+            if child_id not in available_entity_ids:
+                raise RelationHierarchyValidationError("group references an unknown child Entity")
+            if child_id == parent_id or child_id in seen_children:
+                raise RelationHierarchyValidationError(
+                    "group children must be distinct and cannot equal their parent"
+                )
+            seen_children.add(child_id)
+            if child_id in group_edges:
+                raise RelationHierarchyValidationError(
+                    "an Entity can receive only one group parent per batch"
+                )
+            group_edges[child_id] = {
+                "parent_entity_id": parent_id,
+                "relation": _mapping_nonempty_string(child, "relation"),
+                "description": _mapping_nonempty_string(child, "description"),
+            }
+            touched_entity_ids.add(child_id)
+            touched_entity_ids.add(parent_id)
+
+    return _NormalizedHierarchyOperations(
+        merges=merges,
+        replacement_map=replacement_map,
+        canonical_entity_ids=tuple(merges),
+        group_edges=group_edges,
+        touched_entity_ids=frozenset(touched_entity_ids),
+    )
+
+
+def _mapping_nonempty_string(mapping: Mapping[str, Any], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise RelationHierarchyValidationError(f"{key} must be a non-empty string")
+    return value
+
+
+def _mapping_string_list(
+    mapping: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+) -> list[str]:
+    value = mapping.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise RelationHierarchyValidationError(f"{key} must be a list of Entity IDs")
+    values = _deduplicated_strings(value)
+    if len(values) != len(value) or len(values) < minimum:
+        raise RelationHierarchyValidationError(f"{key} must contain at least {minimum} unique IDs")
+    return values
+
+
+def _resolved_hierarchy_edges(
+    existing_relations: Sequence[EntityEntityRelation],
+    *,
+    replacement_map: Mapping[str, str],
+    group_edges: Mapping[str, Mapping[str, str]],
+    available_entity_ids: set[str],
+) -> dict[str, Mapping[str, str]]:
+    resolved: dict[str, Mapping[str, str]] = {}
+    for relation in existing_relations:
+        child_id = replacement_map.get(relation.source_entity_id, relation.source_entity_id)
+        parent_id = replacement_map.get(relation.target_entity_id, relation.target_entity_id)
+        if child_id == parent_id:
+            continue
+        if child_id not in available_entity_ids or parent_id not in available_entity_ids:
+            raise RelationHierarchyValidationError(
+                "existing hierarchy edge references an Entity removed by this batch"
+            )
+        _put_hierarchy_edge(
+            resolved,
+            child_id=child_id,
+            parent_entity_id=parent_id,
+            relation=relation.relation,
+            description=relation.description,
+        )
+    for child_id, edge in group_edges.items():
+        _put_hierarchy_edge(
+            resolved,
+            child_id=child_id,
+            parent_entity_id=edge["parent_entity_id"],
+            relation=edge["relation"],
+            description=edge["description"],
+            replace_existing=True,
+        )
+    return resolved
+
+
+def _put_hierarchy_edge(
+    edges: dict[str, Mapping[str, str]],
+    *,
+    child_id: str,
+    parent_entity_id: str,
+    relation: str,
+    description: str,
+    replace_existing: bool = False,
+) -> None:
+    existing = edges.get(child_id)
+    if (
+        existing is not None
+        and existing["parent_entity_id"] != parent_entity_id
+        and not replace_existing
+    ):
+        raise RelationHierarchyValidationError(
+            f"Entity {child_id} has more than one hierarchy parent"
+        )
+    if existing is None or replace_existing:
+        edges[child_id] = {
+            "parent_entity_id": parent_entity_id,
+            "relation": relation,
+            "description": description,
+        }
+
+
+def _assert_hierarchy_is_acyclic(edges: Mapping[str, Mapping[str, str]]) -> None:
+    for start in edges:
+        visited: set[str] = set()
+        current = start
+        while current in edges:
+            if current in visited:
+                raise RelationHierarchyValidationError("hierarchy operations would create a cycle")
+            visited.add(current)
+            current = edges[current]["parent_entity_id"]
+
+
+def _merge_batch_asset_assignments(
+    explicit_assignments: Sequence[HierarchyAssetAssignment],
+    *,
+    sources: Sequence[RelationEntitySource],
+    existing_relations: Sequence[AssetEntityRelation],
+    replacement_map: Mapping[str, str],
+    replaced_ids: set[str],
+) -> list[HierarchyAssetAssignment]:
+    assignments: dict[str, HierarchyAssetAssignment] = {}
+    merged_canonical_ids = {
+        canonical_id
+        for source_id, canonical_id in replacement_map.items()
+        if source_id != canonical_id
+    }
+    for source in sources:
+        if source.entity_id not in merged_canonical_ids:
+            continue
+        for asset_id in source.asset_ids:
+            assignments.setdefault(
+                asset_id,
+                HierarchyAssetAssignment(
+                    asset_id=asset_id,
+                    entity_id=source.entity_id,
+                    relation="CLUSTER_MEMBER",
+                    description="主体簇 Entity 合并后保留的成员归属。",
+                ),
+            )
+    for relation in existing_relations:
+        if not relation.establishes_relation or relation.entity_id not in replaced_ids:
+            continue
+        assignments.setdefault(
+            relation.asset_id,
+            HierarchyAssetAssignment(
+                asset_id=relation.asset_id,
+                entity_id=replacement_map[relation.entity_id],
+                relation=relation.relation,
+                description=relation.description,
+                reason=relation.reason,
+                content_subject=relation.content_subject,
+            ),
+        )
+    for assignment in explicit_assignments:
+        target_id = (
+            replacement_map.get(assignment.entity_id, assignment.entity_id)
+            if assignment.entity_id is not None
+            else None
+        )
+        assignments[assignment.asset_id] = HierarchyAssetAssignment(
+            asset_id=assignment.asset_id,
+            entity_id=target_id,
+            relation=assignment.relation,
+            description=assignment.description,
+            reason=assignment.reason,
+            content_subject=assignment.content_subject,
+        )
+    return [assignments[asset_id] for asset_id in sorted(assignments)]
+
+
+async def _replace_asset_assignments(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    assignments: Sequence[HierarchyAssetAssignment],
+    entity_ids: set[str],
+    build_version: int,
+) -> None:
+    if not assignments:
+        return
+    asset_ids = [assignment.asset_id for assignment in assignments]
+    if len(asset_ids) != len(set(asset_ids)):
+        raise RelationHierarchyValidationError("Asset assignments must be unique")
+    unknown_entities = {
+        assignment.entity_id
+        for assignment in assignments
+        if assignment.entity_id is not None and assignment.entity_id not in entity_ids
+    }
+    if unknown_entities:
+        raise RelationHierarchyValidationError(
+            f"Asset assignment references unknown Entity IDs: {', '.join(sorted(unknown_entities))}"
+        )
+    persisted_asset_ids = set(
+        await session.scalars(
+            select(Asset.asset_id).where(
+                Asset.workspace_id == workspace_id,
+                Asset.asset_id.in_(asset_ids),
+            )
+        )
+    )
+    missing_asset_ids = set(asset_ids) - persisted_asset_ids
+    if missing_asset_ids:
+        raise RelationHierarchyValidationError(
+            f"Asset assignment references unknown Assets: {', '.join(sorted(missing_asset_ids))}"
+        )
+    await session.execute(
+        delete(AssetEntityRelation).where(
+            AssetEntityRelation.workspace_id == workspace_id,
+            AssetEntityRelation.asset_id.in_(asset_ids),
+        )
+    )
+    await session.flush()
+    for assignment in assignments:
+        if assignment.entity_id is None:
+            continue
+        session.add(
+            AssetEntityRelation(
+                workspace_id=workspace_id,
+                asset_id=assignment.asset_id,
+                entity_id=assignment.entity_id,
+                establishes_relation=True,
+                relation=assignment.relation,
+                description=assignment.description,
+                reason=assignment.reason,
+                content_subject=assignment.content_subject,
+                build_version=build_version,
+            )
+        )
+
+
+async def _upsert_relation_asset_states(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    asset_ids: set[str],
+    asset_revisions: Mapping[str, str],
+    build_version: int,
+) -> None:
+    requested_ids = [asset_id for asset_id in asset_ids if asset_id in asset_revisions]
+    if not requested_ids:
+        return
+    states = list(
+        await session.scalars(
+            select(RelationAssetState)
+            .where(
+                RelationAssetState.workspace_id == workspace_id,
+                RelationAssetState.asset_id.in_(requested_ids),
+            )
+            .with_for_update()
+        )
+    )
+    states_by_asset = {state.asset_id: state for state in states}
+    for asset_id in requested_ids:
+        revision = asset_revisions[asset_id]
+        state = states_by_asset.get(asset_id)
+        if state is None:
+            session.add(
+                RelationAssetState(
+                    workspace_id=workspace_id,
+                    asset_id=asset_id,
+                    asset_revision=revision,
+                    build_version=build_version,
+                )
+            )
+        else:
+            state.asset_revision = revision
+            state.build_version = build_version
+
+
+def _entity_node_payload(entity: RelationEntity) -> dict[str, Any]:
+    return {
+        "entity_id": entity.entity_id,
+        "name": entity.name,
+        "semantic": entity.semantic,
+        "origins": list(entity.origins),
+        "descriptions": list(entity.descriptions),
+        "candidate_ids": list(entity.candidate_ids),
+        "embedding_vector": list(entity.embedding_vector),
+        "embedding_model": entity.embedding_model,
+    }
+
+
+def _entity_tree_roots(
+    edges: Sequence[EntityEntityRelation],
+) -> dict[str, str]:
+    return {edge.source_entity_id: edge.target_entity_id for edge in edges}
+
+
+def _resolve_entity_tree_root(entity_id: str, parent_by_child: Mapping[str, str]) -> str:
+    seen: set[str] = set()
+    current = entity_id
+    while current in parent_by_child:
+        if current in seen:
+            raise RelationHierarchyValidationError("persisted hierarchy contains a cycle")
+        seen.add(current)
+        current = parent_by_child[current]
+    return current
+
+
+def _descendant_entity_ids(
+    root_id: str,
+    children_by_parent: Mapping[str, set[str]],
+) -> set[str]:
+    result = {root_id}
+    pending = [root_id]
+    while pending:
+        parent_id = pending.pop()
+        for child_id in children_by_parent.get(parent_id, set()):
+            if child_id in result:
+                raise RelationHierarchyValidationError("persisted hierarchy contains a cycle")
+            result.add(child_id)
+            pending.append(child_id)
+    return result
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right) or not left:
+        return -1.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return -1.0
+    return sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
+
+
+def _render_workspace_paths(paths: Sequence[str]) -> str:
+    tree: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        current = tree
+        for part in (item for item in path.replace("\\", "/").split("/") if item):
+            current = current.setdefault(part, {})
+    lines: list[str] = []
+
+    def render(nodes: Mapping[str, Mapping[str, Any]], prefix: str = "") -> None:
+        names = sorted(nodes)
+        for index, name in enumerate(names):
+            is_last = index == len(names) - 1
+            lines.append(f"{prefix}{'└── ' if is_last else '├── '}{name}")
+            render(nodes[name], prefix + ("    " if is_last else "│   "))
+
+    render(tree)
+    return "\n".join(lines)
 
 
 @dataclass(slots=True, frozen=True)

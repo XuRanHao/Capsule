@@ -65,6 +65,7 @@ def create_app(
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
     relation_graph_service: RelationGraphService | None = None,
+    entity_hierarchy_checkpointer: Any | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -95,6 +96,7 @@ def create_app(
             app.state.library_clear_service = library_clear_service
             app.state.workspace_service = workspace_service
             app.state.relation_graph_service = relation_graph_service
+            app.state.entity_hierarchy_checkpointer = entity_hierarchy_checkpointer
             yield
             return
 
@@ -233,32 +235,33 @@ def create_app(
             model_client=embedding_client,
         )
         app.state.cluster_service = cluster_service_instance
+        hierarchy_checkpointer = entity_hierarchy_checkpointer
+        owned_checkpointer_context: Any | None = None
+        if hierarchy_checkpointer is None:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            owned_checkpointer_context = AsyncPostgresSaver.from_conn_string(
+                _hierarchy_checkpoint_url(resolved_settings.database_url)
+            )
+            hierarchy_checkpointer = await owned_checkpointer_context.__aenter__()
+            await hierarchy_checkpointer.setup()
         relation_graph_service_instance = RelationGraphService(
             embedding_repository=embedding_repository,
             understanding_service=understanding_service,
             model_client=embedding_client,
             current_cluster_repository=current_cluster_repo,
-            subject_cluster_runner=cluster_service_instance,
             relation_repository=relation_graph_repository,
             vector_store=vectors,
-            entity_merge_similarity_threshold=(
-                resolved_settings.relation_entity_merge_similarity_threshold
-            ),
-            asset_recall_similarity_threshold=(
-                resolved_settings.relation_asset_recall_similarity_threshold
-            ),
-            asset_recall_top_k=resolved_settings.relation_asset_recall_top_k,
-            asset_recall_path_boost=(
-                resolved_settings.relation_asset_recall_path_boost
-            ),
             incremental_entity_recall_similarity_threshold=(
                 resolved_settings.relation_incremental_entity_recall_similarity_threshold
             ),
             incremental_entity_recall_top_k=(
                 resolved_settings.relation_incremental_entity_recall_top_k
             ),
+            hierarchy_checkpointer=hierarchy_checkpointer,
         )
         app.state.relation_graph_service = relation_graph_service_instance
+        app.state.entity_hierarchy_checkpointer = hierarchy_checkpointer
         assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold
         incremental_coordinator = IncrementalClusterCoordinator(
             settings=resolved_settings,
@@ -301,6 +304,8 @@ def create_app(
             await embedding_client.close()
             if durable_task_supervisor is not None:
                 await durable_task_supervisor.close()
+            if owned_checkpointer_context is not None:
+                await owned_checkpointer_context.__aexit__(None, None, None)
             await database.dispose()
 
     logging.basicConfig(
@@ -360,6 +365,12 @@ def create_app(
         }
 
     return application
+
+
+def _hierarchy_checkpoint_url(database_url: str) -> str:
+    """Convert SQLAlchemy's asyncpg URL to the Psycopg URL used by LangGraph."""
+
+    return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 app = create_app()
