@@ -34,9 +34,8 @@ def _retain_recent_tool_rounds(
 ) -> list[dict[str, object]]:
     """Keep tool results from at most the latest complete Agent outputs.
 
-    Results produced before the turn-ID field was introduced are treated as
-    individual legacy rounds. This keeps old checkpoints bounded without
-    pretending that their original conversation boundaries are recoverable.
+    Every result in the current Agent flow carries a turn ID. Entries without
+    one are not part of the current history contract and are discarded.
     """
 
     if max_rounds <= 0:
@@ -44,9 +43,11 @@ def _retain_recent_tool_rounds(
 
     round_keys: list[str] = []
     keyed_history: list[tuple[dict[str, object], str]] = []
-    for index, item in enumerate(history):
+    for item in history:
         turn_id = item.get("turn_id")
-        key = str(turn_id) if turn_id else f"legacy:{index}"
+        if not turn_id:
+            continue
+        key = str(turn_id)
         keyed_history.append((item, key))
 
     for _, key in reversed(keyed_history):
