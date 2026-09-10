@@ -7,6 +7,7 @@ from capsule.db.models import (
     LogicalEntity,
     LogicalEntityRelation,
     NarrativeGraph,
+    WorkspaceUser,
 )
 
 
@@ -78,3 +79,10 @@ def test_logical_entities_do_not_store_embedding_vectors() -> None:
     columns = {column.name for column in LogicalEntity.__table__.columns}
 
     assert {"embedding_vector", "embedding_model"}.isdisjoint(columns)
+
+
+def test_workspace_user_stores_one_permission_level() -> None:
+    columns = {column.name for column in WorkspaceUser.__table__.columns}
+
+    assert "permission_level" in columns
+    assert "permissions" not in columns

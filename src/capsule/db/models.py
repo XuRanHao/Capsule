@@ -46,6 +46,23 @@ class Workspace(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
+class WorkspaceUser(Base, TimestampMixin):
+    """User membership and graph permissions inside one Workspace."""
+
+    __tablename__ = "workspace_users"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    permission_level: Mapped[str] = mapped_column(
+        String(32),
+        default="read",
+        nullable=False,
+    )
+
+
 class SourceFile(Base, TimestampMixin):
     __tablename__ = "source_files"
     __table_args__ = (

@@ -153,6 +153,44 @@ async def test_registry_confirmation_guard_interrupts_direct_write_plan() -> Non
 
 
 @pytest.mark.asyncio
+async def test_runtime_loads_user_permissions_for_each_request() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def load_permissions(*, user_id: str, workspace_id: str) -> list[str]:
+        calls.append((user_id, workspace_id))
+        return ["graph:write"]
+
+    runtime = create_agent_runtime(
+        planner=DirectWritePlanner(),
+        permission_loader=load_permissions,
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="echo",
+                    description="permission-scoped operation",
+                    args_schema=EchoArgs,
+                    handler=lambda args, context: args.value,
+                    required_permission="graph:write",
+                )
+            ]
+        ),
+    )
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="thread-permission",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="执行普通写操作",
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.tool_history[0]["ok"] is True
+    assert calls == [("user-a", "workspace-a")]
+
+
+@pytest.mark.asyncio
 async def test_memory_is_scoped_by_user_and_workspace() -> None:
     memory = InMemoryMemoryStore()
     await memory.save(

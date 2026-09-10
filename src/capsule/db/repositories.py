@@ -24,6 +24,7 @@ from capsule.db.models import (
     QueryImageUpload,
     SourceFile,
     Workspace,
+    WorkspaceUser,
 )
 from capsule.db.session import Database
 from capsule.enums import (
@@ -59,6 +60,66 @@ class AssetMediaTarget:
     source_mime_type: str
     preview_uri: str | None
     derived_file_uri: str | None
+
+
+WORKSPACE_PERMISSION_LEVELS = frozenset({"read", "write", "destructive", "admin"})
+WORKSPACE_PERMISSION_GRANTS: dict[str, frozenset[str]] = {
+    "read": frozenset({"graph:read"}),
+    "write": frozenset({"graph:read", "graph:write"}),
+    "destructive": frozenset(
+        {"graph:read", "graph:write", "graph:destructive"}
+    ),
+    "admin": frozenset({"graph:admin"}),
+}
+
+
+class WorkspaceUserRepository:
+    """Persist and resolve per-user permissions inside a Workspace."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def load_granted_permissions(
+        self, *, user_id: str, workspace_id: str
+    ) -> frozenset[str]:
+        async with self._database.session() as session:
+            member = await session.get(
+                WorkspaceUser,
+                {"workspace_id": workspace_id, "user_id": user_id},
+            )
+        if member is None:
+            return frozenset()
+        return WORKSPACE_PERMISSION_GRANTS.get(member.permission_level, frozenset())
+
+    async def set_permission_level(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        permission_level: str,
+    ) -> str:
+        normalized = _normalize_permission_level(permission_level)
+        async with self._database.session() as session, session.begin():
+            workspace_exists = await session.scalar(
+                select(Workspace.workspace_id).where(Workspace.workspace_id == workspace_id)
+            )
+            if workspace_exists is None:
+                raise ValueError("workspace does not exist")
+            member = await session.get(
+                WorkspaceUser,
+                {"workspace_id": workspace_id, "user_id": user_id},
+            )
+            if member is None:
+                session.add(
+                    WorkspaceUser(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        permission_level=normalized,
+                    )
+                )
+            else:
+                member.permission_level = normalized
+        return normalized
 
 
 class RelationGraphRepository:
@@ -654,6 +715,12 @@ async def _require_narrative_graph(
     )
     if graph is None:
         raise ValueError("narrative graph does not exist in workspace")
+
+
+def _normalize_permission_level(value: str) -> str:
+    if value not in WORKSPACE_PERMISSION_LEVELS:
+        raise ValueError(f"unknown workspace permission level: {value}")
+    return value
 
 
 def _deduplicated_strings(values: Sequence[str]) -> list[str]:

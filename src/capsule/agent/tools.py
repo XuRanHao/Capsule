@@ -20,7 +20,7 @@ class ToolContext:
     thread_id: str
     graph_id: str | None
     state: Mapping[str, Any]
-    permissions: frozenset[str] = frozenset()
+    granted_permissions: frozenset[str] = frozenset()
 
 
 ToolHandler = Callable[[BaseModel, ToolContext], Awaitable[Any] | Any]
@@ -35,7 +35,7 @@ class AgentTool:
     timeout_seconds: float = 30.0
     max_attempts: int = 1
     requires_confirmation: bool = False
-    permission: str | None = None
+    required_permission: str | None = None
 
 
 class ToolExecutionResult(BaseModel):
@@ -64,8 +64,8 @@ class ToolRegistry:
             raise ValueError(f"duplicate or empty Agent tool name: {tool.name!r}")
         if tool.timeout_seconds <= 0 or tool.max_attempts < 1:
             raise ValueError("tool timeout_seconds must be positive and max_attempts >= 1")
-        if tool.permission is not None and not tool.permission.strip():
-            raise ValueError("tool permission must be non-empty when provided")
+        if tool.required_permission is not None and not tool.required_permission.strip():
+            raise ValueError("tool required_permission must be non-empty when provided")
         self._tools[tool.name] = tool
 
     def describe(self) -> list[dict[str, Any]]:
@@ -74,7 +74,7 @@ class ToolRegistry:
                 "name": tool.name,
                 "description": tool.description,
                 "requires_confirmation": tool.requires_confirmation,
-                "permission": tool.permission,
+                "required_permission": tool.required_permission,
                 "args_schema": tool.args_schema.model_json_schema(),
             }
             for tool in self._tools.values()
@@ -96,8 +96,8 @@ class ToolRegistry:
                 error_code="unknown_tool",
                 error_message="tool is not registered",
             )
-        if tool.permission is not None and not _has_permission(
-            context.permissions, tool.permission
+        if tool.required_permission is not None and not _has_permission(
+            context.granted_permissions, tool.required_permission
         ):
             return ToolExecutionResult(
                 call_id=call.call_id,

@@ -21,6 +21,7 @@ class AgentState(TypedDict, total=False):
     user_id: str
     workspace_id: str
     graph_id: str | None
+    granted_permissions: list[str]
     input_message: str | None
     confirmation_response: bool | None
     messages: list[dict[str, Any]]

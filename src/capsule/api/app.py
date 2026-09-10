@@ -19,6 +19,7 @@ from capsule.config import Settings, get_settings
 from capsule.db.repositories import (
     AssetRepository,
     EmbeddingRepository,
+    WorkspaceUserRepository,
 )
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
@@ -80,6 +81,10 @@ def create_app(
             return
 
         database = Database(resolved_settings)
+        if agent_runtime is None:
+            resolved_agent_runtime.set_permission_loader(
+                WorkspaceUserRepository(database).load_granted_permissions
+            )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()
         history = SearchHistoryRepository(database, resolved_settings)

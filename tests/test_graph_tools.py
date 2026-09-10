@@ -14,7 +14,7 @@ def _context() -> ToolContext:
         thread_id="thread",
         graph_id="graph",
         state={},
-        permissions=frozenset({"graph:admin"}),
+        granted_permissions=frozenset({"graph:admin"}),
     )
 
 
@@ -49,7 +49,7 @@ def test_graph_tool_registry_exposes_only_current_graph_tools() -> None:
     assert {
         description["name"]
         for description in descriptions
-        if description["permission"] == "graph:read"
+        if description["required_permission"] == "graph:read"
     } == {
         "load_current_graph_context",
         "get_entity_detail",
@@ -103,7 +103,7 @@ async def test_graph_tool_denies_missing_permission_before_repository_call() -> 
         thread_id="thread",
         graph_id="graph",
         state={},
-        permissions=frozenset({"graph:read"}),
+        granted_permissions=frozenset({"graph:read"}),
     )
 
     result = await registry.execute(

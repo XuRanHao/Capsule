@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -12,6 +13,8 @@ from capsule.agent.graph import AgentPlanner, ReadyPlanner, build_agent_graph
 from capsule.agent.memory import AgentMemoryStore, NullMemoryStore
 from capsule.agent.tools import ToolRegistry
 
+PermissionLoader = Callable[..., Awaitable[Iterable[str]]]
+
 
 class AgentRuntime:
     def __init__(
@@ -21,16 +24,21 @@ class AgentRuntime:
         tools: ToolRegistry | None = None,
         memory: AgentMemoryStore | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
-        tool_permissions: frozenset[str] | None = None,
+        permission_loader: PermissionLoader | None = None,
     ) -> None:
         self._checkpointer = checkpointer or InMemorySaver()
+        self._permission_loader = permission_loader
         self._graph = build_agent_graph(
             planner=planner or ReadyPlanner(),
             tools=tools or ToolRegistry(),
             memory=memory or NullMemoryStore(),
             checkpointer=self._checkpointer,
-            tool_permissions=tool_permissions or frozenset(),
         )
+
+    def set_permission_loader(self, loader: PermissionLoader) -> None:
+        """Attach a server-side permission loader after app startup."""
+
+        self._permission_loader = loader
 
     @property
     def graph(self):
@@ -38,12 +46,21 @@ class AgentRuntime:
 
     async def invoke(self, request: AgentRequest) -> AgentResponse:
         config = {"configurable": {"thread_id": request.thread_id}}
+        granted_permissions = frozenset()
+        if self._permission_loader is not None:
+            granted_permissions = frozenset(
+                await self._permission_loader(
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                )
+            )
         state = await self._graph.ainvoke(
             {
                 "thread_id": request.thread_id,
                 "user_id": request.user_id,
                 "workspace_id": request.workspace_id,
                 "graph_id": request.graph_id,
+                "granted_permissions": sorted(granted_permissions),
                 "input_message": request.message,
                 "confirmation_response": request.confirmation,
                 "max_steps": request.max_steps,
@@ -72,12 +89,12 @@ def create_agent_runtime(
     tools: ToolRegistry | None = None,
     memory: AgentMemoryStore | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
-    tool_permissions: frozenset[str] | None = None,
+    permission_loader: PermissionLoader | None = None,
 ) -> AgentRuntime:
     return AgentRuntime(
         planner=planner,
         tools=tools,
         memory=memory,
         checkpointer=checkpointer,
-        tool_permissions=tool_permissions,
+        permission_loader=permission_loader,
     )

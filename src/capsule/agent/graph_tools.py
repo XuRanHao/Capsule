@@ -181,21 +181,21 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="读取当前选中图谱的实体、关系和叙事背景。",
             args_schema=_NoArguments,
             handler=load_context,
-            permission="graph:read",
+            required_permission="graph:read",
         ),
         AgentTool(
             name="get_entity_detail",
             description="读取指定实体及其关联素材。",
             args_schema=EntityIdArguments,
             handler=get_entity,
-            permission="graph:read",
+            required_permission="graph:read",
         ),
         AgentTool(
             name="list_entity_relations",
             description="读取指定实体的全部关系。",
             args_schema=EntityIdArguments,
             handler=list_relations,
-            permission="graph:read",
+            required_permission="graph:read",
         ),
     ]
     write_tools = [
@@ -204,7 +204,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="在当前图谱中创建逻辑实体。",
             args_schema=CreateEntityArguments,
             handler=create,
-            permission="graph:write",
+            required_permission="graph:write",
         ),
         AgentTool(
             name="merge_entities",
@@ -212,7 +212,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             args_schema=MergeEntitiesArguments,
             handler=merge,
             requires_confirmation=True,
-            permission="graph:destructive",
+            required_permission="graph:destructive",
         ),
         AgentTool(
             name="split_entity",
@@ -220,7 +220,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             args_schema=SplitEntityArguments,
             handler=split,
             requires_confirmation=True,
-            permission="graph:destructive",
+            required_permission="graph:destructive",
         ),
         AgentTool(
             name="delete_entity",
@@ -228,21 +228,21 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             args_schema=EntityIdArguments,
             handler=delete,
             requires_confirmation=True,
-            permission="graph:destructive",
+            required_permission="graph:destructive",
         ),
         AgentTool(
             name="move_asset_to_entity",
             description="将图谱中的素材移动到指定实体。",
             args_schema=MoveAssetArguments,
             handler=move_asset,
-            permission="graph:write",
+            required_permission="graph:write",
         ),
         AgentTool(
             name="create_parent_relation",
             description="创建父实体并建立父子层级关系。",
             args_schema=CreateParentRelationArguments,
             handler=create_parent,
-            permission="graph:write",
+            required_permission="graph:write",
         ),
         AgentTool(
             name="remove_relation",
@@ -250,7 +250,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             args_schema=RemoveRelationArguments,
             handler=remove_relation,
             requires_confirmation=True,
-            permission="graph:destructive",
+            required_permission="graph:destructive",
         ),
     ]
     return ToolRegistry(read_tools + write_tools)
