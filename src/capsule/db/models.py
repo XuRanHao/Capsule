@@ -2,13 +2,13 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     Text,
@@ -94,6 +94,7 @@ class Asset(Base, TimestampMixin):
     __tablename__ = "assets"
     __table_args__ = (
         UniqueConstraint("source_file_id", "asset_key", name="uq_asset_source_key"),
+        UniqueConstraint("asset_id", "workspace_id", name="uq_assets_asset_workspace"),
         UniqueConstraint(
             "parent_asset_id",
             "child_order",
@@ -300,129 +301,126 @@ class ModelCallLog(Base):
     )
 
 
-class RelationEntity(Base, TimestampMixin):
-    """A persistent Entity node available to future narrative-graph tools."""
+class NarrativeGraph(Base, TimestampMixin):
+    """One user-owned narrative graph within a workspace."""
 
-    __tablename__ = "relation_entities"
+    __tablename__ = "narrative_graphs"
+    __table_args__ = (
+        UniqueConstraint("graph_id", "workspace_id", name="uq_narrative_graph_workspace"),
+    )
 
-    entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    graph_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("graph")
+    )
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
     name: Mapped[str] = mapped_column(String(1024), nullable=False)
-    semantic: Mapped[str] = mapped_column(Text, nullable=False)
-    origins: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    descriptions: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    candidate_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    merge_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    narrative_context: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+
+
+class GraphAsset(Base):
+    """One Asset selected into a narrative graph."""
+
+    __tablename__ = "graph_assets"
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["graph_id", "workspace_id"],
+            ["narrative_graphs.graph_id", "narrative_graphs.workspace_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["asset_id", "workspace_id"],
+            ["assets.asset_id", "assets.workspace_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    graph_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class LogicalEntity(Base, TimestampMixin):
+    """A narrative concept such as a character, event, place, or scene."""
+
+    __tablename__ = "logical_entities"
+
+    graph_id: Mapped[str] = mapped_column(
+        ForeignKey("narrative_graphs.graph_id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    semantic: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     embedding_vector: Mapped[list[float]] = mapped_column(JSONB, default=list, nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-class RelationEntitySource(Base):
-    """A source record that contributed metadata or Assets to one Entity."""
+class GraphAssetBinding(Base, TimestampMixin):
+    """A many-to-many binding between selected Assets and logical Entities."""
 
-    __tablename__ = "relation_entity_sources"
-
-    entity_id: Mapped[str] = mapped_column(
-        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    candidate_id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    origin: Mapped[str] = mapped_column(String(64), nullable=False)
-    name: Mapped[str] = mapped_column(String(1024), nullable=False)
-    semantic: Mapped[str] = mapped_column(Text, nullable=False)
-    asset_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    # Source vectors are retained so an Entity can be recomputed without
-    # calling the model again.
-    embedding_vector: Mapped[list[float]] = mapped_column(
-        JSON().with_variant(JSONB, "postgresql"), default=list, nullable=False
-    )
-    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-
-
-class EntityEntityRelation(Base, TimestampMixin):
-    """A durable semantic relationship between two virtual Entity nodes."""
-
-    __tablename__ = "entity_entity_relations"
+    __tablename__ = "graph_asset_bindings"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["graph_id", "asset_id"],
+            ["graph_assets.graph_id", "graph_assets.asset_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["graph_id", "entity_id"],
+            ["logical_entities.graph_id", "logical_entities.entity_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    graph_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    binding_role: Mapped[str] = mapped_column(String(128), nullable=False, default="reference")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class LogicalEntityRelation(Base, TimestampMixin):
+    """A typed directed relation between two Entities in one narrative graph."""
+
+    __tablename__ = "logical_entity_relations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["graph_id", "source_entity_id"],
+            ["logical_entities.graph_id", "logical_entities.entity_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["graph_id", "target_entity_id"],
+            ["logical_entities.graph_id", "logical_entities.entity_id"],
+            ondelete="CASCADE",
+        ),
         UniqueConstraint(
-            "workspace_id",
+            "graph_id",
             "source_entity_id",
             "target_entity_id",
-            name="uq_entity_entity_relation",
+            "relation_type",
+            name="uq_logical_entity_relation",
         ),
     )
 
     relation_id: Mapped[str] = mapped_column(
-        String(64), primary_key=True, default=id_factory("entityrel")
+        String(64), primary_key=True, default=id_factory("graphrel")
     )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    source_entity_id: Mapped[str] = mapped_column(
-        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    target_entity_id: Mapped[str] = mapped_column(
-        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    relation: Mapped[str] = mapped_column(String(255), nullable=False)
+    graph_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    target_entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    relation_type: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    edge_type: Mapped[str] = mapped_column(String(32), nullable=False, default="hierarchy")
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
-class AssetEntityRelation(Base, TimestampMixin):
-    """A durable Agent-approved relationship between one Asset and Entity."""
-
-    __tablename__ = "asset_entity_relations"
-    __table_args__ = (
-        UniqueConstraint(
-            "workspace_id",
-            "asset_id",
-            "entity_id",
-            name="uq_asset_entity_relation",
-        ),
-    )
-
-    relation_id: Mapped[str] = mapped_column(
-        String(64), primary_key=True, default=id_factory("rel")
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    entity_id: Mapped[str] = mapped_column(
-        ForeignKey("relation_entities.entity_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    establishes_relation: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    relation: Mapped[str] = mapped_column(String(255), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
-    content_subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class UserFavorite(Base):

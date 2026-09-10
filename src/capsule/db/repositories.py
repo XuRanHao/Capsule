@@ -15,11 +15,12 @@ from capsule.db.base import id_factory
 from capsule.db.models import (
     Asset,
     EmbeddingRecord,
-    EntityEntityRelation,
+    LogicalEntity,
+    LogicalEntityRelation,
     ModelCallLog,
+    NarrativeGraph,
     ProcessingJob,
     QueryImageUpload,
-    RelationEntity,
     SourceFile,
     Workspace,
 )
@@ -60,11 +61,7 @@ class AssetMediaTarget:
 
 
 class RelationGraphRepository:
-    """Read-only entity-graph context for future Agent tools.
-
-    Entity and relationship mutation will be added with the new narrative-graph
-    operation contract.  The retired automatic workflow is not retained here.
-    """
+    """Read-only narrative-graph context for future Agent tools."""
 
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -73,19 +70,23 @@ class RelationGraphRepository:
         self,
         *,
         workspace_id: str,
+        graph_id: str,
         entity_ids: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """Load Entity context without reading complete Asset contents."""
+        """Load Entity context from one graph without reading Asset contents."""
 
         requested_ids = _deduplicated_strings(entity_ids)
         if not requested_ids:
             return []
         async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
             entities = list(
                 await session.scalars(
-                    select(RelationEntity).where(
-                        RelationEntity.workspace_id == workspace_id,
-                        RelationEntity.entity_id.in_(requested_ids),
+                    select(LogicalEntity).where(
+                        LogicalEntity.graph_id == graph_id,
+                        LogicalEntity.entity_id.in_(requested_ids),
                     )
                 )
             )
@@ -100,11 +101,12 @@ class RelationGraphRepository:
         self,
         *,
         workspace_id: str,
+        graph_id: str,
         incoming_entity_ids: Sequence[str],
         exclude_entity_ids: Sequence[str] = (),
         per_entity_limit: int = 3,
     ) -> list[dict[str, Any]]:
-        """Find Top-K similar Entities and the roots of their hierarchy trees."""
+        """Find Top-K similar Entities and their hierarchy roots in one graph."""
 
         incoming_ids = _deduplicated_strings(incoming_entity_ids)
         if not incoming_ids:
@@ -113,18 +115,21 @@ class RelationGraphRepository:
             raise ValueError("per_entity_limit must be at least 1")
         excluded_ids = set(_deduplicated_strings(exclude_entity_ids)).union(incoming_ids)
         async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
             entities = list(
                 await session.scalars(
-                    select(RelationEntity)
-                    .where(RelationEntity.workspace_id == workspace_id)
-                    .order_by(RelationEntity.entity_id)
+                    select(LogicalEntity)
+                    .where(LogicalEntity.graph_id == graph_id)
+                    .order_by(LogicalEntity.entity_id)
                 )
             )
             hierarchy_edges = list(
                 await session.scalars(
-                    select(EntityEntityRelation).where(
-                        EntityEntityRelation.workspace_id == workspace_id,
-                        EntityEntityRelation.edge_type == "hierarchy",
+                    select(LogicalEntityRelation).where(
+                        LogicalEntityRelation.graph_id == graph_id,
+                        LogicalEntityRelation.relation_type == "hierarchy",
                     )
                 )
             )
@@ -165,24 +170,28 @@ class RelationGraphRepository:
         self,
         *,
         workspace_id: str,
+        graph_id: str,
         root_entity_ids: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """Load each requested hierarchy tree as Agent context."""
+        """Load each requested hierarchy tree from one graph as Agent context."""
 
         requested_roots = _deduplicated_strings(root_entity_ids)
         if not requested_roots:
             return []
         async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
             entities = list(
                 await session.scalars(
-                    select(RelationEntity).where(RelationEntity.workspace_id == workspace_id)
+                    select(LogicalEntity).where(LogicalEntity.graph_id == graph_id)
                 )
             )
             hierarchy_edges = list(
                 await session.scalars(
-                    select(EntityEntityRelation).where(
-                        EntityEntityRelation.workspace_id == workspace_id,
-                        EntityEntityRelation.edge_type == "hierarchy",
+                    select(LogicalEntityRelation).where(
+                        LogicalEntityRelation.graph_id == graph_id,
+                        LogicalEntityRelation.relation_type == "hierarchy",
                     )
                 )
             )
@@ -206,9 +215,8 @@ class RelationGraphRepository:
                         {
                             "source_entity_id": edge.source_entity_id,
                             "target_entity_id": edge.target_entity_id,
-                            "relation": edge.relation,
+                            "relation_type": edge.relation_type,
                             "description": edge.description,
-                            "edge_type": edge.edge_type,
                         }
                         for edge in hierarchy_edges
                         if edge.source_entity_id in member_ids
@@ -218,10 +226,13 @@ class RelationGraphRepository:
             )
         return trees
 
-    async def load_workspace_tree(self, *, workspace_id: str) -> str:
-        """Render imported source paths as compact read-only Agent context."""
+    async def load_workspace_tree(self, *, workspace_id: str, graph_id: str) -> str:
+        """Render the graph's workspace directory as read-only Agent context."""
 
         async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
             paths = list(
                 await session.scalars(
                     select(SourceFile.relative_path)
@@ -230,6 +241,22 @@ class RelationGraphRepository:
                 )
             )
         return _render_workspace_paths(paths)
+
+
+async def _require_narrative_graph(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    graph_id: str,
+) -> None:
+    graph = await session.scalar(
+        select(NarrativeGraph.graph_id).where(
+            NarrativeGraph.graph_id == graph_id,
+            NarrativeGraph.workspace_id == workspace_id,
+        )
+    )
+    if graph is None:
+        raise ValueError("narrative graph does not exist in workspace")
 
 
 def _deduplicated_strings(values: Sequence[str]) -> list[str]:
@@ -244,21 +271,20 @@ def _deduplicated_strings(values: Sequence[str]) -> list[str]:
     return result
 
 
-def _entity_node_payload(entity: RelationEntity) -> dict[str, Any]:
+def _entity_node_payload(entity: LogicalEntity) -> dict[str, Any]:
     return {
         "entity_id": entity.entity_id,
         "name": entity.name,
+        "entity_type": entity.entity_type,
         "semantic": entity.semantic,
-        "origins": list(entity.origins),
-        "descriptions": list(entity.descriptions),
-        "candidate_ids": list(entity.candidate_ids),
+        "description": entity.description,
         "embedding_vector": list(entity.embedding_vector),
         "embedding_model": entity.embedding_model,
     }
 
 
 def _entity_tree_roots(
-    edges: Sequence[EntityEntityRelation],
+    edges: Sequence[LogicalEntityRelation],
 ) -> dict[str, str]:
     return {edge.source_entity_id: edge.target_entity_id for edge in edges}
 
