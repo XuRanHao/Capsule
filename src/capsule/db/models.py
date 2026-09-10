@@ -376,7 +376,6 @@ class LogicalEntity(Base, TimestampMixin):
     entity_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(1024), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
-    semantic: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 

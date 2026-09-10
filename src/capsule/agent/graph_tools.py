@@ -25,7 +25,6 @@ class CreateEntityArguments(BaseModel):
 
     name: str = Field(min_length=1, max_length=1024)
     entity_type: str = Field(default="", max_length=128)
-    semantic: str = Field(default="", max_length=20_000)
     description: str = Field(default="", max_length=20_000)
 
 
@@ -41,7 +40,6 @@ class SplitEntityPart(BaseModel):
 
     name: str = Field(min_length=1, max_length=1024)
     entity_type: str = Field(default="", max_length=128)
-    semantic: str = Field(default="", max_length=20_000)
     description: str = Field(default="", max_length=20_000)
     asset_ids: list[str] = Field(default_factory=list, max_length=500)
 
@@ -68,7 +66,6 @@ class CreateParentRelationArguments(BaseModel):
     child_entity_id: str = Field(min_length=1, max_length=128)
     parent_name: str = Field(min_length=1, max_length=1024)
     parent_entity_type: str = Field(default="", max_length=128)
-    parent_semantic: str = Field(default="", max_length=20_000)
     parent_description: str = Field(default="", max_length=20_000)
     relation_description: str = Field(default="", max_length=20_000)
 
@@ -115,7 +112,6 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             graph_id=graph_id(context),
             name=args.name,
             entity_type=args.entity_type,
-            semantic=args.semantic,
             description=args.description,
         )
 
@@ -161,7 +157,6 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             child_entity_id=args.child_entity_id,
             parent_name=args.parent_name,
             parent_entity_type=args.parent_entity_type,
-            parent_semantic=args.parent_semantic,
             parent_description=args.parent_description,
             relation_description=args.relation_description,
         )

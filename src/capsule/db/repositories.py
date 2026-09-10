@@ -260,7 +260,6 @@ class RelationGraphRepository:
         graph_id: str,
         name: str,
         entity_type: str = "",
-        semantic: str = "",
         description: str = "",
     ) -> dict[str, Any]:
         """Create a graph-local logical Entity."""
@@ -274,7 +273,6 @@ class RelationGraphRepository:
                 entity_id=id_factory("entity")(),
                 name=name,
                 entity_type=entity_type,
-                semantic=semantic,
                 description=description,
             )
             session.add(entity)
@@ -563,7 +561,6 @@ class RelationGraphRepository:
                         entity_id=id_factory("entity")(),
                         name=str(part["name"]),
                         entity_type=str(part.get("entity_type", "")),
-                        semantic=str(part.get("semantic", "")),
                         description=str(part.get("description", "")),
                     )
                 )
@@ -634,7 +631,6 @@ class RelationGraphRepository:
         child_entity_id: str,
         parent_name: str,
         parent_entity_type: str = "",
-        parent_semantic: str = "",
         parent_description: str = "",
         relation_description: str = "",
     ) -> dict[str, Any]:
@@ -657,7 +653,6 @@ class RelationGraphRepository:
                 entity_id=id_factory("entity")(),
                 name=parent_name,
                 entity_type=parent_entity_type,
-                semantic=parent_semantic,
                 description=parent_description,
             )
             session.add(parent)
@@ -740,7 +735,6 @@ def _entity_node_payload(entity: LogicalEntity) -> dict[str, Any]:
         "entity_id": entity.entity_id,
         "name": entity.name,
         "entity_type": entity.entity_type,
-        "semantic": entity.semantic,
         "description": entity.description,
     }
 

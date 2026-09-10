@@ -79,6 +79,7 @@ def test_logical_entities_do_not_store_embedding_vectors() -> None:
     columns = {column.name for column in LogicalEntity.__table__.columns}
 
     assert {"embedding_vector", "embedding_model"}.isdisjoint(columns)
+    assert "semantic" not in columns
 
 
 def test_workspace_user_stores_one_permission_level() -> None:

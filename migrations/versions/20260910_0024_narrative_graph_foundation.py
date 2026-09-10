@@ -91,7 +91,6 @@ def upgrade() -> None:
         sa.Column("entity_id", sa.String(length=64), nullable=False),
         sa.Column("name", sa.String(length=1024), nullable=False),
         sa.Column("entity_type", sa.String(length=128), server_default="", nullable=False),
-        sa.Column("semantic", sa.Text(), server_default="", nullable=False),
         sa.Column("description", sa.Text(), server_default="", nullable=False),
         sa.Column(
             "created_at",
