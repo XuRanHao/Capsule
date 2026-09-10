@@ -308,7 +308,7 @@ def build_graph_tool_registry(
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
-            lock_scope="asset",
+            lock_scope="graph",
             required_permission="graph:write",
         ),
         AgentTool(
