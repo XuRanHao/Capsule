@@ -53,6 +53,18 @@ class DirectWritePlanner:
         return PlanDecision(action="respond", message="已完成。")
 
 
+class OneToolPerOutputPlanner:
+    async def plan(self, state: object) -> PlanDecision:
+        values = state if isinstance(state, dict) else {}
+        messages = values.get("messages", [])
+        if messages and messages[-1].get("role") == "user":
+            return PlanDecision(
+                action="tool",
+                tool_calls=[ToolCall(name="echo", arguments={"value": "round"})],
+            )
+        return PlanDecision(action="respond", message="本轮完成。")
+
+
 @pytest.mark.asyncio
 async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     planner = SequencePlanner()
@@ -87,6 +99,42 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     snapshot = await runtime.state("thread-a")
     assert snapshot is not None
     assert snapshot["messages"][-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_tool_history_keeps_only_the_latest_two_agent_output_rounds() -> None:
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="echo",
+                description="return the supplied value",
+                args_schema=EchoArgs,
+                handler=lambda args, context: args.value,
+            )
+        ]
+    )
+    runtime = create_agent_runtime(
+        planner=OneToolPerOutputPlanner(),
+        tools=registry,
+    )
+
+    for index in range(3):
+        result = await runtime.invoke(
+            AgentRequest(
+                thread_id="thread-round-retention",
+                user_id="user-a",
+                workspace_id="workspace-a",
+                message=f"第 {index + 1} 轮",
+            )
+        )
+        assert result.status == "completed"
+
+    assert len(result.tool_history) == 2
+    turn_ids = [item["turn_id"] for item in result.tool_history]
+    assert len(set(turn_ids)) == 2
+    snapshot = await runtime.state("thread-round-retention")
+    assert snapshot is not None
+    assert len(snapshot["tool_history"]) == 2
 
 
 @pytest.mark.asyncio

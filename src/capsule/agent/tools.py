@@ -23,6 +23,7 @@ class ToolContext:
     graph_id: str | None
     state: Mapping[str, Any]
     granted_permissions: frozenset[str] = frozenset()
+    turn_id: str = ""
 
 
 ToolHandler = Callable[[BaseModel, ToolContext], Awaitable[Any] | Any]

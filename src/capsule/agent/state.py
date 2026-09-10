@@ -18,6 +18,9 @@ AgentStatus = Literal[
 
 class AgentState(TypedDict, total=False):
     thread_id: str
+    # One complete Agent invocation/output. Multiple tool calls in the same
+    # graph loop share this identifier and therefore count as one round.
+    turn_id: str
     user_id: str
     workspace_id: str
     graph_id: str | None

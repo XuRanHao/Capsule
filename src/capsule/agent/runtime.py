@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
+from uuid import uuid4
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
@@ -57,6 +58,9 @@ class AgentRuntime:
         state = await self._graph.ainvoke(
             {
                 "thread_id": request.thread_id,
+                # A complete runtime invocation is one Agent output round.
+                # Tool loops inside this invocation keep the same turn ID.
+                "turn_id": f"turn_{uuid4().hex}",
                 "user_id": request.user_id,
                 "workspace_id": request.workspace_id,
                 "graph_id": request.graph_id,

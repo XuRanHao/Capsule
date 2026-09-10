@@ -29,6 +29,36 @@ class ReadyPlanner:
         )
 
 
+def _retain_recent_tool_rounds(
+    history: list[dict[str, object]], *, max_rounds: int = 2
+) -> list[dict[str, object]]:
+    """Keep tool results from at most the latest complete Agent outputs.
+
+    Results produced before the turn-ID field was introduced are treated as
+    individual legacy rounds. This keeps old checkpoints bounded without
+    pretending that their original conversation boundaries are recoverable.
+    """
+
+    if max_rounds <= 0:
+        return []
+
+    round_keys: list[str] = []
+    keyed_history: list[tuple[dict[str, object], str]] = []
+    for index, item in enumerate(history):
+        turn_id = item.get("turn_id")
+        key = str(turn_id) if turn_id else f"legacy:{index}"
+        keyed_history.append((item, key))
+
+    for _, key in reversed(keyed_history):
+        if key not in round_keys:
+            round_keys.append(key)
+            if len(round_keys) == max_rounds:
+                break
+
+    retained = set(round_keys)
+    return [item for item, key in keyed_history if key in retained]
+
+
 def build_agent_graph(
     *,
     planner: AgentPlanner,
@@ -99,13 +129,17 @@ def build_agent_graph(
             graph_id=state.get("graph_id"),
             state=state,
             granted_permissions=frozenset(state.get("granted_permissions", [])),
+            turn_id=state.get("turn_id", ""),
         )
         results = []
         for call in plan_data.tool_calls:
             result = await tools.execute(call, context=context, confirmed=confirmed)
-            results.append(result.model_dump(mode="json"))
+            result_data = result.model_dump(mode="json")
+            result_data["turn_id"] = context.turn_id
+            results.append(result_data)
         history = list(state.get("tool_history", []))
         history.extend(results)
+        history = _retain_recent_tool_rounds(history)
         tool_messages = list(state.get("messages", []))
         for result in results:
             tool_messages.append(
