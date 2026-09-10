@@ -30,6 +30,10 @@ class ToolContext:
 
 
 ToolHandler = Callable[[BaseModel, ToolContext], Awaitable[Any] | Any]
+ToolInputValidator = Callable[
+    [BaseModel, ToolContext],
+    Awaitable[str | None] | str | None,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +42,7 @@ class AgentTool:
     description: str
     args_schema: type[BaseModel]
     handler: ToolHandler
+    validate_input: ToolInputValidator | None = None
     timeout_seconds: float = 5.0
     max_attempts: int = 1
     requires_confirmation: bool = False
@@ -118,6 +123,8 @@ class ToolRegistry:
             raise ValueError("tool timeout_seconds must be positive and max_attempts >= 1")
         if tool.required_permission is not None and not tool.required_permission.strip():
             raise ValueError("tool required_permission must be non-empty when provided")
+        if tool.validate_input is not None and not callable(tool.validate_input):
+            raise ValueError("tool validate_input must be callable when provided")
         if tool.output_schema is not None:
             try:
                 is_model = issubclass(tool.output_schema, BaseModel)
@@ -141,6 +148,7 @@ class ToolRegistry:
                 "requires_confirmation": tool.requires_confirmation,
                 "required_permission": tool.required_permission,
                 "args_schema": tool.args_schema.model_json_schema(),
+                "has_custom_input_validation": tool.validate_input is not None,
                 "output_schema": (
                     tool.output_schema.model_json_schema()
                     if tool.output_schema is not None
@@ -197,6 +205,24 @@ class ToolRegistry:
             )
             await self._finish_operation(result, context)
             return result
+        if tool.validate_input is not None:
+            try:
+                validation_error = tool.validate_input(arguments, context)
+                if inspect.isawaitable(validation_error):
+                    validation_error = await validation_error
+            except Exception as exc:
+                validation_error = str(exc) or type(exc).__name__
+            if validation_error:
+                result = ToolExecutionResult(
+                    call_id=call.call_id,
+                    operation_id=operation_id,
+                    name=call.name,
+                    ok=False,
+                    error_code="invalid_arguments",
+                    error_message=str(validation_error)[:2000],
+                )
+                await self._finish_operation(result, context)
+                return result
         try:
             pre_result = await self._run_before_hooks(call, tool, context)
         except Exception as exc:

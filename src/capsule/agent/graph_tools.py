@@ -108,6 +108,11 @@ def build_graph_tool_registry(
             raise ValueError("a graph must be selected before using graph tools")
         return context.graph_id
 
+    def validate_graph_selected(_: BaseModel, context: ToolContext) -> str | None:
+        if not context.graph_id:
+            return "a graph must be selected before using graph tools"
+        return None
+
     async def load_context(_: BaseModel, context: ToolContext) -> dict[str, Any]:
         return await repository.load_current_graph_context(
             workspace_id=context.workspace_id,
@@ -212,6 +217,7 @@ def build_graph_tool_registry(
             description="读取当前选中图谱的实体、关系和叙事背景。",
             args_schema=_NoArguments,
             handler=load_context,
+            validate_input=validate_graph_selected,
             timeout_seconds=3.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="parallel",
@@ -223,6 +229,7 @@ def build_graph_tool_registry(
             description="读取指定实体及其关联素材。",
             args_schema=EntityIdArguments,
             handler=get_entity,
+            validate_input=validate_graph_selected,
             timeout_seconds=3.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="parallel",
@@ -234,6 +241,7 @@ def build_graph_tool_registry(
             description="读取指定实体的全部关系。",
             args_schema=EntityIdArguments,
             handler=list_relations,
+            validate_input=validate_graph_selected,
             timeout_seconds=3.0,
             output_schema=_JsonObjectListOutput,
             concurrency_mode="parallel",
@@ -245,6 +253,7 @@ def build_graph_tool_registry(
             description="读取当前用户在本次会话中的工具调用记录。",
             args_schema=ListToolOperationsArguments,
             handler=list_operations,
+            validate_input=validate_graph_selected,
             timeout_seconds=3.0,
             output_schema=_JsonObjectListOutput,
             concurrency_mode="parallel",
@@ -258,6 +267,7 @@ def build_graph_tool_registry(
             description="在当前图谱中创建逻辑实体。",
             args_schema=CreateEntityArguments,
             handler=create,
+            validate_input=validate_graph_selected,
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
@@ -269,6 +279,7 @@ def build_graph_tool_registry(
             description="合并实体并迁移其关联素材和关系。",
             args_schema=MergeEntitiesArguments,
             handler=merge,
+            validate_input=validate_graph_selected,
             timeout_seconds=10.0,
             output_schema=_JsonObjectOutput,
             requires_confirmation=True,
@@ -281,6 +292,7 @@ def build_graph_tool_registry(
             description="拆分实体并按指定清单重新分配素材。",
             args_schema=SplitEntityArguments,
             handler=split,
+            validate_input=validate_graph_selected,
             timeout_seconds=10.0,
             output_schema=_JsonObjectOutput,
             requires_confirmation=True,
@@ -293,6 +305,7 @@ def build_graph_tool_registry(
             description="删除当前图谱中的实体及其绑定和关系。",
             args_schema=EntityIdArguments,
             handler=delete,
+            validate_input=validate_graph_selected,
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             requires_confirmation=True,
@@ -305,6 +318,7 @@ def build_graph_tool_registry(
             description="将图谱中的素材移动到指定实体。",
             args_schema=MoveAssetArguments,
             handler=move_asset,
+            validate_input=validate_graph_selected,
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
@@ -316,6 +330,7 @@ def build_graph_tool_registry(
             description="创建父实体并建立父子层级关系。",
             args_schema=CreateParentRelationArguments,
             handler=create_parent,
+            validate_input=validate_graph_selected,
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
@@ -327,6 +342,7 @@ def build_graph_tool_registry(
             description="删除当前图谱中的一条实体关系。",
             args_schema=RemoveRelationArguments,
             handler=remove_relation,
+            validate_input=validate_graph_selected,
             timeout_seconds=5.0,
             output_schema=_JsonObjectOutput,
             requires_confirmation=True,

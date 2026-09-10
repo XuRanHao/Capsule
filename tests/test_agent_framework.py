@@ -618,3 +618,40 @@ async def test_registry_claims_idempotent_operation_before_handler() -> None:
     )
     execution_store.claim_operation.assert_awaited_once()
     handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_custom_input_validator_runs_after_schema_validation() -> None:
+    handler = AsyncMock(return_value="should not run")
+
+    async def validate(args: EchoArgs, context: ToolContext) -> str | None:
+        del context
+        return "value cannot be empty" if not args.value.strip() else None
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="validated",
+                description="validated input",
+                args_schema=EchoArgs,
+                handler=handler,
+                validate_input=validate,
+            )
+        ]
+    )
+
+    result = await registry.execute(
+        ToolCall(name="validated", arguments={"value": "   "}),
+        context=ToolContext(
+            user_id="user-a",
+            workspace_id="workspace-a",
+            thread_id="thread-a",
+            graph_id=None,
+            state={},
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "invalid_arguments"
+    assert result.error_message == "value cannot be empty"
+    handler.assert_not_awaited()
