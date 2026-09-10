@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from capsule.agent.runtime import AgentRuntime
+from capsule.api.agent import router as agent_router
 from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
 from capsule.api.clusters import router as cluster_runs_router
@@ -61,12 +63,15 @@ def create_app(
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
+    agent_runtime: AgentRuntime | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
+    resolved_agent_runtime = agent_runtime or AgentRuntime()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = resolved_settings
+        app.state.agent_runtime = resolved_agent_runtime
         app.state.video_transcode_semaphore = asyncio.Semaphore(
             resolved_settings.video_transcode_concurrency
         )
@@ -79,6 +84,7 @@ def create_app(
             or asset_repository is not None
             or library_clear_service is not None
             or workspace_service is not None
+            or agent_runtime is not None
         ):
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
@@ -291,6 +297,7 @@ def create_app(
         ],
     )
     application.include_router(search_router)
+    application.include_router(agent_router)
     application.include_router(assets_router)
     application.include_router(capsules_router)
     application.include_router(cluster_runs_router)
