@@ -1,7 +1,7 @@
 """cache completed source assetization by content and processing fingerprint
 
 Revision ID: 20260729_0006
-Revises: 20260728_0005
+Revises: 20260728_0004
 Create Date: 2026-07-29 12:00:00
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260729_0006"
-down_revision: str | None = "20260728_0005"
+down_revision: str | None = "20260728_0004"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

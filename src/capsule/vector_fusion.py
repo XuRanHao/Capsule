@@ -1,4 +1,4 @@
-"""Shared normalized vector fusion for clustering and search."""
+"""Shared normalized vector fusion for multimodal search."""
 
 from collections.abc import Sequence
 

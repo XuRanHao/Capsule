@@ -1,4 +1,4 @@
-"""Capsule multimodal asset clustering pipeline."""
+"""Capsule multimodal asset processing pipeline."""
 
 __all__ = ["__version__"]
 

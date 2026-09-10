@@ -6,7 +6,6 @@ from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.search.contracts import (
     AssetSearchRepository,
-    ClusterSearchRepository,
     QueryImageResolver,
     SearchVectorIndexPreparer,
     TextSearchRepository,
@@ -43,7 +42,6 @@ class SearchService:
         assets: AssetSearchRepository,
         settings: Settings,
         query_parser: QueryParser | None = None,
-        clusters: ClusterSearchRepository | None = None,
         history: SearchHistoryRepository | None = None,
         image_resolver: QueryImageResolver | None = None,
         search_vector_preparer: SearchVectorIndexPreparer | None = None,
@@ -60,7 +58,6 @@ class SearchService:
         self._result_builder = SearchResultBuilder(
             same_source_limit=settings.search_same_source_limit
         )
-        self._clusters = clusters
         self._history = history
         self._image_resolver = image_resolver
         self._search_vector_preparer = search_vector_preparer
@@ -187,31 +184,6 @@ class SearchService:
                 logger.warning("adjacent document context expansion failed", exc_info=True)
                 reasons.append("adjacent document context expansion failed")
         hydration_ms = _elapsed_ms(hydration_started)
-        cluster_started = perf_counter()
-        cluster_results = []
-        if self._clusters is not None and results:
-            ranked_scores = {item.asset_id: item.score for item in ranked}
-            asset_scores = {
-                asset_id: ranked_scores[asset_id]
-                for result in results
-                for asset_id in result.folded_asset_ids
-                if asset_id in ranked_scores
-            }
-            try:
-                cluster_results = list(
-                    await self._clusters.search_by_assets(
-                        workspace_id=request.workspace_id,
-                        asset_scores=asset_scores,
-                        embedding_types=tuple(
-                            dict.fromkeys(vector.embedding_type.value for vector in plan.vectors)
-                        ),
-                        limit=min(request.top_k, self._settings.search_cluster_top_k),
-                    )
-                )
-            except Exception:
-                logger.warning("cluster result aggregation failed", exc_info=True)
-                reasons.append("cluster result aggregation failed")
-        cluster_ms = _elapsed_ms(cluster_started)
         total_ms = _elapsed_ms(started)
         reasons = list(dict.fromkeys(reasons))
 
@@ -240,15 +212,13 @@ class SearchService:
             recall_ms=recall_ms,
             fusion_ms=fusion_ms,
             hydration_ms=hydration_ms,
-            cluster_ms=cluster_ms,
             total_ms=total_ms,
         )
         logger.info(
             "search completed workspace_id=%s query_type=%s results=%d "
             "vector_channels=%d text_hits=%d query_enhancement_ms=%.2f "
             "embedding_ms=%.2f recall_ms=%.2f "
-            "fusion_ms=%.2f hydration_ms=%.2f "
-            "cluster_ms=%.2f total_ms=%.2f degraded=%s",
+            "fusion_ms=%.2f hydration_ms=%.2f total_ms=%.2f degraded=%s",
             request.workspace_id,
             request.query_type.value,
             len(results),
@@ -259,7 +229,6 @@ class SearchService:
             recall_ms,
             fusion_ms,
             hydration_ms,
-            cluster_ms,
             total_ms,
             bool(reasons),
         )
@@ -286,12 +255,10 @@ class SearchService:
             capsule_id=capsule_id,
             total=len(results),
             asset_total=len(results),
-            cluster_total=len(cluster_results),
             degraded=bool(reasons),
             degraded_reasons=reasons,
             timings=timings,
             assets=results,
-            clusters=cluster_results,
             results=results,
         )
 

@@ -1,7 +1,7 @@
 """Remove Agent rerank persistence.
 
 Revision ID: 20260810_0011
-Revises: 20260804_0010
+Revises: 20260803_0009
 """
 
 from collections.abc import Sequence
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260810_0011"
-down_revision: str | None = "20260804_0010"
+down_revision: str | None = "20260803_0009"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

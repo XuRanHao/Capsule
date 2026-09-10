@@ -14,20 +14,17 @@ from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
 from capsule.db.repositories import (
     AssetRepository,
-    ClusterRepository,
-    CurrentClusterRepository,
     EmbeddingRepository,
 )
 from capsule.db.session import Database
-from capsule.enums import ClusterAlgorithm, EmbeddingType
+from capsule.enums import EmbeddingType
 from capsule.features import ACTIVE_EMBEDDING_TYPES
 from capsule.media.model_image import ModelImageCache
 from capsule.model_clients.doubao import DoubaoClient
 from capsule.parsers import discover_files
 from capsule.parsers.video import VideoParser
-from capsule.pipeline.cluster_service import ClusterService, EmbeddingTypeClusterResult
-from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.cloud_source_dispatcher import CloudSourceTaskDispatcher
+from capsule.pipeline.embedding import AssetEmbeddingService, EmbeddingRunResult
 from capsule.pipeline.import_service import AssetEnrichmentResult, enrich_assets
 from capsule.pipeline.processing_task_service import (
     CpuProcessingTaskScheduler,
@@ -47,7 +44,7 @@ from capsule.search.evaluation import evaluate_search_file
 from capsule.storage.object_storage import ObjectStorage
 from capsule.vectorstore.milvus import MilvusVectorStore
 
-app = typer.Typer(no_args_is_help=True, help="Capsule multimodal clustering pipeline")
+app = typer.Typer(no_args_is_help=True, help="Capsule multimodal asset pipeline")
 
 
 @app.callback()
@@ -334,69 +331,6 @@ def embed_command(
         raise typer.Exit(code=2)
 
 
-@app.command(name="cluster")
-def cluster_command(
-    workspace: Annotated[str, typer.Option("--workspace")] = "workspace_demo",
-    embedding_type: Annotated[
-        EmbeddingType,
-        typer.Option(
-            "--embedding-type",
-            help="Embedding Type to cluster; each invocation runs exactly one Type.",
-        ),
-    ] = EmbeddingType.NATIVE_MULTIMODAL,
-    algorithm: Annotated[
-        ClusterAlgorithm,
-        typer.Option("--algorithm", help="Clustering algorithm."),
-    ] = ClusterAlgorithm.COMPLETE_LINK,
-    distance_threshold: Annotated[
-        float,
-        typer.Option(
-            "--distance-threshold",
-            min=0.01,
-            max=2.0,
-            help="Complete-link cutoff on L2-normalized vectors.",
-        ),
-    ] = 0.5,
-    min_cluster_size: Annotated[
-        int,
-        typer.Option(
-            "--min-cluster-size",
-            min=2,
-            max=10_000,
-            help="Minimum retained cluster size; Complete-link defaults to two assets.",
-        ),
-    ] = 2,
-    optimize_parameters: Annotated[
-        bool,
-        typer.Option(
-            "--optimize-parameters/--no-optimize-parameters",
-            help="Evaluate multiple HDBSCAN parameter candidates; disabled by default.",
-        ),
-    ] = False,
-) -> None:
-    """Cluster one Embedding Type into its own PCA and ClusterRun."""
-    if optimize_parameters and algorithm is not ClusterAlgorithm.HDBSCAN:
-        raise typer.BadParameter("--optimize-parameters is only available with --algorithm hdbscan")
-    settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    result = asyncio.run(
-        _cluster_assets(
-            workspace_id=workspace,
-            embedding_type=embedding_type,
-            algorithm=algorithm,
-            distance_threshold=distance_threshold,
-            min_cluster_size=min_cluster_size,
-            optimize_parameters=optimize_parameters,
-        )
-    )
-    typer.echo(result.model_dump_json(indent=2))
-    if result.status.value == "failed":
-        raise typer.Exit(code=2)
-
-
 @app.command(name="enrich")
 def enrich_command(
     job_id: Annotated[str, typer.Option("--job-id", help="Processing Job to update.")],
@@ -510,39 +444,6 @@ async def _embed_assets(
                 embedding_type=embedding_type,
                 asset_ids=asset_ids,
                 force=force,
-            )
-    finally:
-        await database.dispose()
-
-
-async def _cluster_assets(
-    *,
-    workspace_id: str,
-    embedding_type: EmbeddingType,
-    algorithm: ClusterAlgorithm = ClusterAlgorithm.COMPLETE_LINK,
-    distance_threshold: float = 0.5,
-    min_cluster_size: int = 2,
-    optimize_parameters: bool = False,
-) -> EmbeddingTypeClusterResult:
-    settings = get_settings()
-    database = Database(settings)
-    try:
-        async with DoubaoClient(settings) as model_client:
-            service = ClusterService(
-                settings=settings,
-                embedding_repository=EmbeddingRepository(database),
-                cluster_repository=ClusterRepository(database),
-                current_cluster_repository=CurrentClusterRepository(database),
-                vector_store=MilvusVectorStore(settings),
-                model_client=model_client,
-            )
-            return await service.run(
-                workspace_id=workspace_id,
-                embedding_type=embedding_type,
-                algorithm=algorithm,
-                distance_threshold=distance_threshold,
-                min_cluster_size=min_cluster_size,
-                optimize_parameters=optimize_parameters,
             )
     finally:
         await database.dispose()

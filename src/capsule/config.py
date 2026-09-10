@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     api_embedded_cpu_tasks_startup_timeout_seconds: float = Field(default=30.0, gt=0)
     # ``materialized`` preserves the legacy playable MP4/keyframe artifacts.
     # ``logical`` stores only content-aware ranges and representative timestamps;
-    # Assets still run through understanding, vectorization, and clustering.
+    # Assets still run through understanding and vectorization.
     video_output_mode: VideoOutputMode = "logical"
     # Additional local roots permitted for durable video source references.
     # They are checked before a file:// URI reaches PostgreSQL or Redis.
@@ -187,22 +187,10 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = Field(default=60.0, gt=0)
     milvus_batch_size: int = Field(default=100, ge=1)
 
-    cluster_selection_epsilon: float = Field(default=0.5, ge=0.0, le=2.0)
-    cluster_incremental_assignment_threshold: float = Field(
-        default=0.88,
-        ge=-1.0,
-        le=1.0,
-    )
-    cluster_bootstrap_minimum_count: int = Field(default=50, ge=1)
-    cluster_bootstrap_concurrency: int = Field(default=1, ge=1)
-    cluster_auto_recluster_new_ratio: float = Field(default=0.3, gt=0.0, le=1.0)
-    cluster_auto_recluster_minimum_new_count: int = Field(default=20, ge=1)
-
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)
     search_candidate_cap: int = Field(default=300, ge=1)
     search_same_source_limit: int = Field(default=3, ge=1)
-    search_cluster_top_k: int = Field(default=12, ge=1, le=100)
     search_rrf_k: int = Field(default=20, ge=1)
     search_hnsw_ef: int = Field(default=128, ge=1)
     search_vector_visibility_timeout_seconds: float = Field(default=5.0, ge=0)

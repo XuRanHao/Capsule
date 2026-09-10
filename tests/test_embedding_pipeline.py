@@ -16,9 +16,9 @@ from capsule.config import Settings, get_settings
 from capsule.db.models import EmbeddingRecord, Workspace
 from capsule.db.repositories import (
     AssetRepository,
-    ClusterEmbeddingAsset,
     EmbeddingAsset,
     EmbeddingRepository,
+    IndexedEmbeddingAsset,
 )
 from capsule.db.session import Database
 from capsule.enums import AssetType, EmbeddingStatus, EmbeddingType
@@ -128,15 +128,15 @@ class _MutableSearchVectorRepository:
     async def list_assets(self, **_: object) -> list[EmbeddingAsset]:
         return [self.asset]
 
-    async def list_indexed_cluster_embeddings(
+    async def list_indexed_embeddings(
         self,
         *,
         embedding_type: str,
         **_: object,
-    ) -> list[ClusterEmbeddingAsset]:
+    ) -> list[IndexedEmbeddingAsset]:
         prefix = "native" if embedding_type == "native_multimodal" else "visual"
         return [
-            ClusterEmbeddingAsset(
+            IndexedEmbeddingAsset(
                 embedding_id=f"emb_{prefix}_{self.revision}",
                 asset_id=self.asset.asset_id,
                 source_file_id=self.asset.source_file_id,
@@ -367,8 +367,8 @@ async def test_embedding_service_materializes_current_raw_pairs_into_fused_store
         for index in (1, 2)
     ]
 
-    def indexed(embedding_id: str, asset_id: str) -> ClusterEmbeddingAsset:
-        return ClusterEmbeddingAsset(
+    def indexed(embedding_id: str, asset_id: str) -> IndexedEmbeddingAsset:
+        return IndexedEmbeddingAsset(
             embedding_id=embedding_id,
             asset_id=asset_id,
             source_file_id=asset_id.replace("asset", "source"),
@@ -383,12 +383,12 @@ async def test_embedding_service_materializes_current_raw_pairs_into_fused_store
         async def list_assets(self, **_: object) -> list[EmbeddingAsset]:
             return assets
 
-        async def list_indexed_cluster_embeddings(
+        async def list_indexed_embeddings(
             self,
             *,
             embedding_type: str,
             **_: object,
-        ) -> list[ClusterEmbeddingAsset]:
+        ) -> list[IndexedEmbeddingAsset]:
             prefix = "native" if embedding_type == "native_multimodal" else "visual"
             return [indexed(f"emb_{prefix}_{index}", f"asset_{index}") for index in (1, 2)]
 
@@ -591,19 +591,19 @@ async def test_materialization_does_not_wait_for_unrelated_native_vector() -> No
         async def list_assets(self, **_: object) -> list[EmbeddingAsset]:
             return [self.asset, unrelated_asset]
 
-        async def list_indexed_cluster_embeddings(
+        async def list_indexed_embeddings(
             self,
             *,
             embedding_type: str,
             **values: object,
-        ) -> list[ClusterEmbeddingAsset]:
-            records = await super().list_indexed_cluster_embeddings(
+        ) -> list[IndexedEmbeddingAsset]:
+            records = await super().list_indexed_embeddings(
                 embedding_type=embedding_type,
                 **values,
             )
             if embedding_type == EmbeddingType.NATIVE_MULTIMODAL.value:
                 records.append(
-                    ClusterEmbeddingAsset(
+                    IndexedEmbeddingAsset(
                         embedding_id="emb_native_unrelated",
                         asset_id=unrelated_asset.asset_id,
                         source_file_id=unrelated_asset.source_file_id,

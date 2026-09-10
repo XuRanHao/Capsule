@@ -91,15 +91,3 @@ def test_video_keyframe_size_cannot_diverge_from_media_writer_contract() -> None
 
 def test_video_output_mode_can_preserve_materialized_segment_compatibility() -> None:
     assert Settings(video_output_mode="materialized").video_output_mode == "materialized"
-
-
-def test_incremental_cluster_defaults_balance_recall_and_precision() -> None:
-    settings = Settings()
-
-    assert settings.cluster_incremental_assignment_threshold == 0.88
-    assert settings.cluster_bootstrap_minimum_count == 50
-    assert settings.cluster_bootstrap_concurrency == 1
-    assert settings.cluster_auto_recluster_new_ratio == 0.3
-    assert settings.cluster_auto_recluster_minimum_new_count == 20
-    assert "cluster_recluster_ratio_threshold" not in Settings.model_fields
-    assert "cluster_recluster_minimum_count" not in Settings.model_fields

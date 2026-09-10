@@ -58,8 +58,8 @@ class EmbeddingType(StrEnum):
     NATIVE_MULTIMODAL = "native_multimodal"
     VISUAL_PRESENTATION = "visual_presentation"
 
-    # Historical channels remain readable so existing search and clustering
-    # records can still be displayed. New Assets are indexed only through the
+    # Historical channels remain readable for existing indexed records. New
+    # Assets are indexed only through the
     # active channel set declared in ``capsule.features``.
     ASSET_DESCRIPTION = "asset_description"
     SUBJECT_CONTENT = "subject_content"
@@ -107,54 +107,3 @@ class FeatureSalience(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
-
-
-class ClusterRunStatus(StrEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    INSUFFICIENT_DATA = "insufficient_data"
-    FAILED = "failed"
-
-
-class ClusterAlgorithm(StrEnum):
-    HDBSCAN = "hdbscan"
-    COMPLETE_LINK = "complete_link"
-
-
-class ClusterMode(StrEnum):
-    """Whether a current cluster is rebuilt or kept across clustering runs."""
-
-    DYNAMIC = "dynamic"
-    RESIDENT_OPEN = "resident_open"
-    RESIDENT_MANUAL = "resident_manual"
-
-
-class ClusterMemberSource(StrEnum):
-    """The actor/process that established a current cluster membership."""
-
-    FULL_CLUSTER = "full_cluster"
-    INCREMENTAL = "incremental"
-    USER = "user"
-
-
-class NewAssetClusterStatus(StrEnum):
-    """How one post-baseline Asset is handled by the current cluster view."""
-
-    INCREMENTALLY_CLUSTERED = "incrementally_clustered"
-    PENDING = "pending"
-    MANUAL_MANAGEMENT = "manual_management"
-
-
-class ClusterRepresentativeRole(StrEnum):
-    """How an Asset represents a Cluster Capsule."""
-
-    MEDOID = "medoid"
-    CORE = "core"
-    EDGE = "edge"
-
-
-class ClusterInternalVariance(StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"

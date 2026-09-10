@@ -3,7 +3,7 @@
 Parsing is side-effect free. The injected batch committer owns the one durable
 transaction that validates the lease/source generation, writes the whole Asset
 generation, marks the source complete and records task/parent completion.
-Understanding, embedding, indexing and clustering are intentionally not called.
+Understanding, embedding and indexing are intentionally not called.
 """
 
 from __future__ import annotations

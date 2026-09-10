@@ -23,7 +23,7 @@ from capsule.features import (
 )
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.model_clients.structured_output import responses_json_schema_format
-from capsule.schemas import AssetFeatures, AssetUnderstanding, ClusterSummary, EmbeddingResult
+from capsule.schemas import AssetFeatures, AssetUnderstanding, EmbeddingResult
 from capsule.search.models import QueryEnhancement, SearchDimensionSuggestionResponse
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -226,46 +226,6 @@ class DoubaoClient:
                 request_ms=normalization_request_ms,
             )
             return result
-
-    async def summarize_cluster(
-        self,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> ClusterSummary:
-        try:
-            return await self._deepseek_json(
-                messages=messages,
-                output_type=ClusterSummary,
-                pool=self.capsule_pool,
-                timeout_seconds=self._settings.understanding_timeout_seconds,
-                max_output_tokens=self._settings.understanding_max_output_tokens,
-                model=self._settings.search_query_model,
-            )
-        except ValidationError as exc:
-            # Text-model responses can be valid JSON but still violate the Capsule contract.
-            # Retry once with the complete cluster text evidence intact and explicit errors.
-            validation_errors = json.dumps(
-                exc.errors(include_url=False),
-                ensure_ascii=False,
-                default=str,
-            )
-            correction = {
-                "role": "user",
-                "content": (
-                    "上一份输出未通过结构校验。请仅基于前述全部簇内资产文本重新输出完整合法 JSON，"
-                    "不要解释或使用 Markdown。description 必须是 30 到 80 个中文字符；"
-                    "common_features 必须有 1 到 3 项；不要输出 keywords；"
-                    "internal_variance 只能为 low、medium 或 high。"
-                    f"校验错误：{validation_errors}"
-                ),
-            }
-            return await self._deepseek_json(
-                messages=[*messages, correction],
-                output_type=ClusterSummary,
-                pool=self.capsule_pool,
-                timeout_seconds=self._settings.understanding_timeout_seconds,
-                max_output_tokens=self._settings.understanding_max_output_tokens,
-                model=self._settings.search_query_model,
-            )
 
     async def enhance_search_query(
         self,

@@ -25,14 +25,14 @@ export async function generateMetadata(): Promise<Metadata> {
     metadataBase,
     title: "Capsule · 个人多模态素材工作台",
     description:
-      "导入、处理、浏览、聚类与检索个人多模态素材，并把发现保存成可回放的 Capsule。",
+      "导入、处理、浏览与检索个人多模态素材，并把发现保存成可回放的 Capsule。",
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
     },
     openGraph: {
       title: "Capsule · 个人多模态素材工作台",
-      description: "从散落素材到可检索、可聚类、可回放的个人记忆库。",
+      description: "从散落素材到可检索、可回放的个人记忆库。",
       images: [
         {
           url: new URL("/og-workspace.png", metadataBase).toString(),
@@ -45,7 +45,7 @@ export async function generateMetadata(): Promise<Metadata> {
     twitter: {
       card: "summary_large_image",
       title: "Capsule · 个人多模态素材工作台",
-      description: "从散落素材到可检索、可聚类、可回放的个人记忆库。",
+      description: "从散落素材到可检索、可回放的个人记忆库。",
       images: [new URL("/og-workspace.png", metadataBase).toString()],
     },
   };

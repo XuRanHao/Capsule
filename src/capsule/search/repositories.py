@@ -4,20 +4,18 @@ from sqlalchemy import and_, func, select
 
 from capsule.db.models import (
     Asset,
-    CurrentCluster,
-    CurrentClusterMember,
     EmbeddingRecord,
     SourceFile,
     UserFavorite,
 )
 from capsule.db.session import Database
-from capsule.enums import EmbeddingStatus, EmbeddingType, ProcessingStatus
+from capsule.enums import EmbeddingStatus, ProcessingStatus
 from capsule.search.models import (
-    ClusterSearchResult,
     SearchAssetRecord,
     SearchFilters,
     TextSearchHit,
 )
+
 
 class PostgresAssetSearchRepository:
     def __init__(self, database: Database) -> None:
@@ -66,11 +64,6 @@ class PostgresAssetSearchRepository:
             statement = statement.where(Asset.created_at >= filters.created_at_from)
         if filters.created_at_to:
             statement = statement.where(Asset.created_at <= filters.created_at_to)
-        if filters.cluster_capsule_id:
-            statement = statement.join(
-                CurrentClusterMember,
-                CurrentClusterMember.asset_id == Asset.asset_id,
-            ).where(CurrentClusterMember.cluster_id == filters.cluster_capsule_id)
         if filters.favorite is not None:
             statement = statement.outerjoin(
                 UserFavorite,
@@ -230,11 +223,6 @@ class PostgresAssetSearchRepository:
             statement = statement.where(Asset.created_at >= filters.created_at_from)
         if filters.created_at_to:
             statement = statement.where(Asset.created_at <= filters.created_at_to)
-        if filters.cluster_capsule_id:
-            statement = statement.join(
-                CurrentClusterMember,
-                CurrentClusterMember.asset_id == Asset.asset_id,
-            ).where(CurrentClusterMember.cluster_id == filters.cluster_capsule_id)
         if filters.favorite is not None:
             statement = statement.outerjoin(
                 UserFavorite,
@@ -275,102 +263,3 @@ class PostgresAssetSearchRepository:
             )
             for asset, score in rows
         ]
-
-    async def search_by_assets(
-        self,
-        *,
-        workspace_id: str,
-        asset_scores: Mapping[str, float],
-        embedding_types: Sequence[str],
-        limit: int,
-    ) -> Sequence[ClusterSearchResult]:
-        """Aggregate matched Assets through the currently published cluster state."""
-        if not asset_scores or not embedding_types or limit < 1:
-            return []
-
-        member_stats = (
-            select(
-                CurrentClusterMember.cluster_id,
-                func.count(CurrentClusterMember.asset_id).label("member_count"),
-                func.avg(func.coalesce(CurrentClusterMember.score, 1.0)).label("average_score"),
-            )
-            .group_by(CurrentClusterMember.cluster_id)
-            .subquery()
-        )
-        statement = (
-            select(
-                CurrentClusterMember.asset_id,
-                func.coalesce(CurrentClusterMember.score, 1.0),
-                CurrentCluster,
-                member_stats.c.member_count,
-                member_stats.c.average_score,
-            )
-            .join(
-                CurrentCluster,
-                CurrentCluster.cluster_id == CurrentClusterMember.cluster_id,
-            )
-            .join(
-                member_stats,
-                member_stats.c.cluster_id == CurrentCluster.cluster_id,
-            )
-            .where(
-                CurrentClusterMember.asset_id.in_(asset_scores),
-                CurrentCluster.workspace_id == workspace_id,
-                CurrentCluster.embedding_type.in_(set(embedding_types)),
-            )
-        )
-        async with self._database.session() as session:
-            rows = (await session.execute(statement)).all()
-
-        maximum_asset_score = max(asset_scores.values(), default=0.0)
-        if maximum_asset_score <= 0:
-            return []
-        grouped: dict[
-            str,
-            tuple[CurrentCluster, int, float, list[tuple[str, float]]],
-        ] = {}
-        for asset_id, membership_probability, cluster, member_count, average_score in rows:
-            normalized_asset_score = asset_scores.get(asset_id, 0.0) / maximum_asset_score
-            membership_weighted_score = normalized_asset_score * (
-                0.75 + 0.25 * float(membership_probability)
-            )
-            group = grouped.setdefault(
-                cluster.cluster_id,
-                (cluster, int(member_count), float(average_score), []),
-            )
-            group[3].append((asset_id, membership_weighted_score))
-
-        results: list[ClusterSearchResult] = []
-        for cluster, member_count, average_score, matches in grouped.values():
-            matches.sort(key=lambda item: (-item[1], item[0]))
-            match_scores = [item[1] for item in matches]
-            coverage = min(1.0, len(matches) / max(1, member_count))
-            score = (
-                0.65 * max(match_scores)
-                + 0.25 * (sum(match_scores) / len(match_scores))
-                + 0.10 * coverage
-            )
-            results.append(
-                ClusterSearchResult(
-                    cluster_capsule_id=cluster.cluster_id,
-                    cluster_run_id=cluster.source_run_id or "",
-                    embedding_type=EmbeddingType(cluster.embedding_type),
-                    name=cluster.name,
-                    description=cluster.description,
-                    keywords=[],
-                    common_features=[],
-                    member_count=member_count,
-                    average_membership_probability=average_score,
-                    medoid_asset_id=cluster.representative_asset_id,
-                    representative_asset_ids=(
-                        [cluster.representative_asset_id]
-                        if cluster.representative_asset_id is not None
-                        else []
-                    ),
-                    matched_asset_ids=[item[0] for item in matches],
-                    matched_asset_count=len(matches),
-                    score=score,
-                )
-            )
-        results.sort(key=lambda item: (-item.score, item.cluster_capsule_id))
-        return results[:limit]

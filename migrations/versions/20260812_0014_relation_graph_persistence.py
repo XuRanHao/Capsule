@@ -17,37 +17,6 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "relation_graph_builds",
-        sa.Column("workspace_id", sa.String(length=64), nullable=False),
-        sa.Column("input_revision", sa.String(length=64), nullable=False),
-        sa.Column("build_version", sa.Integer(), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column(
-            "subject_cluster_status",
-            postgresql.JSONB(astext_type=sa.Text()),
-            server_default=sa.text("'{}'::jsonb"),
-            nullable=False,
-        ),
-        sa.Column("error_message", sa.Text(), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.workspace_id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("workspace_id"),
-    )
-    op.create_index(
-        "ix_relation_graph_builds_input_revision", "relation_graph_builds", ["input_revision"]
-    )
 
     op.create_table(
         "relation_entities",
@@ -137,4 +106,3 @@ def downgrade() -> None:
     op.drop_table("asset_entity_relations")
     op.drop_table("relation_entity_sources")
     op.drop_table("relation_entities")
-    op.drop_table("relation_graph_builds")

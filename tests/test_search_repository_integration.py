@@ -6,17 +6,12 @@ from sqlalchemy import delete, text
 from capsule.config import get_settings
 from capsule.db.models import (
     Asset,
-    ClusterCapsule,
-    ClusterMembership,
-    ClusterRun,
-    CurrentCluster,
-    CurrentClusterMember,
     EmbeddingRecord,
     SourceFile,
     Workspace,
 )
 from capsule.db.session import Database
-from capsule.enums import ClusterRunStatus, EmbeddingStatus
+from capsule.enums import EmbeddingStatus
 from capsule.search.models import SearchFilters
 from capsule.search.repositories import PostgresAssetSearchRepository
 
@@ -29,8 +24,6 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
     source_file_id = f"src_search_fields_{suffix}"
     asset_id = f"asset_search_fields_{suffix}"
     embedding_id = f"emb_search_fields_{suffix}"
-    cluster_run_id = f"run_search_fields_{suffix}"
-    cluster_capsule_id = f"cc_search_fields_{suffix}"
     model_name = "doubao-embedding-vision-250615"
     database_available = False
     try:
@@ -110,78 +103,6 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
                     status=EmbeddingStatus.INDEXED.value,
                 )
             )
-            session.add(
-                ClusterRun(
-                    cluster_run_id=cluster_run_id,
-                    workspace_id=workspace_id,
-                    embedding_type="native_multimodal",
-                    input_embedding_ids=[embedding_id],
-                    dataset_hash="d" * 64,
-                    sample_count=1,
-                    preprocessing={},
-                    parameters={},
-                    cluster_count=1,
-                    noise_count=0,
-                    noise_ratio=0,
-                    status=ClusterRunStatus.COMPLETED.value,
-                )
-            )
-            await session.flush()
-            session.add(
-                ClusterCapsule(
-                    cluster_capsule_id=cluster_capsule_id,
-                    cluster_run_id=cluster_run_id,
-                    workspace_id=workspace_id,
-                    embedding_type="native_multimodal",
-                    cluster_label=0,
-                    model_generated_name="黄昏场景",
-                    effective_name="黄昏场景",
-                    model_generated_description="包含蓝紫色黄昏素材的聚类。",
-                    effective_description="包含蓝紫色黄昏素材的聚类。",
-                    keywords=["黄昏"],
-                    common_features=["蓝紫色"],
-                    internal_variance="low",
-                    member_count=1,
-                    average_membership_probability=0.95,
-                    medoid_asset_id=asset_id,
-                    representative_asset_ids=[asset_id],
-                )
-            )
-            await session.flush()
-            session.add(
-                ClusterMembership(
-                    cluster_run_id=cluster_run_id,
-                    cluster_capsule_id=cluster_capsule_id,
-                    asset_id=asset_id,
-                    hdbscan_label=0,
-                    membership_probability=0.95,
-                    is_noise=False,
-                    distance_to_representative=0,
-                )
-            )
-            session.add(
-                CurrentCluster(
-                    cluster_id=cluster_capsule_id,
-                    workspace_id=workspace_id,
-                    embedding_type="native_multimodal",
-                    mode="dynamic",
-                    name="黄昏场景",
-                    description="包含蓝紫色黄昏素材的聚类。",
-                    representative_asset_id=asset_id,
-                    source_run_id=cluster_run_id,
-                )
-            )
-            await session.flush()
-            session.add(
-                CurrentClusterMember(
-                    cluster_id=cluster_capsule_id,
-                    asset_id=asset_id,
-                    embedding_type="native_multimodal",
-                    source="full_cluster",
-                    score=0.95,
-                )
-            )
-
         repository = PostgresAssetSearchRepository(database)
         records = await repository.get_by_ids(
             workspace_id=workspace_id,
@@ -216,15 +137,6 @@ async def test_search_hydration_uses_latest_asset_and_embedding_fields() -> None
         )
         assert source_file_type_does_not_override_asset == {}
 
-        clusters = await repository.search_by_assets(
-            workspace_id=workspace_id,
-            asset_scores={asset_id: 0.8},
-            embedding_types=["native_multimodal"],
-            limit=5,
-        )
-        assert len(clusters) == 1
-        assert clusters[0].cluster_capsule_id == cluster_capsule_id
-        assert clusters[0].matched_asset_ids == [asset_id]
     finally:
         if database_available:
             async with database.session() as session, session.begin():

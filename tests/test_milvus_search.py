@@ -179,7 +179,6 @@ def test_search_filter_accepts_legacy_model_field_but_serializes_database_name()
         "created_at_to": None,
         "model_name": ["doubao-embedding-vision-250615"],
         "favorite": None,
-        "cluster_capsule_id": None,
     }
 
 

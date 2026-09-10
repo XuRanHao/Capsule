@@ -9,7 +9,6 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
-    Index,
     Integer,
     String,
     Text,
@@ -301,287 +300,8 @@ class ModelCallLog(Base):
     )
 
 
-class ClusterRun(Base):
-    __tablename__ = "cluster_runs"
-
-    cluster_run_id: Mapped[str] = mapped_column(
-        String(64),
-        primary_key=True,
-        default=id_factory("run"),
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        index=True,
-    )
-    embedding_type: Mapped[str] = mapped_column(String(64), index=True)
-    input_embedding_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    preprocessing: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
-    parameters: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
-    cluster_count: Mapped[int | None] = mapped_column(Integer)
-    noise_count: Mapped[int | None] = mapped_column(Integer)
-    noise_ratio: Mapped[float | None] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
-class ClusterCapsule(Base, TimestampMixin):
-    __tablename__ = "cluster_capsules"
-    __table_args__ = (
-        UniqueConstraint(
-            "cluster_run_id",
-            "cluster_label",
-            name="uq_cluster_capsule_run_label",
-        ),
-    )
-
-    cluster_capsule_id: Mapped[str] = mapped_column(
-        String(64),
-        primary_key=True,
-        default=id_factory("cc"),
-    )
-    cluster_run_id: Mapped[str] = mapped_column(
-        ForeignKey("cluster_runs.cluster_run_id", ondelete="CASCADE"),
-        index=True,
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        index=True,
-    )
-    embedding_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    cluster_label: Mapped[int] = mapped_column(Integer, nullable=False)
-    model_generated_name: Mapped[str] = mapped_column(String(1024), nullable=False)
-    user_override_name: Mapped[str | None] = mapped_column(String(1024))
-    effective_name: Mapped[str] = mapped_column(String(1024), nullable=False)
-    model_generated_description: Mapped[str] = mapped_column(Text, nullable=False)
-    user_override_description: Mapped[str | None] = mapped_column(Text)
-    effective_description: Mapped[str] = mapped_column(Text, nullable=False)
-    keywords: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    common_features: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    internal_variance: Mapped[str | None] = mapped_column(String(16))
-    member_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    average_membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
-    medoid_asset_id: Mapped[str | None] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="SET NULL"),
-        index=True,
-    )
-    representative_asset_ids: Mapped[list[str]] = mapped_column(
-        JSONB,
-        default=list,
-        nullable=False,
-    )
-    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-
-class ClusterRepresentativeAsset(Base):
-    """A durable, ordered Asset reference used to explain one Cluster Capsule."""
-
-    __tablename__ = "cluster_representative_assets"
-    __table_args__ = (
-        UniqueConstraint(
-            "cluster_capsule_id",
-            "asset_id",
-            name="uq_cluster_representative_asset",
-        ),
-        UniqueConstraint(
-            "cluster_capsule_id",
-            "rank",
-            name="uq_cluster_representative_rank",
-        ),
-    )
-
-    cluster_representative_asset_id: Mapped[str] = mapped_column(
-        String(64),
-        primary_key=True,
-        default=id_factory("crep"),
-    )
-    cluster_capsule_id: Mapped[str] = mapped_column(
-        ForeignKey("cluster_capsules.cluster_capsule_id", ondelete="CASCADE"),
-        index=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        index=True,
-    )
-    role: Mapped[str] = mapped_column(String(16), nullable=False)
-    rank: Mapped[int] = mapped_column(Integer, nullable=False)
-    distance_to_medoid: Mapped[float] = mapped_column(Float, nullable=False)
-    membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
-
-
-class ClusterMembership(Base):
-    __tablename__ = "cluster_memberships"
-    __table_args__ = (
-        UniqueConstraint(
-            "cluster_run_id",
-            "asset_id",
-            name="uq_cluster_membership_run_asset",
-        ),
-    )
-
-    membership_id: Mapped[str] = mapped_column(
-        String(64),
-        primary_key=True,
-        default=id_factory("membership"),
-    )
-    cluster_run_id: Mapped[str] = mapped_column(
-        ForeignKey("cluster_runs.cluster_run_id", ondelete="CASCADE"),
-        index=True,
-    )
-    cluster_capsule_id: Mapped[str | None] = mapped_column(
-        ForeignKey("cluster_capsules.cluster_capsule_id", ondelete="CASCADE"),
-        index=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        index=True,
-    )
-    hdbscan_label: Mapped[int] = mapped_column(Integer, nullable=False)
-    membership_probability: Mapped[float] = mapped_column(Float, nullable=False)
-    is_noise: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    distance_to_representative: Mapped[float | None] = mapped_column(Float)
-
-
-class CurrentCluster(Base, TimestampMixin):
-    """The currently published identity and user-controlled mode of a cluster."""
-
-    __tablename__ = "clusters"
-    __table_args__ = (
-        CheckConstraint(
-            "mode IN ('dynamic', 'resident_open', 'resident_manual')",
-            name="ck_clusters_mode",
-        ),
-        Index(
-            "ix_clusters_workspace_embedding_mode",
-            "workspace_id",
-            "embedding_type",
-            "mode",
-        ),
-    )
-
-    cluster_id: Mapped[str] = mapped_column(
-        String(64),
-        primary_key=True,
-        default=id_factory("cluster"),
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    embedding_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="dynamic")
-    name: Mapped[str] = mapped_column(String(1024), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    representative_asset_id: Mapped[str | None] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="SET NULL"),
-        index=True,
-    )
-    source_run_id: Mapped[str | None] = mapped_column(
-        ForeignKey("cluster_runs.cluster_run_id", ondelete="SET NULL"),
-        index=True,
-    )
-    embedding_vector: Mapped[list[float]] = mapped_column(
-        JSONB,
-        nullable=False,
-        default=list,
-    )
-    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    embedding_source_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
-
-
-class CurrentClusterMember(Base):
-    """The single current cluster assignment for an Asset and embedding dimension."""
-
-    __tablename__ = "cluster_members"
-    __table_args__ = (
-        UniqueConstraint(
-            "asset_id",
-            "embedding_type",
-            name="uq_cluster_member_asset_embedding",
-        ),
-        CheckConstraint(
-            "source IN ('full_cluster', 'incremental', 'user')",
-            name="ck_cluster_members_source",
-        ),
-    )
-
-    cluster_id: Mapped[str] = mapped_column(
-        ForeignKey("clusters.cluster_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        primary_key=True,
-        index=True,
-    )
-    embedding_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    source: Mapped[str] = mapped_column(String(32), nullable=False)
-    score: Mapped[float | None] = mapped_column(Float)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-
-class RelationGraphBuild(Base, TimestampMixin):
-    """Latest durable relationship build state for one workspace."""
-
-    __tablename__ = "relation_graph_builds"
-
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    input_revision: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
-    subject_cluster_status: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, default=dict, nullable=False
-    )
-    error_message: Mapped[str | None] = mapped_column(Text)
-
-
-class RelationHierarchyBatchCommit(Base, TimestampMixin):
-    """One idempotent hierarchy-workflow database commit.
-
-    A LangGraph checkpoint can replay a completed node after its database
-    transaction committed.  The ``workspace_id`` + ``operation_id`` key lets
-    the repository return that original outcome instead of applying the
-    hierarchy operation twice.
-    """
-
-    __tablename__ = "relation_hierarchy_batch_commits"
-    __table_args__ = (
-        UniqueConstraint(
-            "workspace_id",
-            "operation_id",
-            name="uq_relation_hierarchy_batch_commit_operation",
-        ),
-    )
-
-    commit_id: Mapped[str] = mapped_column(
-        String(64), primary_key=True, default=id_factory("relcommit")
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    operation_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    input_revision: Mapped[str] = mapped_column(String(64), nullable=False)
-    result_payload: Mapped[dict[str, Any]] = mapped_column(
-        JSON().with_variant(JSONB, "postgresql"), default=dict, nullable=False
-    )
-
-
 class RelationEntity(Base, TimestampMixin):
-    """A persisted virtual Entity node produced by candidate merging."""
+    """A persistent Entity node available to future narrative-graph tools."""
 
     __tablename__ = "relation_entities"
 
@@ -603,7 +323,7 @@ class RelationEntity(Base, TimestampMixin):
 
 
 class RelationEntitySource(Base):
-    """Metadata or subject-cluster candidate that formed one Entity."""
+    """A source record that contributed metadata or Assets to one Entity."""
 
     __tablename__ = "relation_entity_sources"
 
@@ -621,8 +341,8 @@ class RelationEntitySource(Base):
     name: Mapped[str] = mapped_column(String(1024), nullable=False)
     semantic: Mapped[str] = mapped_column(Text, nullable=False)
     asset_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    # Candidate vectors are retained at source level so an Entity merged from
-    # several subject clusters can be recomputed without calling the model.
+    # Source vectors are retained so an Entity can be recomputed without
+    # calling the model again.
     embedding_vector: Mapped[list[float]] = mapped_column(
         JSON().with_variant(JSONB, "postgresql"), default=list, nullable=False
     )
@@ -666,35 +386,6 @@ class EntityEntityRelation(Base, TimestampMixin):
     build_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-class RelationAssetState(Base, TimestampMixin):
-    """Per-Asset revision cursor used by incremental relationship updates."""
-
-    __tablename__ = "relation_asset_states"
-    __table_args__ = (
-        UniqueConstraint(
-            "workspace_id",
-            "asset_id",
-            name="uq_relation_asset_state",
-        ),
-    )
-
-    state_id: Mapped[str] = mapped_column(
-        String(64), primary_key=True, default=id_factory("relstate")
-    )
-    workspace_id: Mapped[str] = mapped_column(
-        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    asset_revision: Mapped[str] = mapped_column(String(64), nullable=False)
-    build_version: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
 class AssetEntityRelation(Base, TimestampMixin):
     """A durable Agent-approved relationship between one Asset and Entity."""
 
@@ -732,28 +423,6 @@ class AssetEntityRelation(Base, TimestampMixin):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     content_subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
     build_version: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
-class ClusterExclusion(Base):
-    """A user rule preventing one Asset from being auto-assigned to one cluster."""
-
-    __tablename__ = "cluster_exclusions"
-
-    cluster_id: Mapped[str] = mapped_column(
-        ForeignKey("clusters.cluster_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("assets.asset_id", ondelete="CASCADE"),
-        primary_key=True,
-        index=True,
-    )
-    created_by: Mapped[str | None] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
 
 
 class UserFavorite(Base):

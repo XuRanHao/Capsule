@@ -111,7 +111,7 @@ export default function TasksPage() {
   const clearJobs = async () => {
     if (
       !window.confirm(
-        "强制清空全部处理任务？正在上传或运行的任务会立即停止，但已生成的素材与聚类结果不会删除。",
+        "强制清空全部处理任务？正在上传或运行的任务会立即停止，但已生成的素材不会删除。",
       )
     ) {
       return;
@@ -276,7 +276,7 @@ export default function TasksPage() {
                 <strong>
                   {selectedWorkspace?.name || selected.workspace_id}
                 </strong>
-                <span>该任务生成的 Assets、特征与聚类结果最终存放在此工作空间。</span>
+                <span>该任务生成的 Assets 与特征最终存放在此工作空间。</span>
               </div>
               <code>{selected.workspace_id}</code>
             </section>

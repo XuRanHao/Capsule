@@ -70,23 +70,6 @@ type SearchResult = {
   available: boolean;
 };
 
-type ClusterSearchResult = {
-  cluster_capsule_id: string;
-  cluster_run_id: string;
-  embedding_type: string;
-  name: string;
-  description: string;
-  keywords: string[];
-  common_features: string[];
-  member_count: number;
-  average_membership_probability: number;
-  medoid_asset_id: string | null;
-  representative_asset_ids: string[];
-  matched_asset_ids: string[];
-  matched_asset_count: number;
-  score: number;
-};
-
 type SearchResponse = {
   query: {
     query_type: QueryType;
@@ -102,7 +85,6 @@ type SearchResponse = {
   capsule_id: string | null;
   total: number;
   asset_total: number;
-  cluster_total: number;
   degraded: boolean;
   degraded_reasons: string[];
   timings: {
@@ -110,7 +92,6 @@ type SearchResponse = {
     total_ms: number;
   };
   assets: SearchResult[];
-  clusters: ClusterSearchResult[];
   results: SearchResult[];
 };
 
@@ -326,29 +307,6 @@ const DEMO_RESULTS: SearchResult[] = [
   },
 ];
 
-const DEMO_CLUSTERS: ClusterSearchResult[] = [
-  {
-    cluster_capsule_id: "cc_demo_twilight",
-    cluster_run_id: "run_demo_mood",
-    embedding_type: "scene_theme",
-    name: "蓝紫与暖金交界的黄昏",
-    description:
-      "这个簇聚合了蓝调时刻、暖金斜阳与克制叙事感的图片和视频片段，主要差异来自人物是否出现以及环境尺度。",
-    keywords: ["蓝调时刻", "暖金斜阳", "安静叙事"],
-    common_features: ["黄昏", "动画电影感"],
-    member_count: 18,
-    average_membership_probability: 0.91,
-    medoid_asset_id: "asset_demo_twilight_01",
-    representative_asset_ids: [
-      "asset_demo_twilight_01",
-      "asset_demo_field_02",
-    ],
-    matched_asset_ids: ["asset_demo_twilight_01", "asset_demo_field_02"],
-    matched_asset_count: 2,
-    score: 0.94,
-  },
-];
-
 const DEMO_RESPONSE: SearchResponse = {
   query: {
     query_type: "text",
@@ -395,12 +353,10 @@ const DEMO_RESPONSE: SearchResponse = {
   capsule_id: "search_capsule_demo",
   total: DEMO_RESULTS.length,
   asset_total: DEMO_RESULTS.length,
-  cluster_total: DEMO_CLUSTERS.length,
   degraded: false,
   degraded_reasons: [],
   timings: { query_enhancement_ms: 74, total_ms: 286 },
   assets: DEMO_RESULTS,
-  clusters: DEMO_CLUSTERS,
   results: DEMO_RESULTS,
 };
 
@@ -420,12 +376,10 @@ const EMPTY_RESPONSE: SearchResponse = {
   capsule_id: null,
   total: 0,
   asset_total: 0,
-  cluster_total: 0,
   degraded: false,
   degraded_reasons: [],
   timings: { query_enhancement_ms: 0, total_ms: 0 },
   assets: [],
-  clusters: [],
   results: [],
 };
 
@@ -559,75 +513,6 @@ function SearchResultCard({
   );
 }
 
-function ClusterResultCard({
-  cluster,
-  index,
-}: {
-  cluster: ClusterSearchResult;
-  index: number;
-}) {
-  const label =
-    CHANNEL_LABELS[cluster.embedding_type] ?? cluster.embedding_type;
-  return (
-    <article className={`cluster-search-card cluster-search-card-${index % 4}`}>
-      <div className="cluster-search-visual" aria-hidden="true">
-        <div className="cluster-search-orbit">
-          {Array.from({
-            length: Math.min(9, Math.max(3, cluster.matched_asset_count + 2)),
-          }).map((_, dotIndex) => (
-            <i key={dotIndex} />
-          ))}
-          <strong>{cluster.member_count}</strong>
-          <span>ASSETS</span>
-        </div>
-        <div className="cluster-search-score">
-          <small>CLUSTER SCORE</small>
-          <strong>{cluster.score.toFixed(3)}</strong>
-        </div>
-      </div>
-      <div className="cluster-search-body">
-        <header>
-          <span>{String(index + 1).padStart(2, "0")}</span>
-          <small>{label}</small>
-        </header>
-        <h2>{cluster.name}</h2>
-        <p>{cluster.description}</p>
-        <div className="cluster-match-summary">
-          <strong>{cluster.matched_asset_count}</strong>
-          <span>个当前命中素材落在此簇</span>
-          <em>
-            平均成员置信度{" "}
-            {(cluster.average_membership_probability * 100).toFixed(0)}%
-          </em>
-        </div>
-        <div className="cluster-keywords">
-          {Array.from(
-            new Set([...cluster.keywords, ...cluster.common_features]),
-          )
-            .slice(0, 6)
-            .map((keyword) => (
-              <span key={keyword}>{keyword}</span>
-            ))}
-        </div>
-        <footer>
-          <code>{cluster.cluster_capsule_id}</code>
-          <a
-            href={`/clusters?cluster_run_id=${encodeURIComponent(
-              cluster.cluster_run_id,
-            )}&cluster_capsule_id=${encodeURIComponent(
-              cluster.cluster_capsule_id,
-            )}`}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            打开簇详情 ↗
-          </a>
-        </footer>
-      </div>
-    </article>
-  );
-}
-
 function QueryPlan({ parsed }: { parsed: ParsedQuery | null }) {
   if (!parsed) return null;
   return (
@@ -687,12 +572,9 @@ export default function Home() {
   const [sourceFileId, setSourceFileId] = useState("");
   const [fileTypes, setFileTypes] = useState("");
   const [modelName, setModelName] = useState("");
-  const [clusterCapsuleId, setClusterCapsuleId] = useState("");
   const [favoriteOnly, setFavoriteOnly] = useState(false);
   const [response, setResponse] = useState<SearchResponse>(EMPTY_RESPONSE);
-  const [resultSet, setResultSet] = useState<"assets" | "clusters">(
-    "assets",
-  );
+  const [resultSet, setResultSet] = useState<"assets">("assets");
   const [viewMode, setViewMode] = useState<"demo" | "live">("live");
   const [capsules, setCapsules] = useState<CapsuleSummary[]>([]);
   const [selectedCapsule, setSelectedCapsule] =
@@ -856,7 +738,6 @@ export default function Home() {
               ? [modelName.trim()]
               : [],
             favorite: favoriteOnly ? true : null,
-            cluster_capsule_id: clusterCapsuleId.trim() || null,
           },
           top_k: 20,
         }),
@@ -1398,13 +1279,6 @@ export default function Home() {
                     onChange={(event) => setModelName(event.target.value)}
                     placeholder="Embedding 模型名称"
                   />
-                  <input
-                    value={clusterCapsuleId}
-                    onChange={(event) =>
-                      setClusterCapsuleId(event.target.value)
-                    }
-                    placeholder="Cluster Capsule ID"
-                  />
                   <label>
                     <input
                       type="checkbox"
@@ -1466,8 +1340,8 @@ export default function Home() {
               <div>
                 <span className="eyebrow">RESULTS / 02</span>
                 <h2>
-                  {response.asset_total + response.cluster_total}
-                  <small> 个结果，分为素材与聚类簇</small>
+                  {response.asset_total}
+                  <small> 个素材结果</small>
                 </h2>
               </div>
               <div className="results-meta">
@@ -1498,16 +1372,6 @@ export default function Home() {
                 <span>图片 / 视频</span>
                 <strong>{response.asset_total}</strong>
               </button>
-              <button
-                className={resultSet === "clusters" ? "active" : ""}
-                type="button"
-                role="tab"
-                aria-selected={resultSet === "clusters"}
-                onClick={() => setResultSet("clusters")}
-              >
-                <span>相关聚类簇</span>
-                <strong>{response.cluster_total}</strong>
-              </button>
             </div>
 
             {response.degraded && (
@@ -1529,28 +1393,14 @@ export default function Home() {
                   />
                 ))}
               </div>
-            ) : resultSet === "clusters" && response.clusters.length > 0 ? (
-              <div className="cluster-search-grid">
-                {response.clusters.map((cluster, index) => (
-                  <ClusterResultCard
-                    cluster={cluster}
-                    index={index}
-                    key={cluster.cluster_capsule_id}
-                  />
-                ))}
-              </div>
             ) : (
               <div className="empty-state">
                 <span>0</span>
                 <h2>
-                  {resultSet === "clusters"
-                    ? "命中素材暂未归入可用聚类簇"
-                    : "没有找到相似素材"}
+                  没有找到相似素材
                 </h2>
                 <p>
-                  {resultSet === "clusters"
-                    ? "请先为相关 Feature 创建完成的 Cluster Run，或切换到素材结果。"
-                    : "尝试减少过滤条件，或换一种更具体的场景描述。"}
+                  尝试减少过滤条件，或换一种更具体的场景描述。
                 </p>
               </div>
             )}

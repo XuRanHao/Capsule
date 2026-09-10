@@ -37,32 +37,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("workspace_id"),
     )
-    op.create_table(
-        "cluster_runs",
-        sa.Column("cluster_run_id", sa.String(length=64), nullable=False),
-        sa.Column("workspace_id", sa.String(length=64), nullable=False),
-        sa.Column("embedding_type", sa.String(length=64), nullable=False),
-        sa.Column("input_embedding_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("dataset_hash", sa.String(length=64), nullable=False),
-        sa.Column("sample_count", sa.Integer(), nullable=False),
-        sa.Column("preprocessing", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("parameters", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("cluster_count", sa.Integer(), nullable=True),
-        sa.Column("noise_count", sa.Integer(), nullable=True),
-        sa.Column("noise_ratio", sa.Float(), nullable=True),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.workspace_id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("cluster_run_id"),
-    )
-    op.create_index(
-        op.f("ix_cluster_runs_embedding_type"), "cluster_runs", ["embedding_type"], unique=False
-    )
-    op.create_index(op.f("ix_cluster_runs_status"), "cluster_runs", ["status"], unique=False)
-    op.create_index(
-        op.f("ix_cluster_runs_workspace_id"), "cluster_runs", ["workspace_id"], unique=False
-    )
+
     op.create_table(
         "source_files",
         sa.Column("source_file_id", sa.String(length=64), nullable=False),
@@ -146,85 +121,7 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_assets_source_file_id"), "assets", ["source_file_id"], unique=False)
     op.create_index(op.f("ix_assets_workspace_id"), "assets", ["workspace_id"], unique=False)
-    op.create_table(
-        "cluster_capsules",
-        sa.Column("cluster_capsule_id", sa.String(length=64), nullable=False),
-        sa.Column("cluster_run_id", sa.String(length=64), nullable=False),
-        sa.Column("workspace_id", sa.String(length=64), nullable=False),
-        sa.Column("embedding_type", sa.String(length=64), nullable=False),
-        sa.Column("cluster_label", sa.Integer(), nullable=False),
-        sa.Column("effective_name", sa.String(length=1024), nullable=False),
-        sa.Column("effective_description", sa.Text(), nullable=False),
-        sa.Column("keywords", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("member_count", sa.Integer(), nullable=False),
-        sa.Column("average_membership_probability", sa.Float(), nullable=False),
-        sa.Column(
-            "representative_asset_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
-        sa.Column("is_favorite", sa.Boolean(), nullable=False),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.ForeignKeyConstraint(
-            ["cluster_run_id"], ["cluster_runs.cluster_run_id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.workspace_id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("cluster_capsule_id"),
-        sa.UniqueConstraint("cluster_run_id", "cluster_label", name="uq_cluster_capsule_run_label"),
-    )
-    op.create_index(
-        op.f("ix_cluster_capsules_cluster_run_id"),
-        "cluster_capsules",
-        ["cluster_run_id"],
-        unique=False,
-    )
-    op.create_index(
-        op.f("ix_cluster_capsules_workspace_id"), "cluster_capsules", ["workspace_id"], unique=False
-    )
-    op.create_table(
-        "cluster_memberships",
-        sa.Column("membership_id", sa.String(length=64), nullable=False),
-        sa.Column("cluster_run_id", sa.String(length=64), nullable=False),
-        sa.Column("cluster_capsule_id", sa.String(length=64), nullable=True),
-        sa.Column("asset_id", sa.String(length=64), nullable=False),
-        sa.Column("hdbscan_label", sa.Integer(), nullable=False),
-        sa.Column("membership_probability", sa.Float(), nullable=False),
-        sa.Column("is_noise", sa.Boolean(), nullable=False),
-        sa.Column("distance_to_representative", sa.Float(), nullable=True),
-        sa.ForeignKeyConstraint(["asset_id"], ["assets.asset_id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(
-            ["cluster_capsule_id"], ["cluster_capsules.cluster_capsule_id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["cluster_run_id"], ["cluster_runs.cluster_run_id"], ondelete="CASCADE"
-        ),
-        sa.PrimaryKeyConstraint("membership_id"),
-        sa.UniqueConstraint("cluster_run_id", "asset_id", name="uq_cluster_membership_run_asset"),
-    )
-    op.create_index(
-        op.f("ix_cluster_memberships_asset_id"), "cluster_memberships", ["asset_id"], unique=False
-    )
-    op.create_index(
-        op.f("ix_cluster_memberships_cluster_capsule_id"),
-        "cluster_memberships",
-        ["cluster_capsule_id"],
-        unique=False,
-    )
-    op.create_index(
-        op.f("ix_cluster_memberships_cluster_run_id"),
-        "cluster_memberships",
-        ["cluster_run_id"],
-        unique=False,
-    )
+
     op.create_table(
         "embedding_records",
         sa.Column("embedding_id", sa.String(length=64), nullable=False),
@@ -319,15 +216,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_embedding_records_embedding_type"), table_name="embedding_records")
     op.drop_index(op.f("ix_embedding_records_asset_id"), table_name="embedding_records")
     op.drop_table("embedding_records")
-    op.drop_index(op.f("ix_cluster_memberships_cluster_run_id"), table_name="cluster_memberships")
-    op.drop_index(
-        op.f("ix_cluster_memberships_cluster_capsule_id"), table_name="cluster_memberships"
-    )
-    op.drop_index(op.f("ix_cluster_memberships_asset_id"), table_name="cluster_memberships")
-    op.drop_table("cluster_memberships")
-    op.drop_index(op.f("ix_cluster_capsules_workspace_id"), table_name="cluster_capsules")
-    op.drop_index(op.f("ix_cluster_capsules_cluster_run_id"), table_name="cluster_capsules")
-    op.drop_table("cluster_capsules")
+
     op.drop_index(op.f("ix_assets_workspace_id"), table_name="assets")
     op.drop_index(op.f("ix_assets_source_file_id"), table_name="assets")
     op.drop_index(op.f("ix_assets_processing_status"), table_name="assets")
@@ -336,9 +225,6 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_source_files_workspace_id"), table_name="source_files")
     op.drop_index(op.f("ix_source_files_processing_status"), table_name="source_files")
     op.drop_table("source_files")
-    op.drop_index(op.f("ix_cluster_runs_workspace_id"), table_name="cluster_runs")
-    op.drop_index(op.f("ix_cluster_runs_status"), table_name="cluster_runs")
-    op.drop_index(op.f("ix_cluster_runs_embedding_type"), table_name="cluster_runs")
-    op.drop_table("cluster_runs")
+
     op.drop_table("workspaces")
     # ### end Alembic commands ###

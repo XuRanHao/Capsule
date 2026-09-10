@@ -12,30 +12,21 @@ from capsule.agent.runtime import AgentRuntime
 from capsule.api.agent import router as agent_router
 from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
-from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
 from capsule.db.repositories import (
     AssetRepository,
-    ClusterRepository,
-    CurrentClusterRepository,
     EmbeddingRepository,
 )
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
 from capsule.media.video_frames import FFmpegVideoFrameExtractor
 from capsule.model_clients.doubao import DoubaoClient
-from capsule.pipeline.cluster_service import ClusterService
 from capsule.pipeline.durable_task_supervisor import DurableTaskRuntimeSupervisor
 from capsule.pipeline.embedding import AssetEmbeddingService
 from capsule.pipeline.import_service import BrowserImportService, ImportWorkflowCoordinator
-from capsule.pipeline.incremental_clustering import (
-    IncrementalAssignmentThresholds,
-    IncrementalClusterCoordinator,
-    IncrementalClusterService,
-)
 from capsule.pipeline.processing_task_service import BrowserProcessingTaskSubmissionService
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
@@ -56,9 +47,6 @@ def create_app(
     *,
     settings: Settings | None = None,
     search_service: SearchService | None = None,
-    cluster_service: ClusterService | None = None,
-    cluster_repository: ClusterRepository | None = None,
-    current_cluster_repository: CurrentClusterRepository | None = None,
     import_service: BrowserImportService | None = None,
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
@@ -77,9 +65,6 @@ def create_app(
         )
         if (
             search_service is not None
-            or cluster_service is not None
-            or cluster_repository is not None
-            or current_cluster_repository is not None
             or import_service is not None
             or asset_repository is not None
             or library_clear_service is not None
@@ -87,10 +72,6 @@ def create_app(
             or agent_runtime is not None
         ):
             app.state.search_service = search_service
-            app.state.cluster_service = cluster_service
-            app.state.cluster_repository = cluster_repository
-            if current_cluster_repository is not None:
-                app.state.current_cluster_repository = current_cluster_repository
             app.state.import_service = import_service
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
@@ -106,8 +87,6 @@ def create_app(
         app.state.search_history = history
         app.state.query_image_service = query_images
         app.state.object_storage = storage
-        cluster_repo = ClusterRepository(database)
-        current_cluster_repo = CurrentClusterRepository(database)
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
         vectors = MilvusVectorStore(resolved_settings)
@@ -138,8 +117,6 @@ def create_app(
                 raise
             app.state.durable_task_runtime_mode = "embedded"
             app.state.durable_task_supervisor = durable_task_supervisor
-        app.state.cluster_repository = cluster_repo
-        app.state.current_cluster_repository = current_cluster_repo
         app.state.asset_repository = asset_repo
         app.state.library_clear_service = LibraryClearService(
             settings=resolved_settings,
@@ -158,7 +135,6 @@ def create_app(
                 "CAPSULE_ARK_API_KEY is not configured; search endpoint will return 503"
             )
             app.state.search_service = None
-            app.state.cluster_service = None
             app.state.import_service = BrowserImportService(
                 settings=resolved_settings,
                 repository=asset_repo,
@@ -215,51 +191,24 @@ def create_app(
             recall=MultiChannelRecall(vectors, resolved_settings),
             assets=search_repository,
             text_recall=search_repository,
-            clusters=search_repository,
             query_parser=QueryParser(embedding_client),
             history=history,
             image_resolver=query_images,
             search_vector_preparer=embedding_service,
             settings=resolved_settings,
         )
-        cluster_service_instance = ClusterService(
-            settings=resolved_settings,
-            embedding_repository=embedding_repository,
-            cluster_repository=cluster_repo,
-            current_cluster_repository=current_cluster_repo,
-            vector_store=vectors,
-            model_client=embedding_client,
-        )
-        app.state.cluster_service = cluster_service_instance
-        assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold
-        incremental_coordinator = IncrementalClusterCoordinator(
-            settings=resolved_settings,
-            assignment_service=IncrementalClusterService(
-                repository=current_cluster_repo,
-                vector_store=vectors,
-                default_thresholds=IncrementalAssignmentThresholds(
-                    resident_open=assignment_threshold,
-                    dynamic=assignment_threshold,
-                ),
-            ),
-            repository=current_cluster_repo,
-            cluster_runner=cluster_service_instance,
-        )
-        app.state.incremental_cluster_coordinator = incremental_coordinator
         app.state.import_service = BrowserImportService(
             settings=resolved_settings,
             repository=asset_repo,
             runner=pipeline_runner,
             understanding_service=understanding_service,
             embedding_service=embedding_service,
-            incremental_cluster_processor=incremental_coordinator,
             durable_task_submitter=durable_task_submitter,
         )
         import_workflow_coordinator = ImportWorkflowCoordinator(
             repository=asset_repo,
             understanding_service=understanding_service,
             embedding_service=embedding_service,
-            incremental_cluster_processor=incremental_coordinator,
         )
         import_workflow_task = asyncio.create_task(import_workflow_coordinator.run_forever())
         try:
@@ -268,7 +217,6 @@ def create_app(
             await import_workflow_coordinator.close()
             import_workflow_task.cancel()
             await asyncio.gather(import_workflow_task, return_exceptions=True)
-            await incremental_coordinator.close()
             await embedding_client.close()
             if durable_task_supervisor is not None:
                 await durable_task_supervisor.close()
@@ -300,7 +248,6 @@ def create_app(
     application.include_router(agent_router)
     application.include_router(assets_router)
     application.include_router(capsules_router)
-    application.include_router(cluster_runs_router)
     application.include_router(imports_router)
     application.include_router(workspaces_router)
 
@@ -318,7 +265,6 @@ def create_app(
         return {
             "status": "ok" if processing_ready else "degraded",
             "search_ready": resolved_settings.ark_api_key is not None,
-            "cluster_ready": resolved_settings.ark_api_key is not None,
             "processing_tasks": {
                 "mode": getattr(
                     application.state,

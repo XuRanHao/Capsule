@@ -1,7 +1,7 @@
 """Persist relation Entity title-and-description embeddings.
 
 Revision ID: 20260812_0016
-Revises: 20260812_0015
+Revises: 20260812_0014
 """
 
 from collections.abc import Sequence
@@ -11,7 +11,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "20260812_0016"
-down_revision: str | None = "20260812_0015"
+down_revision: str | None = "20260812_0014"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

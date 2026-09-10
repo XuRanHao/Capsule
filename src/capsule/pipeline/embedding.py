@@ -240,7 +240,7 @@ class AssetEmbeddingService:
             )
 
         native_embeddings, *dimension_embedding_groups = await asyncio.gather(
-            self._repository.list_indexed_cluster_embeddings(
+            self._repository.list_indexed_embeddings(
                 workspace_id=workspace_id,
                 embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
                 model_name=self._settings.embedding_model,
@@ -249,7 +249,7 @@ class AssetEmbeddingService:
                 asset_ids=tuple(assets_by_id),
             ),
             *(
-                self._repository.list_indexed_cluster_embeddings(
+                self._repository.list_indexed_embeddings(
                     workspace_id=workspace_id,
                     embedding_type=embedding_type.value,
                     model_name=self._settings.embedding_model,
@@ -407,14 +407,14 @@ class AssetEmbeddingService:
         embedding_type: EmbeddingType,
     ) -> tuple[str, tuple[str, ...]]:
         native_embeddings, dimension_embeddings = await asyncio.gather(
-            self._repository.list_indexed_cluster_embeddings(
+            self._repository.list_indexed_embeddings(
                 workspace_id=workspace_id,
                 embedding_type=EmbeddingType.NATIVE_MULTIMODAL.value,
                 model_name=self._settings.embedding_model,
                 dimension=self._settings.embedding_dimension,
                 milvus_collection=self._settings.milvus_collection,
             ),
-            self._repository.list_indexed_cluster_embeddings(
+            self._repository.list_indexed_embeddings(
                 workspace_id=workspace_id,
                 embedding_type=embedding_type.value,
                 model_name=self._settings.embedding_model,
@@ -833,7 +833,12 @@ def _read_local_source(storage_uri: str) -> bytes:
         raise EmbeddingInputUnavailable(
             f"image source must be a local file URI, got {parsed.scheme or 'no scheme'}"
         )
-    path = Path(unquote(parsed.path))
+    raw_path = unquote(parsed.path)
+    # ``Path.as_uri`` on Windows serializes ``E:\\...`` as ``file:///E:/...``;
+    # keep the drive-root slash out of the local path.
+    if len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
+        raw_path = raw_path[1:]
+    path = Path(raw_path)
     if not path.is_file():
         raise EmbeddingInputUnavailable(f"image source file no longer exists: {path}")
     return path.read_bytes()

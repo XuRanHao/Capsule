@@ -1,20 +1,15 @@
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from capsule.enums import (
     AssetIndexRole,
     AssetType,
-    ClusterInternalVariance,
-    ClusterMemberSource,
-    ClusterMode,
-    ClusterRepresentativeRole,
     EmbeddingType,
     FeatureApplicability,
     FeatureSalience,
     FeatureStatus,
-    NewAssetClusterStatus,
     ProcessingStatus,
 )
 from capsule.features import FEATURE_DIMENSION_SCOPES
@@ -695,200 +690,6 @@ class EmbeddingResult(BaseModel):
     model: str
     usage: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = None
-
-
-class ClusterSummary(BaseModel):
-    name: str = Field(min_length=1, max_length=1024)
-    description: str = Field(min_length=30, max_length=80)
-    common_features: list[str] = Field(min_length=1, max_length=3)
-    internal_variance: ClusterInternalVariance
-
-
-class ClusterRepresentativeWrite(BaseModel):
-    """One persisted representative Asset. `asset_id` is always an Asset primary key."""
-
-    asset_id: str = Field(min_length=1, max_length=64)
-    role: ClusterRepresentativeRole
-    rank: int = Field(ge=0)
-    distance_to_medoid: float = Field(ge=0)
-    membership_probability: float = Field(ge=0, le=1)
-
-
-class ClusterCapsuleWrite(BaseModel):
-    """Model-generated Cluster Capsule fields and selected representative Asset IDs."""
-
-    cluster_run_id: str = Field(min_length=1, max_length=64)
-    workspace_id: str = Field(min_length=1, max_length=64)
-    embedding_type: str = Field(min_length=1, max_length=64)
-    cluster_label: int = Field(ge=0)
-    summary: ClusterSummary
-    member_count: int = Field(ge=1)
-    average_membership_probability: float = Field(ge=0, le=1)
-    representatives: list[ClusterRepresentativeWrite] = Field(min_length=1, max_length=10)
-
-
-class ClusterCapsuleRecord(BaseModel):
-    cluster_capsule_id: str
-    cluster_run_id: str
-    workspace_id: str
-    embedding_type: str
-    cluster_label: int
-    model_generated_name: str
-    user_override_name: str | None
-    effective_name: str
-    model_generated_description: str
-    user_override_description: str | None
-    effective_description: str
-    keywords: list[str] = Field(default_factory=list)
-    common_features: list[str] = Field(default_factory=list)
-    internal_variance: ClusterInternalVariance | None
-    member_count: int
-    average_membership_probability: float
-    medoid_asset_id: str | None
-    representative_asset_ids: list[str] = Field(default_factory=list)
-    is_favorite: bool
-
-
-class ClusterRunRecord(BaseModel):
-    cluster_run_id: str
-    workspace_id: str
-    embedding_type: str
-    input_embedding_ids: list[str] = Field(default_factory=list)
-    dataset_hash: str
-    sample_count: int
-    preprocessing: dict[str, Any] = Field(default_factory=dict)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    cluster_count: int | None
-    noise_count: int | None
-    noise_ratio: float | None
-    status: str
-    started_at: datetime | None
-    completed_at: datetime | None
-
-
-class ClusterMemberRecord(BaseModel):
-    asset_id: str
-    asset_type: AssetType
-    file_name: str
-    asset_name: str | None
-    asset_description: str | None
-    source_file_id: str
-    relative_path: str
-    hdbscan_label: int
-    membership_probability: float
-    is_noise: bool
-    distance_to_representative: float | None
-    preview_url: str | None = None
-
-
-class ClusterRunListResponse(BaseModel):
-    items: list[ClusterRunRecord] = Field(default_factory=list)
-
-
-class CurrentClusterRecord(BaseModel):
-    """One currently active logical cluster, independent of a historical run snapshot."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    cluster_id: str
-    workspace_id: str
-    embedding_type: str
-    mode: ClusterMode
-    name: str
-    description: str
-    representative_asset_id: str | None
-    source_run_id: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
-class CurrentClusterMemberRecord(BaseModel):
-    """One Asset's current assignment for an embedding dimension."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    cluster_id: str
-    asset_id: str
-    embedding_type: str
-    source: ClusterMemberSource
-    score: float | None
-    created_at: datetime
-
-
-class CurrentClusterListResponse(BaseModel):
-    items: list[CurrentClusterRecord] = Field(default_factory=list)
-
-
-class CurrentClusterMemberListResponse(BaseModel):
-    items: list[CurrentClusterMemberRecord] = Field(default_factory=list)
-
-
-class NewAssetClusterStatusItem(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    asset_id: str
-    asset_type: AssetType
-    file_name: str
-    asset_name: str | None = None
-    status: NewAssetClusterStatus
-    cluster_id: str | None = None
-    cluster_name: str | None = None
-    cluster_mode: ClusterMode | None = None
-    member_source: ClusterMemberSource | None = None
-    score: float | None = None
-    created_at: datetime
-
-
-class NewAssetClusterStatusResponse(BaseModel):
-    workspace_id: str
-    embedding_type: EmbeddingType
-    initialized: bool
-    bootstrap_minimum_count: int = Field(ge=1)
-    baseline_cluster_run_id: str | None = None
-    baseline_sample_count: int | None = Field(default=None, ge=0)
-    eligible_asset_count: int = Field(ge=0)
-    new_asset_count: int = Field(ge=0)
-    incrementally_clustered_count: int = Field(ge=0)
-    pending_count: int = Field(ge=0)
-    manual_management_count: int = Field(ge=0)
-    items: list[NewAssetClusterStatusItem] = Field(default_factory=list)
-
-
-class CurrentClusterPatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    mode: ClusterMode | None = None
-    name: str | None = Field(default=None, min_length=1, max_length=1024)
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def normalize_name(cls, value: Any) -> Any:
-        return value.strip() if isinstance(value, str) else value
-
-    @model_validator(mode="after")
-    def require_change(self) -> "CurrentClusterPatch":
-        if self.mode is None and self.name is None:
-            raise ValueError("mode or name is required")
-        return self
-
-
-AssetId = Annotated[str, Field(min_length=1, max_length=64)]
-
-
-class CurrentClusterMemberMutation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    asset_ids: list[AssetId] = Field(min_length=1, max_length=500)
-
-    @field_validator("asset_ids")
-    @classmethod
-    def deduplicate_asset_ids(cls, asset_ids: list[str]) -> list[str]:
-        return list(dict.fromkeys(asset_ids))
-
-
-class CurrentClusterMemberMutationResponse(BaseModel):
-    cluster_id: str
-    asset_ids: list[str] = Field(default_factory=list)
 
 
 class ProcessingJobRecord(BaseModel):

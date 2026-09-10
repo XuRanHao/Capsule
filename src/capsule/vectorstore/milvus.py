@@ -313,7 +313,7 @@ class MilvusVectorStore:
         filters: SearchFilters,
         limit: int,
     ) -> list[VectorSearchHit]:
-        """Search the unfused dimension vector used by clustering."""
+        """Search one unfused embedding dimension for diagnostics and retrieval."""
 
         self.validate_vector(vector)
         expression = self.build_filter_expression(
@@ -340,7 +340,7 @@ class MilvusVectorStore:
         return _parse_search_hits(raw)
 
     async def fetch_vectors(self, embedding_ids: Sequence[str]) -> dict[str, list[float]]:
-        """Fetch exact vectors by embedding primary key for offline clustering."""
+        """Fetch exact vectors by embedding primary key for vector materialization."""
         if not embedding_ids:
             return {}
         return await asyncio.to_thread(self._fetch_vectors_sync, list(embedding_ids))

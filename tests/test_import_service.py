@@ -515,21 +515,6 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     repository = Repository()
     embedding = Embedding()
 
-    class IncrementalProcessor:
-        def __init__(self) -> None:
-            self.calls: list[tuple[EmbeddingType, list[str]]] = []
-
-        async def process_assets(
-            self,
-            *,
-            embedding_type: EmbeddingType,
-            asset_ids: list[str],
-            **_: object,
-        ) -> object:
-            self.calls.append((embedding_type, asset_ids))
-            return object()
-
-    processor = IncrementalProcessor()
     result = await enrich_assets(
         job_id="job_test",
         workspace_id="workspace_test",
@@ -537,7 +522,6 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
         repository=repository,  # type: ignore[arg-type]
         understanding_service=Understanding(),  # type: ignore[arg-type]
         embedding_service=embedding,  # type: ignore[arg-type]
-        incremental_cluster_processor=processor,
     )
 
     assert repository.stages == [
@@ -564,10 +548,6 @@ async def test_enrichment_runs_understanding_and_every_embedding_channel() -> No
     assert repository.durations["embedding"] / repository.durations[
         "indexing"
     ] == pytest.approx(10)
-    assert [embedding_type for embedding_type, _ in processor.calls] == list(
-        ACTIVE_EMBEDDING_TYPES
-    )
-    assert all(asset_ids == ["asset_a", "asset_b"] for _, asset_ids in processor.calls)
 
 
 @pytest.mark.asyncio

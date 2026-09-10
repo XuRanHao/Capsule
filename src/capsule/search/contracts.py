@@ -4,7 +4,6 @@ from typing import Protocol
 from capsule.enums import AssetType, EmbeddingType
 from capsule.schemas import EmbeddingResult
 from capsule.search.models import (
-    ClusterSearchResult,
     QueryEnhancement,
     SearchAssetRecord,
     SearchDimensionSuggestionResponse,
@@ -97,13 +96,3 @@ class TextSearchRepository(Protocol):
         created_by: str,
         limit: int,
     ) -> Sequence[TextSearchHit]: ...
-
-class ClusterSearchRepository(Protocol):
-    async def search_by_assets(
-        self,
-        *,
-        workspace_id: str,
-        asset_scores: Mapping[str, float],
-        embedding_types: Sequence[str],
-        limit: int,
-    ) -> Sequence[ClusterSearchResult]: ...

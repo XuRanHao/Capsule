@@ -1,7 +1,7 @@
 # Capsule Web
 
-Capsule 完整 POC 前端工作台，覆盖飞书需求中的导入、处理任务、Asset、
-Cluster、搜索与 Capsule 页面。搜索页直接调用 Capsule FastAPI 的
+Capsule 完整 POC 前端工作台，覆盖导入、处理任务、Asset、
+搜索与 Capsule 页面。搜索页直接调用 Capsule FastAPI 的
 `POST /api/v1/search`；其余页面内置完整可操作的演示数据，便于后端接口逐步接入。
 
 ## 本地运行
@@ -33,14 +33,13 @@ npm run dev
 - `/import`：文件/文件夹导入、格式校验、待导入清单与任务创建
 - `/tasks`：处理阶段、实时日志、统计、失败原因与重试
 - `/assets`：Asset 网格/列表、搜索过滤、状态与来源信息
-- `/assets/:id`：原始定位、关联文字段落、Feature、Embedding 与 Cluster
-- `/clusters`：Cluster Run 参数、2D 分布、代表素材、成员与噪声点
+- `/assets/:id`：原始定位、关联文字段落、Feature 与 Embedding
 - `/search`：完整多模态搜索链路
-- `/capsules`：Cluster/Search Capsule 列表、详情、快照、刷新与收藏
+- `/capsules`：Search Capsule 列表、详情、快照、刷新与收藏
 - 文字、图片上传/URL、图文组合检索
 - 用户选择目标素材类型与检索维度、Weighted RRF/Normalized Similarity
 - 根据自然语言智能选择最多 4 个检索维度并给出近似权重，仍可手动调整
-- Asset、Project、文件、Source File、模型版本、收藏和 Cluster Capsule 过滤
+- Asset、Project、文件、Source File、模型版本与收藏过滤
 - 多维文本 Query 强化、维度权重、source 与最终 Query 展示
 - 加载、空结果、错误及部分降级状态
 - 融合总分、命中通道与通道相似度

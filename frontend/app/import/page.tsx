@@ -434,7 +434,7 @@ export default function ImportPage() {
             <span className="eyebrow">IMPORT DESTINATION</span>
             <h2>选择资产导入位置</h2>
           </div>
-          <p>资产、处理任务和后续聚类都会归属于这里选择的工作空间。</p>
+          <p>资产和处理任务都会归属于这里选择的工作空间。</p>
         </header>
         <div className="workspace-mode-switch" role="radiogroup">
           <label className={workspaceMode === "existing" ? "selected" : ""}>
