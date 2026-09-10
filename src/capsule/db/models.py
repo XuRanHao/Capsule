@@ -9,6 +9,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     Text,
@@ -61,6 +62,45 @@ class WorkspaceUser(Base, TimestampMixin):
         default="read",
         nullable=False,
     )
+
+
+class AgentToolExecution(Base, TimestampMixin):
+    """Durable audit record for one Agent tool operation."""
+
+    __tablename__ = "agent_tool_executions"
+    __table_args__ = (
+        Index(
+            "ix_agent_tool_executions_session_created",
+            "user_id",
+            "workspace_id",
+            "thread_id",
+            "created_at",
+        ),
+    )
+
+    operation_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("op")
+    )
+    call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    graph_id: Mapped[str | None] = mapped_column(String(64))
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    required_permission: Mapped[str | None] = mapped_column(String(64))
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    confirmation_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_required"
+    )
+    execution_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="created"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output: Mapped[Any | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SourceFile(Base, TimestampMixin):

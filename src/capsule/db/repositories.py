@@ -1,5 +1,6 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.db.base import id_factory
 from capsule.db.models import (
+    AgentToolExecution,
     Asset,
     EmbeddingRecord,
     GraphAsset,
@@ -120,6 +122,143 @@ class WorkspaceUserRepository:
             else:
                 member.permission_level = normalized
         return normalized
+
+
+_UNSET = object()
+
+
+class AgentToolExecutionRepository:
+    """Persist Agent tool lifecycle records and enforce session scoping."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def create_operation(
+        self,
+        *,
+        operation_id: str | None,
+        call_id: str,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        graph_id: str | None,
+        tool_name: str,
+        required_permission: str | None,
+        arguments: dict[str, Any],
+        confirmation_status: str,
+        execution_status: str,
+    ) -> str:
+        async with self._database.session() as session, session.begin():
+            record = AgentToolExecution(
+                operation_id=operation_id,
+                call_id=call_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                graph_id=graph_id,
+                tool_name=tool_name,
+                required_permission=required_permission,
+                arguments=_json_safe(arguments),
+                confirmation_status=confirmation_status,
+                execution_status=execution_status,
+            )
+            session.add(record)
+            await session.flush()
+            return record.operation_id
+
+    async def get_operation(
+        self,
+        *,
+        operation_id: str,
+        user_id: str,
+        workspace_id: str,
+        thread_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._database.session() as session:
+            record = await session.scalar(
+                select(AgentToolExecution).where(
+                    AgentToolExecution.operation_id == operation_id,
+                    AgentToolExecution.user_id == user_id,
+                    AgentToolExecution.workspace_id == workspace_id,
+                    AgentToolExecution.thread_id == thread_id,
+                )
+            )
+        return _tool_execution_payload(record) if record is not None else None
+
+    async def update_operation(
+        self,
+        *,
+        operation_id: str,
+        user_id: str,
+        workspace_id: str,
+        thread_id: str,
+        execution_status: str | None = None,
+        confirmation_status: str | None = None,
+        attempts: int | None = None,
+        output: Any = _UNSET,
+        error_code: str | None | object = _UNSET,
+        error_message: str | None | object = _UNSET,
+        started_at: datetime | None | object = _UNSET,
+        finished_at: datetime | None | object = _UNSET,
+    ) -> bool:
+        async with self._database.session() as session, session.begin():
+            record = await session.scalar(
+                select(AgentToolExecution)
+                .where(
+                    AgentToolExecution.operation_id == operation_id,
+                    AgentToolExecution.user_id == user_id,
+                    AgentToolExecution.workspace_id == workspace_id,
+                    AgentToolExecution.thread_id == thread_id,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                return False
+            if execution_status is not None:
+                record.execution_status = execution_status
+            if confirmation_status is not None:
+                record.confirmation_status = confirmation_status
+            if attempts is not None:
+                record.attempts = attempts
+            if output is not _UNSET:
+                record.output = _json_safe(output)
+            if error_code is not _UNSET:
+                record.error_code = error_code
+            if error_message is not _UNSET:
+                record.error_message = error_message
+            if started_at is not _UNSET:
+                record.started_at = started_at
+            if finished_at is not _UNSET:
+                record.finished_at = finished_at
+        return True
+
+    async def list_for_thread(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        thread_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 100:
+            raise ValueError("operation history limit must be between 1 and 100")
+        async with self._database.session() as session:
+            records = list(
+                await session.scalars(
+                    select(AgentToolExecution)
+                    .where(
+                        AgentToolExecution.user_id == user_id,
+                        AgentToolExecution.workspace_id == workspace_id,
+                        AgentToolExecution.thread_id == thread_id,
+                    )
+                    .order_by(
+                        AgentToolExecution.created_at.desc(),
+                        AgentToolExecution.operation_id.desc(),
+                    )
+                    .limit(limit)
+                )
+            )
+        return [_tool_execution_payload(record) for record in records]
 
 
 class RelationGraphRepository:
@@ -716,6 +855,37 @@ def _normalize_permission_level(value: str) -> str:
     if value not in WORKSPACE_PERMISSION_LEVELS:
         raise ValueError(f"unknown workspace permission level: {value}")
     return value
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return json.loads(json.dumps(value, default=str))
+    return value
+
+
+def _tool_execution_payload(record: AgentToolExecution) -> dict[str, Any]:
+    return {
+        "operation_id": record.operation_id,
+        "call_id": record.call_id,
+        "thread_id": record.thread_id,
+        "user_id": record.user_id,
+        "workspace_id": record.workspace_id,
+        "graph_id": record.graph_id,
+        "tool_name": record.tool_name,
+        "required_permission": record.required_permission,
+        "arguments": dict(record.arguments),
+        "confirmation_status": record.confirmation_status,
+        "execution_status": record.execution_status,
+        "attempts": record.attempts,
+        "output": record.output,
+        "error_code": record.error_code,
+        "error_message": record.error_message,
+        "created_at": record.created_at.isoformat(),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "finished_at": record.finished_at.isoformat() if record.finished_at else None,
+    }
 
 
 def _deduplicated_strings(values: Sequence[str]) -> list[str]:

@@ -28,6 +28,7 @@ def test_graph_tool_registry_exposes_only_current_graph_tools() -> None:
         "load_current_graph_context",
         "get_entity_detail",
         "list_entity_relations",
+        "list_recent_tool_operations",
         "create_entity",
         "merge_entities",
         "split_entity",
@@ -54,6 +55,7 @@ def test_graph_tool_registry_exposes_only_current_graph_tools() -> None:
         "load_current_graph_context",
         "get_entity_detail",
         "list_entity_relations",
+        "list_recent_tool_operations",
     }
 
 
@@ -132,3 +134,50 @@ async def test_graph_read_tool_injects_selected_graph_context() -> None:
         graph_id="graph",
         entity_id="entity",
     )
+
+
+@pytest.mark.asyncio
+async def test_operation_history_tool_is_scoped_to_current_session_identity() -> None:
+    repository = AsyncMock()
+    execution_store = AsyncMock()
+    execution_store.create_operation.return_value = "op_history"
+    execution_store.list_for_thread.return_value = [
+        {"operation_id": "op_1", "tool_name": "create_entity"}
+    ]
+    registry = build_graph_tool_registry(repository, execution_store=execution_store)
+
+    result = await registry.execute(
+        ToolCall(name="list_recent_tool_operations", arguments={"limit": 5}),
+        context=_context(),
+    )
+
+    assert result.ok is True
+    execution_store.list_for_thread.assert_awaited_once_with(
+        user_id="user",
+        workspace_id="workspace",
+        thread_id="thread",
+        limit=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_is_audited_before_and_after_handler() -> None:
+    repository = AsyncMock()
+    repository.create_entity.return_value = {"entity_id": "entity"}
+    execution_store = AsyncMock()
+    execution_store.create_operation.return_value = "op_1"
+    registry = build_graph_tool_registry(repository, execution_store=execution_store)
+
+    result = await registry.execute(
+        ToolCall(name="create_entity", arguments={"name": "角色"}),
+        context=_context(),
+    )
+
+    assert result.ok is True
+    assert result.operation_id == "op_1"
+    execution_store.create_operation.assert_awaited_once()
+    statuses = [
+        call.kwargs.get("execution_status")
+        for call in execution_store.update_operation.await_args_list
+    ]
+    assert statuses == ["running", "succeeded"]

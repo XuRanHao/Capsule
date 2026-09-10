@@ -2,6 +2,7 @@ from sqlalchemy import ForeignKeyConstraint
 
 from capsule.db.base import Base
 from capsule.db.models import (
+    AgentToolExecution,
     GraphAsset,
     GraphAssetBinding,
     LogicalEntity,
@@ -87,3 +88,17 @@ def test_workspace_user_stores_one_permission_level() -> None:
 
     assert "permission_level" in columns
     assert "permissions" not in columns
+
+
+def test_agent_tool_execution_has_session_identity_and_lifecycle_fields() -> None:
+    columns = {column.name for column in AgentToolExecution.__table__.columns}
+
+    assert {
+        "operation_id",
+        "user_id",
+        "workspace_id",
+        "thread_id",
+        "tool_name",
+        "execution_status",
+        "attempts",
+    } <= columns

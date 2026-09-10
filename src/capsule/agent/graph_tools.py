@@ -6,12 +6,18 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from capsule.agent.tools import AgentTool, ToolContext, ToolRegistry
+from capsule.agent.tools import AgentTool, ToolContext, ToolExecutionStore, ToolRegistry
 from capsule.db.repositories import RelationGraphRepository
 
 
 class _NoArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ListToolOperationsArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(default=20, ge=1, le=100)
 
 
 class EntityIdArguments(BaseModel):
@@ -76,7 +82,10 @@ class RemoveRelationArguments(BaseModel):
     relation_id: str = Field(min_length=1, max_length=128)
 
 
-def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegistry:
+def build_graph_tool_registry(
+    repository: RelationGraphRepository,
+    execution_store: ToolExecutionStore | None = None,
+) -> ToolRegistry:
     """Register only tools that operate inside the user-selected graph."""
 
     def graph_id(context: ToolContext) -> str:
@@ -104,6 +113,18 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             workspace_id=context.workspace_id,
             graph_id=graph_id(context),
             entity_id=args.entity_id,
+        )
+
+    async def list_operations(
+        args: ListToolOperationsArguments, context: ToolContext
+    ) -> list[dict[str, Any]]:
+        if execution_store is None:
+            raise ValueError("tool execution history is not configured")
+        return await execution_store.list_for_thread(
+            user_id=context.user_id,
+            workspace_id=context.workspace_id,
+            thread_id=context.thread_id,
+            limit=args.limit,
         )
 
     async def create(args: CreateEntityArguments, context: ToolContext) -> dict[str, Any]:
@@ -176,6 +197,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="读取当前选中图谱的实体、关系和叙事背景。",
             args_schema=_NoArguments,
             handler=load_context,
+            timeout_seconds=3.0,
             required_permission="graph:read",
         ),
         AgentTool(
@@ -183,6 +205,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="读取指定实体及其关联素材。",
             args_schema=EntityIdArguments,
             handler=get_entity,
+            timeout_seconds=3.0,
             required_permission="graph:read",
         ),
         AgentTool(
@@ -190,6 +213,15 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="读取指定实体的全部关系。",
             args_schema=EntityIdArguments,
             handler=list_relations,
+            timeout_seconds=3.0,
+            required_permission="graph:read",
+        ),
+        AgentTool(
+            name="list_recent_tool_operations",
+            description="读取当前用户在本次会话中的工具调用记录。",
+            args_schema=ListToolOperationsArguments,
+            handler=list_operations,
+            timeout_seconds=3.0,
             required_permission="graph:read",
         ),
     ]
@@ -199,6 +231,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="在当前图谱中创建逻辑实体。",
             args_schema=CreateEntityArguments,
             handler=create,
+            timeout_seconds=5.0,
             required_permission="graph:write",
         ),
         AgentTool(
@@ -206,6 +239,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="合并实体并迁移其关联素材和关系。",
             args_schema=MergeEntitiesArguments,
             handler=merge,
+            timeout_seconds=10.0,
             requires_confirmation=True,
             required_permission="graph:destructive",
         ),
@@ -214,6 +248,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="拆分实体并按指定清单重新分配素材。",
             args_schema=SplitEntityArguments,
             handler=split,
+            timeout_seconds=10.0,
             requires_confirmation=True,
             required_permission="graph:destructive",
         ),
@@ -222,6 +257,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="删除当前图谱中的实体及其绑定和关系。",
             args_schema=EntityIdArguments,
             handler=delete,
+            timeout_seconds=5.0,
             requires_confirmation=True,
             required_permission="graph:destructive",
         ),
@@ -230,6 +266,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="将图谱中的素材移动到指定实体。",
             args_schema=MoveAssetArguments,
             handler=move_asset,
+            timeout_seconds=5.0,
             required_permission="graph:write",
         ),
         AgentTool(
@@ -237,6 +274,7 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="创建父实体并建立父子层级关系。",
             args_schema=CreateParentRelationArguments,
             handler=create_parent,
+            timeout_seconds=5.0,
             required_permission="graph:write",
         ),
         AgentTool(
@@ -244,8 +282,9 @@ def build_graph_tool_registry(repository: RelationGraphRepository) -> ToolRegist
             description="删除当前图谱中的一条实体关系。",
             args_schema=RemoveRelationArguments,
             handler=remove_relation,
+            timeout_seconds=5.0,
             requires_confirmation=True,
             required_permission="graph:destructive",
         ),
     ]
-    return ToolRegistry(read_tools + write_tools)
+    return ToolRegistry(read_tools + write_tools, execution_store=execution_store)

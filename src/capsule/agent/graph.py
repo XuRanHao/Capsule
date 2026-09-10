@@ -118,11 +118,24 @@ def build_agent_graph(
                 }
             )
         if any(result["needs_confirmation"] for result in results):
+            operation_ids = {
+                result["call_id"]: result.get("operation_id") for result in results
+            }
+            pending_plan = plan_data.model_copy(
+                update={
+                    "tool_calls": [
+                        call.model_copy(
+                            update={"operation_id": operation_ids.get(call.call_id)}
+                        )
+                        for call in plan_data.tool_calls
+                    ]
+                }
+            )
             return {
                 "last_tool_results": results,
                 "tool_history": history,
                 "messages": tool_messages,
-                "pending_action": plan_data.model_dump(mode="json"),
+                "pending_action": pending_plan.model_dump(mode="json"),
                 "approved_action": None,
                 "response": "该操作需要用户确认后才能执行。",
                 "status": "awaiting_confirmation",

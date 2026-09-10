@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import BaseModel
@@ -188,6 +189,46 @@ async def test_runtime_loads_user_permissions_for_each_request() -> None:
     assert result.status == "completed"
     assert result.tool_history[0]["ok"] is True
     assert calls == [("user-a", "workspace-a")]
+
+
+@pytest.mark.asyncio
+async def test_confirmation_keeps_operation_id_for_resume() -> None:
+    execution_store = AsyncMock()
+    execution_store.create_operation.return_value = "op_confirm"
+    execution_store.get_operation.return_value = {"execution_status": "awaiting_confirmation"}
+    handler = AsyncMock(return_value="done")
+    runtime = create_agent_runtime(
+        planner=DirectWritePlanner(),
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="echo",
+                    description="confirmed operation",
+                    args_schema=EchoArgs,
+                    handler=handler,
+                    requires_confirmation=True,
+                )
+            ],
+            execution_store=execution_store,
+        ),
+    )
+    request = AgentRequest(
+        thread_id="thread-operation-id",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="执行操作",
+    )
+
+    pending = await runtime.invoke(request)
+    assert pending.status == "awaiting_confirmation"
+    assert pending.pending_action is not None
+    assert pending.pending_action["tool_calls"][0]["operation_id"] == "op_confirm"
+
+    resumed = await runtime.invoke(
+        request.model_copy(update={"message": "确认", "confirmation": True})
+    )
+    assert resumed.status == "completed"
+    handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio

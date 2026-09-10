@@ -12,6 +12,7 @@ class ToolCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     call_id: str = Field(default_factory=lambda: f"call_{uuid4().hex}", min_length=1)
+    operation_id: str | None = Field(default=None, min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
 
