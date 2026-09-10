@@ -198,13 +198,6 @@ class Settings(BaseSettings):
     cluster_auto_recluster_new_ratio: float = Field(default=0.3, gt=0.0, le=1.0)
     cluster_auto_recluster_minimum_new_count: int = Field(default=20, ge=1)
 
-    relation_incremental_entity_recall_similarity_threshold: float = Field(
-        default=0.72,
-        ge=-1.0,
-        le=1.0,
-    )
-    relation_incremental_entity_recall_top_k: int = Field(default=3, ge=1, le=20)
-
     search_channel_top_k_multiplier: int = Field(default=3, ge=1)
     search_channel_top_k_cap: int = Field(default=100, ge=1)
     search_candidate_cap: int = Field(default=300, ge=1)

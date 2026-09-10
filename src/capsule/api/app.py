@@ -12,7 +12,6 @@ from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
 from capsule.api.clusters import router as cluster_runs_router
 from capsule.api.imports import router as imports_router
-from capsule.api.relation_graphs import router as relation_graphs_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
@@ -21,7 +20,6 @@ from capsule.db.repositories import (
     ClusterRepository,
     CurrentClusterRepository,
     EmbeddingRepository,
-    RelationGraphRepository,
 )
 from capsule.db.session import Database
 from capsule.media.model_image import ModelImageCache
@@ -37,7 +35,6 @@ from capsule.pipeline.incremental_clustering import (
     IncrementalClusterService,
 )
 from capsule.pipeline.processing_task_service import BrowserProcessingTaskSubmissionService
-from capsule.pipeline.relation_graph_service import RelationGraphService
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.pipeline.workspace_clear import LibraryClearService
@@ -64,8 +61,6 @@ def create_app(
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
-    relation_graph_service: RelationGraphService | None = None,
-    entity_hierarchy_checkpointer: Any | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -84,7 +79,6 @@ def create_app(
             or asset_repository is not None
             or library_clear_service is not None
             or workspace_service is not None
-            or relation_graph_service is not None
         ):
             app.state.search_service = search_service
             app.state.cluster_service = cluster_service
@@ -95,8 +89,6 @@ def create_app(
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
             app.state.workspace_service = workspace_service
-            app.state.relation_graph_service = relation_graph_service
-            app.state.entity_hierarchy_checkpointer = entity_hierarchy_checkpointer
             yield
             return
 
@@ -112,7 +104,6 @@ def create_app(
         current_cluster_repo = CurrentClusterRepository(database)
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
-        relation_graph_repository = RelationGraphRepository(database)
         vectors = MilvusVectorStore(resolved_settings)
         pipeline_runner = PipelineRunner(
             settings=resolved_settings,
@@ -162,7 +153,6 @@ def create_app(
             )
             app.state.search_service = None
             app.state.cluster_service = None
-            app.state.relation_graph_service = None
             app.state.import_service = BrowserImportService(
                 settings=resolved_settings,
                 repository=asset_repo,
@@ -235,33 +225,6 @@ def create_app(
             model_client=embedding_client,
         )
         app.state.cluster_service = cluster_service_instance
-        hierarchy_checkpointer = entity_hierarchy_checkpointer
-        owned_checkpointer_context: Any | None = None
-        if hierarchy_checkpointer is None:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-            owned_checkpointer_context = AsyncPostgresSaver.from_conn_string(
-                _hierarchy_checkpoint_url(resolved_settings.database_url)
-            )
-            hierarchy_checkpointer = await owned_checkpointer_context.__aenter__()
-            await hierarchy_checkpointer.setup()
-        relation_graph_service_instance = RelationGraphService(
-            embedding_repository=embedding_repository,
-            understanding_service=understanding_service,
-            model_client=embedding_client,
-            current_cluster_repository=current_cluster_repo,
-            relation_repository=relation_graph_repository,
-            vector_store=vectors,
-            incremental_entity_recall_similarity_threshold=(
-                resolved_settings.relation_incremental_entity_recall_similarity_threshold
-            ),
-            incremental_entity_recall_top_k=(
-                resolved_settings.relation_incremental_entity_recall_top_k
-            ),
-            hierarchy_checkpointer=hierarchy_checkpointer,
-        )
-        app.state.relation_graph_service = relation_graph_service_instance
-        app.state.entity_hierarchy_checkpointer = hierarchy_checkpointer
         assignment_threshold = resolved_settings.cluster_incremental_assignment_threshold
         incremental_coordinator = IncrementalClusterCoordinator(
             settings=resolved_settings,
@@ -275,7 +238,6 @@ def create_app(
             ),
             repository=current_cluster_repo,
             cluster_runner=cluster_service_instance,
-            relation_graph_updater=relation_graph_service_instance,
         )
         app.state.incremental_cluster_coordinator = incremental_coordinator
         app.state.import_service = BrowserImportService(
@@ -304,8 +266,6 @@ def create_app(
             await embedding_client.close()
             if durable_task_supervisor is not None:
                 await durable_task_supervisor.close()
-            if owned_checkpointer_context is not None:
-                await owned_checkpointer_context.__aexit__(None, None, None)
             await database.dispose()
 
     logging.basicConfig(
@@ -336,7 +296,6 @@ def create_app(
     application.include_router(cluster_runs_router)
     application.include_router(imports_router)
     application.include_router(workspaces_router)
-    application.include_router(relation_graphs_router)
 
     @application.get("/health")
     async def health() -> dict[str, Any]:
@@ -365,12 +324,5 @@ def create_app(
         }
 
     return application
-
-
-def _hierarchy_checkpoint_url(database_url: str) -> str:
-    """Convert SQLAlchemy's asyncpg URL to the Psycopg URL used by LangGraph."""
-
-    return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
-
 
 app = create_app()

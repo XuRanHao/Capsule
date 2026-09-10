@@ -115,15 +115,6 @@ class FakeClusterService:
         return SimpleNamespace(status=ClusterRunStatus.COMPLETED)
 
 
-class FakeRelationGraphRebuilder:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    async def build(self, **values: object) -> dict[str, object]:
-        self.calls.append(values)
-        return {}
-
-
 @pytest.mark.asyncio
 async def test_cluster_api_submits_one_default_type_and_exposes_polling_routes() -> None:
     repository = FakeClusterRepository()
@@ -308,32 +299,3 @@ async def test_cluster_api_accepts_fusion_weight_endpoints(native_content_weight
 
     assert response.status_code == 202
     assert service.calls[0]["native_content_weight"] == native_content_weight
-
-
-@pytest.mark.asyncio
-async def test_user_subject_clustering_rebuilds_relation_graph_after_completion() -> None:
-    repository = FakeClusterRepository()
-    service = FakeClusterService(repository)
-    rebuilder = FakeRelationGraphRebuilder()
-    app = create_app(
-        settings=Settings(),
-        cluster_service=service,  # type: ignore[arg-type]
-        cluster_repository=repository,  # type: ignore[arg-type]
-        relation_graph_service=rebuilder,  # type: ignore[arg-type]
-    )
-
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test",
-        ) as client:
-            response = await client.post(
-                "/api/v1/cluster-runs",
-                json={
-                    "workspace_id": "workspace_api_test",
-                    "embedding_type": "subject_content",
-                },
-            )
-
-    assert response.status_code == 202
-    assert rebuilder.calls == []

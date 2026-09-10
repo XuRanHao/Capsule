@@ -14,7 +14,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 from capsule.config import Settings
 from capsule.db.repositories import ClusterBootstrapState
@@ -114,22 +114,6 @@ class FullClusterRunner(Protocol):
         optimize_parameters: bool = False,
         trigger: str = "user",
     ) -> object: ...
-
-
-class IncrementalRelationGraphUpdater(Protocol):
-    async def update_assets(
-        self,
-        *,
-        workspace_id: str,
-        asset_ids: Sequence[str],
-        affected_cluster_ids: Sequence[str],
-    ) -> Any: ...
-
-    async def build(
-        self,
-        *,
-        workspace_id: str,
-    ) -> dict[str, Any]: ...
 
 
 @dataclass(slots=True, frozen=True)
@@ -412,13 +396,11 @@ class IncrementalClusterCoordinator:
         assignment_service: IncrementalClusterService,
         repository: ClusterBootstrapRepository,
         cluster_runner: FullClusterRunner,
-        relation_graph_updater: IncrementalRelationGraphUpdater | None = None,
     ) -> None:
         self._settings = settings
         self._assignment_service = assignment_service
         self._repository = repository
         self._cluster_runner = cluster_runner
-        self._relation_graph_updater = relation_graph_updater
         self._semaphore = asyncio.Semaphore(settings.cluster_bootstrap_concurrency)
         self._running_keys: set[tuple[str, EmbeddingType]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -452,23 +434,6 @@ class IncrementalClusterCoordinator:
                 self._settings.cluster_auto_recluster_minimum_new_count
             ),
         )
-        if (
-            embedding_type is EmbeddingType.SUBJECT_CONTENT
-            and self._relation_graph_updater is not None
-        ):
-            try:
-                await self._relation_graph_updater.update_assets(
-                    workspace_id=workspace_id,
-                    asset_ids=asset_ids,
-                    affected_cluster_ids=tuple(
-                        dict.fromkeys(item.cluster_id for item in assignment.assignments)
-                    ),
-                )
-            except Exception:
-                logger.exception(
-                    "incremental relationship update failed for workspace=%s",
-                    workspace_id,
-                )
         key = (workspace_id, embedding_type)
         scheduled = (
             decision.should_bootstrap

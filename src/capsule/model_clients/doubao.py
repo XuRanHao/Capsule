@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import math
@@ -24,17 +23,6 @@ from capsule.features import (
 )
 from capsule.model_clients.concurrency import AsyncCallPool
 from capsule.model_clients.structured_output import responses_json_schema_format
-from capsule.relation_graph import (
-    AssetEntityAssignmentRequest,
-    AssetEntityAssignmentResolution,
-    CreatedGroupParent,
-    EntityStructureOperationResolution,
-    EntityStructureRequest,
-    GroupEntityOperation,
-    MergeEntityOperation,
-    ReusedGroupParent,
-    SeparateEntityOperation,
-)
 from capsule.schemas import AssetFeatures, AssetUnderstanding, ClusterSummary, EmbeddingResult
 from capsule.search.models import QueryEnhancement, SearchDimensionSuggestionResponse
 
@@ -45,7 +33,6 @@ _ASSET_UNDERSTANDING_RESPONSE_FORMAT = responses_json_schema_format(
     AssetUnderstanding,
     name="asset_understanding",
 )
-_ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE = 10
 _ASSET_FEATURE_NAMES = frozenset(item.value for item in FEATURE_DIMENSION_SCOPES)
 
 
@@ -76,85 +63,6 @@ class DoubaoConfigurationError(RuntimeError):
 
 class DoubaoResponseError(RuntimeError):
     pass
-
-
-def _validate_entity_structure_round(
-    request: EntityStructureRequest,
-    resolution: EntityStructureOperationResolution,
-) -> None:
-    """Validate references and exact incoming-Entity coverage for one Agent round."""
-
-    current_ids = {node.entity_id for node in request.current_graph.nodes}
-    incoming_ids = {node.entity_id for node in request.incoming_entities}
-    known_ids = current_ids | incoming_ids
-    incoming_occurrences: dict[str, int] = {entity_id: 0 for entity_id in incoming_ids}
-
-    def reference(entity_id: str, *, allow_current: bool = True) -> None:
-        allowed_ids = known_ids if allow_current else incoming_ids
-        if entity_id not in allowed_ids:
-            raise DoubaoResponseError(
-                f"entity structure operation references unknown entity_id: {entity_id}"
-            )
-        if entity_id in incoming_occurrences:
-            incoming_occurrences[entity_id] += 1
-
-    for operation in resolution.operations:
-        if isinstance(operation, MergeEntityOperation):
-            for entity_id in operation.source_entity_ids:
-                reference(entity_id)
-            if not incoming_ids.intersection(operation.source_entity_ids):
-                raise DoubaoResponseError("merge must process at least one incoming Entity")
-        elif isinstance(operation, SeparateEntityOperation):
-            for entity_id in operation.entity_ids:
-                reference(entity_id, allow_current=False)
-        elif isinstance(operation, GroupEntityOperation):
-            if isinstance(operation.parent, ReusedGroupParent):
-                reference(operation.parent.parent_entity_id)
-            elif not isinstance(operation.parent, CreatedGroupParent):  # pragma: no cover
-                raise DoubaoResponseError("unsupported group parent mode")
-            for child in operation.children:
-                reference(child.child_entity_id)
-
-    missing_ids = sorted(
-        entity_id for entity_id, count in incoming_occurrences.items() if count == 0
-    )
-    repeated_ids = sorted(
-        entity_id for entity_id, count in incoming_occurrences.items() if count > 1
-    )
-    if missing_ids:
-        raise DoubaoResponseError(
-            f"entity structure response omitted incoming entity_ids: {missing_ids}"
-        )
-    if repeated_ids:
-        raise DoubaoResponseError(
-            f"entity structure response processed incoming entity_ids repeatedly: {repeated_ids}"
-        )
-
-
-def _normalize_entity_structure_resolution(
-    request: EntityStructureRequest,
-    resolution: EntityStructureOperationResolution,
-) -> EntityStructureOperationResolution:
-    """Downgrade an impossible one-child virtual group without losing valid operations."""
-
-    incoming_ids = {node.entity_id for node in request.incoming_entities}
-    operations: list[Any] = []
-    for operation in resolution.operations:
-        if (
-            isinstance(operation, GroupEntityOperation)
-            and isinstance(operation.parent, CreatedGroupParent)
-            and len(operation.children) < 2
-        ):
-            child_ids = [
-                child.child_entity_id
-                for child in operation.children
-                if child.child_entity_id in incoming_ids
-            ]
-            if child_ids:
-                operations.append(SeparateEntityOperation(type="separate", entity_ids=child_ids))
-            continue
-        operations.append(operation)
-    return EntityStructureOperationResolution(operations=operations)
 
 
 class DoubaoClient:
@@ -358,184 +266,6 @@ class DoubaoClient:
                 max_output_tokens=self._settings.understanding_max_output_tokens,
                 model=self._settings.search_query_model,
             )
-
-    async def assign_assets_to_entities(
-        self,
-        assignments: Sequence[Mapping[str, Any]],
-    ) -> AssetEntityAssignmentResolution:
-        """Assign each unclustered Asset to exactly one recalled Entity or to no Entity."""
-
-        system = {
-            "role": "system",
-            "content": (
-                "为每个 asset 从其 candidates 中选择唯一可归属的 Entity，或明确返回 null。"
-                "依据包括 asset.metadata、asset.content_description、asset.content_subject，以及"
-                "候选 Entity 的 name 和 semantic。综合元数据与内容理解二者的实际语义；元数据"
-                "明确揭示直接归属时优先采用。目录路径按语义层级理解：越具体且与 Entity 语义"
-                "对应的层级，越能支持归属；共同上层路径通常只说明共享背景或归属范围，不能自然"
-                "推导为同级 Entity 的归属。正例：路径中的人物与道具层级可支持该人物的道具"
-                "Entity；场景与具体区域层级可支持该区域 Entity；物件与部件层级可支持该部件"
-                "Entity。反例：共享同一人物上层路径，不表示服装素材归属武器 Entity；共享同一"
-                "场景上层路径，不表示一个区域素材归属另一个同级区域 Entity；纯项目或整理目录"
-                "也不直接证明内容归属。每个 asset 只能输出一项 assignment，entity_id 只能取"
-                "该 asset.candidates 中的 entity_id，无法可靠判断时设为 null。reason 必须说明"
-                "选择或拒绝的关键证据；description 可简要描述该归属。输出 JSON："
-                '{"assignments":[{"asset_id":"","entity_id":"候选ID或null",'
-                '"reason":"","description":""}]}。'
-            ),
-        }
-        batches = [
-            list(assignments[offset : offset + _ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE])
-            for offset in range(0, len(assignments), _ASSET_ENTITY_ASSIGNMENT_BATCH_SIZE)
-        ]
-        if not batches:
-            return AssetEntityAssignmentResolution()
-
-        async def resolve_batch(
-            batch: list[Mapping[str, Any]],
-        ) -> AssetEntityAssignmentResolution:
-            request = AssetEntityAssignmentRequest.model_validate({"assignments": batch})
-            resolution = await self._deepseek_json(
-                messages=[
-                    system,
-                    {
-                        "role": "user",
-                        "content": request.model_dump_json(),
-                    },
-                ],
-                output_type=AssetEntityAssignmentResolution,
-                pool=self.capsule_pool,
-                timeout_seconds=self._settings.understanding_timeout_seconds,
-                max_output_tokens=max(
-                    self._settings.understanding_max_output_tokens,
-                    4096,
-                ),
-                model=self._settings.search_query_model,
-            )
-            try:
-                request.validate_resolution(resolution)
-            except ValueError as exc:
-                raise DoubaoResponseError(f"invalid Asset-to-Entity assignment: {exc}") from exc
-            return resolution
-
-        resolutions = await asyncio.gather(*(resolve_batch(batch) for batch in batches))
-        return AssetEntityAssignmentResolution(
-            assignments=[
-                assignment for resolution in resolutions for assignment in resolution.assignments
-            ]
-        )
-
-    async def generate_entity_structure_operations(
-        self,
-        *,
-        current_graph: Mapping[str, Any],
-        incoming_entities: Sequence[Mapping[str, Any]],
-        workspace_tree: str,
-        repair_guidance: str | None = None,
-    ) -> EntityStructureOperationResolution:
-        """Generate one validated round against a retrieved related hierarchy subgraph."""
-
-        request = EntityStructureRequest.model_validate(
-            {
-                "workspace_tree": workspace_tree,
-                "current_graph": dict(current_graph),
-                "incoming_entities": list(incoming_entities),
-            }
-        )
-        system = {
-            "role": "system",
-            "content": (
-                "增量整理 Entity 结构。结合 Entity 的 name、semantic 与 workspace_tree 理解项目"
-                "语义；目录树提供上下文和归属线索。current_graph 不是全图，而是围绕本轮"
-                "incoming_entities 检索得到的完整相关实体层级子图：其中每棵命中的实体树均包含"
-                "全部节点和已接受的 hierarchy 边。只能依据此子图、本轮节点和目录上下文决策，"
-                "不能假设未提供的 Entity 或关系存在。incoming_entities 最多 10 个。仅当两个"
-                "节点的语义身份、抽象层级和用途都基本可互换时 merge；没有结构关系时 separate；"
-                "共享明确的实际主体或上位语义、同时又应保留各自差异时 group。共享主体不等于"
-                "可合并：状态、时期、版本、组成部分或功能角色不同的节点保留区别；地点与其"
-                "内部物件、人物与其装备等不同语义层级也不合并。group 可复用现有父节点或创建"
-                "新的虚拟父节点，并自然描述每个 child 与 parent 的关系。"
-                "正例：同一人物的不同状态、时期或版本可归入该人物；人物的服装、武器和动作设定可"
-                "围绕该人物组织；同一地点的不同区域可归入该地点；同一装置的不同部件或工作状态可"
-                "归入该装置。反例：仅画风相似、题材相近或同属宽泛类别，不足以合并或创建上层节点；"
-                "“素材”“确认候选”“测试”等整理目录不是实际语义节点；名称相似但语义指向不同对象"
-                "时保持分离。例子用于说明判断方式，不限定 Entity 类型或关系名称。"
-                "每个 incoming entity_id 选择一次操作；新建父节点至少包含两个 child。只输出增量"
-                "operations，不重写 current_graph，不输出 reason 或解释。新父节点使用 virtual:"
-                "开头的临时 ID，后端会在下一轮继续处理。输出 JSON 格式为"
-                '{"operations":['
-                '{"type":"merge","source_entity_ids":[""],'
-                '"canonical_entity_id":"","name":"","semantic":""},'
-                '{"type":"separate","entity_ids":[""]},'
-                '{"type":"group","parent":{"mode":"reuse",'
-                '"parent_entity_id":""},"children":[{"child_entity_id":"",'
-                '"relation":"","description":""}]},'
-                '{"type":"group","parent":{"mode":"create",'
-                '"temporary_parent_id":"virtual:group_name","name":"",'
-                '"semantic":""},"children":[{"child_entity_id":"",'
-                '"relation":"","description":""}]}'
-                "]}。"
-            ),
-        }
-        messages = [
-            system,
-            {
-                "role": "user",
-                "content": request.model_dump_json(),
-            },
-        ]
-        if repair_guidance:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "后端拒绝了上一轮结构操作。请依据以下校验错误重新决策，"
-                        "仍只输出完整 operations JSON：\n"
-                        f"{repair_guidance[:2000]}"
-                    ),
-                }
-            )
-        for attempt in range(3):
-            resolution: EntityStructureOperationResolution | None = None
-            try:
-                resolution = await self._deepseek_json(
-                    messages=messages,
-                    output_type=EntityStructureOperationResolution,
-                    pool=self.capsule_pool,
-                    timeout_seconds=self._settings.understanding_timeout_seconds,
-                    max_output_tokens=max(
-                        self._settings.understanding_max_output_tokens,
-                        4096,
-                    ),
-                    model=self._settings.search_query_model,
-                )
-                resolution = _normalize_entity_structure_resolution(request, resolution)
-                _validate_entity_structure_round(request, resolution)
-            except (DoubaoResponseError, ValidationError) as exc:
-                if attempt == 2:
-                    raise
-                if resolution is not None:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": resolution.model_dump_json(),
-                        }
-                    )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"上一输出未通过结构校验：{exc}。请重新输出 operations，为每个 "
-                            "incoming entity_id 选择一次 merge、group 或 separate。创建新的父"
-                            "Entity 时放入至少两个具有共同实际主体的 child；只有一个 child 时"
-                            "复用合适的现有父 Entity，或使用 separate。"
-                        ),
-                    }
-                )
-                continue
-            assert resolution is not None
-            return resolution
-        raise AssertionError("unreachable")
 
     async def enhance_search_query(
         self,

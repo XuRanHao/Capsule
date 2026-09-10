@@ -1,7 +1,7 @@
 """Asynchronous front-end API for one Embedding Type clustering run."""
 
 import logging
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
@@ -173,14 +173,6 @@ class CurrentClusterProcessorProtocol(Protocol):
     ) -> object: ...
 
 
-class RelationGraphRebuilder(Protocol):
-    async def build(
-        self,
-        *,
-        workspace_id: str,
-    ) -> dict[str, Any]: ...
-
-
 def _cluster_service(request: Request) -> ClusterService:
     service = getattr(request.app.state, "cluster_service", None)
     if service is None:
@@ -308,16 +300,11 @@ async def list_current_cluster_members(
 async def patch_current_cluster(
     cluster_id: str,
     payload: CurrentClusterPatch,
-    background_tasks: BackgroundTasks,
     request: Request,
     workspace_id: str = Query(min_length=1, max_length=64),
 ) -> CurrentClusterRecord:
     repository = _current_cluster_repository(request)
     try:
-        previous = await repository.get_cluster(
-            cluster_id=cluster_id,
-            workspace_id=workspace_id,
-        )
         updated: CurrentClusterRecord | None = None
         if payload.mode is not None:
             updated = await repository.set_mode(
@@ -333,12 +320,6 @@ async def patch_current_cluster(
             )
         if updated is None:  # pragma: no cover - guarded by request validation
             raise ValueError("current cluster patch is empty")
-        if _should_refresh_entity_hierarchy(previous, updated):
-            _queue_entity_hierarchy_refresh(
-                background_tasks=background_tasks,
-                request=request,
-                workspace_id=workspace_id,
-            )
         return updated
     except ValueError as exc:
         raise _current_cluster_not_found(cluster_id) from exc
@@ -352,16 +333,11 @@ async def patch_current_cluster(
 async def attach_current_cluster_members(
     cluster_id: str,
     payload: CurrentClusterMemberMutation,
-    background_tasks: BackgroundTasks,
     request: Request,
     workspace_id: str = Query(min_length=1, max_length=64),
 ) -> CurrentClusterMemberMutationResponse:
     repository = _current_cluster_repository(request)
     try:
-        cluster = await repository.get_cluster(
-            cluster_id=cluster_id,
-            workspace_id=workspace_id,
-        )
         await repository.attach_members(
             cluster_id=cluster_id,
             workspace_id=workspace_id,
@@ -370,12 +346,6 @@ async def attach_current_cluster_members(
         )
     except ValueError as exc:
         raise _current_cluster_mutation_error(cluster_id, exc) from exc
-    if _is_entity_hierarchy_cluster(cluster):
-        _queue_entity_hierarchy_refresh(
-            background_tasks=background_tasks,
-            request=request,
-            workspace_id=workspace_id,
-        )
     return CurrentClusterMemberMutationResponse(
         cluster_id=cluster_id,
         asset_ids=payload.asset_ids,
@@ -419,12 +389,6 @@ async def detach_current_cluster_members(
             embedding_type=EmbeddingType(cluster.embedding_type),
             asset_ids=payload.asset_ids,
             cluster_id=cluster_id,
-        )
-    if _is_entity_hierarchy_cluster(cluster):
-        _queue_entity_hierarchy_refresh(
-            background_tasks=background_tasks,
-            request=request,
-            workspace_id=workspace_id,
         )
     return CurrentClusterMemberMutationResponse(
         cluster_id=cluster_id,
@@ -672,53 +636,6 @@ async def _execute_cluster_run(
         distance_threshold=distance_threshold,
         native_content_weight=native_content_weight,
     )
-
-
-def _is_entity_hierarchy_cluster(cluster: CurrentClusterRecord) -> bool:
-    return (
-        cluster.embedding_type == EmbeddingType.SUBJECT_CONTENT.value
-        and cluster.mode in {ClusterMode.RESIDENT_OPEN, ClusterMode.RESIDENT_MANUAL}
-    )
-
-
-def _should_refresh_entity_hierarchy(
-    previous: CurrentClusterRecord,
-    updated: CurrentClusterRecord,
-) -> bool:
-    return _is_entity_hierarchy_cluster(previous) or _is_entity_hierarchy_cluster(updated)
-
-
-def _queue_entity_hierarchy_refresh(
-    *,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    workspace_id: str,
-) -> None:
-    rebuilder = cast(
-        RelationGraphRebuilder | None,
-        getattr(request.app.state, "relation_graph_service", None),
-    )
-    if rebuilder is not None:
-        background_tasks.add_task(
-            _refresh_entity_hierarchy,
-            rebuilder=rebuilder,
-            workspace_id=workspace_id,
-        )
-
-
-async def _refresh_entity_hierarchy(
-    *,
-    rebuilder: RelationGraphRebuilder,
-    workspace_id: str,
-) -> None:
-    try:
-        await rebuilder.build(workspace_id=workspace_id)
-    except Exception as exc:
-        logger.warning(
-            "entity hierarchy refresh failed for workspace=%s: %s",
-            workspace_id,
-            str(exc) or type(exc).__name__,
-        )
 
 
 async def _process_detached_cluster_members(

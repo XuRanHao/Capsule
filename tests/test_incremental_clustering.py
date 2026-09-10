@@ -168,20 +168,6 @@ class FakeClusterRunner:
         return SimpleNamespace(status=ClusterRunStatus.COMPLETED)
 
 
-class FakeRelationGraphUpdater:
-    def __init__(self) -> None:
-        self.incremental_calls: list[dict[str, object]] = []
-        self.rebuild_calls: list[dict[str, object]] = []
-
-    async def update_assets(self, **values: object) -> object:
-        self.incremental_calls.append(values)
-        return object()
-
-    async def build(self, **values: object) -> dict[str, object]:
-        self.rebuild_calls.append(values)
-        return {}
-
-
 class FakeVectorStore:
     def __init__(self, vectors: Mapping[str, list[float]]) -> None:
         self.vectors = dict(vectors)
@@ -648,7 +634,6 @@ async def test_coordinator_reclusters_when_new_subject_sample_ratio_is_large() -
         )
     )
     runner = FakeClusterRunner()
-    graph_updater = FakeRelationGraphUpdater()
     coordinator = IncrementalClusterCoordinator(
         settings=Settings(
             cluster_auto_recluster_new_ratio=0.3,
@@ -660,7 +645,6 @@ async def test_coordinator_reclusters_when_new_subject_sample_ratio_is_large() -
         ),
         repository=repository,
         cluster_runner=runner,
-        relation_graph_updater=graph_updater,
     )
 
     result = await coordinator.process_assets(
@@ -675,11 +659,3 @@ async def test_coordinator_reclusters_when_new_subject_sample_ratio_is_large() -
     assert runner.calls == [
         ("workspace_a", EmbeddingType.SUBJECT_CONTENT, "automatic_recluster")
     ]
-    assert graph_updater.incremental_calls == [
-        {
-            "workspace_id": "workspace_a",
-            "asset_ids": ["new_asset"],
-            "affected_cluster_ids": (),
-        }
-    ]
-    assert graph_updater.rebuild_calls == []
