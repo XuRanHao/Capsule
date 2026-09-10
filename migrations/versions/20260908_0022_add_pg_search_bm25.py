@@ -15,7 +15,9 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_search")
+    # pg_search declares pgvector as a dependency; CASCADE installs it on a
+    # clean database before the BM25 index is created.
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE")
     op.execute(
         """
         CREATE INDEX ix_assets_bm25_search
