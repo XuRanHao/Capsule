@@ -35,6 +35,7 @@ def build_agent_graph(
     tools: ToolRegistry,
     memory: AgentMemoryStore,
     checkpointer: BaseCheckpointSaver,
+    tool_permissions: frozenset[str] = frozenset(),
 ):
     """Compile the resumable Agent graph with injected application dependencies."""
 
@@ -98,6 +99,7 @@ def build_agent_graph(
             thread_id=state["thread_id"],
             graph_id=state.get("graph_id"),
             state=state,
+            permissions=tool_permissions,
         )
         results = []
         for call in plan_data.tool_calls:

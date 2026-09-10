@@ -20,6 +20,7 @@ class ToolContext:
     thread_id: str
     graph_id: str | None
     state: Mapping[str, Any]
+    permissions: frozenset[str] = frozenset()
 
 
 ToolHandler = Callable[[BaseModel, ToolContext], Awaitable[Any] | Any]
@@ -34,6 +35,7 @@ class AgentTool:
     timeout_seconds: float = 30.0
     max_attempts: int = 1
     requires_confirmation: bool = False
+    permission: str | None = None
 
 
 class ToolExecutionResult(BaseModel):
@@ -62,6 +64,8 @@ class ToolRegistry:
             raise ValueError(f"duplicate or empty Agent tool name: {tool.name!r}")
         if tool.timeout_seconds <= 0 or tool.max_attempts < 1:
             raise ValueError("tool timeout_seconds must be positive and max_attempts >= 1")
+        if tool.permission is not None and not tool.permission.strip():
+            raise ValueError("tool permission must be non-empty when provided")
         self._tools[tool.name] = tool
 
     def describe(self) -> list[dict[str, Any]]:
@@ -70,6 +74,7 @@ class ToolRegistry:
                 "name": tool.name,
                 "description": tool.description,
                 "requires_confirmation": tool.requires_confirmation,
+                "permission": tool.permission,
                 "args_schema": tool.args_schema.model_json_schema(),
             }
             for tool in self._tools.values()
@@ -90,6 +95,16 @@ class ToolRegistry:
                 ok=False,
                 error_code="unknown_tool",
                 error_message="tool is not registered",
+            )
+        if tool.permission is not None and not _has_permission(
+            context.permissions, tool.permission
+        ):
+            return ToolExecutionResult(
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                error_code="permission_denied",
+                error_message="the current session is not allowed to use this tool",
             )
         if tool.requires_confirmation and not confirmed:
             return ToolExecutionResult(
@@ -136,3 +151,17 @@ class ToolRegistry:
             error_message=last_error,
             attempts=tool.max_attempts,
         )
+
+
+def _has_permission(granted: frozenset[str], required: str) -> bool:
+    """Apply the small server-side graph permission hierarchy."""
+
+    if "*" in granted or "graph:admin" in granted:
+        return True
+    if required in granted:
+        return True
+    if required == "graph:read":
+        return "graph:write" in granted or "graph:destructive" in granted
+    if required == "graph:write":
+        return "graph:destructive" in granted
+    return False

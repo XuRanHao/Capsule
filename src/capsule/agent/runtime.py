@@ -21,6 +21,7 @@ class AgentRuntime:
         tools: ToolRegistry | None = None,
         memory: AgentMemoryStore | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
+        tool_permissions: frozenset[str] | None = None,
     ) -> None:
         self._checkpointer = checkpointer or InMemorySaver()
         self._graph = build_agent_graph(
@@ -28,6 +29,7 @@ class AgentRuntime:
             tools=tools or ToolRegistry(),
             memory=memory or NullMemoryStore(),
             checkpointer=self._checkpointer,
+            tool_permissions=tool_permissions or frozenset(),
         )
 
     @property
@@ -70,10 +72,12 @@ def create_agent_runtime(
     tools: ToolRegistry | None = None,
     memory: AgentMemoryStore | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    tool_permissions: frozenset[str] | None = None,
 ) -> AgentRuntime:
     return AgentRuntime(
         planner=planner,
         tools=tools,
         memory=memory,
         checkpointer=checkpointer,
+        tool_permissions=tool_permissions,
     )
