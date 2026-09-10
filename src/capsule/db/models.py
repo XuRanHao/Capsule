@@ -69,6 +69,13 @@ class AgentToolExecution(Base, TimestampMixin):
 
     __tablename__ = "agent_tool_executions"
     __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "workspace_id",
+            "thread_id",
+            "idempotency_key",
+            name="uq_agent_tool_executions_session_idempotency",
+        ),
         Index(
             "ix_agent_tool_executions_session_created",
             "user_id",
@@ -81,6 +88,8 @@ class AgentToolExecution(Base, TimestampMixin):
     operation_id: Mapped[str] = mapped_column(
         String(64), primary_key=True, default=id_factory("op")
     )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     call_id: Mapped[str] = mapped_column(String(128), nullable=False)
     thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
@@ -101,6 +110,8 @@ class AgentToolExecution(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SourceFile(Base, TimestampMixin):

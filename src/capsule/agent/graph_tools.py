@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 from capsule.agent.tools import (
     AgentTool,
@@ -86,6 +86,14 @@ class RemoveRelationArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     relation_id: str = Field(min_length=1, max_length=128)
+
+
+class _JsonObjectOutput(RootModel[dict[str, Any]]):
+    """Top-level contract for graph tools returning one JSON object."""
+
+
+class _JsonObjectListOutput(RootModel[list[dict[str, Any]]]):
+    """Top-level contract for graph tools returning object lists."""
 
 
 def build_graph_tool_registry(
@@ -205,6 +213,9 @@ def build_graph_tool_registry(
             args_schema=_NoArguments,
             handler=load_context,
             timeout_seconds=3.0,
+            output_schema=_JsonObjectOutput,
+            concurrency_mode="parallel",
+            lock_scope="none",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -213,6 +224,9 @@ def build_graph_tool_registry(
             args_schema=EntityIdArguments,
             handler=get_entity,
             timeout_seconds=3.0,
+            output_schema=_JsonObjectOutput,
+            concurrency_mode="parallel",
+            lock_scope="none",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -221,6 +235,9 @@ def build_graph_tool_registry(
             args_schema=EntityIdArguments,
             handler=list_relations,
             timeout_seconds=3.0,
+            output_schema=_JsonObjectListOutput,
+            concurrency_mode="parallel",
+            lock_scope="none",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -229,6 +246,9 @@ def build_graph_tool_registry(
             args_schema=ListToolOperationsArguments,
             handler=list_operations,
             timeout_seconds=3.0,
+            output_schema=_JsonObjectListOutput,
+            concurrency_mode="parallel",
+            lock_scope="none",
             required_permission="graph:read",
         ),
     ]
@@ -239,6 +259,9 @@ def build_graph_tool_registry(
             args_schema=CreateEntityArguments,
             handler=create,
             timeout_seconds=5.0,
+            output_schema=_JsonObjectOutput,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -247,7 +270,10 @@ def build_graph_tool_registry(
             args_schema=MergeEntitiesArguments,
             handler=merge,
             timeout_seconds=10.0,
+            output_schema=_JsonObjectOutput,
             requires_confirmation=True,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -256,7 +282,10 @@ def build_graph_tool_registry(
             args_schema=SplitEntityArguments,
             handler=split,
             timeout_seconds=10.0,
+            output_schema=_JsonObjectOutput,
             requires_confirmation=True,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -265,7 +294,10 @@ def build_graph_tool_registry(
             args_schema=EntityIdArguments,
             handler=delete,
             timeout_seconds=5.0,
+            output_schema=_JsonObjectOutput,
             requires_confirmation=True,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -274,6 +306,9 @@ def build_graph_tool_registry(
             args_schema=MoveAssetArguments,
             handler=move_asset,
             timeout_seconds=5.0,
+            output_schema=_JsonObjectOutput,
+            concurrency_mode="exclusive",
+            lock_scope="asset",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -282,6 +317,9 @@ def build_graph_tool_registry(
             args_schema=CreateParentRelationArguments,
             handler=create_parent,
             timeout_seconds=5.0,
+            output_schema=_JsonObjectOutput,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -290,7 +328,10 @@ def build_graph_tool_registry(
             args_schema=RemoveRelationArguments,
             handler=remove_relation,
             timeout_seconds=5.0,
+            output_schema=_JsonObjectOutput,
             requires_confirmation=True,
+            concurrency_mode="exclusive",
+            lock_scope="graph",
             required_permission="graph:destructive",
         ),
     ]

@@ -47,6 +47,20 @@ class AgentRuntime:
 
     async def invoke(self, request: AgentRequest) -> AgentResponse:
         config = {"configurable": {"thread_id": request.thread_id}}
+        snapshot = await self._graph.aget_state(config)
+        previous = dict(snapshot.values) if snapshot.values else {}
+        # Confirmation/cancellation is a continuation of the turn that
+        # produced the pending action.  A normal message starts a new turn
+        # and therefore clears stale queued calls in the graph state.
+        resumes_pending = bool(previous.get("pending_action")) and (
+            request.confirmation is not None or request.cancel
+        )
+        turn_id = (
+            str(previous.get("turn_id"))
+            if resumes_pending and previous.get("turn_id")
+            else f"turn_{uuid4().hex}"
+        )
+        request_id = request.request_id or f"request_{uuid4().hex}"
         granted_permissions = frozenset()
         if self._permission_loader is not None:
             granted_permissions = frozenset(
@@ -60,13 +74,16 @@ class AgentRuntime:
                 "thread_id": request.thread_id,
                 # A complete runtime invocation is one Agent output round.
                 # Tool loops inside this invocation keep the same turn ID.
-                "turn_id": f"turn_{uuid4().hex}",
+                "turn_id": turn_id,
+                "request_id": request_id,
+                "start_new_turn": not resumes_pending,
                 "user_id": request.user_id,
                 "workspace_id": request.workspace_id,
                 "graph_id": request.graph_id,
                 "granted_permissions": sorted(granted_permissions),
                 "input_message": request.message,
                 "confirmation_response": request.confirmation,
+                "cancel_requested": request.cancel,
                 "max_steps": request.max_steps,
             },
             config=config,
@@ -76,6 +93,7 @@ class AgentRuntime:
             status=state.get("status", "failed"),
             message=state.get("response"),
             pending_action=state.get("pending_action"),
+            pending_tool_calls=list(state.get("pending_tool_calls", [])),
             tool_history=list(state.get("tool_history", [])),
             step_count=int(state.get("step_count", 0)),
         )

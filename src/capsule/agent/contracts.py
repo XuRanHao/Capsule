@@ -40,11 +40,15 @@ class AgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     thread_id: str = Field(min_length=1, max_length=128)
+    # Reuse this value when the same client request is retried over the
+    # network.  The server generates one when omitted.
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
     user_id: str = Field(min_length=1, max_length=128)
     workspace_id: str = Field(min_length=1, max_length=128)
     graph_id: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=20_000)
     confirmation: bool | None = None
+    cancel: bool = False
     max_steps: int = Field(default=8, ge=1, le=32)
 
 
@@ -61,5 +65,6 @@ class AgentResponse(BaseModel):
     ]
     message: str | None = None
     pending_action: dict[str, Any] | None = None
+    pending_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     tool_history: list[dict[str, Any]] = Field(default_factory=list)
     step_count: int = 0

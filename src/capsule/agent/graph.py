@@ -8,7 +8,7 @@ from typing import Protocol
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
-from capsule.agent.contracts import PlanDecision
+from capsule.agent.contracts import PlanDecision, ToolCall
 from capsule.agent.memory import AgentMemoryStore
 from capsule.agent.state import AgentState
 from capsule.agent.tools import ToolContext, ToolRegistry
@@ -60,6 +60,35 @@ def _retain_recent_tool_rounds(
     return [item for item, key in keyed_history if key in retained]
 
 
+def _queued_tool_call(call: ToolCall, *, turn_id: str) -> dict[str, object]:
+    """Serialize one planned call into the server-side execution queue."""
+
+    return {
+        "call_id": call.call_id,
+        "operation_id": call.operation_id,
+        "name": call.name,
+        "turn_id": turn_id,
+        "status": "queued",
+    }
+
+
+def _cancel_queued_calls(
+    calls: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Cancel work that has not started while preserving terminal history."""
+
+    cancelled: list[dict[str, object]] = []
+    for call in calls:
+        item = dict(call)
+        if item.get("status") in {
+            "queued",
+            "awaiting_confirmation",
+        }:
+            item["status"] = "cancelled"
+        cancelled.append(item)
+    return cancelled
+
+
 def build_agent_graph(
     *,
     planner: AgentPlanner,
@@ -83,16 +112,47 @@ def build_agent_graph(
             "error": None,
             "step_count": state.get("step_count", 0) + 1,
             "status": "planning",
+            "start_new_turn": False,
         }
+        context = ToolContext(
+            user_id=state["user_id"],
+            workspace_id=state["workspace_id"],
+            thread_id=state["thread_id"],
+            graph_id=state.get("graph_id"),
+            state=state,
+            granted_permissions=frozenset(state.get("granted_permissions", [])),
+            turn_id=state.get("turn_id", ""),
+            request_id=state.get("request_id", ""),
+        )
+        if state.get("start_new_turn"):
+            # A new user round cannot inherit calls left queued by an older
+            # round. Confirmation resumes keep the same turn and skip this.
+            await _cancel_pending_operations(state, context)
+            updates["pending_tool_calls"] = []
+            updates["pending_action"] = None
+            updates["approved_action"] = None
         pending = state.get("pending_action")
         confirmation = state.get("confirmation_response")
-        if pending is not None and confirmation is not None:
+        if state.get("cancel_requested"):
+            await _cancel_pending_operations(state, context)
+            updates["pending_tool_calls"] = _cancel_queued_calls(
+                list(state.get("pending_tool_calls", []))
+            )
+            updates["pending_action"] = None
+            updates["approved_action"] = None
+            updates["response"] = "已主动终止当前待执行操作。"
+            updates["status"] = "cancelled"
+        elif pending is not None and confirmation is not None:
             if confirmation:
                 approved = dict(pending)
                 approved["action"] = "tool"
                 updates["approved_action"] = approved
                 updates["pending_action"] = None
             else:
+                await _cancel_pending_operations(state, context)
+                updates["pending_tool_calls"] = _cancel_queued_calls(
+                    list(state.get("pending_tool_calls", []))
+                )
                 updates["pending_action"] = None
                 updates["approved_action"] = None
                 updates["response"] = "已取消待执行操作。"
@@ -101,6 +161,15 @@ def build_agent_graph(
             updates["response"] = "已达到本次会话的最大执行步数。"
             updates["status"] = "max_steps"
         return updates
+
+    async def _cancel_pending_operations(
+        state: AgentState, context: ToolContext
+    ) -> None:
+        for item in state.get("pending_tool_calls", []):
+            if item.get("status") in {"queued", "awaiting_confirmation"}:
+                operation_id = item.get("operation_id")
+                if operation_id:
+                    await tools.cancel_operation(str(operation_id), context)
 
     async def load_context(state: AgentState) -> dict[str, object]:
         messages = state.get("messages", [])
@@ -123,6 +192,7 @@ def build_agent_graph(
     async def execute_tools(state: AgentState) -> dict[str, object]:
         plan_data = PlanDecision.model_validate(state.get("plan", {}))
         confirmed = state.get("approved_action") is not None
+        turn_id = state.get("turn_id", "")
         context = ToolContext(
             user_id=state["user_id"],
             workspace_id=state["workspace_id"],
@@ -130,14 +200,34 @@ def build_agent_graph(
             graph_id=state.get("graph_id"),
             state=state,
             granted_permissions=frozenset(state.get("granted_permissions", [])),
-            turn_id=state.get("turn_id", ""),
+            turn_id=turn_id,
+            request_id=state.get("request_id", ""),
         )
-        results = []
-        for call in plan_data.tool_calls:
+        pending_calls = [
+            _queued_tool_call(call, turn_id=turn_id) for call in plan_data.tool_calls
+        ]
+        results: list[dict[str, object]] = []
+        for index, call in enumerate(plan_data.tool_calls):
+            # Cancellation is checked immediately before every handler. A
+            # running handler cannot be forcefully rolled back here; queued
+            # calls are marked cancelled and are never submitted to Registry.
+            if state.get("cancel_requested"):
+                for queued in pending_calls[index:]:
+                    queued["status"] = "cancelled"
+                break
+            pending_calls[index]["status"] = "running"
             result = await tools.execute(call, context=context, confirmed=confirmed)
             result_data = result.model_dump(mode="json")
-            result_data["turn_id"] = context.turn_id
+            result_data["turn_id"] = turn_id
             results.append(result_data)
+            pending_calls[index]["operation_id"] = result.operation_id
+            pending_calls[index]["status"] = (
+                "awaiting_confirmation"
+                if result.needs_confirmation
+                else "succeeded"
+                if result.ok
+                else "failed"
+            )
         history = list(state.get("tool_history", []))
         history.extend(results)
         history = _retain_recent_tool_rounds(history)
@@ -152,6 +242,17 @@ def build_agent_graph(
                     else result.get("error_message", "tool failed"),
                 }
             )
+        if state.get("cancel_requested"):
+            return {
+                "last_tool_results": results,
+                "tool_history": history,
+                "pending_tool_calls": pending_calls,
+                "messages": tool_messages,
+                "pending_action": None,
+                "approved_action": None,
+                "response": "已主动终止当前待执行操作。",
+                "status": "cancelled",
+            }
         if any(result["needs_confirmation"] for result in results):
             operation_ids = {
                 result["call_id"]: result.get("operation_id") for result in results
@@ -169,6 +270,7 @@ def build_agent_graph(
             return {
                 "last_tool_results": results,
                 "tool_history": history,
+                "pending_tool_calls": pending_calls,
                 "messages": tool_messages,
                 "pending_action": pending_plan.model_dump(mode="json"),
                 "approved_action": None,
@@ -178,6 +280,7 @@ def build_agent_graph(
         return {
             "last_tool_results": results,
             "tool_history": history,
+            "pending_tool_calls": pending_calls,
             "messages": tool_messages,
             "approved_action": None,
             "status": "tool_executed",
@@ -232,7 +335,11 @@ def build_agent_graph(
         return "finalize"
 
     def route_after_tools(state: AgentState) -> str:
-        return "end" if state.get("status") == "awaiting_confirmation" else "prepare"
+        if state.get("status") == "awaiting_confirmation":
+            return "end"
+        if state.get("status") == "cancelled":
+            return "finalize"
+        return "prepare"
 
     graph = StateGraph(AgentState)
     graph.add_node("prepare", prepare)
@@ -261,7 +368,7 @@ def build_agent_graph(
     graph.add_conditional_edges(
         "execute_tools",
         route_after_tools,
-        {"end": END, "prepare": "prepare"},
+        {"end": END, "finalize": "finalize", "prepare": "prepare"},
     )
     graph.add_edge("await_confirmation", END)
     graph.add_edge("finalize", "persist_memory")

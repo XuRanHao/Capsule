@@ -1,5 +1,6 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.db.base import id_factory
@@ -130,6 +132,8 @@ _UNSET = object()
 class AgentToolExecutionRepository:
     """Persist Agent tool lifecycle records and enforce session scoping."""
 
+    supports_atomic_claim = True
+
     def __init__(self, database: Database) -> None:
         self._database = database
 
@@ -137,6 +141,8 @@ class AgentToolExecutionRepository:
         self,
         *,
         operation_id: str | None,
+        idempotency_key: str | None = None,
+        arguments_hash: str | None = None,
         call_id: str,
         thread_id: str,
         user_id: str,
@@ -148,23 +154,110 @@ class AgentToolExecutionRepository:
         confirmation_status: str,
         execution_status: str,
     ) -> str:
+        stable_key = idempotency_key or operation_id or call_id
+        stable_hash = arguments_hash or _arguments_hash(arguments)
+        generated_operation_id = operation_id or id_factory("op")()
         async with self._database.session() as session, session.begin():
-            record = AgentToolExecution(
-                operation_id=operation_id,
-                call_id=call_id,
-                thread_id=thread_id,
-                user_id=user_id,
-                workspace_id=workspace_id,
-                graph_id=graph_id,
-                tool_name=tool_name,
-                required_permission=required_permission,
-                arguments=_json_safe(arguments),
-                confirmation_status=confirmation_status,
-                execution_status=execution_status,
+            statement = (
+                pg_insert(AgentToolExecution)
+                .values(
+                    operation_id=generated_operation_id,
+                    idempotency_key=stable_key,
+                    arguments_hash=stable_hash,
+                    call_id=call_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    graph_id=graph_id,
+                    tool_name=tool_name,
+                    required_permission=required_permission,
+                    arguments=_json_safe(arguments),
+                    confirmation_status=confirmation_status,
+                    execution_status=execution_status,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "user_id",
+                        "workspace_id",
+                        "thread_id",
+                        "idempotency_key",
+                    ]
+                )
+                .returning(AgentToolExecution.operation_id)
             )
-            session.add(record)
-            await session.flush()
-            return record.operation_id
+            inserted_operation_id = await session.scalar(statement)
+            if inserted_operation_id is not None:
+                return inserted_operation_id
+            existing = await session.scalar(
+                select(AgentToolExecution).where(
+                    AgentToolExecution.user_id == user_id,
+                    AgentToolExecution.workspace_id == workspace_id,
+                    AgentToolExecution.thread_id == thread_id,
+                    AgentToolExecution.idempotency_key == stable_key,
+                )
+            )
+            if existing is None:
+                raise RuntimeError("idempotent tool operation was not created")
+            if existing.arguments_hash != stable_hash or existing.tool_name != tool_name:
+                raise ValueError("idempotency key was reused with different tool input")
+            return existing.operation_id
+
+    async def claim_operation(
+        self,
+        *,
+        operation_id: str,
+        user_id: str,
+        workspace_id: str,
+        thread_id: str,
+        lease_owner: str,
+        lease_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Atomically claim a created or expired operation for one Worker."""
+
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now = datetime.now(UTC)
+        lease_expiry = now + timedelta(seconds=lease_seconds)
+        async with self._database.session() as session, session.begin():
+            record = await session.scalar(
+                select(AgentToolExecution)
+                .where(
+                    AgentToolExecution.operation_id == operation_id,
+                    AgentToolExecution.user_id == user_id,
+                    AgentToolExecution.workspace_id == workspace_id,
+                    AgentToolExecution.thread_id == thread_id,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                return {"claimed": False, "reason": "not_found"}
+            if record.execution_status == "succeeded":
+                return {
+                    "claimed": False,
+                    "reason": "already_succeeded",
+                    **_tool_execution_payload(record),
+                }
+            lease_active = (
+                record.execution_status == "running"
+                and record.lease_expires_at is not None
+                and record.lease_expires_at > now
+            )
+            if lease_active and record.lease_owner != lease_owner:
+                return {
+                    "claimed": False,
+                    "reason": "in_progress",
+                    **_tool_execution_payload(record),
+                }
+            record.execution_status = "running"
+            record.lease_owner = lease_owner
+            record.lease_expires_at = lease_expiry
+            record.started_at = record.started_at or now
+            return {
+                "claimed": True,
+                "operation_id": record.operation_id,
+                "execution_status": record.execution_status,
+                "lease_expires_at": lease_expiry.isoformat(),
+            }
 
     async def get_operation(
         self,
@@ -200,6 +293,8 @@ class AgentToolExecutionRepository:
         error_message: str | None | object = _UNSET,
         started_at: datetime | None | object = _UNSET,
         finished_at: datetime | None | object = _UNSET,
+        lease_owner: str | None | object = _UNSET,
+        lease_expires_at: datetime | None | object = _UNSET,
     ) -> bool:
         async with self._database.session() as session, session.begin():
             record = await session.scalar(
@@ -230,6 +325,10 @@ class AgentToolExecutionRepository:
                 record.started_at = started_at
             if finished_at is not _UNSET:
                 record.finished_at = finished_at
+            if lease_owner is not _UNSET:
+                record.lease_owner = lease_owner
+            if lease_expires_at is not _UNSET:
+                record.lease_expires_at = lease_expires_at
         return True
 
     async def list_for_thread(
@@ -865,9 +964,21 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _arguments_hash(value: Any) -> str:
+    payload = json.dumps(
+        _json_safe(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _tool_execution_payload(record: AgentToolExecution) -> dict[str, Any]:
     return {
         "operation_id": record.operation_id,
+        "idempotency_key": record.idempotency_key,
+        "arguments_hash": record.arguments_hash,
         "call_id": record.call_id,
         "thread_id": record.thread_id,
         "user_id": record.user_id,
@@ -885,6 +996,10 @@ def _tool_execution_payload(record: AgentToolExecution) -> dict[str, Any]:
         "created_at": record.created_at.isoformat(),
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "finished_at": record.finished_at.isoformat() if record.finished_at else None,
+        "lease_owner": record.lease_owner,
+        "lease_expires_at": record.lease_expires_at.isoformat()
+        if record.lease_expires_at
+        else None,
     }
 
 
