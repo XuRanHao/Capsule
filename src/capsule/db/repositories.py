@@ -1,6 +1,5 @@
 """Transactional persistence for source files, assets, jobs, and Embeddings."""
 
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -15,6 +14,8 @@ from capsule.db.base import id_factory
 from capsule.db.models import (
     Asset,
     EmbeddingRecord,
+    GraphAsset,
+    GraphAssetBinding,
     LogicalEntity,
     LogicalEntityRelation,
     ModelCallLog,
@@ -61,63 +62,28 @@ class AssetMediaTarget:
 
 
 class RelationGraphRepository:
-    """Read-only narrative-graph context for future Agent tools."""
+    """Transactional persistence for the selected narrative graph."""
 
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    async def load_entity_nodes(
+    async def load_current_graph_context(
         self,
         *,
         workspace_id: str,
         graph_id: str,
-        entity_ids: Sequence[str],
-    ) -> list[dict[str, Any]]:
-        """Load Entity context from one graph without reading Asset contents."""
+    ) -> dict[str, Any]:
+        """Load the small, user-selected graph context for an Agent turn."""
 
-        requested_ids = _deduplicated_strings(entity_ids)
-        if not requested_ids:
-            return []
         async with self._database.session() as session:
-            await _require_narrative_graph(
-                session, workspace_id=workspace_id, graph_id=graph_id
-            )
-            entities = list(
-                await session.scalars(
-                    select(LogicalEntity).where(
-                        LogicalEntity.graph_id == graph_id,
-                        LogicalEntity.entity_id.in_(requested_ids),
-                    )
+            graph = await session.scalar(
+                select(NarrativeGraph).where(
+                    NarrativeGraph.graph_id == graph_id,
+                    NarrativeGraph.workspace_id == workspace_id,
                 )
             )
-        by_id = {entity.entity_id: entity for entity in entities}
-        return [
-            _entity_node_payload(by_id[entity_id])
-            for entity_id in requested_ids
-            if entity_id in by_id
-        ]
-
-    async def search_similar_entity_nodes(
-        self,
-        *,
-        workspace_id: str,
-        graph_id: str,
-        incoming_entity_ids: Sequence[str],
-        exclude_entity_ids: Sequence[str] = (),
-        per_entity_limit: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Find Top-K similar Entities and their hierarchy roots in one graph."""
-
-        incoming_ids = _deduplicated_strings(incoming_entity_ids)
-        if not incoming_ids:
-            return []
-        if per_entity_limit < 1:
-            raise ValueError("per_entity_limit must be at least 1")
-        excluded_ids = set(_deduplicated_strings(exclude_entity_ids)).union(incoming_ids)
-        async with self._database.session() as session:
-            await _require_narrative_graph(
-                session, workspace_id=workspace_id, graph_id=graph_id
-            )
+            if graph is None:
+                raise ValueError("narrative graph does not exist in workspace")
             entities = list(
                 await session.scalars(
                     select(LogicalEntity)
@@ -125,123 +91,554 @@ class RelationGraphRepository:
                     .order_by(LogicalEntity.entity_id)
                 )
             )
-            hierarchy_edges = list(
+            relations = list(
                 await session.scalars(
-                    select(LogicalEntityRelation).where(
-                        LogicalEntityRelation.graph_id == graph_id,
-                        LogicalEntityRelation.relation_type == "hierarchy",
-                    )
+                    select(LogicalEntityRelation)
+                    .where(LogicalEntityRelation.graph_id == graph_id)
+                    .order_by(LogicalEntityRelation.relation_id)
                 )
             )
-        entities_by_id = {entity.entity_id: entity for entity in entities}
-        roots = _entity_tree_roots(hierarchy_edges)
-        results: list[dict[str, Any]] = []
-        for incoming_id in incoming_ids:
-            incoming = entities_by_id.get(incoming_id)
-            if incoming is None or not incoming.embedding_vector:
-                continue
-            scored = [
-                (
-                    _cosine_similarity(incoming.embedding_vector, candidate.embedding_vector),
-                    candidate,
-                    candidate_root_id,
-                )
-                for candidate in entities
-                if candidate.entity_id not in excluded_ids
-                and candidate.embedding_vector
-                and (candidate_root_id := _resolve_entity_tree_root(candidate.entity_id, roots))
-                not in excluded_ids
-            ]
-            for score, candidate, candidate_root_id in sorted(
-                scored,
-                key=lambda item: (-item[0], item[1].entity_id),
-            )[:per_entity_limit]:
-                results.append(
-                    {
-                        "incoming_entity_id": incoming_id,
-                        "entity_id": candidate.entity_id,
-                        "root_entity_id": candidate_root_id,
-                        "score": score,
-                    }
-                )
-        return results
+        return {
+            "graph": {
+                "graph_id": graph.graph_id,
+                "workspace_id": graph.workspace_id,
+                "name": graph.name,
+                "description": graph.description,
+                "narrative_context": dict(graph.narrative_context),
+            },
+            "entities": [_entity_node_payload(entity) for entity in entities],
+            "relations": [_relation_payload(relation) for relation in relations],
+        }
 
-    async def load_complete_entity_trees(
+    async def get_entity_detail(
         self,
         *,
         workspace_id: str,
         graph_id: str,
-        root_entity_ids: Sequence[str],
-    ) -> list[dict[str, Any]]:
-        """Load each requested hierarchy tree from one graph as Agent context."""
+        entity_id: str,
+    ) -> dict[str, Any]:
+        """Load one logical entity and the Assets currently bound to it."""
 
-        requested_roots = _deduplicated_strings(root_entity_ids)
-        if not requested_roots:
-            return []
         async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            entity = await session.scalar(
+                select(LogicalEntity).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == entity_id,
+                )
+            )
+            if entity is None:
+                raise ValueError("entity does not exist in graph")
+            assets = list(
+                await session.scalars(
+                    select(Asset)
+                    .join(
+                        GraphAsset,
+                        (GraphAsset.asset_id == Asset.asset_id)
+                        & (GraphAsset.workspace_id == Asset.workspace_id),
+                    )
+                    .join(
+                        GraphAssetBinding,
+                        (GraphAssetBinding.graph_id == GraphAsset.graph_id)
+                        & (GraphAssetBinding.asset_id == GraphAsset.asset_id),
+                    )
+                    .where(
+                        GraphAsset.graph_id == graph_id,
+                        GraphAsset.workspace_id == workspace_id,
+                        GraphAssetBinding.entity_id == entity_id,
+                    )
+                    .order_by(Asset.asset_id)
+                )
+            )
+        payload = _entity_node_payload(entity)
+        payload["assets"] = [_asset_payload(asset) for asset in assets]
+        return payload
+
+    async def list_entity_relations(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        entity_id: str,
+    ) -> list[dict[str, Any]]:
+        """List all incoming and outgoing relations for one graph Entity."""
+
+        async with self._database.session() as session:
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            entity_exists = await session.scalar(
+                select(LogicalEntity.entity_id).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == entity_id,
+                )
+            )
+            if entity_exists is None:
+                raise ValueError("entity does not exist in graph")
+            relations = list(
+                await session.scalars(
+                    select(LogicalEntityRelation)
+                    .where(
+                        LogicalEntityRelation.graph_id == graph_id,
+                        or_(
+                            LogicalEntityRelation.source_entity_id == entity_id,
+                            LogicalEntityRelation.target_entity_id == entity_id,
+                        ),
+                    )
+                    .order_by(LogicalEntityRelation.relation_id)
+                )
+            )
+        return [_relation_payload(relation) for relation in relations]
+
+    async def create_entity(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        name: str,
+        entity_type: str = "",
+        semantic: str = "",
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Create a graph-local logical Entity."""
+
+        async with self._database.session() as session, session.begin():
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            entity = LogicalEntity(
+                graph_id=graph_id,
+                entity_id=id_factory("entity")(),
+                name=name,
+                entity_type=entity_type,
+                semantic=semantic,
+                description=description,
+            )
+            session.add(entity)
+            await session.flush()
+        return _entity_node_payload(entity)
+
+    async def delete_entity(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        entity_id: str,
+    ) -> dict[str, Any]:
+        """Delete one graph Entity and its bound Assets/relations."""
+
+        async with self._database.session() as session, session.begin():
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            entity = await session.scalar(
+                select(LogicalEntity).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == entity_id,
+                )
+            )
+            if entity is None:
+                raise ValueError("entity does not exist in graph")
+            await session.delete(entity)
+        return {"deleted_entity_id": entity_id}
+
+    async def move_asset_to_entity(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        asset_id: str,
+        entity_id: str,
+        binding_role: str = "reference",
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Move a graph Asset to exactly one target Entity."""
+
+        async with self._database.session() as session, session.begin():
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            asset_in_graph = await session.scalar(
+                select(GraphAsset.asset_id).where(
+                    GraphAsset.graph_id == graph_id,
+                    GraphAsset.workspace_id == workspace_id,
+                    GraphAsset.asset_id == asset_id,
+                )
+            )
+            if asset_in_graph is None:
+                raise ValueError("asset does not belong to graph")
+            entity_exists = await session.scalar(
+                select(LogicalEntity.entity_id).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == entity_id,
+                )
+            )
+            if entity_exists is None:
+                raise ValueError("entity does not exist in graph")
+            existing_bindings = list(
+                await session.scalars(
+                    select(GraphAssetBinding).where(
+                        GraphAssetBinding.graph_id == graph_id,
+                        GraphAssetBinding.asset_id == asset_id,
+                    )
+                )
+            )
+            for binding in existing_bindings:
+                await session.delete(binding)
+            await session.flush()
+            session.add(
+                GraphAssetBinding(
+                    graph_id=graph_id,
+                    asset_id=asset_id,
+                    entity_id=entity_id,
+                    binding_role=binding_role,
+                    description=description,
+                )
+            )
+        return {"asset_id": asset_id, "entity_id": entity_id, "moved": True}
+
+    async def merge_entities(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        target_entity_id: str,
+        source_entity_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Merge source Entities into an existing target Entity."""
+
+        source_ids = _deduplicated_strings(source_entity_ids)
+        if not source_ids:
+            raise ValueError("at least one source entity is required")
+        if target_entity_id in source_ids:
+            raise ValueError("target entity cannot also be a source entity")
+        async with self._database.session() as session, session.begin():
             await _require_narrative_graph(
                 session, workspace_id=workspace_id, graph_id=graph_id
             )
             entities = list(
                 await session.scalars(
-                    select(LogicalEntity).where(LogicalEntity.graph_id == graph_id)
-                )
-            )
-            hierarchy_edges = list(
-                await session.scalars(
-                    select(LogicalEntityRelation).where(
-                        LogicalEntityRelation.graph_id == graph_id,
-                        LogicalEntityRelation.relation_type == "hierarchy",
+                    select(LogicalEntity).where(
+                        LogicalEntity.graph_id == graph_id,
+                        LogicalEntity.entity_id.in_([target_entity_id, *source_ids]),
                     )
                 )
             )
-        entities_by_id = {entity.entity_id: entity for entity in entities}
-        children_by_parent: dict[str, set[str]] = {}
-        for edge in hierarchy_edges:
-            children_by_parent.setdefault(edge.target_entity_id, set()).add(edge.source_entity_id)
-        trees: list[dict[str, Any]] = []
-        for root_id in requested_roots:
-            if root_id not in entities_by_id:
-                continue
-            member_ids = _descendant_entity_ids(root_id, children_by_parent)
-            trees.append(
-                {
-                    "root_entity_id": root_id,
-                    "nodes": [
-                        _entity_node_payload(entities_by_id[entity_id])
-                        for entity_id in sorted(member_ids)
-                    ],
-                    "edges": [
-                        {
-                            "source_entity_id": edge.source_entity_id,
-                            "target_entity_id": edge.target_entity_id,
-                            "relation_type": edge.relation_type,
-                            "description": edge.description,
-                        }
-                        for edge in hierarchy_edges
-                        if edge.source_entity_id in member_ids
-                        and edge.target_entity_id in member_ids
-                    ],
-                }
+            entities_by_id = {entity.entity_id: entity for entity in entities}
+            missing = [
+                entity_id
+                for entity_id in [target_entity_id, *source_ids]
+                if entity_id not in entities_by_id
+            ]
+            if missing:
+                raise ValueError(f"entities do not exist in graph: {', '.join(missing)}")
+
+            source_bindings = list(
+                await session.scalars(
+                    select(GraphAssetBinding).where(
+                        GraphAssetBinding.graph_id == graph_id,
+                        GraphAssetBinding.entity_id.in_(source_ids),
+                    )
+                )
             )
-        return trees
+            target_asset_ids = set(
+                await session.scalars(
+                    select(GraphAssetBinding.asset_id).where(
+                        GraphAssetBinding.graph_id == graph_id,
+                        GraphAssetBinding.entity_id == target_entity_id,
+                    )
+                )
+            )
+            for binding in source_bindings:
+                if binding.asset_id not in target_asset_ids:
+                    session.add(
+                        GraphAssetBinding(
+                            graph_id=graph_id,
+                            asset_id=binding.asset_id,
+                            entity_id=target_entity_id,
+                            binding_role=binding.binding_role,
+                            description=binding.description,
+                        )
+                    )
+                    target_asset_ids.add(binding.asset_id)
+                await session.delete(binding)
+            await session.flush()
 
-    async def load_workspace_tree(self, *, workspace_id: str, graph_id: str) -> str:
-        """Render the graph's workspace directory as read-only Agent context."""
+            source_relations = list(
+                await session.scalars(
+                    select(LogicalEntityRelation).where(
+                        LogicalEntityRelation.graph_id == graph_id,
+                        or_(
+                            LogicalEntityRelation.source_entity_id.in_(source_ids),
+                            LogicalEntityRelation.target_entity_id.in_(source_ids),
+                        ),
+                    )
+                )
+            )
+            preserved_keys = set(
+                (
+                    row.source_entity_id,
+                    row.target_entity_id,
+                    row.relation_type,
+                )
+                for row in (
+                    await session.execute(
+                        select(
+                            LogicalEntityRelation.source_entity_id,
+                            LogicalEntityRelation.target_entity_id,
+                            LogicalEntityRelation.relation_type,
+                        ).where(
+                            LogicalEntityRelation.graph_id == graph_id,
+                            ~or_(
+                                LogicalEntityRelation.source_entity_id.in_(source_ids),
+                                LogicalEntityRelation.target_entity_id.in_(source_ids),
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            for relation in source_relations:
+                source_id = (
+                    target_entity_id
+                    if relation.source_entity_id in source_ids
+                    else relation.source_entity_id
+                )
+                target_id = (
+                    target_entity_id
+                    if relation.target_entity_id in source_ids
+                    else relation.target_entity_id
+                )
+                key = (source_id, target_id, relation.relation_type)
+                if source_id != target_id and key not in preserved_keys:
+                    session.add(
+                        LogicalEntityRelation(
+                            graph_id=graph_id,
+                            source_entity_id=source_id,
+                            target_entity_id=target_id,
+                            relation_type=relation.relation_type,
+                            description=relation.description,
+                        )
+                    )
+                    preserved_keys.add(key)
+                await session.delete(relation)
+            await session.flush()
+            for entity_id in source_ids:
+                await session.delete(entities_by_id[entity_id])
+        return {
+            "target_entity_id": target_entity_id,
+            "merged_entity_ids": source_ids,
+            "moved_asset_count": len({binding.asset_id for binding in source_bindings}),
+        }
 
-        async with self._database.session() as session:
+    async def split_entity(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        entity_id: str,
+        parts: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Split one Entity and assign each bound Asset to a new Entity."""
+
+        if len(parts) < 2:
+            raise ValueError("split requires at least two new entities")
+        part_asset_ids = [
+            asset_id
+            for part in parts
+            for asset_id in _deduplicated_strings(part.get("asset_ids", []))
+        ]
+        if len(part_asset_ids) != len(set(part_asset_ids)):
+            raise ValueError("each asset can be assigned to only one split entity")
+
+        async with self._database.session() as session, session.begin():
             await _require_narrative_graph(
                 session, workspace_id=workspace_id, graph_id=graph_id
             )
-            paths = list(
-                await session.scalars(
-                    select(SourceFile.relative_path)
-                    .where(SourceFile.workspace_id == workspace_id)
-                    .order_by(SourceFile.relative_path)
+            source = await session.scalar(
+                select(LogicalEntity).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == entity_id,
                 )
             )
-        return _render_workspace_paths(paths)
+            if source is None:
+                raise ValueError("entity does not exist in graph")
+            source_bindings = list(
+                await session.scalars(
+                    select(GraphAssetBinding).where(
+                        GraphAssetBinding.graph_id == graph_id,
+                        GraphAssetBinding.entity_id == entity_id,
+                    )
+                )
+            )
+            source_asset_ids = {binding.asset_id for binding in source_bindings}
+            if source_asset_ids != set(part_asset_ids):
+                missing = sorted(source_asset_ids - set(part_asset_ids))
+                unknown = sorted(set(part_asset_ids) - source_asset_ids)
+                details = []
+                if missing:
+                    details.append(f"unassigned assets: {', '.join(missing)}")
+                if unknown:
+                    details.append(f"assets not bound to source: {', '.join(unknown)}")
+                raise ValueError("invalid split asset assignment (" + "; ".join(details) + ")")
 
+            source_relations = list(
+                await session.scalars(
+                    select(LogicalEntityRelation).where(
+                        LogicalEntityRelation.graph_id == graph_id,
+                        or_(
+                            LogicalEntityRelation.source_entity_id == entity_id,
+                            LogicalEntityRelation.target_entity_id == entity_id,
+                        ),
+                    )
+                )
+            )
+            created: list[LogicalEntity] = []
+            for part in parts:
+                created.append(
+                    LogicalEntity(
+                        graph_id=graph_id,
+                        entity_id=id_factory("entity")(),
+                        name=str(part["name"]),
+                        entity_type=str(part.get("entity_type", "")),
+                        semantic=str(part.get("semantic", "")),
+                        description=str(part.get("description", "")),
+                    )
+                )
+            session.add_all(created)
+            await session.flush()
+            part_by_asset = {
+                asset_id: created[index].entity_id
+                for index, part in enumerate(parts)
+                for asset_id in _deduplicated_strings(part.get("asset_ids", []))
+            }
+            for binding in source_bindings:
+                target_id = part_by_asset[binding.asset_id]
+                session.add(
+                    GraphAssetBinding(
+                        graph_id=graph_id,
+                        asset_id=binding.asset_id,
+                        entity_id=target_id,
+                        binding_role=binding.binding_role,
+                        description=binding.description,
+                    )
+                )
+                await session.delete(binding)
+            await session.flush()
+            # Preserve existing narrative edges on the first new part until
+            # relation-specific reassignment is added to the tool contract.
+            relation_owner = created[0].entity_id
+            replacement_relations: list[tuple[str, str, str, str]] = []
+            for relation in source_relations:
+                source_id = (
+                    relation_owner
+                    if relation.source_entity_id == entity_id
+                    else relation.source_entity_id
+                )
+                target_id = (
+                    relation_owner
+                    if relation.target_entity_id == entity_id
+                    else relation.target_entity_id
+                )
+                await session.delete(relation)
+                if source_id != target_id:
+                    replacement_relations.append(
+                        (source_id, target_id, relation.relation_type, relation.description)
+                    )
+            await session.flush()
+            for source_id, target_id, relation_type, description in replacement_relations:
+                session.add(
+                    LogicalEntityRelation(
+                        graph_id=graph_id,
+                        source_entity_id=source_id,
+                        target_entity_id=target_id,
+                        relation_type=relation_type,
+                        description=description,
+                    )
+                )
+            await session.flush()
+            await session.delete(source)
+        return {
+            "deleted_entity_id": entity_id,
+            "created_entities": [_entity_node_payload(entity) for entity in created],
+            "reassigned_relation_count": len(source_relations),
+        }
+
+    async def create_parent_relation(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        child_entity_id: str,
+        parent_name: str,
+        parent_entity_type: str = "",
+        parent_semantic: str = "",
+        parent_description: str = "",
+        relation_description: str = "",
+    ) -> dict[str, Any]:
+        """Create a parent Entity and attach one child with a hierarchy edge."""
+
+        async with self._database.session() as session, session.begin():
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            child = await session.scalar(
+                select(LogicalEntity).where(
+                    LogicalEntity.graph_id == graph_id,
+                    LogicalEntity.entity_id == child_entity_id,
+                )
+            )
+            if child is None:
+                raise ValueError("child entity does not exist in graph")
+            parent = LogicalEntity(
+                graph_id=graph_id,
+                entity_id=id_factory("entity")(),
+                name=parent_name,
+                entity_type=parent_entity_type,
+                semantic=parent_semantic,
+                description=parent_description,
+            )
+            session.add(parent)
+            session.add(
+                LogicalEntityRelation(
+                    graph_id=graph_id,
+                    source_entity_id=child_entity_id,
+                    target_entity_id=parent.entity_id,
+                    relation_type="hierarchy",
+                    description=relation_description,
+                )
+            )
+            await session.flush()
+        return {
+            "parent": _entity_node_payload(parent),
+            "child_entity_id": child_entity_id,
+            "relation_type": "hierarchy",
+        }
+
+    async def remove_relation(
+        self,
+        *,
+        workspace_id: str,
+        graph_id: str,
+        relation_id: str,
+    ) -> dict[str, Any]:
+        """Delete one graph relation by its stable identifier."""
+
+        async with self._database.session() as session, session.begin():
+            await _require_narrative_graph(
+                session, workspace_id=workspace_id, graph_id=graph_id
+            )
+            relation = await session.scalar(
+                select(LogicalEntityRelation).where(
+                    LogicalEntityRelation.graph_id == graph_id,
+                    LogicalEntityRelation.relation_id == relation_id,
+                )
+            )
+            if relation is None:
+                raise ValueError("relation does not exist in graph")
+            await session.delete(relation)
+        return {"deleted_relation_id": relation_id}
 
 async def _require_narrative_graph(
     session: AsyncSession,
@@ -278,71 +675,28 @@ def _entity_node_payload(entity: LogicalEntity) -> dict[str, Any]:
         "entity_type": entity.entity_type,
         "semantic": entity.semantic,
         "description": entity.description,
-        "embedding_vector": list(entity.embedding_vector),
-        "embedding_model": entity.embedding_model,
     }
 
 
-def _entity_tree_roots(
-    edges: Sequence[LogicalEntityRelation],
-) -> dict[str, str]:
-    return {edge.source_entity_id: edge.target_entity_id for edge in edges}
+def _asset_payload(asset: Asset) -> dict[str, Any]:
+    return {
+        "asset_id": asset.asset_id,
+        "file_name": asset.file_name,
+        "asset_name": asset.asset_name,
+        "asset_type": asset.asset_type,
+        "asset_description": asset.asset_description,
+        "relative_path": asset.source_locator.get("relative_path", ""),
+    }
 
 
-def _resolve_entity_tree_root(entity_id: str, parent_by_child: Mapping[str, str]) -> str:
-    seen: set[str] = set()
-    current = entity_id
-    while current in parent_by_child:
-        if current in seen:
-            raise ValueError("persisted hierarchy contains a cycle")
-        seen.add(current)
-        current = parent_by_child[current]
-    return current
-
-
-def _descendant_entity_ids(
-    root_id: str,
-    children_by_parent: Mapping[str, set[str]],
-) -> set[str]:
-    result = {root_id}
-    pending = [root_id]
-    while pending:
-        parent_id = pending.pop()
-        for child_id in children_by_parent.get(parent_id, set()):
-            if child_id in result:
-                raise ValueError("persisted hierarchy contains a cycle")
-            result.add(child_id)
-            pending.append(child_id)
-    return result
-
-
-def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right) or not left:
-        return -1.0
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm == 0 or right_norm == 0:
-        return -1.0
-    return sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
-
-
-def _render_workspace_paths(paths: Sequence[str]) -> str:
-    tree: dict[str, dict[str, Any]] = {}
-    for path in paths:
-        current = tree
-        for part in (item for item in path.replace("\\", "/").split("/") if item):
-            current = current.setdefault(part, {})
-    lines: list[str] = []
-
-    def render(nodes: Mapping[str, Mapping[str, Any]], prefix: str = "") -> None:
-        names = sorted(nodes)
-        for index, name in enumerate(names):
-            is_last = index == len(names) - 1
-            lines.append(f"{prefix}{'└── ' if is_last else '├── '}{name}")
-            render(nodes[name], prefix + ("    " if is_last else "│   "))
-
-    render(tree)
-    return "\n".join(lines)
+def _relation_payload(relation: LogicalEntityRelation) -> dict[str, Any]:
+    return {
+        "relation_id": relation.relation_id,
+        "source_entity_id": relation.source_entity_id,
+        "target_entity_id": relation.target_entity_id,
+        "relation_type": relation.relation_type,
+        "description": relation.description,
+    }
 
 
 @dataclass(slots=True, frozen=True)

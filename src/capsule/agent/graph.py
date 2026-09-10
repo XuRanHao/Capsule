@@ -96,6 +96,7 @@ def build_agent_graph(
             user_id=state["user_id"],
             workspace_id=state["workspace_id"],
             thread_id=state["thread_id"],
+            graph_id=state.get("graph_id"),
             state=state,
         )
         results = []

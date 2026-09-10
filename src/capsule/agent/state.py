@@ -20,6 +20,7 @@ class AgentState(TypedDict, total=False):
     thread_id: str
     user_id: str
     workspace_id: str
+    graph_id: str | None
     input_message: str | None
     confirmation_response: bool | None
     messages: list[dict[str, Any]]

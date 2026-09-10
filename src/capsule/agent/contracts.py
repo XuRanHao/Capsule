@@ -41,6 +41,7 @@ class AgentRequest(BaseModel):
     thread_id: str = Field(min_length=1, max_length=128)
     user_id: str = Field(min_length=1, max_length=128)
     workspace_id: str = Field(min_length=1, max_length=128)
+    graph_id: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=20_000)
     confirmation: bool | None = None
     max_steps: int = Field(default=8, ge=1, le=32)

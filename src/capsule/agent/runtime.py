@@ -41,6 +41,7 @@ class AgentRuntime:
                 "thread_id": request.thread_id,
                 "user_id": request.user_id,
                 "workspace_id": request.workspace_id,
+                "graph_id": request.graph_id,
                 "input_message": request.message,
                 "confirmation_response": request.confirmation,
                 "max_steps": request.max_steps,

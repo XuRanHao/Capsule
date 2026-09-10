@@ -2,6 +2,7 @@
 
 from capsule.agent.contracts import AgentRequest, AgentResponse, PlanDecision, ToolCall
 from capsule.agent.graph import AgentPlanner, ReadyPlanner
+from capsule.agent.graph_tools import build_graph_tool_registry
 from capsule.agent.memory import InMemoryMemoryStore, NullMemoryStore
 from capsule.agent.runtime import AgentRuntime, create_agent_runtime
 from capsule.agent.tools import AgentTool, ToolContext, ToolRegistry
@@ -20,4 +21,5 @@ __all__ = [
     "ToolContext",
     "ToolRegistry",
     "create_agent_runtime",
+    "build_graph_tool_registry",
 ]

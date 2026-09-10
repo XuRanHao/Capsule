@@ -94,13 +94,6 @@ def upgrade() -> None:
         sa.Column("semantic", sa.Text(), server_default="", nullable=False),
         sa.Column("description", sa.Text(), server_default="", nullable=False),
         sa.Column(
-            "embedding_vector",
-            postgresql.JSONB(astext_type=sa.Text()),
-            server_default=sa.text("'[]'::jsonb"),
-            nullable=False,
-        ),
-        sa.Column("embedding_model", sa.String(length=255), server_default="", nullable=False),
-        sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),

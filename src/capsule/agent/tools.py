@@ -18,6 +18,7 @@ class ToolContext:
     user_id: str
     workspace_id: str
     thread_id: str
+    graph_id: str | None
     state: Mapping[str, Any]
 
 

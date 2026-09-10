@@ -361,8 +361,6 @@ class LogicalEntity(Base, TimestampMixin):
     entity_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     semantic: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    embedding_vector: Mapped[list[float]] = mapped_column(JSONB, default=list, nullable=False)
-    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
 class GraphAssetBinding(Base, TimestampMixin):

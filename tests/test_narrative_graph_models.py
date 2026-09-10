@@ -72,3 +72,9 @@ def test_entity_relation_edges_are_scoped_to_one_graph() -> None:
         == {"graph_id", "target_entity_id"}
         for constraint in constraints
     )
+
+
+def test_logical_entities_do_not_store_embedding_vectors() -> None:
+    columns = {column.name for column in LogicalEntity.__table__.columns}
+
+    assert {"embedding_vector", "embedding_model"}.isdisjoint(columns)
