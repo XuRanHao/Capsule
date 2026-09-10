@@ -55,6 +55,24 @@ class ToolExecutionResult(BaseModel):
     needs_confirmation: bool = False
 
 
+ToolPreHook = Callable[
+    [ToolCall, AgentTool | None, ToolContext],
+    Awaitable[ToolExecutionResult | None] | ToolExecutionResult | None,
+]
+ToolPostHook = Callable[
+    [ToolExecutionResult, ToolCall, AgentTool | None, ToolContext],
+    Awaitable[ToolExecutionResult | None] | ToolExecutionResult | None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolHooks:
+    """Server-side hooks shared by every registered tool execution."""
+
+    before: tuple[ToolPreHook, ...] = ()
+    after: tuple[ToolPostHook, ...] = ()
+
+
 class ToolExecutionStore(Protocol):
     async def create_operation(self, **kwargs: Any) -> str: ...
 
@@ -72,9 +90,11 @@ class ToolRegistry:
         self,
         tools: list[AgentTool] | None = None,
         execution_store: ToolExecutionStore | None = None,
+        hooks: ToolHooks | None = None,
     ) -> None:
         self._tools: dict[str, AgentTool] = {}
         self._execution_store = execution_store
+        self._hooks = hooks or ToolHooks()
         for tool in tools or []:
             self.register(tool)
 
@@ -130,6 +150,37 @@ class ToolRegistry:
             )
             await self._finish_operation(result, context)
             return result
+        try:
+            arguments = tool.args_schema.model_validate(call.arguments)
+        except ValidationError as exc:
+            result = ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="invalid_arguments",
+                error_message=str(exc)[:2000],
+            )
+            await self._finish_operation(result, context)
+            return result
+        try:
+            pre_result = await self._run_before_hooks(call, tool, context)
+        except Exception as exc:
+            result = ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="pre_hook_failed",
+                error_message=str(exc) or type(exc).__name__,
+            )
+            await self._finish_operation(result, context)
+            return result
+        if pre_result is not None:
+            if pre_result.operation_id is None:
+                pre_result = pre_result.model_copy(update={"operation_id": operation_id})
+            await self._finish_operation(pre_result, context)
+            return pre_result
         if tool.required_permission is not None and not _has_permission(
             context.granted_permissions, tool.required_permission
         ):
@@ -171,20 +222,6 @@ class ToolRegistry:
                 error_message="tool execution requires user confirmation",
                 needs_confirmation=True,
             )
-        try:
-            arguments = tool.args_schema.model_validate(call.arguments)
-        except ValidationError as exc:
-            result = ToolExecutionResult(
-                call_id=call.call_id,
-                operation_id=operation_id,
-                name=call.name,
-                ok=False,
-                error_code="invalid_arguments",
-                error_message=str(exc)[:2000],
-            )
-            await self._finish_operation(result, context)
-            return result
-
         last_error: str | None = None
         for attempt in range(1, tool.max_attempts + 1):
             if self._execution_store is not None:
@@ -212,19 +249,7 @@ class ToolRegistry:
                     output=value,
                     attempts=attempt,
                 )
-                try:
-                    await self._finish_operation(result, context)
-                except Exception as exc:
-                    return ToolExecutionResult(
-                        call_id=call.call_id,
-                        operation_id=operation_id,
-                        name=call.name,
-                        ok=False,
-                        error_code="execution_audit_failed",
-                        error_message=str(exc) or type(exc).__name__,
-                        attempts=attempt,
-                    )
-                return result
+                return await self._complete_operation(result, call, tool, context)
             except TimeoutError:
                 last_error = f"tool timed out after {tool.timeout_seconds:.1f}s"
             except Exception as exc:  # tool failures become planner-visible data
@@ -238,7 +263,69 @@ class ToolRegistry:
             error_message=last_error,
             attempts=tool.max_attempts,
         )
-        await self._finish_operation(result, context)
+        return await self._complete_operation(result, call, tool, context)
+
+    async def _run_before_hooks(
+        self,
+        call: ToolCall,
+        tool: AgentTool,
+        context: ToolContext,
+    ) -> ToolExecutionResult | None:
+        for hook in self._hooks.before:
+            result = hook(call, tool, context)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None:
+                return result
+        return None
+
+    async def _run_after_hooks(
+        self,
+        result: ToolExecutionResult,
+        call: ToolCall,
+        tool: AgentTool,
+        context: ToolContext,
+    ) -> ToolExecutionResult:
+        current = result
+        for hook in self._hooks.after:
+            updated = hook(current, call, tool, context)
+            if inspect.isawaitable(updated):
+                updated = await updated
+            if updated is not None:
+                current = updated
+        return current
+
+    async def _complete_operation(
+        self,
+        result: ToolExecutionResult,
+        call: ToolCall,
+        tool: AgentTool,
+        context: ToolContext,
+    ) -> ToolExecutionResult:
+        try:
+            result = await self._run_after_hooks(result, call, tool, context)
+        except Exception as exc:
+            result = ToolExecutionResult(
+                call_id=result.call_id,
+                operation_id=result.operation_id,
+                name=result.name,
+                ok=False,
+                error_code="post_hook_failed",
+                error_message=str(exc) or type(exc).__name__,
+                attempts=result.attempts,
+            )
+        try:
+            await self._finish_operation(result, context)
+        except Exception as exc:
+            return ToolExecutionResult(
+                call_id=result.call_id,
+                operation_id=result.operation_id,
+                name=result.name,
+                ok=False,
+                error_code="execution_audit_failed",
+                error_message=str(exc) or type(exc).__name__,
+                attempts=result.attempts,
+            )
         return result
 
     async def _start_operation(

@@ -10,6 +10,7 @@ from capsule.agent import (
     AgentRequest,
     AgentTool,
     InMemoryMemoryStore,
+    ToolHooks,
     ToolRegistry,
     create_agent_runtime,
 )
@@ -320,3 +321,43 @@ async def test_tool_schema_and_timeout_fail_as_structured_results() -> None:
     )
     assert invalid.error_code == "invalid_arguments"
     assert timed_out.error_code == "execution_failed"
+
+
+@pytest.mark.asyncio
+async def test_tool_hooks_run_in_one_registry_pipeline() -> None:
+    events: list[str] = []
+
+    def before(call: ToolCall, tool: AgentTool, context: object) -> None:
+        del call, tool, context
+        events.append("before")
+
+    def handler(args: EchoArgs, context: object) -> str:
+        del args, context
+        events.append("handler")
+        return "raw"
+
+    def after(result: object, call: ToolCall, tool: AgentTool, context: object):
+        del call, tool, context
+        events.append("after")
+        return result.model_copy(update={"output": {"value": result.output}})
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="echo",
+                description="echo",
+                args_schema=EchoArgs,
+                handler=handler,
+            )
+        ],
+        hooks=ToolHooks(before=(before,), after=(after,)),
+    )
+
+    result = await registry.execute(
+        ToolCall(name="echo", arguments={"value": "x"}),
+        context=None,  # type: ignore[arg-type]
+    )
+
+    assert result.ok is True
+    assert result.output == {"value": "raw"}
+    assert events == ["before", "handler", "after"]

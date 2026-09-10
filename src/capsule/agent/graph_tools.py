@@ -6,7 +6,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from capsule.agent.tools import AgentTool, ToolContext, ToolExecutionStore, ToolRegistry
+from capsule.agent.tools import (
+    AgentTool,
+    ToolContext,
+    ToolExecutionStore,
+    ToolHooks,
+    ToolRegistry,
+)
 from capsule.db.repositories import RelationGraphRepository
 
 
@@ -85,6 +91,7 @@ class RemoveRelationArguments(BaseModel):
 def build_graph_tool_registry(
     repository: RelationGraphRepository,
     execution_store: ToolExecutionStore | None = None,
+    hooks: ToolHooks | None = None,
 ) -> ToolRegistry:
     """Register only tools that operate inside the user-selected graph."""
 
@@ -287,4 +294,8 @@ def build_graph_tool_registry(
             required_permission="graph:destructive",
         ),
     ]
-    return ToolRegistry(read_tools + write_tools, execution_store=execution_store)
+    return ToolRegistry(
+        read_tools + write_tools,
+        execution_store=execution_store,
+        hooks=hooks,
+    )
