@@ -11,6 +11,7 @@ from capsule.agent import (
     AgentRequest,
     AgentTool,
     InMemoryMemoryStore,
+    RetryableToolError,
     ToolContext,
     ToolHooks,
     ToolRegistry,
@@ -412,7 +413,121 @@ async def test_tool_schema_and_timeout_fail_as_structured_results() -> None:
         context=None,  # type: ignore[arg-type]
     )
     assert invalid.error_code == "invalid_arguments"
-    assert timed_out.error_code == "execution_failed"
+    assert timed_out.error_code == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_retryable_tool_error_uses_backoff_and_succeeds() -> None:
+    attempts = 0
+
+    async def handler(args: EchoArgs, context: ToolContext) -> str:
+        nonlocal attempts
+        del context
+        attempts += 1
+        if attempts < 3:
+            raise RetryableToolError("temporary dependency failure")
+        return args.value
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="retryable",
+                description="retryable test tool",
+                args_schema=EchoArgs,
+                handler=handler,
+                max_attempts=3,
+                retry_backoff_seconds=0,
+                retry_jitter_seconds=0,
+            )
+        ]
+    )
+    result = await registry.execute(
+        ToolCall(name="retryable", arguments={"value": "ok"}),
+        context=ToolContext(
+            user_id="user-a",
+            workspace_id="workspace-a",
+            thread_id="thread-retry",
+            graph_id=None,
+            state={},
+        ),
+    )
+
+    assert result.ok is True
+    assert result.attempts == 3
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_tool_error_stops_without_repeating() -> None:
+    attempts = 0
+
+    def handler(args: EchoArgs, context: ToolContext) -> str:
+        nonlocal attempts
+        del args, context
+        attempts += 1
+        raise ValueError("invalid business state")
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="non-retryable",
+                description="non-retryable test tool",
+                args_schema=EchoArgs,
+                handler=handler,
+                max_attempts=3,
+            )
+        ]
+    )
+    result = await registry.execute(
+        ToolCall(name="non-retryable", arguments={"value": "x"}),
+        context=ToolContext(
+            user_id="user-a",
+            workspace_id="workspace-a",
+            thread_id="thread-retry-no-repeat",
+            graph_id=None,
+            state={},
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "execution_failed"
+    assert result.attempts == 1
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_failure_reports_retry_exhausted() -> None:
+    async def handler(args: EchoArgs, context: ToolContext) -> str:
+        del args, context
+        raise ConnectionError("temporary network failure")
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="exhausted",
+                description="retry exhaustion test tool",
+                args_schema=EchoArgs,
+                handler=handler,
+                max_attempts=2,
+                retry_backoff_seconds=0,
+                retry_jitter_seconds=0,
+            )
+        ]
+    )
+    result = await registry.execute(
+        ToolCall(name="exhausted", arguments={"value": "x"}),
+        context=ToolContext(
+            user_id="user-a",
+            workspace_id="workspace-a",
+            thread_id="thread-retry-exhausted",
+            graph_id=None,
+            state={},
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "retry_exhausted"
+    assert result.attempts == 2
 
 
 @pytest.mark.asyncio

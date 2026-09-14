@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import random
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
@@ -21,6 +22,10 @@ from capsule.agent.contracts import ToolCall
 
 class ToolCancellationRequested(RuntimeError):
     """Raised by a handler when a cooperative cancellation was requested."""
+
+
+class RetryableToolError(RuntimeError):
+    """Base error for transient tool failures that are safe to retry."""
 
 
 class ToolLockUnavailable(RuntimeError):
@@ -134,6 +139,16 @@ class AgentTool:
     validate_input: ToolInputValidator | None = None
     timeout_seconds: float = 5.0
     max_attempts: int = 1
+    retryable_exceptions: tuple[type[BaseException], ...] = (
+        RetryableToolError,
+        ConnectionError,
+        OSError,
+    )
+    retry_timeouts: bool = False
+    retry_backoff_seconds: float = 0.25
+    retry_backoff_multiplier: float = 2.0
+    retry_max_delay_seconds: float = 5.0
+    retry_jitter_seconds: float = 0.1
     requires_confirmation: bool = False
     required_permission: str | None = None
     output_schema: type[BaseModel] | None = None
@@ -215,6 +230,18 @@ class ToolRegistry:
             raise ValueError(f"duplicate or empty Agent tool name: {tool.name!r}")
         if tool.timeout_seconds <= 0 or tool.max_attempts < 1:
             raise ValueError("tool timeout_seconds must be positive and max_attempts >= 1")
+        if any(
+            not inspect.isclass(error_type) or not issubclass(error_type, BaseException)
+            for error_type in tool.retryable_exceptions
+        ):
+            raise ValueError("tool retryable_exceptions must contain exception types")
+        if (
+            tool.retry_backoff_seconds < 0
+            or tool.retry_backoff_multiplier < 1
+            or tool.retry_max_delay_seconds < 0
+            or tool.retry_jitter_seconds < 0
+        ):
+            raise ValueError("tool retry backoff settings must be non-negative and valid")
         if tool.required_permission is not None and not tool.required_permission.strip():
             raise ValueError("tool required_permission must be non-empty when provided")
         if tool.validate_input is not None and not callable(tool.validate_input):
@@ -253,6 +280,9 @@ class ToolRegistry:
                 "max_output_bytes": tool.max_output_bytes,
                 "concurrency_mode": tool.concurrency_mode,
                 "lock_scope": tool.lock_scope,
+                "max_attempts": tool.max_attempts,
+                "retry_timeouts": tool.retry_timeouts,
+                "retry_backoff_seconds": tool.retry_backoff_seconds,
             }
             for tool in self._tools.values()
         ]
@@ -421,9 +451,7 @@ class ToolRegistry:
                     else:
                         async with self._lock_provider.lock(
                             self._lock_key(tool, context, arguments),
-                            lease_seconds=max(
-                                tool.timeout_seconds * tool.max_attempts + 5.0, 30.0
-                            ),
+                            lease_seconds=max(_retry_window_seconds(tool) + 5.0, 30.0),
                             wait_seconds=self._lock_wait_seconds,
                         ):
                             result = await self._run_with_retries(
@@ -483,7 +511,10 @@ class ToolRegistry:
         """Run one tool call, keeping an exclusive lock across its retries."""
 
         last_error: str | None = None
+        last_error_code = "execution_failed"
+        attempts = 0
         for attempt in range(1, tool.max_attempts + 1):
+            attempts = attempt
             if self._execution_store is not None:
                 await self._execution_store.update_operation(
                     operation_id=operation_id,
@@ -530,16 +561,33 @@ class ToolRegistry:
                 )
             except TimeoutError:
                 last_error = f"tool timed out after {tool.timeout_seconds:.1f}s"
+                last_error_code = "timeout"
+                retryable = tool.retry_timeouts
             except Exception as exc:  # tool failures become planner-visible data
                 last_error = str(exc) or type(exc).__name__
+                last_error_code = "execution_failed"
+                retryable = isinstance(exc, tool.retryable_exceptions)
+            else:
+                retryable = False
+
+            if not retryable:
+                break
+            if attempt >= tool.max_attempts:
+                last_error_code = "retry_exhausted"
+                break
+            delay = _retry_delay(tool, attempt)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if isinstance(context, ToolContext):
+                context.raise_if_cancelled()
         return ToolExecutionResult(
             call_id=call.call_id,
             operation_id=operation_id,
             name=call.name,
             ok=False,
-            error_code="execution_failed",
+            error_code=last_error_code,
             error_message=last_error,
-            attempts=tool.max_attempts,
+            attempts=attempts,
         )
 
     @staticmethod
@@ -826,3 +874,32 @@ def _idempotency_key(call: ToolCall, context: ToolContext) -> str:
 def _arguments_hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _retry_delay(tool: AgentTool, failed_attempt: int) -> float:
+    """Calculate capped exponential backoff with optional positive jitter."""
+
+    base_delay = tool.retry_backoff_seconds * (
+        tool.retry_backoff_multiplier ** max(failed_attempt - 1, 0)
+    )
+    delay = min(tool.retry_max_delay_seconds, base_delay)
+    if delay <= 0 or tool.retry_jitter_seconds <= 0:
+        return delay
+    return min(
+        tool.retry_max_delay_seconds,
+        delay + random.uniform(0, tool.retry_jitter_seconds),
+    )
+
+
+def _retry_window_seconds(tool: AgentTool) -> float:
+    """Upper-bound one tool lease, including configured retry waits."""
+
+    execution_seconds = tool.timeout_seconds * tool.max_attempts
+    wait_seconds = 0.0
+    for failed_attempt in range(1, tool.max_attempts):
+        base_delay = tool.retry_backoff_seconds * (
+            tool.retry_backoff_multiplier ** max(failed_attempt - 1, 0)
+        )
+        wait_seconds += min(tool.retry_max_delay_seconds, base_delay)
+        wait_seconds += tool.retry_jitter_seconds
+    return execution_seconds + wait_seconds

@@ -8,6 +8,7 @@ from capsule.agent.runtime import AgentRuntime, create_agent_runtime
 from capsule.agent.tools import (
     AgentTool,
     RedisToolLockProvider,
+    RetryableToolError,
     ToolCancellationToken,
     ToolContext,
     ToolHooks,
@@ -32,6 +33,7 @@ __all__ = [
     "ToolLockProvider",
     "ToolRegistry",
     "RedisToolLockProvider",
+    "RetryableToolError",
     "create_agent_runtime",
     "build_graph_tool_registry",
 ]
