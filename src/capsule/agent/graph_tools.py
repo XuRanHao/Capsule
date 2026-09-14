@@ -11,6 +11,7 @@ from capsule.agent.tools import (
     ToolContext,
     ToolExecutionStore,
     ToolHooks,
+    ToolLockProvider,
     ToolRegistry,
 )
 from capsule.db.repositories import RelationGraphRepository
@@ -100,6 +101,7 @@ def build_graph_tool_registry(
     repository: RelationGraphRepository,
     execution_store: ToolExecutionStore | None = None,
     hooks: ToolHooks | None = None,
+    lock_provider: ToolLockProvider | None = None,
 ) -> ToolRegistry:
     """Register only tools that operate inside the user-selected graph."""
 
@@ -355,4 +357,5 @@ def build_graph_tool_registry(
         read_tools + write_tools,
         execution_store=execution_store,
         hooks=hooks,
+        lock_provider=lock_provider,
     )

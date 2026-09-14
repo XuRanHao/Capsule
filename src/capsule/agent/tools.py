@@ -7,14 +7,98 @@ import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from threading import Event
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from capsule.agent.contracts import ToolCall
+
+
+class ToolCancellationRequested(RuntimeError):
+    """Raised by a handler when a cooperative cancellation was requested."""
+
+
+class ToolLockUnavailable(RuntimeError):
+    """Raised when an exclusive tool cannot acquire its distributed lock."""
+
+
+class ToolCancellationToken:
+    """Thread-safe cancellation signal visible to sync and async handlers."""
+
+    def __init__(self) -> None:
+        self._event = Event()
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+    def request(self) -> None:
+        self._event.set()
+
+    def raise_if_requested(self) -> None:
+        if self.requested:
+            raise ToolCancellationRequested("tool cancellation was requested")
+
+
+class ToolLockProvider(Protocol):
+    def lock(
+        self,
+        key: str,
+        *,
+        lease_seconds: float,
+        wait_seconds: float,
+    ) -> AbstractAsyncContextManager[None]: ...
+
+
+class RedisToolLockProvider:
+    """Redis-backed lock provider for exclusive tools across Worker processes."""
+
+    def __init__(self, client: Any, *, prefix: str = "capsule:agent:lock") -> None:
+        self._client = client
+        self._prefix = prefix
+
+    def lock(
+        self,
+        key: str,
+        *,
+        lease_seconds: float,
+        wait_seconds: float,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._hold(
+            key,
+            lease_seconds=lease_seconds,
+            wait_seconds=wait_seconds,
+        )
+
+    @asynccontextmanager
+    async def _hold(
+        self,
+        key: str,
+        *,
+        lease_seconds: float,
+        wait_seconds: float,
+    ):
+        lock = self._client.lock(
+            f"{self._prefix}:{key}",
+            timeout=max(lease_seconds, 1.0),
+            blocking_timeout=max(wait_seconds, 0.0),
+        )
+        acquired = await lock.acquire()
+        if not acquired:
+            raise ToolLockUnavailable(f"could not acquire distributed lock: {key}")
+        try:
+            yield
+        finally:
+            try:
+                await lock.release()
+            except Exception:
+                # The lease may have expired; the lock must not hide the tool result.
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +111,11 @@ class ToolContext:
     granted_permissions: frozenset[str] = frozenset()
     turn_id: str = ""
     request_id: str = ""
+    cancellation_token: ToolCancellationToken | None = None
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancellation_token is not None:
+            self.cancellation_token.raise_if_requested()
 
 
 ToolHandler = Callable[[BaseModel, ToolContext], Awaitable[Any] | Any]
@@ -107,12 +196,17 @@ class ToolRegistry:
         tools: list[AgentTool] | None = None,
         execution_store: ToolExecutionStore | None = None,
         hooks: ToolHooks | None = None,
+        lock_provider: ToolLockProvider | None = None,
+        lock_wait_seconds: float = 5.0,
     ) -> None:
         self._tools: dict[str, AgentTool] = {}
         self._execution_store = execution_store
         self._hooks = hooks or ToolHooks()
+        self._lock_provider = lock_provider
+        self._lock_wait_seconds = lock_wait_seconds
         self._worker_id = f"worker_{uuid4().hex}"
         self._locks: dict[str, asyncio.Lock] = {}
+        self._cancellation_tokens: dict[str, ToolCancellationToken] = {}
         for tool in tools or []:
             self.register(tool)
 
@@ -134,6 +228,8 @@ class ToolRegistry:
                 raise ValueError("tool output_schema must be a Pydantic BaseModel")
         if tool.max_output_bytes <= 0:
             raise ValueError("tool max_output_bytes must be positive")
+        if self._lock_wait_seconds < 0:
+            raise ValueError("lock_wait_seconds must be non-negative")
         if tool.concurrency_mode not in {"parallel", "exclusive"}:
             raise ValueError("tool concurrency_mode must be parallel or exclusive")
         if tool.lock_scope not in {"none", "graph", "entity", "asset"}:
@@ -169,8 +265,14 @@ class ToolRegistry:
         confirmed: bool = False,
     ) -> ToolExecutionResult:
         tool = self._tools.get(call.name)
+        cancellation_token = self._cancellation_tokens.setdefault(
+            call.call_id, ToolCancellationToken()
+        )
+        if isinstance(context, ToolContext):
+            context = replace(context, cancellation_token=cancellation_token)
         operation_id, audit_error, existing = await self._start_operation(call, tool, context)
         if audit_error is not None:
+            self._clear_cancellation(call.call_id)
             return ToolExecutionResult(
                 call_id=call.call_id,
                 operation_id=operation_id,
@@ -255,6 +357,7 @@ class ToolRegistry:
             await self._finish_operation(result, context)
             return result
         if existing is not None and existing["execution_status"] == "succeeded":
+            self._clear_cancellation(call.call_id)
             return ToolExecutionResult(
                 call_id=call.call_id,
                 operation_id=operation_id,
@@ -273,6 +376,7 @@ class ToolRegistry:
                     execution_status="awaiting_confirmation",
                     confirmation_status="pending",
                 )
+            self._clear_cancellation(call.call_id)
             return ToolExecutionResult(
                 call_id=call.call_id,
                 operation_id=operation_id,
@@ -285,6 +389,7 @@ class ToolRegistry:
         claim = await self._claim_operation(operation_id, context)
         if claim is not None and not claim.get("claimed", False):
             if claim.get("reason") == "already_succeeded":
+                self._clear_cancellation(call.call_id)
                 return ToolExecutionResult(
                     call_id=call.call_id,
                     operation_id=operation_id,
@@ -305,17 +410,48 @@ class ToolRegistry:
                 if claim.get("reason") == "in_progress"
                 else "the tool operation could not be claimed",
             )
-        if tool.concurrency_mode == "exclusive":
-            lock = self._get_lock(tool, context, arguments)
-            async with lock:
+        try:
+            if tool.concurrency_mode == "exclusive":
+                lock = self._get_lock(tool, context, arguments)
+                async with lock:
+                    if self._lock_provider is None:
+                        result = await self._run_with_retries(
+                            call, tool, arguments, context, operation_id
+                        )
+                    else:
+                        async with self._lock_provider.lock(
+                            self._lock_key(tool, context, arguments),
+                            lease_seconds=max(
+                                tool.timeout_seconds * tool.max_attempts + 5.0, 30.0
+                            ),
+                            wait_seconds=self._lock_wait_seconds,
+                        ):
+                            result = await self._run_with_retries(
+                                call, tool, arguments, context, operation_id
+                            )
+            else:
                 result = await self._run_with_retries(
                     call, tool, arguments, context, operation_id
                 )
-        else:
-            result = await self._run_with_retries(
-                call, tool, arguments, context, operation_id
+        except ToolLockUnavailable as exc:
+            result = ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="lock_timeout",
+                error_message=str(exc),
             )
         return await self._complete_operation(result, call, tool, context)
+
+    def request_cancel(self, call_id: str) -> bool:
+        """Request cooperative cancellation for a currently running call."""
+
+        token = self._cancellation_tokens.get(call_id)
+        if token is None:
+            return False
+        token.request()
+        return True
 
     async def cancel_operation(self, operation_id: str, context: ToolContext) -> bool:
         """Cancel a queued operation without exposing the store to the graph."""
@@ -362,6 +498,8 @@ class ToolRegistry:
                     started_at=datetime.now(UTC),
                 )
             try:
+                if isinstance(context, ToolContext):
+                    context.raise_if_cancelled()
                 if inspect.iscoroutinefunction(tool.handler):
                     value = tool.handler(arguments, context)
                     value = await self._await_with_timeout(value, tool.timeout_seconds)
@@ -378,6 +516,16 @@ class ToolRegistry:
                     name=call.name,
                     ok=True,
                     output=value,
+                    attempts=attempt,
+                )
+            except ToolCancellationRequested as exc:
+                return ToolExecutionResult(
+                    call_id=call.call_id,
+                    operation_id=operation_id,
+                    name=call.name,
+                    ok=False,
+                    error_code="cancelled",
+                    error_message=str(exc),
                     attempts=attempt,
                 )
             except TimeoutError:
@@ -413,6 +561,16 @@ class ToolRegistry:
     ) -> asyncio.Lock:
         """Return the process-local lock for an exclusive tool resource."""
 
+        return self._locks.setdefault(
+            self._lock_key(tool, context, arguments), asyncio.Lock()
+        )
+
+    def _lock_key(
+        self,
+        tool: AgentTool,
+        context: ToolContext,
+        arguments: BaseModel,
+    ) -> str:
         values = arguments.model_dump(mode="json")
         scope = tool.lock_scope
         if scope == "graph":
@@ -431,8 +589,7 @@ class ToolRegistry:
             key = f"asset:{resource_id or tool.name}"
         else:
             key = f"tool:{tool.name}"
-        key = f"{getattr(context, 'workspace_id', 'default')}:{key}"
-        return self._locks.setdefault(key, asyncio.Lock())
+        return f"{getattr(context, 'workspace_id', 'default')}:{key}"
 
     async def _run_before_hooks(
         self,
@@ -606,22 +763,34 @@ class ToolRegistry:
         result: ToolExecutionResult,
         context: ToolContext,
     ) -> None:
-        if self._execution_store is None or result.operation_id is None:
-            return
-        await self._execution_store.update_operation(
-            operation_id=result.operation_id,
-            user_id=context.user_id,
-            workspace_id=context.workspace_id,
-            thread_id=context.thread_id,
-            execution_status="succeeded" if result.ok else "failed",
-            attempts=result.attempts,
-            output=result.output,
-            error_code=result.error_code,
-            error_message=result.error_message,
-            finished_at=datetime.now(UTC),
-            lease_owner=None,
-            lease_expires_at=None,
-        )
+        try:
+            if self._execution_store is None or result.operation_id is None:
+                return
+            await self._execution_store.update_operation(
+                operation_id=result.operation_id,
+                user_id=context.user_id,
+                workspace_id=context.workspace_id,
+                thread_id=context.thread_id,
+                execution_status=(
+                    "cancelled"
+                    if result.error_code == "cancelled"
+                    else "succeeded"
+                    if result.ok
+                    else "failed"
+                ),
+                attempts=result.attempts,
+                output=result.output,
+                error_code=result.error_code,
+                error_message=result.error_message,
+                finished_at=datetime.now(UTC),
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        finally:
+            self._clear_cancellation(result.call_id)
+
+    def _clear_cancellation(self, call_id: str) -> None:
+        self._cancellation_tokens.pop(call_id, None)
 
 
 def _has_permission(granted: frozenset[str], required: str) -> bool:

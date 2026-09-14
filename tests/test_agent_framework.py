@@ -416,6 +416,48 @@ async def test_tool_schema_and_timeout_fail_as_structured_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_running_tool_can_stop_at_a_cooperative_cancellation_point() -> None:
+    started = asyncio.Event()
+
+    async def cancellable_handler(args: EchoArgs, context: ToolContext) -> str:
+        del args
+        started.set()
+        while True:
+            context.raise_if_cancelled()
+            await asyncio.sleep(0.001)
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="cancellable",
+                description="cooperative cancellation test",
+                args_schema=EchoArgs,
+                handler=cancellable_handler,
+            )
+        ]
+    )
+    call = ToolCall(name="cancellable", arguments={"value": "x"})
+    task = asyncio.create_task(
+        registry.execute(
+            call,
+            context=ToolContext(
+                user_id="user-a",
+                workspace_id="workspace-a",
+                thread_id="thread-cancel-running",
+                graph_id=None,
+                state={},
+            ),
+        )
+    )
+    await started.wait()
+    assert registry.request_cancel(call.call_id) is True
+
+    result = await task
+    assert result.ok is False
+    assert result.error_code == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_tool_hooks_run_in_one_registry_pipeline() -> None:
     events: list[str] = []
 
@@ -557,6 +599,75 @@ async def test_exclusive_tools_lock_the_declared_resource_but_parallel_tools_do_
         parallel.execute(ToolCall(name="read", arguments={"value": "b"}), context=context),
     )
     assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_injected_lock_provider_serializes_two_registries() -> None:
+    class SharedLock:
+        def __init__(self, lock: asyncio.Lock) -> None:
+            self._lock = lock
+
+        async def __aenter__(self) -> None:
+            await self._lock.acquire()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self._lock.release()
+
+    class SharedLockProvider:
+        def __init__(self) -> None:
+            self._locks: dict[str, asyncio.Lock] = {}
+
+        def lock(
+            self,
+            key: str,
+            *,
+            lease_seconds: float,
+            wait_seconds: float,
+        ) -> SharedLock:
+            del lease_seconds, wait_seconds
+            return SharedLock(self._locks.setdefault(key, asyncio.Lock()))
+
+    active = 0
+    max_active = 0
+
+    async def handler(args: EchoArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return args.value
+
+    provider = SharedLockProvider()
+    context = ToolContext(
+        user_id="user-a",
+        workspace_id="workspace-a",
+        thread_id="thread-a",
+        graph_id="graph-a",
+        state={},
+    )
+    registries = [
+        ToolRegistry(
+            [
+                AgentTool(
+                    name="write",
+                    description="exclusive graph write",
+                    args_schema=EchoArgs,
+                    handler=handler,
+                    concurrency_mode="exclusive",
+                    lock_scope="graph",
+                )
+            ],
+            lock_provider=provider,
+        )
+        for _ in range(2)
+    ]
+    await asyncio.gather(
+        registries[0].execute(ToolCall(name="write", arguments={"value": "a"}), context=context),
+        registries[1].execute(ToolCall(name="write", arguments={"value": "b"}), context=context),
+    )
+
+    assert max_active == 1
 
 
 @pytest.mark.asyncio

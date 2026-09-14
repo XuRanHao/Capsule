@@ -166,7 +166,9 @@ def build_agent_graph(
         state: AgentState, context: ToolContext
     ) -> None:
         for item in state.get("pending_tool_calls", []):
-            if item.get("status") in {"queued", "awaiting_confirmation"}:
+            if item.get("status") == "running":
+                tools.request_cancel(str(item.get("call_id", "")))
+            elif item.get("status") in {"queued", "awaiting_confirmation"}:
                 operation_id = item.get("operation_id")
                 if operation_id:
                     await tools.cancel_operation(str(operation_id), context)
@@ -224,6 +226,8 @@ def build_agent_graph(
             pending_calls[index]["status"] = (
                 "awaiting_confirmation"
                 if result.needs_confirmation
+                else "cancelled"
+                if result.error_code == "cancelled"
                 else "succeeded"
                 if result.ok
                 else "failed"
