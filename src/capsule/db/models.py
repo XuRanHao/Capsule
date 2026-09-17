@@ -150,6 +150,13 @@ class AgentThread(Base, TimestampMixin):
     last_message_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # One runtime invocation may span model calls and tool execution. This
+    # lease prevents another API instance from interleaving a second turn for
+    # the same durable conversation while the first invocation is active.
+    turn_lease_owner: Mapped[str | None] = mapped_column(String(128))
+    turn_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     memory_lease_owner: Mapped[str | None] = mapped_column(String(128))
     memory_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

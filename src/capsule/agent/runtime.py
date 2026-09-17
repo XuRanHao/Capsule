@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import suppress
 from typing import Any
 from uuid import uuid4
 
@@ -39,7 +41,10 @@ class AgentRuntime:
         conversation_repository: AgentConversationRepository | None = None,
         context_budget: ContextBudget | None = None,
         memory_event_publisher: MemoryEventPublisher | None = None,
+        turn_lease_seconds: float = 300.0,
     ) -> None:
+        if turn_lease_seconds <= 0:
+            raise ValueError("turn lease duration must be positive")
         self._checkpointer = checkpointer or InMemorySaver()
         self._planner = planner or ReadyPlanner()
         self._tools = tools or ToolRegistry()
@@ -48,6 +53,7 @@ class AgentRuntime:
         self._conversation_repository = conversation_repository
         self._context_budget = context_budget or ContextBudget()
         self._memory_event_publisher = memory_event_publisher
+        self._turn_lease_seconds = turn_lease_seconds
         self._context_budget_controller = ContextBudgetController(
             budget=self._context_budget,
             repository=conversation_repository,
@@ -66,12 +72,17 @@ class AgentRuntime:
         *,
         context_budget: ContextBudget | None = None,
         memory_event_publisher: MemoryEventPublisher | None = None,
+        turn_lease_seconds: float | None = None,
     ) -> None:
         """Attach durable conversation storage after application database startup."""
 
         self._conversation_repository = repository
         if context_budget is not None:
             self._context_budget = context_budget
+        if turn_lease_seconds is not None:
+            if turn_lease_seconds <= 0:
+                raise ValueError("turn lease duration must be positive")
+            self._turn_lease_seconds = turn_lease_seconds
         self._memory_event_publisher = memory_event_publisher
         self._context_budget_controller = ContextBudgetController(
             budget=self._context_budget,
@@ -96,6 +107,51 @@ class AgentRuntime:
         return self._graph
 
     async def invoke(self, request: AgentRequest) -> AgentResponse:
+        conversation = self._conversation_repository
+        turn_lease_owner: str | None = None
+        turn_lease_lost = asyncio.Event()
+        turn_lease_heartbeat: asyncio.Task[None] | None = None
+        if conversation is not None:
+            turn_lease_owner = f"agent-turn-{uuid4().hex}"
+            await conversation.acquire_turn_lease(
+                thread_id=request.thread_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                owner=turn_lease_owner,
+                lease_seconds=self._turn_lease_seconds,
+            )
+            turn_lease_heartbeat = asyncio.create_task(
+                self._renew_turn_lease_until_done(
+                    repository=conversation,
+                    request=request,
+                    owner=turn_lease_owner,
+                    lease_lost=turn_lease_lost,
+                )
+            )
+        try:
+            return await self._invoke_under_turn_lease(
+                request,
+                turn_lease_lost=turn_lease_lost,
+            )
+        finally:
+            if turn_lease_heartbeat is not None:
+                turn_lease_heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await turn_lease_heartbeat
+            if conversation is not None and turn_lease_owner is not None:
+                await conversation.release_turn_lease(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    owner=turn_lease_owner,
+                )
+
+    async def _invoke_under_turn_lease(
+        self,
+        request: AgentRequest,
+        *,
+        turn_lease_lost: asyncio.Event,
+    ) -> AgentResponse:
         config = {"configurable": {"thread_id": request.thread_id}}
         snapshot = await self._graph.aget_state(config)
         previous = dict(snapshot.values) if snapshot.values else {}
@@ -205,11 +261,20 @@ class AgentRuntime:
                 "confirmation_response": request.confirmation,
                 "cancel_requested": request.cancel,
                 "max_steps": request.max_steps,
-                "memory_context_request_id": None,
+                # Resuming confirmation executes the stored action before the
+                # next planner pass. Preserve the earlier frozen recall so a
+                # background memory Worker cannot change that turn's result.
+                "memory_context_request_id": (
+                    request_id
+                    if resumes_pending and "memory_context" in previous
+                    else None
+                ),
                 **durable_context,
             },
             config=config,
         )
+        if turn_lease_lost.is_set():
+            raise RuntimeError("agent turn lease was lost before the response completed")
         if conversation is not None and state.get("response") is not None:
             persisted_assistant = await conversation.append_message(
                 thread_id=request.thread_id,
@@ -238,6 +303,37 @@ class AgentRuntime:
             tool_history=list(state.get("tool_history", [])),
             step_count=int(state.get("step_count", 0)),
         )
+
+    async def _renew_turn_lease_until_done(
+        self,
+        *,
+        repository: AgentConversationRepository,
+        request: AgentRequest,
+        owner: str,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        """Keep a long model/tool turn exclusive without holding a DB transaction."""
+
+        interval = min(30.0, max(0.1, self._turn_lease_seconds / 3))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = await repository.renew_turn_lease(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    owner=owner,
+                    lease_seconds=self._turn_lease_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient database error should not end a model call;
+                # another heartbeat may renew before the durable lease ends.
+                continue
+            if not renewed:
+                lease_lost.set()
+                return
 
     async def state(self, thread_id: str) -> dict[str, Any] | None:
         snapshot = await self._graph.aget_state(
@@ -270,6 +366,7 @@ def create_agent_runtime(
     conversation_repository: AgentConversationRepository | None = None,
     context_budget: ContextBudget | None = None,
     memory_event_publisher: MemoryEventPublisher | None = None,
+    turn_lease_seconds: float = 300.0,
 ) -> AgentRuntime:
     return AgentRuntime(
         planner=planner,
@@ -280,6 +377,7 @@ def create_agent_runtime(
         conversation_repository=conversation_repository,
         context_budget=context_budget,
         memory_event_publisher=memory_event_publisher,
+        turn_lease_seconds=turn_lease_seconds,
     )
 
 

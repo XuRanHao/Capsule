@@ -133,6 +133,7 @@ def create_app(
                 app.state.agent_conversation_repository,
                 context_budget=_agent_context_budget(resolved_settings),
                 memory_event_publisher=memory_event_publisher,
+                turn_lease_seconds=resolved_settings.agent_turn_lease_seconds,
             )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()

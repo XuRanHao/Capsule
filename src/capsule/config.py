@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     agent_context_max_reduction_rounds: int = Field(default=3, ge=1, le=3)
     agent_context_summary_wait_seconds: float = Field(default=12.0, gt=0, le=60)
     agent_context_summary_poll_seconds: float = Field(default=0.1, gt=0, le=5)
+    # A lease is refreshed while one LangGraph invocation may span model and
+    # tool waits. It is deliberately independent from memory-worker leases.
+    agent_turn_lease_seconds: float = Field(default=300.0, gt=0)
     agent_memory_max_active_topics: int = Field(default=5, ge=1, le=20)
     agent_memory_max_topic_chars: int = Field(default=32, ge=8, le=128)
     agent_memory_batch_max_mutations: int = Field(default=3, ge=1, le=10)

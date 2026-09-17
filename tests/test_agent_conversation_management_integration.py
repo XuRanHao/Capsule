@@ -5,7 +5,11 @@ import pytest
 from sqlalchemy import delete
 
 from capsule.config import Settings
-from capsule.db.agent_memory import AgentConversationRepository, AgentThreadStateError
+from capsule.db.agent_memory import (
+    AgentConversationRepository,
+    AgentThreadStateError,
+    AgentTurnBusyError,
+)
 from capsule.db.models import AgentMemoryOutbox, AgentThread, Workspace
 from capsule.db.session import Database
 
@@ -181,6 +185,94 @@ async def test_context_reads_only_the_raw_tail_after_summary_watermark() -> None
 
         assert context.thread.summary == "前两条已整理"
         assert [message.content for message in context.messages] == ["最新一条"]
+    finally:
+        async with database.session() as session, session.begin():
+            workspace = await session.get(Workspace, workspace_id)
+            if workspace is not None:
+                await session.delete(workspace)
+        await database.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.getenv("CAPSULE_RUN_POSTGRES_INTEGRATION") != "1",
+    reason="set CAPSULE_RUN_POSTGRES_INTEGRATION=1 to exercise conversation lifecycle persistence",
+)
+async def test_turn_lease_allows_one_owner_and_blocks_lifecycle_changes() -> None:
+    suffix = uuid4().hex
+    workspace_id = f"conversation-lease-{suffix}"
+    user_id = f"conversation-lease-user-{suffix}"
+    database = Database(Settings())
+    repository = AgentConversationRepository(database)
+    try:
+        async with database.session() as session, session.begin():
+            session.add(Workspace(workspace_id=workspace_id, name="会话租约测试"))
+        auto_thread_id = f"turn-auto-{suffix}"
+        await repository.acquire_turn_lease(
+            thread_id=auto_thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            owner="runtime-auto",
+            lease_seconds=30,
+        )
+        auto_context = await repository.get_context(
+            thread_id=auto_thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            max_messages=None,
+        )
+        assert auto_context.thread.thread_id == auto_thread_id
+        await repository.release_turn_lease(
+            thread_id=auto_thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            owner="runtime-auto",
+        )
+        thread = await repository.create_thread(
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+
+        await repository.acquire_turn_lease(
+            thread_id=thread.thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            owner="runtime-a",
+            lease_seconds=30,
+        )
+        with pytest.raises(AgentTurnBusyError):
+            await repository.acquire_turn_lease(
+                thread_id=thread.thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                owner="runtime-b",
+                lease_seconds=30,
+            )
+        with pytest.raises(AgentTurnBusyError):
+            await repository.archive_thread(
+                thread_id=thread.thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+        assert await repository.renew_turn_lease(
+            thread_id=thread.thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            owner="runtime-a",
+            lease_seconds=30,
+        )
+        await repository.release_turn_lease(
+            thread_id=thread.thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            owner="runtime-a",
+        )
+        archived = await repository.archive_thread(
+            thread_id=thread.thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        assert archived.status == "archived"
     finally:
         async with database.session() as session, session.begin():
             workspace = await session.get(Workspace, workspace_id)

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.agent.contracts import MemoryWrite
@@ -38,6 +39,10 @@ ThreadStatus = Literal["active", "archived", "deleted"]
 
 class AgentThreadStateError(ValueError):
     """The identified conversation exists but cannot accept this operation."""
+
+
+class AgentTurnBusyError(AgentThreadStateError):
+    """Another runtime instance currently owns this conversation turn."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +196,96 @@ class AgentConversationRepository:
             await session.flush()
             return _thread_record(thread)
 
+    async def acquire_turn_lease(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        owner: str,
+        lease_seconds: float,
+    ) -> None:
+        """Claim the only active Agent invocation for one durable thread."""
+
+        if not owner.strip():
+            raise ValueError("turn lease owner must not be blank")
+        if lease_seconds <= 0:
+            raise ValueError("turn lease duration must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread_for_turn_lease(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            self._require_active(thread)
+            now = datetime.now(UTC)
+            if (
+                thread.turn_lease_expires_at is not None
+                and thread.turn_lease_expires_at > now
+                and thread.turn_lease_owner != owner
+            ):
+                raise AgentTurnBusyError("another request is already active for this thread")
+            thread.turn_lease_owner = owner
+            thread.turn_lease_expires_at = now + timedelta(seconds=lease_seconds)
+            await session.flush()
+
+    async def renew_turn_lease(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        owner: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend an owned turn lease; false means the invocation lost ownership."""
+
+        if lease_seconds <= 0:
+            raise ValueError("turn lease duration must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            now = datetime.now(UTC)
+            if (
+                thread.status != "active"
+                or thread.turn_lease_owner != owner
+                or thread.turn_lease_expires_at is None
+                or thread.turn_lease_expires_at <= now
+            ):
+                return False
+            thread.turn_lease_expires_at = now + timedelta(seconds=lease_seconds)
+            await session.flush()
+            return True
+
+    async def release_turn_lease(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        owner: str,
+    ) -> None:
+        """Release only the lease owned by this runtime invocation."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            if thread.turn_lease_owner == owner:
+                thread.turn_lease_owner = None
+                thread.turn_lease_expires_at = None
+                await session.flush()
+
     async def rename_thread(
         self,
         *,
@@ -240,6 +335,7 @@ class AgentConversationRepository:
                 raise AgentThreadStateError(
                     "only an active agent thread can be archived"
                 )
+            self._require_no_active_turn(thread)
             thread.status = "archived"
             await session.flush()
             return _thread_record(thread)
@@ -263,6 +359,8 @@ class AgentConversationRepository:
             )
             thread.status = "active"
             thread.deleted_at = None
+            thread.turn_lease_owner = None
+            thread.turn_lease_expires_at = None
             thread.memory_lease_owner = None
             thread.memory_lease_expires_at = None
             await session.flush()
@@ -287,8 +385,11 @@ class AgentConversationRepository:
             )
             if thread.status == "deleted":
                 return _thread_record(thread)
+            self._require_no_active_turn(thread)
             thread.status = "deleted"
             thread.deleted_at = datetime.now(UTC)
+            thread.turn_lease_owner = None
+            thread.turn_lease_expires_at = None
             thread.memory_lease_owner = None
             thread.memory_lease_expires_at = None
             await session.execute(
@@ -1348,6 +1449,35 @@ class AgentConversationRepository:
             raise PermissionError("agent thread does not belong to this user and workspace")
         return thread
 
+    async def _locked_thread_for_turn_lease(
+        self,
+        session: AsyncSession,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> AgentThread:
+        """Create-or-lock a thread without a first-invocation insert race."""
+
+        workspace = await session.get(Workspace, workspace_id)
+        if workspace is None:
+            raise ValueError(f"workspace does not exist: {workspace_id}")
+        await session.execute(
+            pg_insert(AgentThread)
+            .values(
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            .on_conflict_do_nothing(index_elements=[AgentThread.thread_id])
+        )
+        thread = await session.get(AgentThread, thread_id, with_for_update=True)
+        if thread is None:  # pragma: no cover - insert-or-lock guarantees a row.
+            raise RuntimeError("agent thread was not available after lease insert")
+        if thread.user_id != user_id or thread.workspace_id != workspace_id:
+            raise PermissionError("agent thread does not belong to this user and workspace")
+        return thread
+
     async def _thread_for_identity(
         self,
         session: AsyncSession,
@@ -1368,6 +1498,16 @@ class AgentConversationRepository:
         if thread.status != "active":
             raise AgentThreadStateError(
                 f"agent thread is {thread.status} and cannot accept new messages"
+            )
+
+    @staticmethod
+    def _require_no_active_turn(thread: AgentThread) -> None:
+        if (
+            thread.turn_lease_expires_at is not None
+            and thread.turn_lease_expires_at > datetime.now(UTC)
+        ):
+            raise AgentTurnBusyError(
+                "agent thread has an active invocation and cannot change lifecycle"
             )
 
     @staticmethod

@@ -17,6 +17,11 @@ class _EchoArgs(BaseModel):
 
 class _ConfirmationPlanner:
     async def plan(self, state: dict[str, object]) -> PlanDecision:
+        if not state.get("tool_details"):
+            return PlanDecision(
+                action="select_tools",
+                selected_tool_names=["checkpoint_echo"],
+            )
         if not state.get("tool_history"):
             return PlanDecision(
                 action="confirm",

@@ -23,6 +23,7 @@ from capsule.agent.contracts import PlanDecision, ToolCall
 from capsule.db.agent_memory import (
     AgentMessageRecord,
     AgentThreadRecord,
+    AgentTurnBusyError,
     ConversationContext,
     ConversationSyncState,
 )
@@ -44,6 +45,8 @@ class SequencePlanner:
     async def plan(self, state: object) -> PlanDecision:
         self.calls += 1
         values = state if isinstance(state, dict) else {}
+        if not values.get("tool_details"):
+            return PlanDecision(action="select_tools", selected_tool_names=["echo"])
         if self.confirmation and not values.get("tool_history"):
             return PlanDecision(
                 action="confirm",
@@ -61,6 +64,8 @@ class SequencePlanner:
 class DirectWritePlanner:
     async def plan(self, state: object) -> PlanDecision:
         values = state if isinstance(state, dict) else {}
+        if not values.get("tool_details"):
+            return PlanDecision(action="select_tools", selected_tool_names=["echo"])
         if not values.get("tool_history"):
             return PlanDecision(
                 action="tool",
@@ -72,6 +77,8 @@ class DirectWritePlanner:
 class OneToolPerOutputPlanner:
     async def plan(self, state: object) -> PlanDecision:
         values = state if isinstance(state, dict) else {}
+        if not values.get("tool_details"):
+            return PlanDecision(action="select_tools", selected_tool_names=["echo"])
         messages = values.get("messages", [])
         if messages and messages[-1].get("role") == "user":
             return PlanDecision(
@@ -84,6 +91,8 @@ class OneToolPerOutputPlanner:
 class ConfirmationThenRespondPlanner:
     async def plan(self, state: object) -> PlanDecision:
         values = state if isinstance(state, dict) else {}
+        if not values.get("tool_details"):
+            return PlanDecision(action="select_tools", selected_tool_names=["echo"])
         messages = values.get("messages", [])
         if messages and messages[-1].get("content") == "准备操作":
             return PlanDecision(
@@ -107,6 +116,29 @@ class RecordingPlanner:
             }
         )
         return PlanDecision(action="respond", message="已读取上下文。")
+
+
+class UndisclosedToolPlanner:
+    """Represents a planner that violates the two-step tool contract."""
+
+    async def plan(self, state: object) -> PlanDecision:
+        del state
+        return PlanDecision(
+            action="tool",
+            tool_calls=[ToolCall(name="echo", arguments={"value": "blocked"})],
+        )
+
+
+class BlockingPlanner:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def plan(self, state: object) -> PlanDecision:
+        del state
+        self.started.set()
+        await self.release.wait()
+        return PlanDecision(action="respond", message="已完成阻塞回合。")
 
 
 class FakeConversationRepository:
@@ -172,6 +204,19 @@ class FakeConversationRepository:
             last_message_sequence=3,
             memory_revision=revision,
         )
+        self.turn_lease_owner: str | None = None
+
+    async def acquire_turn_lease(self, *, owner: str, **_: object) -> None:
+        if self.turn_lease_owner is not None and self.turn_lease_owner != owner:
+            raise AgentTurnBusyError("thread is already leased")
+        self.turn_lease_owner = owner
+
+    async def renew_turn_lease(self, *, owner: str, **_: object) -> bool:
+        return self.turn_lease_owner == owner
+
+    async def release_turn_lease(self, *, owner: str, **_: object) -> None:
+        if self.turn_lease_owner == owner:
+            self.turn_lease_owner = None
 
     async def enqueue_consolidation_if_needed(self, **_: object) -> None:
         self.enqueued += 1
@@ -249,6 +294,36 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     assert snapshot["messages"][-1]["role"] == "assistant"
     assert "args_schema" not in snapshot["tool_catalog"][0]
     assert snapshot["tool_details"][0]["args_schema"]["title"] == "EchoArgs"
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_tool_calls_without_explicit_schema_disclosure() -> None:
+    runtime = create_agent_runtime(
+        planner=UndisclosedToolPlanner(),
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="echo",
+                    description="return the supplied value",
+                    args_schema=EchoArgs,
+                    handler=lambda args, context: args.value,
+                )
+            ]
+        ),
+    )
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="thread-undisclosed-tool",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="跳过选择直接调用",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.tool_history == []
+    assert result.message == "工具调用必须先选择工具并读取完整定义。"
 
 
 @pytest.mark.asyncio
@@ -469,6 +544,76 @@ async def test_write_tool_requires_confirmation_and_can_resume() -> None:
     assert resumed.status == "completed"
     assert resumed.tool_history[0]["ok"] is True
     assert len({item["turn_id"] for item in resumed.tool_history}) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmation_resume_reuses_frozen_memory_before_direct_execution() -> None:
+    class CountingMemoryReader:
+        def __init__(self) -> None:
+            self.loads = 0
+
+        async def load(self, **_: object) -> list[dict[str, object]]:
+            self.loads += 1
+            return [{"scope": "workspace", "text": "固定召回"}]
+
+        async def save(self, **_: object) -> None:
+            return None
+
+    memory = CountingMemoryReader()
+    runtime = create_agent_runtime(
+        planner=SequencePlanner(confirmation=True),
+        memory=memory,  # type: ignore[arg-type]
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="echo",
+                    description="confirmed test operation",
+                    args_schema=EchoArgs,
+                    handler=lambda args, context: args.value,
+                    requires_confirmation=True,
+                )
+            ]
+        ),
+    )
+    request = AgentRequest(
+        thread_id="thread-confirm-frozen-memory",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="准备执行",
+    )
+
+    pending = await runtime.invoke(request)
+    assert pending.status == "awaiting_confirmation"
+    assert memory.loads == 1
+
+    resumed = await runtime.invoke(
+        request.model_copy(update={"message": "确认", "confirmation": True})
+    )
+    assert resumed.status == "completed"
+    assert memory.loads == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_turn_lease_rejects_an_overlapping_invocation() -> None:
+    planner = BlockingPlanner()
+    repository = FakeConversationRepository(revision=1)
+    runtime = create_agent_runtime(
+        planner=planner,
+        conversation_repository=repository,  # type: ignore[arg-type]
+    )
+    request = AgentRequest(
+        thread_id="durable-thread",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="慢请求",
+    )
+
+    first = asyncio.create_task(runtime.invoke(request))
+    await planner.started.wait()
+    with pytest.raises(AgentTurnBusyError):
+        await runtime.invoke(request.model_copy(update={"message": "重叠请求"}))
+    planner.release.set()
+    assert (await first).status == "completed"
 
 
 @pytest.mark.asyncio

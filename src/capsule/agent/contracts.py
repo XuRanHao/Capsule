@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ToolCall(BaseModel):
@@ -29,11 +29,33 @@ class PlanDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["respond", "tool", "confirm", "finish"] = "respond"
+    action: Literal["respond", "select_tools", "tool", "confirm", "finish"] = (
+        "respond"
+    )
     message: str | None = None
+    # The first planner pass sees only the compact tool catalog.  It must use
+    # this action to request complete schemas before it can create calls.
+    selected_tool_names: list[str] = Field(default_factory=list, max_length=8)
     tool_calls: list[ToolCall] = Field(default_factory=list, max_length=8)
-    memory_writes: list[MemoryWrite] = Field(default_factory=list, max_length=20)
     confirmation_message: str | None = None
+
+    @model_validator(mode="after")
+    def validate_action_payload(self) -> PlanDecision:
+        if self.action == "select_tools":
+            if not self.selected_tool_names:
+                raise ValueError("select_tools requires at least one selected tool")
+            if self.tool_calls:
+                raise ValueError("select_tools cannot contain tool calls")
+        elif self.action in {"tool", "confirm"}:
+            if not self.tool_calls:
+                raise ValueError(f"{self.action} requires at least one tool call")
+            if self.selected_tool_names:
+                raise ValueError(
+                    f"{self.action} must follow a prior select_tools decision"
+                )
+        elif self.selected_tool_names or self.tool_calls:
+            raise ValueError(f"{self.action} cannot contain tool selection or calls")
+        return self
 
 
 class AgentRequest(BaseModel):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -95,9 +95,9 @@ def build_agent_graph(
     planner: AgentPlanner,
     tools: ToolRegistry,
     memory: AgentMemoryStore,
-    checkpointer: BaseCheckpointSaver,
+    checkpointer: BaseCheckpointSaver[Any],
     context_budget: ContextBudgetController | None = None,
-):
+) -> Any:
     """Compile the resumable Agent graph with injected application dependencies."""
 
     async def prepare(state: AgentState) -> dict[str, object]:
@@ -106,13 +106,15 @@ def build_agent_graph(
         if input_message:
             messages.append({"role": "user", "content": input_message})
 
+        current_step = state.get("step_count", 0)
+        next_step = current_step + 1 if isinstance(current_step, int) else 1
         updates: dict[str, object] = {
             "messages": messages,
             "input_message": None,
             "confirmation_response": None,
             "response": None,
             "error": None,
-            "step_count": state.get("step_count", 0) + 1,
+            "step_count": next_step,
             "status": "planning",
             "start_new_turn": False,
             "tool_catalog": tools.catalog(),
@@ -163,7 +165,8 @@ def build_agent_graph(
                 updates["approved_action"] = None
                 updates["response"] = "已取消待执行操作。"
                 updates["status"] = "cancelled"
-        if int(updates["step_count"]) > int(state.get("max_steps", 8)):
+        max_steps = state.get("max_steps", 8)
+        if next_step > (max_steps if isinstance(max_steps, int) else 8):
             updates["response"] = "已达到本次会话的最大执行步数。"
             updates["status"] = "max_steps"
         return updates
@@ -213,8 +216,15 @@ def build_agent_graph(
         return {"plan": decision.model_dump(mode="json")}
 
     async def execute_tools(state: AgentState) -> dict[str, object]:
-        plan_data = PlanDecision.model_validate(state.get("plan", {}))
-        confirmed = state.get("approved_action") is not None
+        # A confirmation resume bypasses planning altogether.  The stored
+        # pending action is still validated here and ToolRegistry remains the
+        # authority for permission, argument, idempotency, and confirmation
+        # enforcement before a handler can run.
+        approved = state.get("approved_action")
+        plan_data = PlanDecision.model_validate(
+            approved if approved is not None else state.get("plan", {})
+        )
+        confirmed = approved is not None
         turn_id = state.get("turn_id", "")
         context = ToolContext(
             user_id=state["user_id"],
@@ -239,32 +249,36 @@ def build_agent_graph(
                     queued["status"] = "cancelled"
                 break
             pending_calls[index]["status"] = "running"
-            result = await tools.execute(call, context=context, confirmed=confirmed)
-            result_data = result.model_dump(mode="json")
+            execution_result = await tools.execute(
+                call,
+                context=context,
+                confirmed=confirmed,
+            )
+            result_data = execution_result.model_dump(mode="json")
             result_data["turn_id"] = turn_id
             results.append(result_data)
-            pending_calls[index]["operation_id"] = result.operation_id
+            pending_calls[index]["operation_id"] = execution_result.operation_id
             pending_calls[index]["status"] = (
                 "awaiting_confirmation"
-                if result.needs_confirmation
+                if execution_result.needs_confirmation
                 else "cancelled"
-                if result.error_code == "cancelled"
+                if execution_result.error_code == "cancelled"
                 else "succeeded"
-                if result.ok
+                if execution_result.ok
                 else "failed"
             )
         history = list(state.get("tool_history", []))
         history.extend(results)
         history = _retain_recent_tool_rounds(history)
         tool_messages = list(state.get("messages", []))
-        for result in results:
+        for result_data in results:
             tool_messages.append(
                 {
                     "role": "tool",
-                    "name": result["name"],
-                    "content": result.get("output")
-                    if result["ok"]
-                    else result.get("error_message", "tool failed"),
+                    "name": result_data["name"],
+                    "content": result_data.get("output")
+                    if result_data["ok"]
+                    else result_data.get("error_message", "tool failed"),
                 }
             )
         if state.get("cancel_requested"):
@@ -322,11 +336,35 @@ def build_agent_graph(
                 "error": "tool_schema_context_exceeded",
             }
         plan_data = PlanDecision.model_validate(state.get("plan", {}))
+        selected_names = plan_data.selected_tool_names
+        details = tools.describe_selected(selected_names)
+        exposed_names = {str(item.get("name")) for item in details}
+        missing_names = [name for name in selected_names if name not in exposed_names]
+        if missing_names:
+            return {
+                "response": "请求了不存在的工具定义。",
+                "status": "failed",
+                "error": f"unknown_tool_selection: {', '.join(missing_names)}",
+            }
         return {
-            "tool_details": tools.describe_selected(
-                [call.name for call in plan_data.tool_calls],
-            ),
+            "tool_details": details,
             "tool_disclosure_attempts": attempts + 1,
+        }
+
+    async def reject_undisclosed_tools(state: AgentState) -> dict[str, object]:
+        """Reject calls whose full schema was never explicitly disclosed."""
+
+        decision = PlanDecision.model_validate(state.get("plan", {}))
+        detailed_names = {
+            str(item.get("name")) for item in state.get("tool_details", [])
+        }
+        missing_names = sorted(
+            {call.name for call in decision.tool_calls if call.name not in detailed_names}
+        )
+        return {
+            "response": "工具调用必须先选择工具并读取完整定义。",
+            "status": "failed",
+            "error": f"tool_schema_not_disclosed: {', '.join(missing_names)}",
         }
 
     async def await_confirmation(state: AgentState) -> dict[str, object]:
@@ -356,33 +394,30 @@ def build_agent_graph(
             else "completed",
         }
 
-    async def persist_memory(state: AgentState) -> dict[str, object]:
-        plan_data = PlanDecision.model_validate(state.get("plan", {}))
-        if plan_data.memory_writes:
-            await memory.save(
-                user_id=state["user_id"],
-                workspace_id=state["workspace_id"],
-                writes=plan_data.memory_writes,
-            )
-        return {}
-
     def route_after_prepare(state: AgentState) -> str:
-        return "finalize" if state.get("status") in {"cancelled", "max_steps"} else "load_context"
+        if state.get("status") in {"cancelled", "max_steps"}:
+            return "finalize"
+        # User confirmation restores a server-stored action directly into the
+        # executor. It deliberately does not make another model planning call
+        # before the protected operation is submitted.
+        if state.get("approved_action") is not None:
+            return "execute_tools"
+        return "load_context"
 
     def route_after_context_management(state: AgentState) -> str:
         return "finalize" if state.get("status") == "failed" else "plan"
 
     def route_after_plan(state: AgentState) -> str:
         decision = PlanDecision.model_validate(state.get("plan", {}))
-        if decision.action == "tool" and decision.tool_calls:
+        if decision.action == "select_tools":
+            return "load_tool_details"
+        if decision.action in {"tool", "confirm"}:
             detailed_names = {
                 str(item.get("name")) for item in state.get("tool_details", [])
             }
             if any(call.name not in detailed_names for call in decision.tool_calls):
-                return "load_tool_details"
-            return "execute_tools"
-        if decision.action == "confirm":
-            return "await_confirmation"
+                return "reject_undisclosed_tools"
+            return "execute_tools" if decision.action == "tool" else "await_confirmation"
         return "finalize"
 
     def route_after_tools(state: AgentState) -> str:
@@ -398,15 +433,19 @@ def build_agent_graph(
     graph.add_node("manage_context", manage_context)
     graph.add_node("plan", plan)
     graph.add_node("load_tool_details", load_tool_details)
+    graph.add_node("reject_undisclosed_tools", reject_undisclosed_tools)
     graph.add_node("execute_tools", execute_tools)
     graph.add_node("await_confirmation", await_confirmation)
     graph.add_node("finalize", finalize)
-    graph.add_node("persist_memory", persist_memory)
     graph.add_edge(START, "prepare")
     graph.add_conditional_edges(
         "prepare",
         route_after_prepare,
-        {"load_context": "load_context", "finalize": "finalize"},
+        {
+            "load_context": "load_context",
+            "execute_tools": "execute_tools",
+            "finalize": "finalize",
+        },
     )
     graph.add_edge("load_context", "manage_context")
     graph.add_conditional_edges(
@@ -419,18 +458,19 @@ def build_agent_graph(
         route_after_plan,
         {
             "load_tool_details": "load_tool_details",
+            "reject_undisclosed_tools": "reject_undisclosed_tools",
             "execute_tools": "execute_tools",
             "await_confirmation": "await_confirmation",
             "finalize": "finalize",
         },
     )
     graph.add_edge("load_tool_details", "manage_context")
+    graph.add_edge("reject_undisclosed_tools", "finalize")
     graph.add_conditional_edges(
         "execute_tools",
         route_after_tools,
         {"end": END, "finalize": "finalize", "prepare": "prepare"},
     )
     graph.add_edge("await_confirmation", END)
-    graph.add_edge("finalize", "persist_memory")
-    graph.add_edge("persist_memory", END)
+    graph.add_edge("finalize", END)
     return graph.compile(checkpointer=checkpointer)
