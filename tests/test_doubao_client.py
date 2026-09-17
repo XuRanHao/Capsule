@@ -192,7 +192,7 @@ async def test_query_enhancer_uses_ark_responses_with_bounded_non_thinking_outpu
         await client.close()
 
     assert captured["thinking"] == {"type": "disabled"}
-    assert captured["model"] == "doubao-seed-2-0-lite-260428"
+    assert captured["model"] == "deepseek-v4-1-flash-260910"
     assert captured["max_output_tokens"] == 400
     assert captured["text"] == {"format": {"type": "json_object"}}
     assert "根节点必须且只能包含 queries 和 weights" in str(captured["input"])

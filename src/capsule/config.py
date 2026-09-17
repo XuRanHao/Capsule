@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     understanding_model: str = "doubao-seed-2-0-lite-260428"
     search_query_model: str = Field(
-        default="doubao-seed-2-0-lite-260428",
+        default="deepseek-v4-1-flash-260910",
         validation_alias=AliasChoices(
             "search_query_model",
             "CAPSULE_SEARCH_QUERY_MODEL",
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     agent_context_summary_poll_seconds: float = Field(default=0.1, gt=0, le=5)
     # Conversation planning has its own model identifier even though it reuses
     # the Ark client and strict JSON output transport used elsewhere.
-    agent_planner_model: str = "doubao-seed-2-0-lite-260428"
+    agent_planner_model: str = "deepseek-v4-1-flash-260910"
     agent_planner_max_output_tokens: int = Field(default=1_024, ge=256, le=4_096)
     # A lease is refreshed while one LangGraph invocation may span model and
     # tool waits. It is deliberately independent from memory-worker leases.
