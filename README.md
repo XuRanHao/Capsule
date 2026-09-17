@@ -155,6 +155,10 @@ capsule media-scheduler
 
 ## 开发检查
 
+### Agent 开发文档
+
+Agent 的工具、记忆、上下文、会话与 LangGraph 循环设计见 [docs/agent/README.md](docs/agent/README.md)。
+
 后端：
 
 ```bash
