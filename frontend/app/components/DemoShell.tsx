@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 export type DemoSection =
+  | "workspace"
   | "import"
   | "tasks"
   | "assets"
@@ -14,10 +15,10 @@ const NAV_ITEMS: Array<{
   label: string;
   marker: string;
 }> = [
-  { id: "import", href: "/import", label: "导入", marker: "01" },
-  { id: "tasks", href: "/tasks", label: "处理任务", marker: "02" },
-  { id: "assets", href: "/assets", label: "Assets", marker: "03" },
-  { id: "search", href: "/search", label: "搜索", marker: "04" },
+  { id: "workspace", href: "/", label: "工作台", marker: "01" },
+  { id: "import", href: "/import", label: "导入", marker: "02" },
+  { id: "tasks", href: "/tasks", label: "处理任务", marker: "03" },
+  { id: "assets", href: "/assets", label: "Assets", marker: "04" },
   { id: "capsules", href: "/capsules", label: "Capsule", marker: "05" },
 ];
 
@@ -62,7 +63,7 @@ export function ProductTopbar({
 }) {
   return (
     <header className="topbar product-topbar">
-      <Link className="brand" href="/search" aria-label="Capsule 搜索">
+      <Link className="brand" href="/" aria-label="Capsule 工作台">
         <span className="brand-orbit" aria-hidden="true">
           <i />
         </span>
