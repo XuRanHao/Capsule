@@ -14,6 +14,11 @@ from capsule.db.agent_memory import (
     ClaimedMemoryConsolidation,
     MemoryOutboxEvent,
 )
+from capsule.pipeline.redis_stream_queue import (
+    RedisStreamDelivery,
+    RedisStreamQueue,
+    StreamFields,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,29 +58,34 @@ class MemoryQueueMessage:
         }
 
     @classmethod
-    def from_fields(cls, fields: dict[str, str]) -> MemoryQueueMessage:
+    def from_fields(cls, fields: StreamFields) -> MemoryQueueMessage:
+        decoded = {
+            (key.decode() if isinstance(key, bytes) else str(key)): (
+                value.decode() if isinstance(value, bytes) else str(value)
+            )
+            for key, value in fields.items()
+        }
         try:
             return cls(
-                event_id=fields["event_id"],
-                thread_id=fields["thread_id"],
-                user_id=fields["user_id"],
-                workspace_id=fields["workspace_id"],
-                through_sequence=int(fields["through_sequence"]),
+                event_id=decoded["event_id"],
+                thread_id=decoded["thread_id"],
+                user_id=decoded["user_id"],
+                workspace_id=decoded["workspace_id"],
+                through_sequence=int(decoded["through_sequence"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid agent-memory queue message") from exc
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryQueueDelivery:
-    message: MemoryQueueMessage
-    receipt: str
+class MemoryQueueDelivery(RedisStreamDelivery[MemoryQueueMessage]):
+    """Memory-specific delivery type used by the consolidation worker."""
 
 
 class MemoryQueue(Protocol):
     async def start(self) -> None: ...
 
-    async def publish(self, message: MemoryQueueMessage) -> None: ...
+    async def publish(self, message: MemoryQueueMessage) -> str: ...
 
     async def receive(self) -> MemoryQueueDelivery: ...
 
@@ -94,11 +104,12 @@ class InMemoryMemoryQueue:
     async def start(self) -> None:
         return None
 
-    async def publish(self, message: MemoryQueueMessage) -> None:
+    async def publish(self, message: MemoryQueueMessage) -> str:
         self._sequence += 1
         await self._items.put(
             MemoryQueueDelivery(message=message, receipt=f"memory-{self._sequence}")
         )
+        return f"memory-{self._sequence}"
 
     async def receive(self) -> MemoryQueueDelivery:
         return await self._items.get()
@@ -111,7 +122,7 @@ class InMemoryMemoryQueue:
         return None
 
 
-class RedisMemoryQueue:
+class RedisMemoryQueue(RedisStreamQueue[MemoryQueueMessage]):
     """Redis Streams transport with consumer-group recovery for memory workers."""
 
     def __init__(
@@ -124,83 +135,21 @@ class RedisMemoryQueue:
         claim_idle_ms: int = 60_000,
         client: Any | None = None,
     ) -> None:
-        self._redis_url = redis_url
-        self._stream = stream
-        self._group = group
-        self._consumer = consumer
-        self._claim_idle_ms = claim_idle_ms
-        self._client = client
-
-    async def start(self) -> None:
-        if self._client is None:
-            from redis.asyncio import Redis
-
-            self._client = Redis.from_url(self._redis_url, decode_responses=True)
-        try:
-            await self._client.xgroup_create(
-                self._stream,
-                self._group,
-                id="0-0",
-                mkstream=True,
-            )
-        except Exception as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
-
-    async def publish(self, message: MemoryQueueMessage) -> None:
-        await self._required_client().xadd(self._stream, message.to_fields())
+        super().__init__(
+            redis_url=redis_url,
+            stream=stream,
+            group=group,
+            consumer=consumer,
+            encode=lambda message: message.to_fields(),
+            decode=MemoryQueueMessage.from_fields,
+            claim_idle_ms=claim_idle_ms,
+            delete_on_ack=True,
+            client=client,
+        )
 
     async def receive(self) -> MemoryQueueDelivery:
-        client = self._required_client()
-        while True:
-            claimed = await client.xautoclaim(
-                self._stream,
-                self._group,
-                self._consumer,
-                min_idle_time=self._claim_idle_ms,
-                start_id="0-0",
-                count=1,
-            )
-            claimed_messages = claimed[1] if len(claimed) > 1 else []
-            if claimed_messages:
-                return _redis_delivery(claimed_messages[0])
-            response = await client.xreadgroup(
-                self._group,
-                self._consumer,
-                {self._stream: ">"},
-                count=1,
-                block=1_000,
-            )
-            if response:
-                return _redis_delivery(response[0][1][0])
-
-    async def acknowledge(self, delivery: MemoryQueueDelivery) -> None:
-        client = self._required_client()
-        await client.xack(self._stream, self._group, delivery.receipt)
-        await client.xdel(self._stream, delivery.receipt)
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-
-    def _required_client(self) -> Any:
-        if self._client is None:
-            raise RuntimeError("Redis memory queue has not been started")
-        return self._client
-
-
-def _redis_delivery(message: tuple[str, dict[str, str]]) -> MemoryQueueDelivery:
-    receipt, fields = message
-    decoded = {
-        (key.decode() if isinstance(key, bytes) else str(key)): (
-            value.decode() if isinstance(value, bytes) else str(value)
-        )
-        for key, value in fields.items()
-    }
-    return MemoryQueueDelivery(
-        message=MemoryQueueMessage.from_fields(decoded),
-        receipt=str(receipt),
-    )
+        delivery = await super().receive()
+        return MemoryQueueDelivery(message=delivery.message, receipt=delivery.receipt)
 
 
 class MemoryConsolidator(Protocol):

@@ -21,6 +21,12 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
+from capsule.pipeline.redis_stream_queue import (
+    RedisStreamDelivery,
+    RedisStreamQueue,
+    StreamFields,
+)
+
 
 class ProcessingTaskKind(StrEnum):
     """Stable worker routing class, persisted in transport messages."""
@@ -194,9 +200,8 @@ class ProcessingTaskMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class ProcessingTaskDelivery:
-    message: ProcessingTaskMessage
-    receipt: str
+class ProcessingTaskDelivery(RedisStreamDelivery[ProcessingTaskMessage]):
+    """Processing-task compatibility wrapper around the shared delivery."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +271,7 @@ class ProcessingTaskQueue(Protocol):
         delay_seconds: float,
         failure_event_id: str,
         max_failures: int,
-    ) -> "RetryEnqueueResult": ...
+    ) -> RetryEnqueueResult: ...
 
     async def route_dlq(self, delivery: ProcessingTaskDelivery, *, error: str) -> None: ...
 
@@ -310,9 +315,9 @@ class ProcessingTaskRepository(Protocol):
         *,
         error: str,
         retry_at: float,
-    ) -> "RetryWait": ...
+    ) -> RetryWait: ...
 
-    async def pending_retry_wait(self, message: ProcessingTaskMessage) -> "RetryWait | None": ...
+    async def pending_retry_wait(self, message: ProcessingTaskMessage) -> RetryWait | None: ...
 
     async def advance_dispatch_round(
         self,
@@ -588,7 +593,7 @@ return {0, count}
 """
 
 
-class RedisVideoTaskQueue:
+class RedisVideoTaskQueue(RedisStreamQueue[ProcessingTaskMessage]):
     """Redis Streams adapter with PEL recovery, delayed retry and a separate DLQ."""
 
     def __init__(
@@ -604,68 +609,26 @@ class RedisVideoTaskQueue:
         delayed_key: str | None = None,
         client: Any | None = None,
     ) -> None:
-        if claim_idle_ms < 1:
-            raise ValueError("claim_idle_ms must be positive")
-        self._redis_url = redis_url
-        self._stream = stream
-        self._group = group
-        self._consumer = consumer
+        super().__init__(
+            redis_url=redis_url,
+            stream=stream,
+            group=group,
+            consumer=consumer,
+            encode=lambda message: message.to_fields(),
+            decode=ProcessingTaskMessage.from_fields,
+            claim_idle_ms=claim_idle_ms,
+            client=client,
+        )
         self._dlq_stream = dlq_stream
         self._quarantine_stream = quarantine_stream or f"{stream}:quarantine"
         self._delayed_key = delayed_key or f"{stream}:delayed"
-        self._claim_idle_ms = claim_idle_ms
-        self._client = client
-
-    async def start(self) -> None:
-        if self._client is None:
-            from redis.asyncio import Redis
-
-            self._client = Redis.from_url(self._redis_url, decode_responses=True)
-        try:
-            await self._client.xgroup_create(self._stream, self._group, id="0-0", mkstream=True)
-        except Exception as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
 
     async def publish(self, message: VideoTaskMessage) -> str:
-        return str(await self._required_client().xadd(self._stream, message.to_fields()))
+        return await super().publish(message)
 
     async def receive(self) -> VideoTaskDelivery:
-        client = self._required_client()
-        while True:
-            await self.release_due_retries()
-            claimed = await client.xautoclaim(
-                self._stream,
-                self._group,
-                self._consumer,
-                min_idle_time=self._claim_idle_ms,
-                start_id="0-0",
-                count=1,
-            )
-            messages = claimed[1] if len(claimed) > 1 else []
-            if messages:
-                delivery = await self._decode_or_quarantine(messages[0])
-                if delivery is not None:
-                    return delivery
-                continue
-            response = await client.xreadgroup(
-                self._group,
-                self._consumer,
-                {self._stream: ">"},
-                count=1,
-                block=1_000,
-            )
-            if response:
-                delivery = await self._decode_or_quarantine(response[0][1][0])
-                if delivery is not None:
-                    return delivery
-
-    async def acknowledge(self, delivery: VideoTaskDelivery) -> None:
-        await self._required_client().xack(self._stream, self._group, delivery.receipt)
+        delivery = await super().receive()
+        return VideoTaskDelivery(message=delivery.message, receipt=delivery.receipt)
 
     async def retry(
         self,
@@ -735,35 +698,31 @@ class RedisVideoTaskQueue:
             fields=delivery.message.to_fields(),
             error=error,
         )
-        await self.acknowledge(delivery)
+        await self._acknowledge_receipt(delivery.receipt)
 
-    def _required_client(self) -> Any:
-        if self._client is None:
-            raise RuntimeError("RedisVideoTaskQueue has not been started")
-        return self._client
+    async def _before_receive(self) -> None:
+        await self.release_due_retries()
 
-    async def _decode_or_quarantine(
+    async def _handle_decode_error(
         self,
-        message: tuple[str | bytes, Mapping[str, str | bytes]],
-    ) -> VideoTaskDelivery | None:
-        receipt, fields = message
-        normalized_receipt = receipt.decode() if isinstance(receipt, bytes) else str(receipt)
-        try:
-            return VideoTaskDelivery(VideoTaskMessage.from_fields(fields), normalized_receipt)
-        except (TypeError, ValueError) as exc:
-            await self._write_quarantine(
-                receipt=normalized_receipt,
-                fields=fields,
-                error=_quarantine_error(exc),
-            )
-            await self._required_client().xack(self._stream, self._group, normalized_receipt)
-            return None
+        *,
+        receipt: str,
+        fields: StreamFields,
+        error: TypeError | ValueError,
+    ) -> RedisStreamDelivery[ProcessingTaskMessage] | None:
+        await self._write_quarantine(
+            receipt=receipt,
+            fields=fields,
+            error=_quarantine_error(error),
+        )
+        await self._acknowledge_receipt(receipt)
+        return None
 
     async def _write_quarantine(
         self,
         *,
         receipt: str,
-        fields: Mapping[str, str | bytes],
+        fields: StreamFields,
         error: str,
     ) -> None:
         safe_fields = {
