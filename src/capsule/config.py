@@ -93,6 +93,17 @@ class Settings(BaseSettings):
     video_spool_max_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     video_upload_queue_backend: Literal["memory", "redis"] = "redis"
     redis_url: str = "redis://localhost:6379/0"
+    agent_conversation_context_messages: int = Field(default=24, ge=1, le=200)
+    agent_memory_consolidation_token_threshold: int = Field(default=4_000, ge=128)
+    agent_memory_max_active_topics: int = Field(default=5, ge=1, le=20)
+    agent_memory_max_topic_chars: int = Field(default=32, ge=8, le=128)
+    agent_memory_batch_max_mutations: int = Field(default=3, ge=1, le=10)
+    agent_memory_context_per_scope: int = Field(default=3, ge=1, le=10)
+    agent_memory_workspace_decay_rate: float = Field(default=0.002, ge=0)
+    agent_memory_global_decay_rate: float = Field(default=0.0005, ge=0)
+    agent_memory_worker_lease_seconds: float = Field(default=120.0, gt=0)
+    agent_memory_stream: str = "capsule:agent-memory"
+    agent_memory_group: str = "capsule-agent-memory-workers"
     video_upload_stream: str = "capsule:video-uploads"
     video_upload_group: str = "capsule-video-uploaders"
     video_upload_claim_idle_ms: int = Field(default=30_000, ge=100)

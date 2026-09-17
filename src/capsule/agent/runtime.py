@@ -11,8 +11,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from capsule.agent.contracts import AgentRequest, AgentResponse
 from capsule.agent.graph import AgentPlanner, ReadyPlanner, build_agent_graph
-from capsule.agent.memory import AgentMemoryStore, NullMemoryStore
+from capsule.agent.memory import AgentMemoryStore, DelegatingMemoryStore, NullMemoryStore
 from capsule.agent.tools import ToolRegistry
+from capsule.db.agent_memory import AgentConversationRepository, ConversationContext
 
 PermissionLoader = Callable[..., Awaitable[Iterable[str]]]
 
@@ -24,15 +25,26 @@ class AgentRuntime:
         planner: AgentPlanner | None = None,
         tools: ToolRegistry | None = None,
         memory: AgentMemoryStore | None = None,
-        checkpointer: BaseCheckpointSaver | None = None,
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
         permission_loader: PermissionLoader | None = None,
+        conversation_repository: AgentConversationRepository | None = None,
+        conversation_context_messages: int = 24,
+        memory_consolidation_token_threshold: int = 4_000,
     ) -> None:
+        if conversation_context_messages < 1:
+            raise ValueError("conversation_context_messages must be positive")
+        if memory_consolidation_token_threshold < 1:
+            raise ValueError("memory_consolidation_token_threshold must be positive")
         self._checkpointer = checkpointer or InMemorySaver()
+        self._memory_store = DelegatingMemoryStore(memory or NullMemoryStore())
         self._permission_loader = permission_loader
+        self._conversation_repository = conversation_repository
+        self._conversation_context_messages = conversation_context_messages
+        self._memory_consolidation_token_threshold = memory_consolidation_token_threshold
         self._graph = build_agent_graph(
             planner=planner or ReadyPlanner(),
             tools=tools or ToolRegistry(),
-            memory=memory or NullMemoryStore(),
+            memory=self._memory_store,
             checkpointer=self._checkpointer,
         )
 
@@ -41,8 +53,28 @@ class AgentRuntime:
 
         self._permission_loader = loader
 
+    def set_conversation_repository(
+        self,
+        repository: AgentConversationRepository,
+        *,
+        context_messages: int,
+        consolidation_token_threshold: int,
+    ) -> None:
+        """Attach durable conversation storage after application database startup."""
+
+        if context_messages < 1 or consolidation_token_threshold < 1:
+            raise ValueError("conversation limits must be positive")
+        self._conversation_repository = repository
+        self._conversation_context_messages = context_messages
+        self._memory_consolidation_token_threshold = consolidation_token_threshold
+
+    def set_memory_store(self, memory: AgentMemoryStore) -> None:
+        """Swap the durable reader without rebuilding active graph checkpoints."""
+
+        self._memory_store.set_delegate(memory)
+
     @property
-    def graph(self):
+    def graph(self) -> Any:
         return self._graph
 
     async def invoke(self, request: AgentRequest) -> AgentResponse:
@@ -61,7 +93,64 @@ class AgentRuntime:
             else f"turn_{uuid4().hex}"
         )
         request_id = request.request_id or f"request_{uuid4().hex}"
-        granted_permissions = frozenset()
+        durable_context: dict[str, object] = {}
+        conversation = self._conversation_repository
+        if conversation is not None:
+            if previous:
+                # A hot in-process conversation is still the fastest context source.
+                await conversation.enqueue_consolidation_if_needed(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    token_threshold=self._memory_consolidation_token_threshold,
+                )
+            persisted_user = await conversation.append_message(
+                thread_id=request.thread_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                role="user",
+                content=request.message,
+                request_id=request_id,
+                turn_id=turn_id,
+            )
+            if not previous:
+                durable = await conversation.get_context(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    max_messages=self._conversation_context_messages + 1,
+                )
+                durable_context = {
+                    "messages": [
+                        item.to_graph_message()
+                        for item in durable.messages
+                        if item.message_id != persisted_user.message_id
+                    ],
+                    "working_context": _working_context(durable),
+                }
+            elif not resumes_pending:
+                # A Worker may have summarized while this process retained a
+                # hot LangGraph checkpoint. Refresh only between ordinary
+                # turns, never while an action awaits user confirmation.
+                durable = await conversation.get_context(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    max_messages=self._conversation_context_messages + 1,
+                )
+                if durable.thread.memory_revision > _memory_revision(previous):
+                    await self._graph.aupdate_state(
+                        config,
+                        {
+                            "messages": [
+                                item.to_graph_message()
+                                for item in durable.messages
+                                if item.message_id != persisted_user.message_id
+                            ],
+                            "working_context": _working_context(durable),
+                        },
+                    )
+        granted_permissions: frozenset[str] = frozenset()
         if self._permission_loader is not None:
             granted_permissions = frozenset(
                 await self._permission_loader(
@@ -85,9 +174,20 @@ class AgentRuntime:
                 "confirmation_response": request.confirmation,
                 "cancel_requested": request.cancel,
                 "max_steps": request.max_steps,
+                **durable_context,
             },
             config=config,
         )
+        if conversation is not None and state.get("response") is not None:
+            await conversation.append_message(
+                thread_id=request.thread_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                role="assistant",
+                content=state["response"],
+                request_id=request_id,
+                turn_id=turn_id,
+            )
         return AgentResponse(
             thread_id=request.thread_id,
             status=state.get("status", "failed"),
@@ -110,8 +210,11 @@ def create_agent_runtime(
     planner: AgentPlanner | None = None,
     tools: ToolRegistry | None = None,
     memory: AgentMemoryStore | None = None,
-    checkpointer: BaseCheckpointSaver | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
     permission_loader: PermissionLoader | None = None,
+    conversation_repository: AgentConversationRepository | None = None,
+    conversation_context_messages: int = 24,
+    memory_consolidation_token_threshold: int = 4_000,
 ) -> AgentRuntime:
     return AgentRuntime(
         planner=planner,
@@ -119,4 +222,24 @@ def create_agent_runtime(
         memory=memory,
         checkpointer=checkpointer,
         permission_loader=permission_loader,
+        conversation_repository=conversation_repository,
+        conversation_context_messages=conversation_context_messages,
+        memory_consolidation_token_threshold=memory_consolidation_token_threshold,
     )
+
+
+def _working_context(context: ConversationContext) -> dict[str, Any]:
+    return {
+        "conversation_summary": context.thread.summary,
+        "conversation_topic": context.thread.summary_topic,
+        "summary_covered_sequence": context.thread.summary_covered_sequence,
+        "memory_revision": context.thread.memory_revision,
+    }
+
+
+def _memory_revision(state: dict[str, Any]) -> int:
+    working_context = state.get("working_context")
+    if not isinstance(working_context, dict):
+        return 0
+    revision = working_context.get("memory_revision")
+    return revision if isinstance(revision, int) and revision >= 0 else 0

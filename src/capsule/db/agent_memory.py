@@ -1,0 +1,970 @@
+"""PostgreSQL repositories for Agent conversations and memory consolidation."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from capsule.agent.contracts import MemoryWrite
+from capsule.agent.memory_contracts import (
+    MemoryCandidate,
+    MemoryConsolidation,
+    MemoryMutation,
+)
+from capsule.db.models import (
+    AgentMemory,
+    AgentMemoryOutbox,
+    AgentMemorySource,
+    AgentMessage,
+    AgentThread,
+    Workspace,
+    WorkspaceMemoryProfile,
+)
+from capsule.db.session import Database
+
+MessageRole = Literal["user", "assistant", "tool", "system"]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMessageRecord:
+    message_id: str
+    thread_id: str
+    sequence: int
+    role: str
+    content: Any
+    name: str | None
+    turn_id: str | None
+    request_id: str | None
+    estimated_tokens: int
+    created_at: datetime
+
+    def to_graph_message(self) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.name is not None:
+            message["name"] = self.name
+        return message
+
+
+@dataclass(frozen=True, slots=True)
+class AgentThreadRecord:
+    thread_id: str
+    user_id: str
+    workspace_id: str
+    title: str
+    status: str
+    summary: str | None
+    summary_topic: str | None
+    summary_covered_sequence: int
+    last_consolidated_sequence: int
+    memory_revision: int
+    last_message_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationContext:
+    thread: AgentThreadRecord
+    messages: list[AgentMessageRecord]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryOutboxEvent:
+    event_id: str
+    thread_id: str
+    user_id: str
+    workspace_id: str
+    through_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedMemoryConsolidation:
+    event: MemoryOutboxEvent
+    messages: list[AgentMessageRecord]
+    thread: AgentThreadRecord
+    active_topics: list[dict[str, Any]]
+
+
+MemoryClaimStatus = Literal["claimed", "already_consolidated", "lease_held"]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryConsolidationClaim:
+    """The durable disposition of one Worker attempt to acquire a thread lease."""
+
+    status: MemoryClaimStatus
+    consolidation: ClaimedMemoryConsolidation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMatch:
+    memory_id: str
+    scope: str
+    kind: str
+    memory_key: str
+    value: dict[str, Any]
+    display_text: str
+    topics: list[str]
+    confidence: float
+    effective_confidence: float
+    decay_rate: float
+    status: str
+    relevance: float
+
+
+class AgentConversationRepository:
+    """Own conversation history, threshold events, and memory-worker fences."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def create_thread(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        title: str | None = None,
+    ) -> AgentThreadRecord:
+        async with self._database.session() as session, session.begin():
+            workspace = await session.get(Workspace, workspace_id)
+            if workspace is None:
+                raise ValueError(f"workspace does not exist: {workspace_id}")
+            thread = AgentThread(user_id=user_id, workspace_id=workspace_id)
+            if title is not None:
+                thread.title = title
+            session.add(thread)
+            await session.flush()
+            return _thread_record(thread)
+
+    async def append_message(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        role: MessageRole,
+        content: Any,
+        request_id: str | None = None,
+        turn_id: str | None = None,
+        name: str | None = None,
+        estimated_tokens: int | None = None,
+    ) -> AgentMessageRecord:
+        """Append one message or return the idempotent existing message."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=True,
+            )
+            if request_id is not None:
+                existing = await session.scalar(
+                    select(AgentMessage).where(
+                        AgentMessage.thread_id == thread_id,
+                        AgentMessage.role == role,
+                        AgentMessage.request_id == request_id,
+                    )
+                )
+                if existing is not None:
+                    return _message_record(existing)
+            current_max = await session.scalar(
+                select(func.coalesce(func.max(AgentMessage.sequence), 0)).where(
+                    AgentMessage.thread_id == thread_id
+                )
+            )
+            now = datetime.now(UTC)
+            message = AgentMessage(
+                thread_id=thread_id,
+                sequence=int(current_max or 0) + 1,
+                turn_id=turn_id,
+                request_id=request_id,
+                role=role,
+                name=name,
+                content=content,
+                estimated_tokens=(
+                    estimated_tokens
+                    if estimated_tokens is not None
+                    else estimate_message_tokens(content)
+                ),
+            )
+            session.add(message)
+            thread.last_message_at = now
+            await session.flush()
+            return _message_record(message)
+
+    async def get_context(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        max_messages: int,
+    ) -> ConversationContext:
+        if max_messages < 1:
+            raise ValueError("max_messages must be positive")
+        async with self._database.session() as session:
+            thread = await self._thread_for_identity(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            rows = list(
+                await session.scalars(
+                    select(AgentMessage)
+                    .where(AgentMessage.thread_id == thread_id)
+                    .order_by(AgentMessage.sequence.desc())
+                    .limit(max_messages)
+                )
+            )
+        rows.reverse()
+        return ConversationContext(
+            thread=_thread_record(thread),
+            messages=[_message_record(row) for row in rows],
+        )
+
+    async def list_messages(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[AgentMessageRecord]:
+        if after_sequence < 0:
+            raise ValueError("after_sequence must not be negative")
+        if limit < 1 or limit > 200:
+            raise ValueError("limit must be between 1 and 200")
+        async with self._database.session() as session:
+            await self._thread_for_identity(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            rows = list(
+                await session.scalars(
+                    select(AgentMessage)
+                    .where(
+                        AgentMessage.thread_id == thread_id,
+                        AgentMessage.sequence > after_sequence,
+                    )
+                    .order_by(AgentMessage.sequence)
+                    .limit(limit)
+                )
+            )
+        return [_message_record(row) for row in rows]
+
+    async def list_threads(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        limit: int = 50,
+    ) -> list[AgentThreadRecord]:
+        if limit < 1 or limit > 200:
+            raise ValueError("limit must be between 1 and 200")
+        async with self._database.session() as session:
+            rows = list(
+                await session.scalars(
+                    select(AgentThread)
+                    .where(
+                        AgentThread.user_id == user_id,
+                        AgentThread.workspace_id == workspace_id,
+                    )
+                    .order_by(AgentThread.updated_at.desc())
+                    .limit(limit)
+                )
+            )
+        return [_thread_record(row) for row in rows]
+
+    async def enqueue_consolidation_if_needed(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        token_threshold: int,
+    ) -> MemoryOutboxEvent | None:
+        """Durably request consolidation when the unprocessed range is large enough."""
+
+        if token_threshold < 1:
+            raise ValueError("token_threshold must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            pending_tokens = await session.scalar(
+                select(func.coalesce(func.sum(AgentMessage.estimated_tokens), 0)).where(
+                    AgentMessage.thread_id == thread_id,
+                    AgentMessage.sequence > thread.last_consolidated_sequence,
+                )
+            )
+            if int(pending_tokens or 0) < token_threshold:
+                return None
+            through_sequence = await session.scalar(
+                select(func.coalesce(func.max(AgentMessage.sequence), 0)).where(
+                    AgentMessage.thread_id == thread_id
+                )
+            )
+            resolved_through_sequence = int(through_sequence or 0)
+            if resolved_through_sequence <= thread.last_consolidated_sequence:
+                return None
+            existing = await session.scalar(
+                select(AgentMemoryOutbox).where(
+                    AgentMemoryOutbox.thread_id == thread_id,
+                    AgentMemoryOutbox.through_sequence == resolved_through_sequence,
+                )
+            )
+            if existing is not None:
+                return _outbox_event(existing)
+            event = AgentMemoryOutbox(
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                through_sequence=resolved_through_sequence,
+            )
+            session.add(event)
+            await session.flush()
+            return _outbox_event(event)
+
+    async def pending_outbox_events(self, *, limit: int = 100) -> list[MemoryOutboxEvent]:
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            rows = list(
+                await session.scalars(
+                    select(AgentMemoryOutbox)
+                    .where(
+                        AgentMemoryOutbox.status == "pending",
+                        AgentMemoryOutbox.available_at <= now,
+                    )
+                    .order_by(AgentMemoryOutbox.created_at)
+                    .limit(limit)
+                )
+            )
+        return [_outbox_event(row) for row in rows]
+
+    async def retrieve_memory_matches(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        candidate: MemoryCandidate,
+        limit: int = 3,
+    ) -> list[MemoryMatch]:
+        """Retrieve the top existing memories for one proposed-memory RAG pass."""
+
+        if limit < 1 or limit > 20:
+            raise ValueError("limit must be between 1 and 20")
+        filters = [
+            AgentMemory.scope == candidate.scope,
+            AgentMemory.user_id == user_id,
+            AgentMemory.status == "active",
+        ]
+        if candidate.scope == "workspace":
+            filters.append(AgentMemory.workspace_id == workspace_id)
+        else:
+            filters.append(AgentMemory.workspace_id.is_(None))
+        exact_statement = select(AgentMemory).where(
+            *filters,
+            AgentMemory.kind == candidate.kind,
+            AgentMemory.memory_key == candidate.memory_key,
+        )
+        text_statement = (
+            select(
+                AgentMemory,
+                func.pdb.score(AgentMemory.memory_id).label("bm25_score"),
+            )
+            .where(*filters, AgentMemory.memory_id.op("@@@")(candidate.display_text))
+            .order_by(
+                func.pdb.score(AgentMemory.memory_id).desc(),
+                AgentMemory.memory_id.asc(),
+            )
+            .limit(max(limit * 4, 8))
+        )
+        async with self._database.session() as session:
+            exact = list(await session.scalars(exact_statement))
+            text_rows = (await session.execute(text_statement)).all()
+        bm25_by_id = {memory.memory_id: float(score) for memory, score in text_rows}
+        by_id = {memory.memory_id: memory for memory in exact}
+        by_id.update({memory.memory_id: memory for memory, _ in text_rows})
+        maximum_bm25 = max(bm25_by_id.values(), default=0.0)
+        now = datetime.now(UTC)
+        matches = [
+            _memory_match(
+                memory,
+                exact_key=(
+                    memory.kind == candidate.kind
+                    and memory.memory_key == candidate.memory_key
+                ),
+                bm25_score=bm25_by_id.get(memory.memory_id, 0.0),
+                maximum_bm25=maximum_bm25,
+                now=now,
+            )
+            for memory in by_id.values()
+        ]
+        matches.sort(
+            key=lambda item: (item.relevance, item.memory_id),
+            reverse=True,
+        )
+        return matches[:limit]
+
+    async def retrieve_memory_context(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        query: str,
+        per_scope_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recall a bounded context set, keeping workspace memory before global memory."""
+
+        if per_scope_limit < 1 or per_scope_limit > 10:
+            raise ValueError("per_scope_limit must be between 1 and 10")
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
+        workspace_matches, global_matches = await asyncio.gather(
+            self._retrieve_memory_scope(
+                scope="workspace",
+                user_id=user_id,
+                workspace_id=workspace_id,
+                query=normalized_query,
+                limit=per_scope_limit,
+            ),
+            self._retrieve_memory_scope(
+                scope="global",
+                user_id=user_id,
+                workspace_id=workspace_id,
+                query=normalized_query,
+                limit=per_scope_limit,
+            ),
+        )
+        return [
+            *[_agent_memory_context(item) for item in workspace_matches],
+            *[_agent_memory_context(item) for item in global_matches],
+        ]
+
+    async def _retrieve_memory_scope(
+        self,
+        *,
+        scope: Literal["workspace", "global"],
+        user_id: str,
+        workspace_id: str,
+        query: str,
+        limit: int,
+    ) -> list[MemoryMatch]:
+        filters = [
+            AgentMemory.scope == scope,
+            AgentMemory.user_id == user_id,
+            AgentMemory.status == "active",
+        ]
+        if scope == "workspace":
+            filters.append(AgentMemory.workspace_id == workspace_id)
+        else:
+            filters.append(AgentMemory.workspace_id.is_(None))
+        statement = (
+            select(
+                AgentMemory,
+                func.pdb.score(AgentMemory.memory_id).label("bm25_score"),
+            )
+            .where(*filters, AgentMemory.memory_id.op("@@@")(query))
+            .order_by(
+                func.pdb.score(AgentMemory.memory_id).desc(),
+                AgentMemory.memory_id.asc(),
+            )
+            .limit(max(limit * 4, 8))
+        )
+        async with self._database.session() as session:
+            rows = (await session.execute(statement)).all()
+        bm25_by_id = {memory.memory_id: float(score) for memory, score in rows}
+        maximum_bm25 = max(bm25_by_id.values(), default=0.0)
+        now = datetime.now(UTC)
+        matches = [
+            _memory_match(
+                memory,
+                exact_key=False,
+                bm25_score=bm25_by_id[memory.memory_id],
+                maximum_bm25=maximum_bm25,
+                now=now,
+            )
+            for memory, _ in rows
+        ]
+        matches.sort(
+            key=lambda item: (item.relevance, item.memory_id),
+            reverse=True,
+        )
+        return matches[:limit]
+
+    async def mark_outbox_published(self, *, event_id: str) -> None:
+        async with self._database.session() as session, session.begin():
+            event = await session.get(AgentMemoryOutbox, event_id, with_for_update=True)
+            if event is None or event.status == "published":
+                return
+            event.status = "published"
+            event.attempts += 1
+            event.published_at = datetime.now(UTC)
+
+    async def release_outbox_for_retry(
+        self,
+        *,
+        event_id: str,
+        delay_seconds: float,
+    ) -> None:
+        if delay_seconds < 0:
+            raise ValueError("delay_seconds must not be negative")
+        async with self._database.session() as session, session.begin():
+            event = await session.get(AgentMemoryOutbox, event_id, with_for_update=True)
+            if event is None:
+                return
+            event.attempts += 1
+            event.available_at = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+
+    async def claim_consolidation(
+        self,
+        *,
+        event: MemoryOutboxEvent,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> MemoryConsolidationClaim:
+        """Fence one thread so distinct workers never consolidate it concurrently."""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = datetime.now(UTC)
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=event.thread_id,
+                user_id=event.user_id,
+                workspace_id=event.workspace_id,
+                create=False,
+            )
+            if thread.last_consolidated_sequence >= event.through_sequence:
+                return MemoryConsolidationClaim(status="already_consolidated")
+            if (
+                thread.memory_lease_expires_at is not None
+                and thread.memory_lease_expires_at > now
+                and thread.memory_lease_owner != worker_id
+            ):
+                return MemoryConsolidationClaim(status="lease_held")
+            thread.memory_lease_owner = worker_id
+            thread.memory_lease_expires_at = now + timedelta(seconds=lease_seconds)
+            messages = list(
+                await session.scalars(
+                    select(AgentMessage)
+                    .where(
+                        AgentMessage.thread_id == event.thread_id,
+                        AgentMessage.sequence > thread.last_consolidated_sequence,
+                        AgentMessage.sequence <= event.through_sequence,
+                    )
+                    .order_by(AgentMessage.sequence)
+                )
+            )
+            profile = await session.get(WorkspaceMemoryProfile, event.workspace_id)
+            active_topics = list(profile.active_topics) if profile is not None else []
+            return MemoryConsolidationClaim(
+                status="claimed",
+                consolidation=ClaimedMemoryConsolidation(
+                    event=event,
+                    messages=[_message_record(item) for item in messages],
+                    thread=_thread_record(thread),
+                    active_topics=active_topics,
+                ),
+            )
+
+    async def renew_consolidation_lease(
+        self,
+        *,
+        event: MemoryOutboxEvent,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend the fence while model calls run; false means this Worker lost it."""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=event.thread_id,
+                user_id=event.user_id,
+                workspace_id=event.workspace_id,
+                create=False,
+            )
+            if (
+                thread.last_consolidated_sequence >= event.through_sequence
+                or thread.memory_lease_owner != worker_id
+            ):
+                return False
+            thread.memory_lease_expires_at = datetime.now(UTC) + timedelta(
+                seconds=lease_seconds
+            )
+            return True
+
+    async def complete_consolidation(
+        self,
+        *,
+        claimed: ClaimedMemoryConsolidation,
+        worker_id: str,
+        consolidation: MemoryConsolidation,
+        max_active_topics: int,
+    ) -> None:
+        """Atomically write derived state, memory mutations, and the consolidation cursor."""
+
+        if max_active_topics < 1:
+            raise ValueError("max_active_topics must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=claimed.event.thread_id,
+                user_id=claimed.event.user_id,
+                workspace_id=claimed.event.workspace_id,
+                create=False,
+            )
+            if thread.memory_lease_owner != worker_id:
+                raise RuntimeError("memory consolidation lease is no longer owned by worker")
+            if thread.last_consolidated_sequence >= claimed.event.through_sequence:
+                return
+            if consolidation.summary.covered_sequence != claimed.event.through_sequence:
+                raise ValueError("summary must cover exactly the claimed message range")
+            thread.summary = consolidation.summary.summary
+            thread.summary_topic = consolidation.summary.topic
+            thread.summary_covered_sequence = consolidation.summary.covered_sequence
+            thread.last_consolidated_sequence = claimed.event.through_sequence
+            thread.memory_lease_owner = None
+            thread.memory_lease_expires_at = None
+            await self._apply_mutations(
+                session,
+                thread=thread,
+                source_messages=claimed.messages,
+                mutations=consolidation.mutations,
+            )
+            await self._refresh_profile(
+                session,
+                workspace_id=thread.workspace_id,
+                topic=consolidation.summary.topic,
+                max_active_topics=max_active_topics,
+            )
+            thread.memory_revision += 1
+
+    async def _apply_mutations(
+        self,
+        session: AsyncSession,
+        *,
+        thread: AgentThread,
+        source_messages: Sequence[AgentMessageRecord],
+        mutations: Sequence[MemoryMutation],
+    ) -> None:
+        for mutation in mutations:
+            memory = await self._apply_mutation(session, thread=thread, mutation=mutation)
+            if memory is None:
+                continue
+            for message in source_messages:
+                session.add(
+                    AgentMemorySource(
+                        memory_id=memory.memory_id,
+                        thread_id=thread.thread_id,
+                        message_id=message.message_id,
+                        relation=mutation.action,
+                        confidence_delta=mutation.confidence_delta,
+                    )
+                )
+
+    async def _apply_mutation(
+        self,
+        session: AsyncSession,
+        *,
+        thread: AgentThread,
+        mutation: MemoryMutation,
+    ) -> AgentMemory | None:
+        now = datetime.now(UTC)
+        if mutation.action == "create":
+            candidate = mutation.candidate
+            if candidate is None:  # Pydantic contract protects this branch.
+                raise ValueError("create mutation requires candidate")
+            if candidate.scope == "workspace":
+                workspace_id: str | None = thread.workspace_id
+            else:
+                workspace_id = None
+            new_memory = AgentMemory(
+                scope=candidate.scope,
+                user_id=thread.user_id,
+                workspace_id=workspace_id,
+                kind=candidate.kind,
+                memory_key=candidate.memory_key,
+                value=candidate.value,
+                display_text=candidate.display_text,
+                topics=candidate.topics,
+                initial_confidence=candidate.initial_confidence,
+                confidence=candidate.initial_confidence,
+                decay_rate=candidate.decay_rate,
+                last_reinforced_at=now,
+            )
+            session.add(new_memory)
+            await session.flush()
+            return new_memory
+
+        target_id = mutation.target_memory_id
+        if target_id is None:  # Pydantic contract protects this branch.
+            raise ValueError("mutation requires target_memory_id")
+        target_memory = await session.get(AgentMemory, target_id, with_for_update=True)
+        if target_memory is None:
+            raise ValueError(f"memory does not exist: {target_id}")
+        _validate_memory_owner(target_memory, thread=thread)
+        if mutation.action == "merge":
+            candidate = mutation.candidate
+            if candidate is None:
+                raise ValueError("merge mutation requires candidate")
+            target_memory.value = candidate.value
+            target_memory.display_text = candidate.display_text
+            target_memory.topics = candidate.topics
+            target_memory.confidence = min(
+                1.0,
+                target_memory.confidence + max(0.0, mutation.confidence_delta),
+            )
+            target_memory.last_reinforced_at = now
+            target_memory.version += 1
+        elif mutation.action == "deactivate":
+            target_memory.status = "inactive"
+            target_memory.version += 1
+        elif mutation.action == "lower_confidence":
+            target_memory.confidence = max(
+                0.0,
+                target_memory.confidence + mutation.confidence_delta,
+            )
+            target_memory.version += 1
+        else:  # pragma: no cover - model validation bounds the Literal.
+            raise ValueError(f"unsupported memory mutation: {mutation.action}")
+        return target_memory
+
+    async def _refresh_profile(
+        self,
+        session: AsyncSession,
+        *,
+        workspace_id: str,
+        topic: str | None,
+        max_active_topics: int,
+    ) -> None:
+        if topic is None:
+            return
+        profile = await session.get(WorkspaceMemoryProfile, workspace_id, with_for_update=True)
+        if profile is None:
+            profile = WorkspaceMemoryProfile(workspace_id=workspace_id)
+            session.add(profile)
+            await session.flush()
+        now = datetime.now(UTC)
+        updated = False
+        topics = [dict(item) for item in profile.active_topics]
+        for item in topics:
+            if item.get("topic") == topic:
+                item["last_active_at"] = now.isoformat()
+                item["thread_count"] = int(item.get("thread_count", 0)) + 1
+                updated = True
+                break
+        if not updated:
+            topics.append(
+                {"topic": topic, "last_active_at": now.isoformat(), "thread_count": 1}
+            )
+        topics.sort(
+            key=lambda item: (
+                str(item.get("last_active_at", "")),
+                int(item.get("thread_count", 0)),
+            ),
+            reverse=True,
+        )
+        profile.active_topics = topics[:max_active_topics]
+        profile.primary_topic = str(profile.active_topics[0]["topic"])
+        profile.revision += 1
+
+    async def _locked_thread(
+        self,
+        session: AsyncSession,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        create: bool,
+    ) -> AgentThread:
+        thread = await session.get(AgentThread, thread_id, with_for_update=True)
+        if thread is None:
+            if not create:
+                raise ValueError(f"agent thread does not exist: {thread_id}")
+            workspace = await session.get(Workspace, workspace_id)
+            if workspace is None:
+                raise ValueError(f"workspace does not exist: {workspace_id}")
+            thread = AgentThread(
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            session.add(thread)
+            await session.flush()
+            return thread
+        if thread.user_id != user_id or thread.workspace_id != workspace_id:
+            raise PermissionError("agent thread does not belong to this user and workspace")
+        return thread
+
+    async def _thread_for_identity(
+        self,
+        session: AsyncSession,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> AgentThread:
+        thread = await session.get(AgentThread, thread_id)
+        if thread is None:
+            raise ValueError(f"agent thread does not exist: {thread_id}")
+        if thread.user_id != user_id or thread.workspace_id != workspace_id:
+            raise PermissionError("agent thread does not belong to this user and workspace")
+        return thread
+
+
+def estimate_message_tokens(content: Any) -> int:
+    """Cheap, deterministic fallback used only to decide deferred summarization."""
+
+    encoded = json.dumps(content, ensure_ascii=False, separators=(",", ":"), default=str)
+    return max(1, (len(encoded) + 3) // 4)
+
+
+def _message_record(message: AgentMessage) -> AgentMessageRecord:
+    return AgentMessageRecord(
+        message_id=message.message_id,
+        thread_id=message.thread_id,
+        sequence=message.sequence,
+        role=message.role,
+        content=message.content,
+        name=message.name,
+        turn_id=message.turn_id,
+        request_id=message.request_id,
+        estimated_tokens=message.estimated_tokens,
+        created_at=message.created_at,
+    )
+
+
+def _thread_record(thread: AgentThread) -> AgentThreadRecord:
+    return AgentThreadRecord(
+        thread_id=thread.thread_id,
+        user_id=thread.user_id,
+        workspace_id=thread.workspace_id,
+        title=thread.title,
+        status=thread.status,
+        summary=thread.summary,
+        summary_topic=thread.summary_topic,
+        summary_covered_sequence=thread.summary_covered_sequence,
+        last_consolidated_sequence=thread.last_consolidated_sequence,
+        memory_revision=thread.memory_revision,
+        last_message_at=thread.last_message_at,
+    )
+
+
+def _outbox_event(event: AgentMemoryOutbox) -> MemoryOutboxEvent:
+    return MemoryOutboxEvent(
+        event_id=event.event_id,
+        thread_id=event.thread_id,
+        user_id=event.user_id,
+        workspace_id=event.workspace_id,
+        through_sequence=event.through_sequence,
+    )
+
+
+def _validate_memory_owner(memory: AgentMemory, *, thread: AgentThread) -> None:
+    if memory.user_id != thread.user_id:
+        raise PermissionError("memory does not belong to this user")
+    if memory.scope == "workspace" and memory.workspace_id != thread.workspace_id:
+        raise PermissionError("workspace memory does not belong to this workspace")
+
+
+def _memory_match(
+    memory: AgentMemory,
+    *,
+    exact_key: bool,
+    bm25_score: float,
+    maximum_bm25: float,
+    now: datetime,
+) -> MemoryMatch:
+    age_days = max(0.0, (now - memory.last_reinforced_at).total_seconds() / 86_400)
+    effective_confidence = memory.confidence * math.exp(-memory.decay_rate * age_days)
+    normalized_bm25 = bm25_score / maximum_bm25 if maximum_bm25 > 0 else 0.0
+    relevance = (1.0 if exact_key else normalized_bm25) * effective_confidence
+    return MemoryMatch(
+        memory_id=memory.memory_id,
+        scope=memory.scope,
+        kind=memory.kind,
+        memory_key=memory.memory_key,
+        value=memory.value,
+        display_text=memory.display_text,
+        topics=memory.topics,
+        confidence=memory.confidence,
+        effective_confidence=effective_confidence,
+        decay_rate=memory.decay_rate,
+        status=memory.status,
+        relevance=relevance,
+    )
+
+
+def _agent_memory_context(match: MemoryMatch) -> dict[str, Any]:
+    return {
+        "memory_id": match.memory_id,
+        "scope": match.scope,
+        "kind": match.kind,
+        "key": match.memory_key,
+        "value": match.value,
+        "text": match.display_text,
+        "topics": match.topics,
+        "confidence": match.effective_confidence,
+    }
+
+
+class PostgresAgentMemoryStore:
+    """Read structured memory for graph context; the Worker owns all writes."""
+
+    def __init__(
+        self,
+        repository: AgentConversationRepository,
+        *,
+        per_scope_limit: int,
+    ) -> None:
+        self._repository = repository
+        self._per_scope_limit = per_scope_limit
+
+    async def load(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        query: str,
+    ) -> list[dict[str, Any]]:
+        return await self._repository.retrieve_memory_context(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            query=query,
+            per_scope_limit=self._per_scope_limit,
+        )
+
+    async def save(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        writes: Iterable[MemoryWrite],
+    ) -> None:
+        """Ignore legacy graph-side writes; deferred consolidation is authoritative."""
+
+        del user_id, workspace_id, writes

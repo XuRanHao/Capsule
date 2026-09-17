@@ -68,3 +68,38 @@ class AgentResponse(BaseModel):
     pending_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     tool_history: list[dict[str, Any]] = Field(default_factory=list)
     step_count: int = 0
+
+
+class AgentThreadCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=128)
+    workspace_id: str = Field(min_length=1, max_length=128)
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class AgentThreadResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    user_id: str
+    workspace_id: str
+    title: str
+    status: str
+    summary: str | None = None
+    summary_topic: str | None = None
+    memory_revision: int
+    last_message_at: str | None = None
+
+
+class AgentMessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    sequence: int
+    role: str
+    content: Any
+    name: str | None = None
+    turn_id: str | None = None
+    request_id: str | None = None
+    created_at: str

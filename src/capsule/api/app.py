@@ -16,6 +16,7 @@ from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
+from capsule.db.agent_memory import AgentConversationRepository, PostgresAgentMemoryStore
 from capsule.db.repositories import (
     AssetRepository,
     EmbeddingRepository,
@@ -81,9 +82,23 @@ def create_app(
             return
 
         database = Database(resolved_settings)
+        app.state.agent_conversation_repository = AgentConversationRepository(database)
         if agent_runtime is None:
             resolved_agent_runtime.set_permission_loader(
                 WorkspaceUserRepository(database).load_granted_permissions
+            )
+            resolved_agent_runtime.set_conversation_repository(
+                app.state.agent_conversation_repository,
+                context_messages=resolved_settings.agent_conversation_context_messages,
+                consolidation_token_threshold=(
+                    resolved_settings.agent_memory_consolidation_token_threshold
+                ),
+            )
+            resolved_agent_runtime.set_memory_store(
+                PostgresAgentMemoryStore(
+                    app.state.agent_conversation_repository,
+                    per_scope_limit=resolved_settings.agent_memory_context_per_scope,
+                )
             )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()

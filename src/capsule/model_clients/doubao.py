@@ -142,6 +142,27 @@ class DoubaoClient:
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
+    async def generate_structured(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        output_type: type[ModelT],
+        schema_name: str,
+        max_output_tokens: int,
+    ) -> ModelT:
+        """Generate one strict Pydantic response for non-asset application flows."""
+
+        response_format = responses_json_schema_format(output_type, name=schema_name)
+        return await self._responses_json(
+            messages=messages,
+            output_type=output_type,
+            pool=self.capsule_pool,
+            timeout_seconds=self._settings.understanding_timeout_seconds,
+            max_output_tokens=max_output_tokens,
+            model=self._settings.understanding_model,
+            response_format=response_format,
+        )
+
     async def understand_asset(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -536,6 +557,7 @@ class DoubaoClient:
         timeout_seconds: float,
         max_output_tokens: int | None = None,
         model: str | None = None,
+        response_format: Mapping[str, Any] | None = None,
     ) -> ModelT:
         """Call Ark Responses API for the Lite model with thinking disabled."""
 
@@ -546,6 +568,7 @@ class DoubaoClient:
                 timeout_seconds=timeout_seconds,
                 max_output_tokens=max_output_tokens,
                 model=model,
+                response_format=response_format,
             )
             return result
 

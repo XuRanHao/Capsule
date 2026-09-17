@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +19,11 @@ from capsule.agent import (
     create_agent_runtime,
 )
 from capsule.agent.contracts import PlanDecision, ToolCall
+from capsule.db.agent_memory import (
+    AgentMessageRecord,
+    AgentThreadRecord,
+    ConversationContext,
+)
 
 
 class EchoArgs(BaseModel):
@@ -85,6 +91,91 @@ class ConfirmationThenRespondPlanner:
         return PlanDecision(action="respond", message="已开始新的对话轮次。")
 
 
+class RecordingPlanner:
+    def __init__(self) -> None:
+        self.contexts: list[dict[str, object]] = []
+
+    async def plan(self, state: object) -> PlanDecision:
+        values = state if isinstance(state, dict) else {}
+        self.contexts.append(
+            {
+                "messages": list(values.get("messages", [])),
+                "working_context": dict(values.get("working_context", {})),
+                "memory_context": list(values.get("memory_context", [])),
+            }
+        )
+        return PlanDecision(action="respond", message="已读取上下文。")
+
+
+class FakeConversationRepository:
+    def __init__(self, *, revision: int) -> None:
+        now = datetime.now(UTC)
+        self.current_user = AgentMessageRecord(
+            message_id="current-user",
+            thread_id="durable-thread",
+            sequence=4,
+            role="user",
+            content="新问题",
+            name=None,
+            turn_id="turn-current",
+            request_id="request-current",
+            estimated_tokens=4,
+            created_at=now,
+        )
+        self.assistant = AgentMessageRecord(
+            message_id="current-assistant",
+            thread_id="durable-thread",
+            sequence=5,
+            role="assistant",
+            content="已读取上下文。",
+            name=None,
+            turn_id="turn-current",
+            request_id="request-current",
+            estimated_tokens=4,
+            created_at=now,
+        )
+        self.context = ConversationContext(
+            thread=AgentThreadRecord(
+                thread_id="durable-thread",
+                user_id="user-a",
+                workspace_id="workspace-a",
+                title="新会话",
+                status="active",
+                summary="此前讨论了记忆架构。",
+                summary_topic="记忆架构",
+                summary_covered_sequence=2,
+                last_consolidated_sequence=2,
+                memory_revision=revision,
+                last_message_at=now,
+            ),
+            messages=[
+                AgentMessageRecord(
+                    message_id="old-user",
+                    thread_id="durable-thread",
+                    sequence=3,
+                    role="user",
+                    content="旧问题",
+                    name=None,
+                    turn_id="turn-old",
+                    request_id="request-old",
+                    estimated_tokens=4,
+                    created_at=now,
+                ),
+                self.current_user,
+            ],
+        )
+        self.enqueued = 0
+
+    async def enqueue_consolidation_if_needed(self, **_: object) -> None:
+        self.enqueued += 1
+
+    async def append_message(self, *, role: str, **_: object) -> AgentMessageRecord:
+        return self.current_user if role == "user" else self.assistant
+
+    async def get_context(self, **_: object) -> ConversationContext:
+        return self.context
+
+
 @pytest.mark.asyncio
 async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     planner = SequencePlanner()
@@ -119,6 +210,102 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     snapshot = await runtime.state("thread-a")
     assert snapshot is not None
     assert snapshot["messages"][-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_runtime_hydrates_cold_conversation_context_from_postgres_repository() -> None:
+    planner = RecordingPlanner()
+    repository = FakeConversationRepository(revision=1)
+    runtime = create_agent_runtime(
+        planner=planner,
+        conversation_repository=repository,  # type: ignore[arg-type]
+    )
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="durable-thread",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="新问题",
+            request_id="request-current",
+        )
+    )
+
+    assert result.status == "completed"
+    assert [item["content"] for item in planner.contexts[-1]["messages"]] == [
+        "旧问题",
+        "新问题",
+    ]
+    assert planner.contexts[-1]["working_context"] == {
+        "conversation_summary": "此前讨论了记忆架构。",
+        "conversation_topic": "记忆架构",
+        "summary_covered_sequence": 2,
+        "memory_revision": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_refreshes_hot_context_after_worker_updates_summary() -> None:
+    planner = RecordingPlanner()
+    runtime = create_agent_runtime(planner=planner)
+    request = AgentRequest(
+        thread_id="durable-thread",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="第一次问题",
+    )
+    await runtime.invoke(request)
+
+    repository = FakeConversationRepository(revision=1)
+    runtime.set_conversation_repository(
+        repository,  # type: ignore[arg-type]
+        context_messages=24,
+        consolidation_token_threshold=4_000,
+    )
+    result = await runtime.invoke(
+        request.model_copy(
+            update={"message": "新问题", "request_id": "request-current"}
+        )
+    )
+
+    assert result.status == "completed"
+    assert repository.enqueued == 1
+    assert [item["content"] for item in planner.contexts[-1]["messages"]] == [
+        "旧问题",
+        "新问题",
+    ]
+    snapshot = await runtime.state("durable-thread")
+    assert snapshot is not None
+    assert snapshot["working_context"]["memory_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_memory_reader_attached_after_graph_creation() -> None:
+    planner = RecordingPlanner()
+
+    class MemoryReader:
+        async def load(self, **_: object) -> list[dict[str, object]]:
+            return [{"scope": "workspace", "text": "使用中文"}]
+
+        async def save(self, **_: object) -> None:
+            return None
+
+    runtime = create_agent_runtime(planner=planner)
+    runtime.set_memory_store(MemoryReader())  # type: ignore[arg-type]
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="thread-memory-reader",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="继续讨论",
+        )
+    )
+
+    assert result.status == "completed"
+    assert planner.contexts[-1]["memory_context"] == [
+        {"scope": "workspace", "text": "使用中文"}
+    ]
 
 
 @pytest.mark.asyncio

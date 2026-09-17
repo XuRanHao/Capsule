@@ -114,6 +114,202 @@ class AgentToolExecution(Base, TimestampMixin):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AgentThread(Base, TimestampMixin):
+    """User-visible conversation and its durable memory-consolidation cursor."""
+
+    __tablename__ = "agent_threads"
+    __table_args__ = (
+        Index(
+            "ix_agent_threads_user_workspace_updated",
+            "user_id",
+            "workspace_id",
+            "updated_at",
+        ),
+    )
+
+    thread_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True, default=id_factory("thread")
+    )
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新会话")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    summary: Mapped[str | None] = mapped_column(Text)
+    summary_topic: Mapped[str | None] = mapped_column(String(128))
+    summary_covered_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_consolidated_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    memory_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_lease_owner: Mapped[str | None] = mapped_column(String(128))
+    memory_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentMessage(Base):
+    """Append-only Agent message history; never use checkpoints as chat history."""
+
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "sequence", name="uq_agent_messages_thread_sequence"),
+        UniqueConstraint(
+            "thread_id",
+            "role",
+            "request_id",
+            name="uq_agent_messages_thread_role_request",
+        ),
+        Index("ix_agent_messages_thread_sequence", "thread_id", "sequence"),
+    )
+
+    message_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("msg")
+    )
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_threads.thread_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    turn_id: Mapped[str | None] = mapped_column(String(128))
+    request_id: Mapped[str | None] = mapped_column(String(128))
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128))
+    content: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    estimated_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class WorkspaceMemoryProfile(Base, TimestampMixin):
+    """Small derived topic view shared by isolated conversation threads."""
+
+    __tablename__ = "workspace_memory_profiles"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    active_topics: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    primary_topic: Mapped[str | None] = mapped_column(String(128))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class AgentMemory(Base, TimestampMixin):
+    """Structured workspace or user-global memory with a decaying confidence."""
+
+    __tablename__ = "agent_memories"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('workspace', 'global')",
+            name="ck_agent_memories_scope",
+        ),
+        CheckConstraint(
+            "(scope = 'workspace' AND workspace_id IS NOT NULL) "
+            "OR (scope = 'global' AND workspace_id IS NULL)",
+            name="ck_agent_memories_scope_workspace",
+        ),
+        Index(
+            "ix_agent_memories_scope_lookup",
+            "scope",
+            "user_id",
+            "workspace_id",
+            "status",
+            "kind",
+            "memory_key",
+        ),
+    )
+
+    memory_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("mem")
+    )
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    workspace_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    memory_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    display_text: Mapped[str] = mapped_column(Text, nullable=False)
+    topics: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    initial_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    decay_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    last_reinforced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class AgentMemorySource(Base):
+    """Evidence and feedback that created, reinforced, or weakened a memory."""
+
+    __tablename__ = "agent_memory_sources"
+    __table_args__ = (
+        Index("ix_agent_memory_sources_memory_created", "memory_id", "created_at"),
+    )
+
+    source_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("memsrc")
+    )
+    memory_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_memories.memory_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    thread_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    message_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    relation: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence_delta: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AgentMemoryOutbox(Base, TimestampMixin):
+    """Durable delivery record for one deferred memory-consolidation range."""
+
+    __tablename__ = "agent_memory_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "thread_id",
+            "through_sequence",
+            name="uq_agent_memory_outbox_thread_through_sequence",
+        ),
+        Index(
+            "ix_agent_memory_outbox_pending",
+            "status",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("memout")
+    )
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_threads.thread_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    through_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class SourceFile(Base, TimestampMixin):
     __tablename__ = "source_files"
     __table_args__ = (

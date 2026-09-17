@@ -50,6 +50,42 @@ class NullMemoryStore:
         return None
 
 
+class DelegatingMemoryStore:
+    """Stable graph dependency whose concrete memory reader can change after startup."""
+
+    def __init__(self, delegate: AgentMemoryStore) -> None:
+        self._delegate = delegate
+
+    def set_delegate(self, delegate: AgentMemoryStore) -> None:
+        self._delegate = delegate
+
+    async def load(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        query: str,
+    ) -> list[dict[str, Any]]:
+        return await self._delegate.load(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            query=query,
+        )
+
+    async def save(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        writes: Iterable[MemoryWrite],
+    ) -> None:
+        await self._delegate.save(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            writes=writes,
+        )
+
+
 class InMemoryMemoryStore:
     """Small deterministic implementation for local development and unit tests."""
 

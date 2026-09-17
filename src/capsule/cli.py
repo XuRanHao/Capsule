@@ -1,17 +1,26 @@
 import asyncio
 import json
 import logging
+import socket
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import typer
 from alembic import command
 from alembic.config import Config
 
 from capsule import __version__
+from capsule.agent.memory_consolidator import DoubaoMemoryModel, StructuredMemoryConsolidator
+from capsule.agent.memory_worker import (
+    MemoryOutboxDispatcher,
+    MemoryWorker,
+    RedisMemoryQueue,
+)
 from capsule.bootstrap import bootstrap_runtime
 from capsule.config import get_settings
+from capsule.db.agent_memory import AgentConversationRepository
 from capsule.db.repositories import (
     AssetRepository,
     EmbeddingRepository,
@@ -100,6 +109,38 @@ def bootstrap(
         )
     )
     typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+
+
+@app.command(name="agent-memory-dispatcher")
+def agent_memory_dispatcher_command(
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Publish one Outbox scan, then stop."),
+    ] = False,
+    poll_seconds: Annotated[
+        float,
+        typer.Option("--poll-seconds", min=0.1, help="Delay between Outbox scans."),
+    ] = 1.0,
+) -> None:
+    """Publish durable Agent memory events from PostgreSQL to Redis Streams."""
+
+    asyncio.run(_run_agent_memory_dispatcher(once=once, poll_seconds=poll_seconds))
+
+
+@app.command(name="agent-memory-worker")
+def agent_memory_worker_command(
+    worker_id: Annotated[
+        str | None,
+        typer.Option("--worker-id", help="Stable identifier for this Worker process."),
+    ] = None,
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Process one queue delivery, then stop."),
+    ] = False,
+) -> None:
+    """Run one independently deployable Agent memory consolidation Worker."""
+
+    asyncio.run(_run_agent_memory_worker(worker_id=worker_id, once=once))
 
 
 @app.command()
@@ -505,4 +546,73 @@ async def _enrich_assets(
                 force_understanding=force_understanding,
             )
     finally:
+        await database.dispose()
+
+
+async def _run_agent_memory_dispatcher(*, once: bool, poll_seconds: float) -> None:
+    settings = get_settings()
+    database = Database(settings)
+    queue = RedisMemoryQueue(
+        redis_url=settings.redis_url,
+        stream=settings.agent_memory_stream,
+        group=settings.agent_memory_group,
+        consumer=f"dispatcher-{socket.gethostname()}-{uuid4().hex[:8]}",
+    )
+    try:
+        await queue.start()
+        dispatcher = MemoryOutboxDispatcher(
+            repository=AgentConversationRepository(database),
+            queue=queue,
+        )
+        while True:
+            published = await dispatcher.dispatch_once()
+            if once:
+                typer.echo(json.dumps({"published": published}, ensure_ascii=False))
+                return
+            if published == 0:
+                await asyncio.sleep(poll_seconds)
+    finally:
+        await queue.close()
+        await database.dispose()
+
+
+async def _run_agent_memory_worker(*, worker_id: str | None, once: bool) -> None:
+    settings = get_settings()
+    database = Database(settings)
+    resolved_worker_id = worker_id or f"{socket.gethostname()}-{uuid4().hex[:12]}"
+    queue = RedisMemoryQueue(
+        redis_url=settings.redis_url,
+        stream=settings.agent_memory_stream,
+        group=settings.agent_memory_group,
+        consumer=resolved_worker_id,
+    )
+    try:
+        await queue.start()
+        async with DoubaoClient(settings) as model_client:
+            repository = AgentConversationRepository(database)
+            worker = MemoryWorker(
+                worker_id=resolved_worker_id,
+                repository=repository,
+                queue=queue,
+                consolidator=StructuredMemoryConsolidator(
+                    model=DoubaoMemoryModel(
+                        model_client,
+                        max_topic_chars=settings.agent_memory_max_topic_chars,
+                    ),
+                    repository=repository,
+                    max_mutations=settings.agent_memory_batch_max_mutations,
+                    workspace_decay_rate=settings.agent_memory_workspace_decay_rate,
+                    global_decay_rate=settings.agent_memory_global_decay_rate,
+                ),
+                lease_seconds=settings.agent_memory_worker_lease_seconds,
+                max_active_topics=settings.agent_memory_max_active_topics,
+            )
+            if once:
+                processed = await worker.run_once()
+                typer.echo(json.dumps({"processed": processed}, ensure_ascii=False))
+                return
+            while True:
+                await worker.run_once()
+    finally:
+        await queue.close()
         await database.dispose()
