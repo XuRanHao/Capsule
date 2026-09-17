@@ -7,6 +7,7 @@
 !.codex/MEMORY/**
 !.codex/MEMORY.md
 .pytest_cache/
+/.pytest-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
