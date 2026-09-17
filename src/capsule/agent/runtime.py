@@ -66,6 +66,12 @@ class AgentRuntime:
 
         self._permission_loader = loader
 
+    def set_planner(self, planner: AgentPlanner) -> None:
+        """Install the model planner during application startup and rebuild the graph."""
+
+        self._planner = planner
+        self._graph = self._build_graph()
+
     def set_conversation_repository(
         self,
         repository: AgentConversationRepository,

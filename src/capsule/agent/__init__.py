@@ -18,6 +18,7 @@ __all__ = [
     "AgentPlanner",
     "AgentTool",
     "InMemoryMemoryStore",
+    "ModelAgentPlanner",
     "NullMemoryStore",
     "PlanDecision",
     "ReadyPlanner",
@@ -39,6 +40,10 @@ def __getattr__(name: str) -> Any:
         from capsule.agent.graph import AgentPlanner, ReadyPlanner
 
         return {"AgentPlanner": AgentPlanner, "ReadyPlanner": ReadyPlanner}[name]
+    if name == "ModelAgentPlanner":
+        from capsule.agent.model_planner import ModelAgentPlanner
+
+        return ModelAgentPlanner
     if name in {"AgentRuntime", "create_agent_runtime"}:
         from capsule.agent.runtime import AgentRuntime, create_agent_runtime
 

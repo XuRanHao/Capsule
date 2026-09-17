@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     agent_context_max_reduction_rounds: int = Field(default=3, ge=1, le=3)
     agent_context_summary_wait_seconds: float = Field(default=12.0, gt=0, le=60)
     agent_context_summary_poll_seconds: float = Field(default=0.1, gt=0, le=5)
+    # Conversation planning has its own model identifier even though it reuses
+    # the Ark client and strict JSON output transport used elsewhere.
+    agent_planner_model: str = "doubao-seed-2-0-lite-260428"
+    agent_planner_max_output_tokens: int = Field(default=1_024, ge=256, le=4_096)
     # A lease is refreshed while one LangGraph invocation may span model and
     # tool waits. It is deliberately independent from memory-worker leases.
     agent_turn_lease_seconds: float = Field(default=300.0, gt=0)

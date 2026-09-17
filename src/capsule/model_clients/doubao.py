@@ -149,6 +149,7 @@ class DoubaoClient:
         output_type: type[ModelT],
         schema_name: str,
         max_output_tokens: int,
+        model: str | None = None,
     ) -> ModelT:
         """Generate one strict Pydantic response for non-asset application flows."""
 
@@ -159,7 +160,7 @@ class DoubaoClient:
             pool=self.capsule_pool,
             timeout_seconds=self._settings.understanding_timeout_seconds,
             max_output_tokens=max_output_tokens,
-            model=self._settings.understanding_model,
+            model=model or self._settings.understanding_model,
             response_format=response_format,
         )
 

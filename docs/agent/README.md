@@ -10,7 +10,7 @@
 | 记忆 | 三层记忆如何整理、存储、召回与投影 | [记忆系统](memory.md) |
 | 上下文 | 超出模型窗口时如何压缩而不删除源数据 | [上下文预算](context.md) |
 | 会话 | 消息权威来源、热镜像、生命周期与并发 | [会话系统](conversations.md) |
-| 循环 | LangGraph 节点、状态与恢复路径 | [图循环](graph-cycle.md) |
+| 循环与规划 | LangGraph 节点、模型 Planner、状态与恢复路径 | [图循环](graph-cycle.md) |
 
 ## 系统总览
 
@@ -53,6 +53,7 @@ PostgreSQL 是业务数据唯一权威来源。Milvus 只提供召回候选，Re
 4. 所有工具调用必须在服务端重新做参数、权限、确认、幂等和并发校验；模型输出不是授权。
 5. 单个 `thread_id` 同时最多一个活跃 Runtime 回合；业务回合租约与 Memory Worker 租约互不替代。
 6. 一次 Runtime 请求内长期/通用记忆最多同步召回一次，工具循环复用同一批结果。
+7. 正常应用中的 Planner 只产出受 Schema 限制的 `PlanDecision`；它不能直接执行工具、写入记忆或改变会话状态。
 
 ## 配置与数据库升级
 
@@ -62,7 +63,13 @@ Agent 配置位于 `src/capsule/config.py`，环境变量使用 `CAPSULE_` 前�
 CAPSULE_AGENT_CONTEXT_WINDOW_TOKENS=32000
 CAPSULE_AGENT_CONTEXT_OUTPUT_RESERVE_TOKENS=4000
 CAPSULE_AGENT_TURN_LEASE_SECONDS=300
+CAPSULE_AGENT_PLANNER_MODEL=doubao-seed-2-0-lite-260428
+CAPSULE_AGENT_PLANNER_MAX_OUTPUT_TOKENS=1024
 ```
+
+`ModelAgentPlanner` 复用 Ark/Doubao 客户端的严格 JSON 输出通道。可用的模型名称和
+上下文窗口因部署账户而异：若替换规划模型，应同步调整上述模型配置及
+`CAPSULE_AGENT_CONTEXT_*` 的窗口参数。
 
 修改模型、数据库或部署环境后，先执行：
 

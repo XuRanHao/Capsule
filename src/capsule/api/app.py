@@ -14,6 +14,7 @@ from capsule.agent.checkpoints import postgres_checkpoint_url
 from capsule.agent.context_budget import ContextBudget
 from capsule.agent.memory_worker import MemoryOutboxDispatcher, RedisMemoryQueue
 from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
+from capsule.agent.model_planner import ModelAgentPlanner
 from capsule.agent.runtime import AgentRuntime
 from capsule.api.agent import router as agent_router
 from capsule.api.assets import router as assets_router
@@ -227,6 +228,13 @@ def create_app(
 
         embedding_client = DoubaoClient(resolved_settings)
         if agent_runtime is None:
+            resolved_agent_runtime.set_planner(
+                ModelAgentPlanner(
+                    model=embedding_client,
+                    model_name=resolved_settings.agent_planner_model,
+                    max_output_tokens=resolved_settings.agent_planner_max_output_tokens,
+                )
+            )
             resolved_agent_runtime.set_memory_store(
                 MilvusAgentMemoryStore(
                     repository=app.state.agent_conversation_repository,

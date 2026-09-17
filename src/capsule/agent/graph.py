@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from capsule.agent.context_budget import ContextBudgetController
 from capsule.agent.contracts import PlanDecision, ToolCall
 from capsule.agent.memory import AgentMemoryStore
+from capsule.agent.model_planner import AgentPlanningError
 from capsule.agent.state import AgentState
 from capsule.agent.tools import ToolContext, ToolRegistry
 
@@ -212,7 +213,14 @@ def build_agent_graph(
         if approved is not None:
             decision = PlanDecision.model_validate(approved)
         else:
-            decision = await planner.plan(state)
+            try:
+                decision = await planner.plan(state)
+            except AgentPlanningError:
+                return {
+                    "status": "failed",
+                    "response": "对话规划服务暂不可用，请稍后重试。",
+                    "error": "planner_unavailable",
+                }
         return {"plan": decision.model_dump(mode="json")}
 
     async def execute_tools(state: AgentState) -> dict[str, object]:
@@ -408,6 +416,8 @@ def build_agent_graph(
         return "finalize" if state.get("status") == "failed" else "plan"
 
     def route_after_plan(state: AgentState) -> str:
+        if state.get("status") == "failed":
+            return "finalize"
         decision = PlanDecision.model_validate(state.get("plan", {}))
         if decision.action == "select_tools":
             return "load_tool_details"

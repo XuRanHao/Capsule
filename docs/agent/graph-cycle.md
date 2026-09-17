@@ -4,6 +4,22 @@
 
 LangGraph 管理一条可中断、可恢复的 Agent 执行流程。它协调规划、上下文、工具和确认，但不替代 PostgreSQL 会话历史、工具审计或 Memory Worker。图的 `thread_id` 与业务会话 `thread_id` 一致；在持久化部署中 checkpoint 使用 PostgreSQL Saver。
 
+## 模型 Planner 与应用注入
+
+正常 API 启动且配置了 Ark 密钥时，应用创建一个 `DoubaoClient`，并将
+`ModelAgentPlanner` 注入默认 `AgentRuntime`。Planner 通过该客户端的严格 JSON
+输出能力生成 `PlanDecision`；模型名称与最大输出 Token 分别由
+`CAPSULE_AGENT_PLANNER_MODEL` 和 `CAPSULE_AGENT_PLANNER_MAX_OUTPUT_TOKENS` 配置。
+
+模型只会收到治理后的白名单投影：会话摘要/主题和消息、冻结的记忆召回、近期工具
+结果、当前工具目录与已披露 Schema，以及已授予权限。checkpoint 控制字段、待执行
+动作和内部请求标识不会进入提示词。`PlanDecision` 仍会经过图路由及 `ToolRegistry`
+的服务端校验，因此模型既不能自行授权，也不能直接执行副作用。
+
+无 Ark 密钥时，或测试显式传入自定义 `AgentRuntime` 时，不替换其 Planner；默认
+`ReadyPlanner` 保留为安全降级。模型请求失败会转换为 `planner_unavailable`，图以
+“对话规划服务暂不可用，请稍后重试。”结束本轮，而不会尝试执行工具。
+
 ## 节点与路由
 
 当前图由以下节点组成：
@@ -94,7 +110,7 @@ plan(select_tools)
 | `completed` | 已形成最终回复 | 持久化助手消息。 |
 | `awaiting_confirmation` | 计划或 Registry 要求确认 | 保存 checkpoint，等待下一请求。 |
 | `cancelled` | 用户拒绝/取消或图检测到取消 | 取消未开始调用并形成取消回复。 |
-| `failed` | 上下文不可压缩、工具未披露、未知工具选择等 | 形成明确失败回复，不执行后续操作。 |
+| `failed` | 上下文不可压缩、工具未披露、未知工具选择或 Planner 不可用 | 形成明确失败回复，不执行后续操作。 |
 | `max_steps` | 节点步数超过请求上限 | 形成最大步数回复，停止循环。 |
 
 工具失败本身通常作为结构化 `ToolExecutionResult` 返回给后续规划器；是否终止由规划器和图状态决定。权限、参数或确认拒绝不会被模型绕过。
@@ -114,6 +130,7 @@ plan(select_tools)
 ## 测试入口
 
 - `tests/test_agent_framework.py`：图路由、渐进工具披露、确认恢复、取消和回合租约调用。
+- `tests/test_agent_model_planner.py`：模型输入白名单、远端模型失败与 Runtime 重新装配。
 - `tests/test_agent_context_budget.py`：治理边界和不可压缩失败。
 - `tests/test_agent_postgres_checkpoint_integration.py`：跨 Runtime 恢复待确认动作。
 - `tests/test_agent_conversation_management_integration.py`：真实 PostgreSQL 会话与租约。
