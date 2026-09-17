@@ -78,6 +78,14 @@ class AgentThreadCreateRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=255)
 
 
+class AgentThreadRenameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=128)
+    workspace_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=255)
+
+
 class AgentThreadResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,6 +98,7 @@ class AgentThreadResponse(BaseModel):
     summary_topic: str | None = None
     memory_revision: int
     last_message_at: str | None = None
+    deleted_at: str | None = None
 
 
 class AgentMessageResponse(BaseModel):

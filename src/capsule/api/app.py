@@ -7,7 +7,9 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from capsule.agent.checkpoints import postgres_checkpoint_url
 from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
 from capsule.agent.runtime import AgentRuntime
 from capsule.api.agent import router as agent_router
@@ -167,12 +169,21 @@ def create_app(
                 runner=pipeline_runner,
                 durable_task_submitter=durable_task_submitter,
             )
+            checkpoint_context = None
+            if agent_runtime is None:
+                checkpointer, checkpoint_context = await _open_agent_checkpointer(
+                    settings=resolved_settings,
+                    runtime=resolved_agent_runtime,
+                )
+                app.state.agent_checkpointer = checkpointer
             try:
                 yield
             finally:
                 if durable_task_supervisor is not None:
                     await durable_task_supervisor.close()
                 await database.dispose()
+                if checkpoint_context is not None:
+                    await checkpoint_context.__aexit__(None, None, None)
             return
 
         embedding_client = DoubaoClient(resolved_settings)
@@ -249,6 +260,13 @@ def create_app(
             embedding_service=embedding_service,
         )
         import_workflow_task = asyncio.create_task(import_workflow_coordinator.run_forever())
+        checkpoint_context = None
+        if agent_runtime is None:
+            checkpointer, checkpoint_context = await _open_agent_checkpointer(
+                settings=resolved_settings,
+                runtime=resolved_agent_runtime,
+            )
+            app.state.agent_checkpointer = checkpointer
         try:
             yield
         finally:
@@ -259,6 +277,8 @@ def create_app(
             if durable_task_supervisor is not None:
                 await durable_task_supervisor.close()
             await database.dispose()
+            if checkpoint_context is not None:
+                await checkpoint_context.__aexit__(None, None, None)
 
     logging.basicConfig(
         level=getattr(logging, resolved_settings.log_level.upper(), logging.INFO),
@@ -315,5 +335,23 @@ def create_app(
         }
 
     return application
+
+async def _open_agent_checkpointer(
+    *,
+    settings: Settings,
+    runtime: AgentRuntime,
+) -> tuple[AsyncPostgresSaver, Any]:
+    """Start LangGraph's checkpoint schema beside Capsule's business tables."""
+
+    context = AsyncPostgresSaver.from_conn_string(postgres_checkpoint_url(settings))
+    checkpointer = await context.__aenter__()
+    try:
+        await checkpointer.setup()
+    except BaseException as exc:
+        await context.__aexit__(type(exc), exc, exc.__traceback__)
+        raise
+    runtime.set_checkpointer(checkpointer)
+    return checkpointer, context
+
 
 app = create_app()

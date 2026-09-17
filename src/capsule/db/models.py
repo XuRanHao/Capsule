@@ -119,6 +119,10 @@ class AgentThread(Base, TimestampMixin):
 
     __tablename__ = "agent_threads"
     __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'archived', 'deleted')",
+            name="ck_agent_threads_status",
+        ),
         Index(
             "ix_agent_threads_user_workspace_updated",
             "user_id",
@@ -145,6 +149,7 @@ class AgentThread(Base, TimestampMixin):
     memory_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_message_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     memory_lease_owner: Mapped[str | None] = mapped_column(String(128))
     memory_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

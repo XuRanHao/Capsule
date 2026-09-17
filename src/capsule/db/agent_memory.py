@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.agent.contracts import MemoryWrite
@@ -33,6 +33,11 @@ from capsule.db.models import (
 from capsule.db.session import Database
 
 MessageRole = Literal["user", "assistant", "tool", "system"]
+ThreadStatus = Literal["active", "archived", "deleted"]
+
+
+class AgentThreadStateError(ValueError):
+    """The identified conversation exists but cannot accept this operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +74,7 @@ class AgentThreadRecord:
     memory_revision: int
     last_message_at: datetime | None
     last_message_sequence: int = 0
+    deleted_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +191,114 @@ class AgentConversationRepository:
             await session.flush()
             return _thread_record(thread)
 
+    async def rename_thread(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        title: str,
+    ) -> AgentThreadRecord:
+        """Change the visible title without changing the durable message history."""
+
+        normalized_title = title.strip()
+        if not normalized_title:
+            raise ValueError("thread title must not be blank")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            self._require_not_deleted(thread)
+            thread.title = normalized_title
+            await session.flush()
+            return _thread_record(thread)
+
+    async def archive_thread(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> AgentThreadRecord:
+        """Hide an active conversation while preserving its durable history."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            if thread.status == "archived":
+                return _thread_record(thread)
+            if thread.status != "active":
+                raise AgentThreadStateError(
+                    "only an active agent thread can be archived"
+                )
+            thread.status = "archived"
+            await session.flush()
+            return _thread_record(thread)
+
+    async def restore_thread(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> AgentThreadRecord:
+        """Restore an archived or softly deleted conversation as a new active session."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            thread.status = "active"
+            thread.deleted_at = None
+            thread.memory_lease_owner = None
+            thread.memory_lease_expires_at = None
+            await session.flush()
+            return _thread_record(thread)
+
+    async def soft_delete_thread(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> AgentThreadRecord:
+        """Hide a conversation and prevent its queued history from creating new memory."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            if thread.status == "deleted":
+                return _thread_record(thread)
+            thread.status = "deleted"
+            thread.deleted_at = datetime.now(UTC)
+            thread.memory_lease_owner = None
+            thread.memory_lease_expires_at = None
+            await session.execute(
+                delete(AgentMemoryOutbox).where(
+                    AgentMemoryOutbox.thread_id == thread_id
+                )
+            )
+            await session.flush()
+            return _thread_record(thread)
+
     async def append_message(
         self,
         *,
@@ -208,6 +322,7 @@ class AgentConversationRepository:
                 workspace_id=workspace_id,
                 create=True,
             )
+            self._require_active(thread)
             if request_id is not None:
                 existing = await session.scalar(
                     select(AgentMessage).where(
@@ -287,6 +402,7 @@ class AgentConversationRepository:
                 user_id=user_id,
                 workspace_id=workspace_id,
             )
+            self._require_active(thread)
             return ConversationSyncState(
                 last_message_sequence=thread.last_message_sequence,
                 memory_revision=thread.memory_revision,
@@ -306,12 +422,13 @@ class AgentConversationRepository:
         if limit < 1 or limit > 200:
             raise ValueError("limit must be between 1 and 200")
         async with self._database.session() as session:
-            await self._thread_for_identity(
+            thread = await self._thread_for_identity(
                 session,
                 thread_id=thread_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
             )
+            self._require_not_deleted(thread)
             rows = list(
                 await session.scalars(
                     select(AgentMessage)
@@ -331,17 +448,33 @@ class AgentConversationRepository:
         user_id: str,
         workspace_id: str,
         limit: int = 50,
+        status: ThreadStatus | None = None,
+        query: str | None = None,
+        include_deleted: bool = False,
     ) -> list[AgentThreadRecord]:
         if limit < 1 or limit > 200:
             raise ValueError("limit must be between 1 and 200")
+        search_title = query.strip() if query is not None else ""
+        filters = [
+            AgentThread.user_id == user_id,
+            AgentThread.workspace_id == workspace_id,
+        ]
+        if status is not None:
+            filters.append(AgentThread.status == status)
+        elif not include_deleted:
+            filters.append(AgentThread.status != "deleted")
+        if search_title:
+            escaped = (
+                search_title.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            filters.append(AgentThread.title.ilike(f"%{escaped}%", escape="\\"))
         async with self._database.session() as session:
             rows = list(
                 await session.scalars(
                     select(AgentThread)
-                    .where(
-                        AgentThread.user_id == user_id,
-                        AgentThread.workspace_id == workspace_id,
-                    )
+                    .where(*filters)
                     .order_by(AgentThread.updated_at.desc())
                     .limit(limit)
                 )
@@ -368,6 +501,7 @@ class AgentConversationRepository:
                 workspace_id=workspace_id,
                 create=False,
             )
+            self._require_active(thread)
             pending_tokens = await session.scalar(
                 select(func.coalesce(func.sum(AgentMessage.estimated_tokens), 0)).where(
                     AgentMessage.thread_id == thread_id,
@@ -817,6 +951,13 @@ class AgentConversationRepository:
             raise ValueError("lease_seconds must be positive")
         now = datetime.now(UTC)
         async with self._database.session() as session, session.begin():
+            outbox = await session.get(
+                AgentMemoryOutbox,
+                event.event_id,
+                with_for_update=True,
+            )
+            if outbox is None:
+                return MemoryConsolidationClaim(status="already_consolidated")
             thread = await self._locked_thread(
                 session,
                 thread_id=event.thread_id,
@@ -824,6 +965,7 @@ class AgentConversationRepository:
                 workspace_id=event.workspace_id,
                 create=False,
             )
+            self._require_not_deleted(thread)
             if thread.last_consolidated_sequence >= event.through_sequence:
                 return MemoryConsolidationClaim(status="already_consolidated")
             if (
@@ -908,6 +1050,7 @@ class AgentConversationRepository:
                 workspace_id=claimed.event.workspace_id,
                 create=False,
             )
+            self._require_not_deleted(thread)
             if thread.memory_lease_owner != worker_id:
                 raise RuntimeError("memory consolidation lease is no longer owned by worker")
             if thread.last_consolidated_sequence >= claimed.event.through_sequence:
@@ -953,6 +1096,7 @@ class AgentConversationRepository:
                 workspace_id=claimed.event.workspace_id,
                 create=False,
             )
+            self._require_not_deleted(thread)
             if thread.memory_lease_owner != worker_id:
                 raise RuntimeError("memory consolidation lease is no longer owned by worker")
             if thread.last_consolidated_sequence >= claimed.event.through_sequence:
@@ -1168,6 +1312,18 @@ class AgentConversationRepository:
             raise PermissionError("agent thread does not belong to this user and workspace")
         return thread
 
+    @staticmethod
+    def _require_active(thread: AgentThread) -> None:
+        if thread.status != "active":
+            raise AgentThreadStateError(
+                f"agent thread is {thread.status} and cannot accept new messages"
+            )
+
+    @staticmethod
+    def _require_not_deleted(thread: AgentThread) -> None:
+        if thread.status == "deleted":
+            raise ValueError("agent thread has been deleted")
+
 
 def estimate_message_tokens(content: Any) -> int:
     """Cheap, deterministic fallback used only to decide deferred summarization."""
@@ -1205,6 +1361,7 @@ def _thread_record(thread: AgentThread) -> AgentThreadRecord:
         memory_revision=thread.memory_revision,
         last_message_at=thread.last_message_at,
         last_message_sequence=thread.last_message_sequence,
+        deleted_at=thread.deleted_at,
     )
 
 

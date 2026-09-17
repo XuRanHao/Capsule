@@ -40,17 +40,14 @@ class AgentRuntime:
         if memory_consolidation_token_threshold < 1:
             raise ValueError("memory_consolidation_token_threshold must be positive")
         self._checkpointer = checkpointer or InMemorySaver()
+        self._planner = planner or ReadyPlanner()
+        self._tools = tools or ToolRegistry()
         self._memory_store = DelegatingMemoryStore(memory or NullMemoryStore())
         self._permission_loader = permission_loader
         self._conversation_repository = conversation_repository
         self._conversation_context_messages = conversation_context_messages
         self._memory_consolidation_token_threshold = memory_consolidation_token_threshold
-        self._graph = build_agent_graph(
-            planner=planner or ReadyPlanner(),
-            tools=tools or ToolRegistry(),
-            memory=self._memory_store,
-            checkpointer=self._checkpointer,
-        )
+        self._graph = self._build_graph()
 
     def set_permission_loader(self, loader: PermissionLoader) -> None:
         """Attach a server-side permission loader after app startup."""
@@ -76,6 +73,12 @@ class AgentRuntime:
         """Swap the durable reader without rebuilding active graph checkpoints."""
 
         self._memory_store.set_delegate(memory)
+
+    def set_checkpointer(self, checkpointer: BaseCheckpointSaver[Any]) -> None:
+        """Install a durable saver during application startup before any invocation."""
+
+        self._checkpointer = checkpointer
+        self._graph = self._build_graph()
 
     @property
     def graph(self) -> Any:
@@ -236,6 +239,19 @@ class AgentRuntime:
             {"configurable": {"thread_id": thread_id}},
         )
         return dict(snapshot.values) if snapshot.values else None
+
+    async def discard_state(self, thread_id: str) -> None:
+        """Remove a suspended graph so archived or deleted threads cannot resume it."""
+
+        await self._checkpointer.adelete_thread(thread_id)
+
+    def _build_graph(self) -> Any:
+        return build_agent_graph(
+            planner=self._planner,
+            tools=self._tools,
+            memory=self._memory_store,
+            checkpointer=self._checkpointer,
+        )
 
 
 def create_agent_runtime(
