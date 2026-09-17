@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from capsule.agent.contracts import MemoryWrite
 from capsule.agent.memory_contracts import (
+    ConversationSummary,
     MemoryCandidate,
     MemoryConsolidation,
     MemoryMutation,
@@ -617,18 +618,65 @@ class AgentConversationRepository:
             )
             return True
 
+    async def persist_short_term_consolidation(
+        self,
+        *,
+        claimed: ClaimedMemoryConsolidation,
+        worker_id: str,
+        summary: ConversationSummary,
+        max_active_topics: int,
+    ) -> ClaimedMemoryConsolidation:
+        """Commit the summary and topic profile before memory extraction begins."""
+
+        if max_active_topics < 1:
+            raise ValueError("max_active_topics must be positive")
+        if summary.covered_sequence != claimed.event.through_sequence:
+            raise ValueError("summary must cover exactly the claimed message range")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=claimed.event.thread_id,
+                user_id=claimed.event.user_id,
+                workspace_id=claimed.event.workspace_id,
+                create=False,
+            )
+            if thread.memory_lease_owner != worker_id:
+                raise RuntimeError("memory consolidation lease is no longer owned by worker")
+            if thread.last_consolidated_sequence >= claimed.event.through_sequence:
+                raise RuntimeError("memory consolidation is already complete")
+            if thread.summary_covered_sequence > claimed.event.through_sequence:
+                raise RuntimeError("summary cursor is ahead of the claimed message range")
+            if thread.summary_covered_sequence < claimed.event.through_sequence:
+                thread.summary = summary.summary
+                thread.summary_topic = summary.topic
+                thread.summary_covered_sequence = summary.covered_sequence
+                active_topics = await self._refresh_profile(
+                    session,
+                    workspace_id=thread.workspace_id,
+                    topic=summary.topic,
+                    max_active_topics=max_active_topics,
+                )
+                thread.memory_revision += 1
+            else:
+                active_topics = await self._profile_topics(
+                    session,
+                    workspace_id=thread.workspace_id,
+                )
+            return replace(
+                claimed,
+                thread=_thread_record(thread),
+                active_topics=active_topics,
+            )
+
     async def complete_consolidation(
         self,
         *,
         claimed: ClaimedMemoryConsolidation,
         worker_id: str,
         consolidation: MemoryConsolidation,
-        max_active_topics: int,
     ) -> None:
-        """Atomically write derived state, memory mutations, and the consolidation cursor."""
+        """Write memory mutations and then advance the long-memory cursor."""
 
-        if max_active_topics < 1:
-            raise ValueError("max_active_topics must be positive")
         async with self._database.session() as session, session.begin():
             thread = await self._locked_thread(
                 session,
@@ -643,25 +691,30 @@ class AgentConversationRepository:
                 return
             if consolidation.summary.covered_sequence != claimed.event.through_sequence:
                 raise ValueError("summary must cover exactly the claimed message range")
-            thread.summary = consolidation.summary.summary
-            thread.summary_topic = consolidation.summary.topic
-            thread.summary_covered_sequence = consolidation.summary.covered_sequence
-            thread.last_consolidated_sequence = claimed.event.through_sequence
-            thread.memory_lease_owner = None
-            thread.memory_lease_expires_at = None
+            if thread.summary_covered_sequence != claimed.event.through_sequence:
+                raise RuntimeError("short-term summary must be committed before memory writes")
             await self._apply_mutations(
                 session,
                 thread=thread,
                 source_messages=claimed.messages,
                 mutations=consolidation.mutations,
             )
-            await self._refresh_profile(
-                session,
-                workspace_id=thread.workspace_id,
-                topic=consolidation.summary.topic,
-                max_active_topics=max_active_topics,
-            )
-            thread.memory_revision += 1
+            thread.last_consolidated_sequence = claimed.event.through_sequence
+            thread.memory_lease_owner = None
+            thread.memory_lease_expires_at = None
+
+    async def _profile_topics(
+        self,
+        session: AsyncSession,
+        *,
+        workspace_id: str,
+    ) -> list[dict[str, Any]]:
+        profile = await session.get(
+            WorkspaceMemoryProfile,
+            workspace_id,
+            with_for_update=True,
+        )
+        return list(profile.active_topics) if profile is not None else []
 
     async def _apply_mutations(
         self,
@@ -734,6 +787,7 @@ class AgentConversationRepository:
             target_memory.value = candidate.value
             target_memory.display_text = candidate.display_text
             target_memory.topics = candidate.topics
+            target_memory.decay_rate = candidate.decay_rate
             target_memory.confidence = min(
                 1.0,
                 target_memory.confidence + max(0.0, mutation.confidence_delta),
@@ -760,10 +814,10 @@ class AgentConversationRepository:
         workspace_id: str,
         topic: str | None,
         max_active_topics: int,
-    ) -> None:
-        if topic is None:
-            return
+    ) -> list[dict[str, Any]]:
         profile = await session.get(WorkspaceMemoryProfile, workspace_id, with_for_update=True)
+        if topic is None:
+            return list(profile.active_topics) if profile is not None else []
         if profile is None:
             profile = WorkspaceMemoryProfile(workspace_id=workspace_id)
             session.add(profile)
@@ -791,6 +845,7 @@ class AgentConversationRepository:
         profile.active_topics = topics[:max_active_topics]
         profile.primary_topic = str(profile.active_topics[0]["topic"])
         profile.revision += 1
+        return [dict(item) for item in profile.active_topics]
 
     async def _locked_thread(
         self,

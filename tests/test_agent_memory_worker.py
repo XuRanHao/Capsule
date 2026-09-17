@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -106,16 +107,38 @@ async def test_worker_acknowledges_delivery_after_consolidation_commits() -> Non
         async def renew_consolidation_lease(self, **_: object) -> bool:
             return True
 
+        async def persist_short_term_consolidation(
+            self,
+            *,
+            claimed: ClaimedMemoryConsolidation,
+            summary: ConversationSummary,
+            **_: object,
+        ) -> ClaimedMemoryConsolidation:
+            assert summary.topic == "规范主题"
+            calls.append("persist_short_term")
+            return replace(
+                claimed,
+                active_topics=[{"topic": "规范主题", "thread_count": 1}],
+            )
+
         async def complete_consolidation(self, **_: object):
             calls.append("complete")
 
     class Consolidator:
-        async def consolidate(self, claimed: object) -> MemoryConsolidation:
+        async def summarize(self, claimed: object) -> ConversationSummary:
             assert claimed is not None
+            calls.append("summarize")
+            return ConversationSummary(summary="摘要", topic="规范主题", covered_sequence=2)
+
+        async def consolidate(
+            self,
+            claimed: ClaimedMemoryConsolidation,
+            *,
+            summary: ConversationSummary,
+        ) -> MemoryConsolidation:
+            assert claimed.active_topics[0]["topic"] == "规范主题"
             calls.append("consolidate")
-            return MemoryConsolidation(
-                summary=ConversationSummary(summary="摘要", covered_sequence=2)
-            )
+            return MemoryConsolidation(summary=summary)
 
     worker = MemoryWorker(
         worker_id="worker-1",
@@ -127,7 +150,13 @@ async def test_worker_acknowledges_delivery_after_consolidation_commits() -> Non
     )
 
     assert await asyncio.wait_for(worker.run_once(), timeout=1) is True
-    assert calls == ["claim", "consolidate", "complete"]
+    assert calls == [
+        "claim",
+        "summarize",
+        "persist_short_term",
+        "consolidate",
+        "complete",
+    ]
     assert queue.acknowledged == ["memory-1"]
 
 
@@ -197,16 +226,31 @@ async def test_worker_renews_its_lease_during_slow_model_work() -> None:
             renewals.append(datetime.now(UTC))
             return True
 
+        async def persist_short_term_consolidation(
+            self,
+            *,
+            claimed: ClaimedMemoryConsolidation,
+            **_: object,
+        ) -> ClaimedMemoryConsolidation:
+            return claimed
+
         async def complete_consolidation(self, **_: object) -> None:
             return None
 
     class Consolidator:
-        async def consolidate(self, claimed: object) -> MemoryConsolidation:
+        async def summarize(self, claimed: object) -> ConversationSummary:
+            assert claimed is not None
+            return ConversationSummary(summary="摘要", covered_sequence=2)
+
+        async def consolidate(
+            self,
+            claimed: object,
+            *,
+            summary: ConversationSummary,
+        ) -> MemoryConsolidation:
             assert claimed is not None
             await asyncio.sleep(0.15)
-            return MemoryConsolidation(
-                summary=ConversationSummary(summary="摘要", covered_sequence=2)
-            )
+            return MemoryConsolidation(summary=summary)
 
     worker = MemoryWorker(
         worker_id="worker-3",
@@ -219,3 +263,65 @@ async def test_worker_renews_its_lease_during_slow_model_work() -> None:
 
     assert await asyncio.wait_for(worker.run_once(), timeout=1) is True
     assert renewals
+
+
+@pytest.mark.asyncio
+async def test_worker_reuses_staged_summary_after_a_memory_extraction_retry() -> None:
+    queue = _TrackingQueue()
+    await queue.publish(MemoryQueueMessage.from_event(_event()))
+    claimed = _claimed()
+    staged = replace(
+        claimed,
+        thread=replace(
+            claimed.thread,
+            summary="已持久化的摘要",
+            summary_topic="规范主题",
+            summary_covered_sequence=2,
+            memory_revision=1,
+        ),
+    )
+
+    class Repository:
+        async def claim_consolidation(self, **_: object) -> MemoryConsolidationClaim:
+            return MemoryConsolidationClaim(status="claimed", consolidation=staged)
+
+        async def renew_consolidation_lease(self, **_: object) -> bool:
+            return True
+
+        async def persist_short_term_consolidation(
+            self,
+            *,
+            claimed: ClaimedMemoryConsolidation,
+            summary: ConversationSummary,
+            **_: object,
+        ) -> ClaimedMemoryConsolidation:
+            assert summary.summary == "已持久化的摘要"
+            return claimed
+
+        async def complete_consolidation(self, **_: object) -> None:
+            return None
+
+    class Consolidator:
+        async def summarize(self, claimed: object) -> ConversationSummary:
+            raise AssertionError(f"must reuse staged summary: {claimed}")
+
+        async def consolidate(
+            self,
+            claimed: ClaimedMemoryConsolidation,
+            *,
+            summary: ConversationSummary,
+        ) -> MemoryConsolidation:
+            assert claimed.thread.summary_topic == "规范主题"
+            return MemoryConsolidation(summary=summary)
+
+    worker = MemoryWorker(
+        worker_id="worker-retry",
+        repository=Repository(),  # type: ignore[arg-type]
+        queue=queue,
+        consolidator=Consolidator(),  # type: ignore[arg-type]
+        lease_seconds=60,
+        max_active_topics=5,
+    )
+
+    assert await asyncio.wait_for(worker.run_once(), timeout=1) is True
+    assert queue.acknowledged == ["memory-1"]

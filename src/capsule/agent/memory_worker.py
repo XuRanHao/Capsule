@@ -8,7 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from capsule.agent.memory_contracts import MemoryConsolidation
+from capsule.agent.memory_contracts import ConversationSummary, MemoryConsolidation
 from capsule.db.agent_memory import (
     AgentConversationRepository,
     ClaimedMemoryConsolidation,
@@ -206,9 +206,16 @@ def _redis_delivery(message: tuple[str, dict[str, str]]) -> MemoryQueueDelivery:
 class MemoryConsolidator(Protocol):
     """Model-backed extraction node used by the deterministic worker flow."""
 
+    async def summarize(
+        self,
+        claimed: ClaimedMemoryConsolidation,
+    ) -> ConversationSummary: ...
+
     async def consolidate(
         self,
         claimed: ClaimedMemoryConsolidation,
+        *,
+        summary: ConversationSummary,
     ) -> MemoryConsolidation: ...
 
 
@@ -271,12 +278,23 @@ class MemoryWorker:
             raise RuntimeError("claimed memory consolidation is missing its payload")
         heartbeat = asyncio.create_task(self._renew_lease_until_complete(claimed))
         try:
-            consolidation = await self._consolidator.consolidate(claimed)
-            await self._repository.complete_consolidation(
+            summary = _staged_summary(claimed)
+            if summary is None:
+                summary = await self._consolidator.summarize(claimed)
+            prepared = await self._repository.persist_short_term_consolidation(
                 claimed=claimed,
                 worker_id=self._worker_id,
-                consolidation=consolidation,
+                summary=summary,
                 max_active_topics=self._max_active_topics,
+            )
+            consolidation = await self._consolidator.consolidate(
+                prepared,
+                summary=summary,
+            )
+            await self._repository.complete_consolidation(
+                claimed=prepared,
+                worker_id=self._worker_id,
+                consolidation=consolidation,
             )
         finally:
             heartbeat.cancel()
@@ -299,6 +317,22 @@ class MemoryWorker:
             )
             if not renewed:
                 return
+
+
+def _staged_summary(
+    claimed: ClaimedMemoryConsolidation,
+) -> ConversationSummary | None:
+    thread = claimed.thread
+    if (
+        thread.summary_covered_sequence != claimed.event.through_sequence
+        or thread.summary is None
+    ):
+        return None
+    return ConversationSummary(
+        summary=thread.summary,
+        topic=thread.summary_topic,
+        covered_sequence=thread.summary_covered_sequence,
+    )
 
 
 async def run_memory_worker(

@@ -1,10 +1,11 @@
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
-from capsule.agent.memory_consolidator import StructuredMemoryConsolidator
+from capsule.agent.memory_consolidator import DoubaoMemoryModel, StructuredMemoryConsolidator
 from capsule.agent.memory_contracts import MemoryCandidate
 from capsule.db.agent_memory import (
     AgentMessageRecord,
@@ -143,7 +144,9 @@ async def test_consolidator_parallelizes_scope_and_candidate_work_with_a_batch_c
         max_mutations=3,
     )
 
-    result = await consolidator.consolidate(_claimed())
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    result = await consolidator.consolidate(claimed, summary=summary)
 
     assert result.summary.topic == "记忆主题"
     assert model.extract_scopes == ["workspace", "global"]
@@ -189,7 +192,35 @@ async def test_consolidator_falls_back_to_create_when_resolution_targets_unknown
         max_mutations=3,
     )
 
-    result = await consolidator.consolidate(_claimed())
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    result = await consolidator.consolidate(claimed, summary=summary)
 
     assert len(result.mutations) == 1
     assert result.mutations[0].action == "create"
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_receives_existing_workspace_topics() -> None:
+    class Client:
+        request_messages: list[dict[str, str]]
+
+        async def generate_structured(self, *, messages, **_: object):
+            self.request_messages = messages
+            return SimpleNamespace(summary="摘要", topic="已有主题")
+
+    client = Client()
+    model = DoubaoMemoryModel(client, max_topic_chars=32)  # type: ignore[arg-type]
+    claimed = _claimed()
+    claimed = ClaimedMemoryConsolidation(
+        event=claimed.event,
+        messages=claimed.messages,
+        thread=claimed.thread,
+        active_topics=[{"topic": "已有主题", "thread_count": 3}],
+    )
+
+    summary = await model.summarize(claimed=claimed)
+
+    assert summary.topic == "已有主题"
+    assert "active_workspace_topics" in client.request_messages[1]["content"]
+    assert "已有主题" in client.request_messages[1]["content"]

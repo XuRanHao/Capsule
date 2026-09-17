@@ -85,6 +85,7 @@ class DoubaoMemoryModel:
     async def summarize(self, *, claimed: ClaimedMemoryConsolidation) -> _SummaryDraft:
         payload = {
             "previous_summary": claimed.thread.summary,
+            "active_workspace_topics": claimed.active_topics,
             "messages": [_message_payload(item) for item in claimed.messages],
             "covered_through_sequence": claimed.event.through_sequence,
         }
@@ -96,7 +97,9 @@ class DoubaoMemoryModel:
                         "你负责压缩一个 Agent 会话。仅输出 JSON。summary 要保留近期目标、"
                         "已确认决定、未完成事项和必要上下文；较旧且未被再次提及的信息优先省略。"
                         "输入按 sequence 排序且包含创建时间，越近期的信息权重越高。"
-                        "topic 是简短主题，不能包含规则、偏好或具体记忆。"
+                        "topic 是简短主题，不能包含规则、偏好或具体记忆。若当前会话延续"
+                        "active_workspace_topics 中的主题，必须原样复用对应 topic；仅在确实"
+                        "进入新情景时生成新 topic。"
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -200,16 +203,23 @@ class StructuredMemoryConsolidator(MemoryConsolidator):
         self._workspace_decay_rate = workspace_decay_rate
         self._global_decay_rate = global_decay_rate
 
-    async def consolidate(
+    async def summarize(
         self,
         claimed: ClaimedMemoryConsolidation,
-    ) -> MemoryConsolidation:
+    ) -> ConversationSummary:
         draft = await self._model.summarize(claimed=claimed)
-        summary = ConversationSummary(
+        return ConversationSummary(
             summary=draft.summary,
             topic=draft.topic,
             covered_sequence=claimed.event.through_sequence,
         )
+
+    async def consolidate(
+        self,
+        claimed: ClaimedMemoryConsolidation,
+        *,
+        summary: ConversationSummary,
+    ) -> MemoryConsolidation:
         workspace_candidates, global_candidates = await asyncio.gather(
             self._model.extract_candidates(
                 scope="workspace",
