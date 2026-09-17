@@ -143,6 +143,7 @@ class AgentThread(Base, TimestampMixin):
     summary_covered_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_consolidated_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     memory_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_message_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     memory_lease_owner: Mapped[str | None] = mapped_column(String(128))
     memory_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

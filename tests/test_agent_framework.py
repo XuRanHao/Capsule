@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -23,6 +24,7 @@ from capsule.db.agent_memory import (
     AgentMessageRecord,
     AgentThreadRecord,
     ConversationContext,
+    ConversationSyncState,
 )
 
 
@@ -165,6 +167,11 @@ class FakeConversationRepository:
             ],
         )
         self.enqueued = 0
+        self.context_reads = 0
+        self.sync_state = ConversationSyncState(
+            last_message_sequence=3,
+            memory_revision=revision,
+        )
 
     async def enqueue_consolidation_if_needed(self, **_: object) -> None:
         self.enqueued += 1
@@ -173,7 +180,35 @@ class FakeConversationRepository:
         return self.current_user if role == "user" else self.assistant
 
     async def get_context(self, **_: object) -> ConversationContext:
+        self.context_reads += 1
         return self.context
+
+    async def get_sync_state(self, **_: object) -> ConversationSyncState:
+        return self.sync_state
+
+    def prepare_next_turn(
+        self,
+        *,
+        user_sequence: int,
+        durable_last_sequence: int | None = None,
+    ) -> None:
+        self.current_user = replace(
+            self.current_user,
+            sequence=user_sequence,
+            content="下一问题",
+        )
+        self.assistant = replace(
+            self.assistant,
+            sequence=user_sequence + 1,
+        )
+        self.sync_state = ConversationSyncState(
+            last_message_sequence=(
+                user_sequence - 1
+                if durable_last_sequence is None
+                else durable_last_sequence
+            ),
+            memory_revision=self.context.thread.memory_revision,
+        )
 
 
 @pytest.mark.asyncio
@@ -241,6 +276,7 @@ async def test_runtime_hydrates_cold_conversation_context_from_postgres_reposito
         "conversation_topic": "记忆架构",
         "summary_covered_sequence": 2,
         "memory_revision": 1,
+        "hot_mirror_through_sequence": 3,
     }
 
 
@@ -277,6 +313,59 @@ async def test_runtime_refreshes_hot_context_after_worker_updates_summary() -> N
     snapshot = await runtime.state("durable-thread")
     assert snapshot is not None
     assert snapshot["working_context"]["memory_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_reuses_a_valid_hot_mirror_without_reloading_messages() -> None:
+    planner = RecordingPlanner()
+    repository = FakeConversationRepository(revision=1)
+    runtime = create_agent_runtime(
+        planner=planner,
+        conversation_repository=repository,  # type: ignore[arg-type]
+    )
+    request = AgentRequest(
+        thread_id="durable-thread",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="新问题",
+        request_id="request-current",
+    )
+
+    await runtime.invoke(request)
+    repository.prepare_next_turn(user_sequence=6)
+    await runtime.invoke(
+        request.model_copy(update={"message": "下一问题", "request_id": "request-next"})
+    )
+
+    assert repository.context_reads == 1
+    snapshot = await runtime.state("durable-thread")
+    assert snapshot is not None
+    assert snapshot["working_context"]["hot_mirror_through_sequence"] == 7
+
+
+@pytest.mark.asyncio
+async def test_runtime_rebuilds_a_hot_mirror_advanced_by_another_process() -> None:
+    planner = RecordingPlanner()
+    repository = FakeConversationRepository(revision=1)
+    runtime = create_agent_runtime(
+        planner=planner,
+        conversation_repository=repository,  # type: ignore[arg-type]
+    )
+    request = AgentRequest(
+        thread_id="durable-thread",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="新问题",
+        request_id="request-current",
+    )
+
+    await runtime.invoke(request)
+    repository.prepare_next_turn(user_sequence=7, durable_last_sequence=6)
+    await runtime.invoke(
+        request.model_copy(update={"message": "下一问题", "request_id": "request-next"})
+    )
+
+    assert repository.context_reads == 2
 
 
 @pytest.mark.asyncio

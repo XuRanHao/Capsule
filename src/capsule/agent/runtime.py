@@ -13,7 +13,11 @@ from capsule.agent.contracts import AgentRequest, AgentResponse
 from capsule.agent.graph import AgentPlanner, ReadyPlanner, build_agent_graph
 from capsule.agent.memory import AgentMemoryStore, DelegatingMemoryStore, NullMemoryStore
 from capsule.agent.tools import ToolRegistry
-from capsule.db.agent_memory import AgentConversationRepository, ConversationContext
+from capsule.db.agent_memory import (
+    AgentConversationRepository,
+    ConversationContext,
+    ConversationSyncState,
+)
 
 PermissionLoader = Callable[..., Awaitable[Iterable[str]]]
 
@@ -96,6 +100,7 @@ class AgentRuntime:
         durable_context: dict[str, object] = {}
         conversation = self._conversation_repository
         if conversation is not None:
+            sync_state: ConversationSyncState | None = None
             if previous:
                 # A hot in-process conversation is still the fastest context source.
                 await conversation.enqueue_consolidation_if_needed(
@@ -104,6 +109,12 @@ class AgentRuntime:
                     workspace_id=request.workspace_id,
                     token_threshold=self._memory_consolidation_token_threshold,
                 )
+                if not resumes_pending:
+                    sync_state = await conversation.get_sync_state(
+                        thread_id=request.thread_id,
+                        user_id=request.user_id,
+                        workspace_id=request.workspace_id,
+                    )
             persisted_user = await conversation.append_message(
                 thread_id=request.thread_id,
                 user_id=request.user_id,
@@ -126,30 +137,43 @@ class AgentRuntime:
                         for item in durable.messages
                         if item.message_id != persisted_user.message_id
                     ],
-                    "working_context": _working_context(durable),
+                    "working_context": _working_context(
+                        durable,
+                        hot_mirror_through_sequence=persisted_user.sequence - 1,
+                    ),
                 }
-            elif not resumes_pending:
-                # A Worker may have summarized while this process retained a
-                # hot LangGraph checkpoint. Refresh only between ordinary
-                # turns, never while an action awaits user confirmation.
+            elif (
+                not resumes_pending
+                and sync_state is not None
+                and _requires_hot_mirror_refresh(
+                    previous,
+                    sync_state=sync_state,
+                    persisted_user_sequence=persisted_user.sequence,
+                )
+            ):
+                # A different process may have advanced this thread, or the
+                # memory Worker may have replaced its summary.  Rehydrate only
+                # when one of the two durable watermarks no longer matches.
                 durable = await conversation.get_context(
                     thread_id=request.thread_id,
                     user_id=request.user_id,
                     workspace_id=request.workspace_id,
                     max_messages=self._conversation_context_messages + 1,
                 )
-                if durable.thread.memory_revision > _memory_revision(previous):
-                    await self._graph.aupdate_state(
-                        config,
-                        {
-                            "messages": [
-                                item.to_graph_message()
-                                for item in durable.messages
-                                if item.message_id != persisted_user.message_id
-                            ],
-                            "working_context": _working_context(durable),
-                        },
-                    )
+                await self._graph.aupdate_state(
+                    config,
+                    {
+                        "messages": [
+                            item.to_graph_message()
+                            for item in durable.messages
+                            if item.message_id != persisted_user.message_id
+                        ],
+                        "working_context": _working_context(
+                            durable,
+                            hot_mirror_through_sequence=persisted_user.sequence - 1,
+                        ),
+                    },
+                )
         granted_permissions: frozenset[str] = frozenset()
         if self._permission_loader is not None:
             granted_permissions = frozenset(
@@ -179,7 +203,7 @@ class AgentRuntime:
             config=config,
         )
         if conversation is not None and state.get("response") is not None:
-            await conversation.append_message(
+            persisted_assistant = await conversation.append_message(
                 thread_id=request.thread_id,
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
@@ -187,6 +211,15 @@ class AgentRuntime:
                 content=state["response"],
                 request_id=request_id,
                 turn_id=turn_id,
+            )
+            await self._graph.aupdate_state(
+                config,
+                {
+                    "working_context": _with_hot_mirror_sequence(
+                        state.get("working_context"),
+                        persisted_assistant.sequence,
+                    )
+                },
             )
         return AgentResponse(
             thread_id=request.thread_id,
@@ -228,12 +261,17 @@ def create_agent_runtime(
     )
 
 
-def _working_context(context: ConversationContext) -> dict[str, Any]:
+def _working_context(
+    context: ConversationContext,
+    *,
+    hot_mirror_through_sequence: int,
+) -> dict[str, Any]:
     return {
         "conversation_summary": context.thread.summary,
         "conversation_topic": context.thread.summary_topic,
         "summary_covered_sequence": context.thread.summary_covered_sequence,
         "memory_revision": context.thread.memory_revision,
+        "hot_mirror_through_sequence": hot_mirror_through_sequence,
     }
 
 
@@ -243,3 +281,36 @@ def _memory_revision(state: dict[str, Any]) -> int:
         return 0
     revision = working_context.get("memory_revision")
     return revision if isinstance(revision, int) and revision >= 0 else 0
+
+
+def _requires_hot_mirror_refresh(
+    state: dict[str, Any],
+    *,
+    sync_state: ConversationSyncState,
+    persisted_user_sequence: int,
+) -> bool:
+    """Decide whether cached graph messages still describe the durable thread."""
+
+    mirrored_sequence = _hot_mirror_sequence(state)
+    return (
+        mirrored_sequence != sync_state.last_message_sequence
+        or mirrored_sequence != persisted_user_sequence - 1
+        or sync_state.memory_revision > _memory_revision(state)
+    )
+
+
+def _hot_mirror_sequence(state: dict[str, Any]) -> int | None:
+    working_context = state.get("working_context")
+    if not isinstance(working_context, dict):
+        return None
+    value = working_context.get("hot_mirror_through_sequence")
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def _with_hot_mirror_sequence(
+    working_context: object,
+    sequence: int,
+) -> dict[str, Any]:
+    context = dict(working_context) if isinstance(working_context, dict) else {}
+    context["hot_mirror_through_sequence"] = sequence
+    return context

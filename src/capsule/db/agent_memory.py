@@ -68,12 +68,21 @@ class AgentThreadRecord:
     last_consolidated_sequence: int
     memory_revision: int
     last_message_at: datetime | None
+    last_message_sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class ConversationContext:
     thread: AgentThreadRecord
     messages: list[AgentMessageRecord]
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationSyncState:
+    """Small authoritative marker used to validate an in-process session mirror."""
+
+    last_message_sequence: int
+    memory_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,15 +218,11 @@ class AgentConversationRepository:
                 )
                 if existing is not None:
                     return _message_record(existing)
-            current_max = await session.scalar(
-                select(func.coalesce(func.max(AgentMessage.sequence), 0)).where(
-                    AgentMessage.thread_id == thread_id
-                )
-            )
+            next_sequence = thread.last_message_sequence + 1
             now = datetime.now(UTC)
             message = AgentMessage(
                 thread_id=thread_id,
-                sequence=int(current_max or 0) + 1,
+                sequence=next_sequence,
                 turn_id=turn_id,
                 request_id=request_id,
                 role=role,
@@ -230,6 +235,7 @@ class AgentConversationRepository:
                 ),
             )
             session.add(message)
+            thread.last_message_sequence = next_sequence
             thread.last_message_at = now
             await session.flush()
             return _message_record(message)
@@ -264,6 +270,27 @@ class AgentConversationRepository:
             thread=_thread_record(thread),
             messages=[_message_record(row) for row in rows],
         )
+
+    async def get_sync_state(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> ConversationSyncState:
+        """Read only the durable markers needed before reusing hot graph state."""
+
+        async with self._database.session() as session:
+            thread = await self._thread_for_identity(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            return ConversationSyncState(
+                last_message_sequence=thread.last_message_sequence,
+                memory_revision=thread.memory_revision,
+            )
 
     async def list_messages(
         self,
@@ -1177,6 +1204,7 @@ def _thread_record(thread: AgentThread) -> AgentThreadRecord:
         last_consolidated_sequence=thread.last_consolidated_sequence,
         memory_revision=thread.memory_revision,
         last_message_at=thread.last_message_at,
+        last_message_sequence=thread.last_message_sequence,
     )
 
 
