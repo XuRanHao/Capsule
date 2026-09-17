@@ -36,7 +36,18 @@ class AgentState(TypedDict, total=False):
     cancel_requested: bool
     messages: list[dict[str, Any]]
     memory_context: list[dict[str, Any]]
+    # Memory is recalled once for each runtime request.  Tool-loop re-plans
+    # reuse this exact set so an asynchronous writer cannot change context in
+    # the middle of one response.
+    memory_context_request_id: str | None
     working_context: dict[str, Any]
+    # Tools follow progressive disclosure: the compact catalog is always
+    # available, while complete schemas appear only for selected tools.
+    tool_catalog: list[dict[str, Any]]
+    tool_details: list[dict[str, Any]]
+    deferred_tool_names: list[str]
+    tool_disclosure_attempts: int
+    context_budget: dict[str, Any]
     plan: dict[str, Any]
     pending_action: dict[str, Any] | None
     approved_action: dict[str, Any] | None

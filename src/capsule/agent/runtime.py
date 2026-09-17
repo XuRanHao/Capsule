@@ -9,6 +9,11 @@ from uuid import uuid4
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 
+from capsule.agent.context_budget import (
+    ContextBudget,
+    ContextBudgetController,
+    MemoryEventPublisher,
+)
 from capsule.agent.contracts import AgentRequest, AgentResponse
 from capsule.agent.graph import AgentPlanner, ReadyPlanner, build_agent_graph
 from capsule.agent.memory import AgentMemoryStore, DelegatingMemoryStore, NullMemoryStore
@@ -32,21 +37,22 @@ class AgentRuntime:
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         permission_loader: PermissionLoader | None = None,
         conversation_repository: AgentConversationRepository | None = None,
-        conversation_context_messages: int = 24,
-        memory_consolidation_token_threshold: int = 4_000,
+        context_budget: ContextBudget | None = None,
+        memory_event_publisher: MemoryEventPublisher | None = None,
     ) -> None:
-        if conversation_context_messages < 1:
-            raise ValueError("conversation_context_messages must be positive")
-        if memory_consolidation_token_threshold < 1:
-            raise ValueError("memory_consolidation_token_threshold must be positive")
         self._checkpointer = checkpointer or InMemorySaver()
         self._planner = planner or ReadyPlanner()
         self._tools = tools or ToolRegistry()
         self._memory_store = DelegatingMemoryStore(memory or NullMemoryStore())
         self._permission_loader = permission_loader
         self._conversation_repository = conversation_repository
-        self._conversation_context_messages = conversation_context_messages
-        self._memory_consolidation_token_threshold = memory_consolidation_token_threshold
+        self._context_budget = context_budget or ContextBudget()
+        self._memory_event_publisher = memory_event_publisher
+        self._context_budget_controller = ContextBudgetController(
+            budget=self._context_budget,
+            repository=conversation_repository,
+            publish_event=memory_event_publisher,
+        )
         self._graph = self._build_graph()
 
     def set_permission_loader(self, loader: PermissionLoader) -> None:
@@ -58,16 +64,21 @@ class AgentRuntime:
         self,
         repository: AgentConversationRepository,
         *,
-        context_messages: int,
-        consolidation_token_threshold: int,
+        context_budget: ContextBudget | None = None,
+        memory_event_publisher: MemoryEventPublisher | None = None,
     ) -> None:
         """Attach durable conversation storage after application database startup."""
 
-        if context_messages < 1 or consolidation_token_threshold < 1:
-            raise ValueError("conversation limits must be positive")
         self._conversation_repository = repository
-        self._conversation_context_messages = context_messages
-        self._memory_consolidation_token_threshold = consolidation_token_threshold
+        if context_budget is not None:
+            self._context_budget = context_budget
+        self._memory_event_publisher = memory_event_publisher
+        self._context_budget_controller = ContextBudgetController(
+            budget=self._context_budget,
+            repository=repository,
+            publish_event=memory_event_publisher,
+        )
+        self._graph = self._build_graph()
 
     def set_memory_store(self, memory: AgentMemoryStore) -> None:
         """Swap the durable reader without rebuilding active graph checkpoints."""
@@ -105,13 +116,6 @@ class AgentRuntime:
         if conversation is not None:
             sync_state: ConversationSyncState | None = None
             if previous:
-                # A hot in-process conversation is still the fastest context source.
-                await conversation.enqueue_consolidation_if_needed(
-                    thread_id=request.thread_id,
-                    user_id=request.user_id,
-                    workspace_id=request.workspace_id,
-                    token_threshold=self._memory_consolidation_token_threshold,
-                )
                 if not resumes_pending:
                     sync_state = await conversation.get_sync_state(
                         thread_id=request.thread_id,
@@ -132,7 +136,7 @@ class AgentRuntime:
                     thread_id=request.thread_id,
                     user_id=request.user_id,
                     workspace_id=request.workspace_id,
-                    max_messages=self._conversation_context_messages + 1,
+                    max_messages=None,
                 )
                 durable_context = {
                     "messages": [
@@ -161,7 +165,7 @@ class AgentRuntime:
                     thread_id=request.thread_id,
                     user_id=request.user_id,
                     workspace_id=request.workspace_id,
-                    max_messages=self._conversation_context_messages + 1,
+                    max_messages=None,
                 )
                 await self._graph.aupdate_state(
                     config,
@@ -201,6 +205,7 @@ class AgentRuntime:
                 "confirmation_response": request.confirmation,
                 "cancel_requested": request.cancel,
                 "max_steps": request.max_steps,
+                "memory_context_request_id": None,
                 **durable_context,
             },
             config=config,
@@ -251,6 +256,7 @@ class AgentRuntime:
             tools=self._tools,
             memory=self._memory_store,
             checkpointer=self._checkpointer,
+            context_budget=self._context_budget_controller,
         )
 
 
@@ -262,8 +268,8 @@ def create_agent_runtime(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     permission_loader: PermissionLoader | None = None,
     conversation_repository: AgentConversationRepository | None = None,
-    conversation_context_messages: int = 24,
-    memory_consolidation_token_threshold: int = 4_000,
+    context_budget: ContextBudget | None = None,
+    memory_event_publisher: MemoryEventPublisher | None = None,
 ) -> AgentRuntime:
     return AgentRuntime(
         planner=planner,
@@ -272,8 +278,8 @@ def create_agent_runtime(
         checkpointer=checkpointer,
         permission_loader=permission_loader,
         conversation_repository=conversation_repository,
-        conversation_context_messages=conversation_context_messages,
-        memory_consolidation_token_threshold=memory_consolidation_token_threshold,
+        context_budget=context_budget,
+        memory_event_publisher=memory_event_publisher,
     )
 
 

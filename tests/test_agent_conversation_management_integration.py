@@ -6,7 +6,7 @@ from sqlalchemy import delete
 
 from capsule.config import Settings
 from capsule.db.agent_memory import AgentConversationRepository, AgentThreadStateError
-from capsule.db.models import AgentMemoryOutbox, Workspace
+from capsule.db.models import AgentMemoryOutbox, AgentThread, Workspace
 from capsule.db.session import Database
 
 
@@ -130,6 +130,59 @@ async def test_conversation_management_preserves_history_and_stops_deleted_work(
                     AgentMemoryOutbox.workspace_id == workspace_id
                 )
             )
+            workspace = await session.get(Workspace, workspace_id)
+            if workspace is not None:
+                await session.delete(workspace)
+        await database.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.getenv("CAPSULE_RUN_POSTGRES_INTEGRATION") != "1",
+    reason="set CAPSULE_RUN_POSTGRES_INTEGRATION=1 to exercise conversation lifecycle persistence",
+)
+async def test_context_reads_only_the_raw_tail_after_summary_watermark() -> None:
+    suffix = uuid4().hex
+    workspace_id = f"conversation-context-{suffix}"
+    user_id = f"conversation-context-user-{suffix}"
+    database = Database(Settings())
+    repository = AgentConversationRepository(database)
+    try:
+        async with database.session() as session, session.begin():
+            session.add(Workspace(workspace_id=workspace_id, name="上下文水位测试"))
+        thread = await repository.create_thread(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            title="摘要水位",
+        )
+        for sequence, content in enumerate(["第一条", "第二条", "最新一条"], start=1):
+            await repository.append_message(
+                thread_id=thread.thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                role="user",
+                content=content,
+                request_id=f"summary-{sequence}-{suffix}",
+            )
+        async with database.session() as session, session.begin():
+            stored_thread = await session.get(AgentThread, thread.thread_id)
+            assert stored_thread is not None
+            stored_thread.summary = "前两条已整理"
+            stored_thread.summary_topic = "上下文"
+            stored_thread.summary_covered_sequence = 2
+            stored_thread.memory_revision = 1
+
+        context = await repository.get_context(
+            thread_id=thread.thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            max_messages=None,
+        )
+
+        assert context.thread.summary == "前两条已整理"
+        assert [message.content for message in context.messages] == ["最新一条"]
+    finally:
+        async with database.session() as session, session.begin():
             workspace = await session.get(Workspace, workspace_id)
             if workspace is not None:
                 await session.delete(workspace)

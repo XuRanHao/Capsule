@@ -178,10 +178,15 @@ class MemoryOutboxDispatcher:
     async def dispatch_once(self, *, limit: int = 100) -> int:
         published = 0
         for event in await self._repository.pending_outbox_events(limit=limit):
-            await self._queue.publish(MemoryQueueMessage.from_event(event))
-            await self._repository.mark_outbox_published(event_id=event.event_id)
+            await self.dispatch_event(event)
             published += 1
         return published
+
+    async def dispatch_event(self, event: MemoryOutboxEvent) -> None:
+        """Publish one just-created event without waiting for the next scan."""
+
+        await self._queue.publish(MemoryQueueMessage.from_event(event))
+        await self._repository.mark_outbox_published(event_id=event.event_id)
 
 
 class MemoryWorker:

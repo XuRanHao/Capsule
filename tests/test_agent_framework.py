@@ -241,10 +241,14 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     assert result.status == "completed"
     assert result.message == "已完成。"
     assert result.tool_history[0]["output"]["workspace"] == "workspace-a"
-    assert planner.calls == 2
+    # First pass selects the tool from the compact catalog; its full schema is
+    # disclosed before the second planning pass can execute it.
+    assert planner.calls == 3
     snapshot = await runtime.state("thread-a")
     assert snapshot is not None
     assert snapshot["messages"][-1]["role"] == "assistant"
+    assert "args_schema" not in snapshot["tool_catalog"][0]
+    assert snapshot["tool_details"][0]["args_schema"]["title"] == "EchoArgs"
 
 
 @pytest.mark.asyncio
@@ -295,8 +299,6 @@ async def test_runtime_refreshes_hot_context_after_worker_updates_summary() -> N
     repository = FakeConversationRepository(revision=1)
     runtime.set_conversation_repository(
         repository,  # type: ignore[arg-type]
-        context_messages=24,
-        consolidation_token_threshold=4_000,
     )
     result = await runtime.invoke(
         request.model_copy(
@@ -305,7 +307,9 @@ async def test_runtime_refreshes_hot_context_after_worker_updates_summary() -> N
     )
 
     assert result.status == "completed"
-    assert repository.enqueued == 1
+    # Ordinary turns never enqueue memory work.  Consolidation is now only
+    # requested by the context-budget node after an actual overflow.
+    assert repository.enqueued == 0
     assert [item["content"] for item in planner.contexts[-1]["messages"]] == [
         "旧问题",
         "新问题",

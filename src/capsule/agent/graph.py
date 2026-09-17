@@ -8,6 +8,7 @@ from typing import Protocol
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
+from capsule.agent.context_budget import ContextBudgetController
 from capsule.agent.contracts import PlanDecision, ToolCall
 from capsule.agent.memory import AgentMemoryStore
 from capsule.agent.state import AgentState
@@ -95,6 +96,7 @@ def build_agent_graph(
     tools: ToolRegistry,
     memory: AgentMemoryStore,
     checkpointer: BaseCheckpointSaver,
+    context_budget: ContextBudgetController | None = None,
 ):
     """Compile the resumable Agent graph with injected application dependencies."""
 
@@ -113,6 +115,7 @@ def build_agent_graph(
             "step_count": state.get("step_count", 0) + 1,
             "status": "planning",
             "start_new_turn": False,
+            "tool_catalog": tools.catalog(),
         }
         context = ToolContext(
             user_id=state["user_id"],
@@ -131,6 +134,9 @@ def build_agent_graph(
             updates["pending_tool_calls"] = []
             updates["pending_action"] = None
             updates["approved_action"] = None
+            updates["tool_details"] = []
+            updates["deferred_tool_names"] = []
+            updates["tool_disclosure_attempts"] = 0
         pending = state.get("pending_action")
         confirmation = state.get("confirmation_response")
         if state.get("cancel_requested"):
@@ -174,6 +180,11 @@ def build_agent_graph(
                     await tools.cancel_operation(str(operation_id), context)
 
     async def load_context(state: AgentState) -> dict[str, object]:
+        request_id = state.get("request_id")
+        if request_id and state.get("memory_context_request_id") == request_id:
+            # Do not let a background Worker replace recalled long/global
+            # memories half-way through a tool loop in this logical request.
+            return {}
         messages = state.get("messages", [])
         query = str(messages[-1].get("content", "")) if messages else ""
         context = await memory.load(
@@ -181,7 +192,17 @@ def build_agent_graph(
             workspace_id=state["workspace_id"],
             query=query,
         )
-        return {"memory_context": context}
+        return {
+            "memory_context": context,
+            "memory_context_request_id": request_id,
+        }
+
+    async def manage_context(state: AgentState) -> dict[str, object]:
+        if state.get("status") == "failed":
+            return {}
+        if context_budget is None:
+            return {}
+        return await context_budget.govern(state)
 
     async def plan(state: AgentState) -> dict[str, object]:
         approved = state.get("approved_action")
@@ -290,6 +311,24 @@ def build_agent_graph(
             "status": "tool_executed",
         }
 
+    async def load_tool_details(state: AgentState) -> dict[str, object]:
+        """Reveal whole schemas only after the planner has selected a tool."""
+
+        attempts = int(state.get("tool_disclosure_attempts", 0))
+        if attempts >= 3:
+            return {
+                "response": "工具定义无法在当前上下文预算内完整展开。",
+                "status": "failed",
+                "error": "tool_schema_context_exceeded",
+            }
+        plan_data = PlanDecision.model_validate(state.get("plan", {}))
+        return {
+            "tool_details": tools.describe_selected(
+                [call.name for call in plan_data.tool_calls],
+            ),
+            "tool_disclosure_attempts": attempts + 1,
+        }
+
     async def await_confirmation(state: AgentState) -> dict[str, object]:
         plan_data = PlanDecision.model_validate(state.get("plan", {}))
         pending = plan_data.model_dump(mode="json")
@@ -313,7 +352,7 @@ def build_agent_graph(
             "messages": messages,
             "response": response,
             "status": state.get("status", "completed")
-            if state.get("status") in {"cancelled", "max_steps"}
+            if state.get("status") in {"cancelled", "max_steps", "failed"}
             else "completed",
         }
 
@@ -330,9 +369,17 @@ def build_agent_graph(
     def route_after_prepare(state: AgentState) -> str:
         return "finalize" if state.get("status") in {"cancelled", "max_steps"} else "load_context"
 
+    def route_after_context_management(state: AgentState) -> str:
+        return "finalize" if state.get("status") == "failed" else "plan"
+
     def route_after_plan(state: AgentState) -> str:
         decision = PlanDecision.model_validate(state.get("plan", {}))
         if decision.action == "tool" and decision.tool_calls:
+            detailed_names = {
+                str(item.get("name")) for item in state.get("tool_details", [])
+            }
+            if any(call.name not in detailed_names for call in decision.tool_calls):
+                return "load_tool_details"
             return "execute_tools"
         if decision.action == "confirm":
             return "await_confirmation"
@@ -348,7 +395,9 @@ def build_agent_graph(
     graph = StateGraph(AgentState)
     graph.add_node("prepare", prepare)
     graph.add_node("load_context", load_context)
+    graph.add_node("manage_context", manage_context)
     graph.add_node("plan", plan)
+    graph.add_node("load_tool_details", load_tool_details)
     graph.add_node("execute_tools", execute_tools)
     graph.add_node("await_confirmation", await_confirmation)
     graph.add_node("finalize", finalize)
@@ -359,16 +408,23 @@ def build_agent_graph(
         route_after_prepare,
         {"load_context": "load_context", "finalize": "finalize"},
     )
-    graph.add_edge("load_context", "plan")
+    graph.add_edge("load_context", "manage_context")
+    graph.add_conditional_edges(
+        "manage_context",
+        route_after_context_management,
+        {"plan": "plan", "finalize": "finalize"},
+    )
     graph.add_conditional_edges(
         "plan",
         route_after_plan,
         {
+            "load_tool_details": "load_tool_details",
             "execute_tools": "execute_tools",
             "await_confirmation": "await_confirmation",
             "finalize": "finalize",
         },
     )
+    graph.add_edge("load_tool_details", "manage_context")
     graph.add_conditional_edges(
         "execute_tools",
         route_after_tools,

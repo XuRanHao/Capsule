@@ -264,28 +264,57 @@ class ToolRegistry:
         self._tools[tool.name] = tool
 
     def describe(self) -> list[dict[str, Any]]:
+        """Return complete schemas for administrative inspection only."""
+
+        return self.describe_selected(list(self._tools))
+
+    def catalog(self) -> list[dict[str, Any]]:
+        """Return the small first-pass catalog visible to every planner call."""
+
         return [
             {
                 "name": tool.name,
                 "description": tool.description,
                 "requires_confirmation": tool.requires_confirmation,
                 "required_permission": tool.required_permission,
-                "args_schema": tool.args_schema.model_json_schema(),
-                "has_custom_input_validation": tool.validate_input is not None,
-                "output_schema": (
-                    tool.output_schema.model_json_schema()
-                    if tool.output_schema is not None
-                    else None
-                ),
-                "max_output_bytes": tool.max_output_bytes,
-                "concurrency_mode": tool.concurrency_mode,
-                "lock_scope": tool.lock_scope,
-                "max_attempts": tool.max_attempts,
-                "retry_timeouts": tool.retry_timeouts,
-                "retry_backoff_seconds": tool.retry_backoff_seconds,
             }
             for tool in self._tools.values()
         ]
+
+    def describe_selected(self, names: list[str]) -> list[dict[str, Any]]:
+        """Reveal full schemas only for the planner's currently selected tools."""
+
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            selected.append(
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "requires_confirmation": tool.requires_confirmation,
+                    "required_permission": tool.required_permission,
+                    "args_schema": tool.args_schema.model_json_schema(),
+                    "has_custom_input_validation": tool.validate_input is not None,
+                    "output_schema": (
+                        tool.output_schema.model_json_schema()
+                        if tool.output_schema is not None
+                        else None
+                    ),
+                    "max_output_bytes": tool.max_output_bytes,
+                    "concurrency_mode": tool.concurrency_mode,
+                    "lock_scope": tool.lock_scope,
+                    "max_attempts": tool.max_attempts,
+                    "retry_timeouts": tool.retry_timeouts,
+                    "retry_backoff_seconds": tool.retry_backoff_seconds,
+                }
+            )
+        return selected
 
     async def execute(
         self,

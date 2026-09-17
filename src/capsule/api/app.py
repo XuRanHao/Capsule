@@ -4,12 +4,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from capsule.agent.checkpoints import postgres_checkpoint_url
+from capsule.agent.context_budget import ContextBudget
+from capsule.agent.memory_worker import MemoryOutboxDispatcher, RedisMemoryQueue
 from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
 from capsule.agent.runtime import AgentRuntime
 from capsule.api.agent import router as agent_router
@@ -19,7 +22,11 @@ from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
 from capsule.config import Settings, get_settings
-from capsule.db.agent_memory import AgentConversationRepository, PostgresAgentMemoryStore
+from capsule.db.agent_memory import (
+    AgentConversationRepository,
+    MemoryOutboxEvent,
+    PostgresAgentMemoryStore,
+)
 from capsule.db.repositories import (
     AssetRepository,
     EmbeddingRepository,
@@ -87,16 +94,45 @@ def create_app(
 
         database = Database(resolved_settings)
         app.state.agent_conversation_repository = AgentConversationRepository(database)
+        memory_context_queue: RedisMemoryQueue | None = None
+        memory_event_publisher = None
+        try:
+            memory_context_queue = RedisMemoryQueue(
+                redis_url=resolved_settings.redis_url,
+                stream=resolved_settings.agent_memory_stream,
+                group=resolved_settings.agent_memory_group,
+                consumer=f"api-context-{uuid4().hex[:12]}",
+            )
+            await memory_context_queue.start()
+            memory_dispatcher = MemoryOutboxDispatcher(
+                repository=app.state.agent_conversation_repository,
+                queue=memory_context_queue,
+            )
+
+            async def publish_memory_event(event: MemoryOutboxEvent) -> None:
+                # The outbox remains recoverable by the external dispatcher;
+                # this just removes one polling interval from a blocked turn.
+                await memory_dispatcher.dispatch_event(event)
+
+            memory_event_publisher = publish_memory_event
+        except Exception:
+            if memory_context_queue is not None:
+                await memory_context_queue.close()
+            memory_context_queue = None
+            logging.getLogger(__name__).warning(
+                "Agent memory context publisher is unavailable; "
+                "external outbox dispatch will be used",
+                exc_info=True,
+            )
+        app.state.agent_memory_context_publisher_ready = memory_event_publisher is not None
         if agent_runtime is None:
             resolved_agent_runtime.set_permission_loader(
                 WorkspaceUserRepository(database).load_granted_permissions
             )
             resolved_agent_runtime.set_conversation_repository(
                 app.state.agent_conversation_repository,
-                context_messages=resolved_settings.agent_conversation_context_messages,
-                consolidation_token_threshold=(
-                    resolved_settings.agent_memory_consolidation_token_threshold
-                ),
+                context_budget=_agent_context_budget(resolved_settings),
+                memory_event_publisher=memory_event_publisher,
             )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()
@@ -181,6 +217,8 @@ def create_app(
             finally:
                 if durable_task_supervisor is not None:
                     await durable_task_supervisor.close()
+                if memory_context_queue is not None:
+                    await memory_context_queue.close()
                 await database.dispose()
                 if checkpoint_context is not None:
                     await checkpoint_context.__aexit__(None, None, None)
@@ -276,6 +314,8 @@ def create_app(
             await embedding_client.close()
             if durable_task_supervisor is not None:
                 await durable_task_supervisor.close()
+            if memory_context_queue is not None:
+                await memory_context_queue.close()
             await database.dispose()
             if checkpoint_context is not None:
                 await checkpoint_context.__aexit__(None, None, None)
@@ -335,6 +375,19 @@ def create_app(
         }
 
     return application
+
+
+def _agent_context_budget(settings: Settings) -> ContextBudget:
+    return ContextBudget(
+        window_tokens=settings.agent_context_window_tokens,
+        output_reserve_tokens=settings.agent_context_output_reserve_tokens,
+        short_term_ratio=settings.agent_context_short_term_ratio,
+        tool_result_ratio=settings.agent_context_tool_result_ratio,
+        raw_tail_tokens=settings.agent_context_raw_tail_tokens,
+        max_reduction_rounds=settings.agent_context_max_reduction_rounds,
+        summary_wait_seconds=settings.agent_context_summary_wait_seconds,
+        summary_poll_seconds=settings.agent_context_summary_poll_seconds,
+    )
 
 async def _open_agent_checkpointer(
     *,

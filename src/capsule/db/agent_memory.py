@@ -361,9 +361,9 @@ class AgentConversationRepository:
         thread_id: str,
         user_id: str,
         workspace_id: str,
-        max_messages: int,
+        max_messages: int | None,
     ) -> ConversationContext:
-        if max_messages < 1:
+        if max_messages is not None and max_messages < 1:
             raise ValueError("max_messages must be positive")
         async with self._database.session() as session:
             thread = await self._thread_for_identity(
@@ -372,14 +372,17 @@ class AgentConversationRepository:
                 user_id=user_id,
                 workspace_id=workspace_id,
             )
-            rows = list(
-                await session.scalars(
-                    select(AgentMessage)
-                    .where(AgentMessage.thread_id == thread_id)
-                    .order_by(AgentMessage.sequence.desc())
-                    .limit(max_messages)
+            statement = (
+                select(AgentMessage)
+                .where(
+                    AgentMessage.thread_id == thread_id,
+                    AgentMessage.sequence > thread.summary_covered_sequence,
                 )
+                .order_by(AgentMessage.sequence.desc())
             )
+            if max_messages is not None:
+                statement = statement.limit(max_messages)
+            rows = list(await session.scalars(statement))
         rows.reverse()
         return ConversationContext(
             thread=_thread_record(thread),
@@ -531,6 +534,54 @@ class AgentConversationRepository:
                 user_id=user_id,
                 workspace_id=workspace_id,
                 through_sequence=resolved_through_sequence,
+            )
+            session.add(event)
+            await session.flush()
+            return _outbox_event(event)
+
+    async def enqueue_consolidation(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        through_sequence: int,
+    ) -> MemoryOutboxEvent | None:
+        """Durably request a specific old-message prefix for compaction.
+
+        The caller chooses the cutoff after a complete context preflight.  No
+        ordinary message-count or token threshold is consulted here: this path
+        exists solely for an over-budget context that needs a new summary.
+        """
+
+        if through_sequence < 1:
+            raise ValueError("through_sequence must be positive")
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            self._require_active(thread)
+            if through_sequence <= thread.last_consolidated_sequence:
+                return None
+            if through_sequence > thread.last_message_sequence:
+                raise ValueError("through_sequence is ahead of conversation messages")
+            existing = await session.scalar(
+                select(AgentMemoryOutbox).where(
+                    AgentMemoryOutbox.thread_id == thread_id,
+                    AgentMemoryOutbox.through_sequence == through_sequence,
+                )
+            )
+            if existing is not None:
+                return _outbox_event(existing)
+            event = AgentMemoryOutbox(
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                through_sequence=through_sequence,
             )
             session.add(event)
             await session.flush()
@@ -818,7 +869,7 @@ class AgentConversationRepository:
     async def mark_outbox_published(self, *, event_id: str) -> None:
         async with self._database.session() as session, session.begin():
             event = await session.get(AgentMemoryOutbox, event_id, with_for_update=True)
-            if event is None or event.status == "published":
+            if event is None or event.status != "pending":
                 return
             event.status = "published"
             event.attempts += 1

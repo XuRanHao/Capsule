@@ -94,8 +94,17 @@ class Settings(BaseSettings):
     video_spool_max_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
     video_upload_queue_backend: Literal["memory", "redis"] = "redis"
     redis_url: str = "redis://localhost:6379/0"
-    agent_conversation_context_messages: int = Field(default=24, ge=1, le=200)
-    agent_memory_consolidation_token_threshold: int = Field(default=4_000, ge=128)
+    # The planner may use a different model from the understanding pipeline,
+    # therefore its token window is explicit configuration rather than inferred
+    # from ``understanding_model``.
+    agent_context_window_tokens: int = Field(default=32_000, ge=2_048)
+    agent_context_output_reserve_tokens: int = Field(default=4_000, ge=1)
+    agent_context_short_term_ratio: float = Field(default=0.30, gt=0, le=1)
+    agent_context_tool_result_ratio: float = Field(default=0.50, gt=0, le=1)
+    agent_context_raw_tail_tokens: int = Field(default=4_000, ge=128)
+    agent_context_max_reduction_rounds: int = Field(default=3, ge=1, le=3)
+    agent_context_summary_wait_seconds: float = Field(default=12.0, gt=0, le=60)
+    agent_context_summary_poll_seconds: float = Field(default=0.1, gt=0, le=5)
     agent_memory_max_active_topics: int = Field(default=5, ge=1, le=20)
     agent_memory_max_topic_chars: int = Field(default=32, ge=8, le=128)
     agent_memory_batch_max_mutations: int = Field(default=3, ge=1, le=10)
@@ -247,6 +256,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "document token limits must satisfy min <= target <= max <= merge_max <= parent"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_agent_context_budget(self) -> "Settings":
+        if self.agent_context_output_reserve_tokens >= self.agent_context_window_tokens:
+            raise ValueError(
+                "agent context output reserve must be smaller than its token window"
+            )
+        if self.agent_context_raw_tail_tokens >= self.agent_context_window_tokens:
+            raise ValueError("agent context raw tail must fit inside its token window")
         return self
 
     @model_validator(mode="after")
