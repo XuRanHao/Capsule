@@ -5,10 +5,9 @@ from capsule.config import Settings
 
 
 def test_blank_optional_secrets_are_unset() -> None:
-    settings = Settings(ark_api_key="", deepseek_api_key="", milvus_token="")
+    settings = Settings(ark_api_key="", milvus_token="")
 
     assert settings.ark_api_key is None
-    assert settings.deepseek_api_key is None
     assert settings.milvus_token is None
 
 
@@ -16,8 +15,7 @@ def test_document_chunk_size_defaults_to_250_400_500_600_tokens() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.assetization_version == "assetization-v6"
-    assert settings.deepseek_base_url == "https://api.deepseek.com"
-    assert settings.search_query_model == "deepseek-v4-flash"
+    assert settings.search_query_model == "doubao-seed-2-0-lite-260428"
     assert settings.search_query_max_output_tokens == 500
     assert settings.search_rrf_k == 20
     assert settings.document_tokenizer_path is None

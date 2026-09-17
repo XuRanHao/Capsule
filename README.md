@@ -109,7 +109,6 @@ make setup
 
 ```dotenv
 CAPSULE_ARK_API_KEY=your-ark-api-key
-CAPSULE_DEEPSEEK_API_KEY=your-deepseek-api-key
 ```
 
 `.env` 不会被 Git 跟踪；其他可配置项可参考 `.env.example`。
