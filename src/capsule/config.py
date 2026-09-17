@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     milvus_token: SecretStr | None = None
     milvus_collection: str = "asset_embeddings_seed16_1024"
     milvus_fused_search_collection: str = "asset_embeddings_seed16_1024_fused_n03_v1"
+    agent_memory_milvus_collection: str = "agent_memory_embeddings_seed16_1024_v1"
 
     object_storage_endpoint: str = "http://localhost:9000"
     object_storage_public_endpoint: str | None = None
@@ -99,11 +100,15 @@ class Settings(BaseSettings):
     agent_memory_max_topic_chars: int = Field(default=32, ge=8, le=128)
     agent_memory_batch_max_mutations: int = Field(default=3, ge=1, le=10)
     agent_memory_context_per_scope: int = Field(default=3, ge=1, le=10)
+    agent_memory_vector_candidate_multiplier: int = Field(default=4, ge=1, le=20)
     agent_memory_workspace_decay_rate: float = Field(default=0.002, ge=0)
     agent_memory_global_decay_rate: float = Field(default=0.0005, ge=0)
     agent_memory_worker_lease_seconds: float = Field(default=120.0, gt=0)
     agent_memory_stream: str = "capsule:agent-memory"
     agent_memory_group: str = "capsule-agent-memory-workers"
+    agent_memory_vector_worker_lease_seconds: float = Field(default=120.0, gt=0)
+    agent_memory_vector_stream: str = "capsule:agent-memory-vectors"
+    agent_memory_vector_group: str = "capsule-agent-memory-vector-workers"
     video_upload_stream: str = "capsule:video-uploads"
     video_upload_group: str = "capsule-video-uploaders"
     video_upload_claim_idle_ms: int = Field(default=30_000, ge=100)
@@ -246,8 +251,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_milvus_collections(self) -> "Settings":
-        if self.milvus_collection == self.milvus_fused_search_collection:
-            raise ValueError("raw and fused-search Milvus collections must be distinct")
+        collections = {
+            self.milvus_collection,
+            self.milvus_fused_search_collection,
+            self.agent_memory_milvus_collection,
+        }
+        if len(collections) != 3:
+            raise ValueError("asset raw, asset fused-search, and memory collections must differ")
         if (
             self.search_vector_visibility_poll_initial_seconds
             > self.search_vector_visibility_poll_max_seconds

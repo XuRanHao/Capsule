@@ -1,6 +1,7 @@
 """Workspace lifecycle operations scoped to exactly one workspace."""
 
 import asyncio
+import os
 import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -38,11 +39,13 @@ class WorkspaceService:
         settings: Settings,
         repository: WorkspaceRepository,
         vector_store: WorkspaceVectorStore,
+        memory_vector_store: WorkspaceVectorStore | None = None,
         object_storage: WorkspaceObjectStorage,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._vector_store = vector_store
+        self._memory_vector_store = memory_vector_store
         self._object_storage = object_storage
 
     async def list(self) -> list[WorkspaceRecord]:
@@ -60,6 +63,13 @@ class WorkspaceService:
         vector_count = await _best_effort(
             lambda: self._vector_store.delete_workspace(workspace_id), "Milvus 向量", warnings
         )
+        memory_vector_store = self._memory_vector_store
+        if memory_vector_store is not None:
+            vector_count += await _best_effort(
+                lambda: memory_vector_store.delete_workspace(workspace_id),
+                "Milvus 记忆向量",
+                warnings,
+            )
         object_count = await _best_effort(
             lambda: self._object_storage.delete_uris(s3_uris), "MinIO 素材文件", warnings
         )
@@ -111,9 +121,7 @@ def _delete_workspace_paths(
         settings.document_media_root.expanduser().resolve(),
     )
     candidates = [Path(path).expanduser().resolve() for path in staging_paths]
-    candidates.extend(
-        Path(unquote(urlparse(uri).path)).resolve() for uri in local_uris
-    )
+    candidates.extend(_path_from_file_uri(uri) for uri in local_uris)
     deleted = 0
     for path in sorted(set(candidates), key=lambda item: len(item.parts), reverse=True):
         if not any(path.is_relative_to(root) and path != root for root in managed_roots):
@@ -125,3 +133,13 @@ def _delete_workspace_paths(
             path.unlink()
             deleted += 1
     return deleted
+
+
+def _path_from_file_uri(uri: str) -> Path:
+    """Convert a local ``file://`` URI without turning ``/E:/...`` into ``E:\\E:``."""
+
+    parsed = urlparse(uri)
+    raw_path = unquote(parsed.path)
+    if os.name == "nt" and len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
+        raw_path = raw_path[1:]
+    return Path(raw_path).resolve()

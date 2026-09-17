@@ -13,6 +13,11 @@ from alembic.config import Config
 
 from capsule import __version__
 from capsule.agent.memory_consolidator import DoubaoMemoryModel, StructuredMemoryConsolidator
+from capsule.agent.memory_vector_worker import (
+    MemoryVectorOutboxDispatcher,
+    MemoryVectorWorker,
+    RedisMemoryVectorQueue,
+)
 from capsule.agent.memory_worker import (
     MemoryOutboxDispatcher,
     MemoryWorker,
@@ -51,6 +56,7 @@ from capsule.pipeline.video_task_service import (
 )
 from capsule.search.evaluation import evaluate_search_file
 from capsule.storage.object_storage import ObjectStorage
+from capsule.vectorstore.agent_memory import AgentMemoryMilvusStore
 from capsule.vectorstore.milvus import MilvusVectorStore
 
 app = typer.Typer(no_args_is_help=True, help="Capsule multimodal asset pipeline")
@@ -141,6 +147,38 @@ def agent_memory_worker_command(
     """Run one independently deployable Agent memory consolidation Worker."""
 
     asyncio.run(_run_agent_memory_worker(worker_id=worker_id, once=once))
+
+
+@app.command(name="agent-memory-vector-dispatcher")
+def agent_memory_vector_dispatcher_command(
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Publish one memory-vector Outbox scan, then stop."),
+    ] = False,
+    poll_seconds: Annotated[
+        float,
+        typer.Option("--poll-seconds", min=0.1, help="Delay between Outbox scans."),
+    ] = 1.0,
+) -> None:
+    """Publish durable Agent-memory vector-index events to Redis Streams."""
+
+    asyncio.run(_run_agent_memory_vector_dispatcher(once=once, poll_seconds=poll_seconds))
+
+
+@app.command(name="agent-memory-vector-worker")
+def agent_memory_vector_worker_command(
+    worker_id: Annotated[
+        str | None,
+        typer.Option("--worker-id", help="Stable identifier for this Worker process."),
+    ] = None,
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Process one vector-index delivery, then stop."),
+    ] = False,
+) -> None:
+    """Run one independently deployable Agent memory-vector Worker."""
+
+    asyncio.run(_run_agent_memory_vector_worker(worker_id=worker_id, once=once))
 
 
 @app.command()
@@ -606,6 +644,65 @@ async def _run_agent_memory_worker(*, worker_id: str | None, once: bool) -> None
                 ),
                 lease_seconds=settings.agent_memory_worker_lease_seconds,
                 max_active_topics=settings.agent_memory_max_active_topics,
+            )
+            if once:
+                processed = await worker.run_once()
+                typer.echo(json.dumps({"processed": processed}, ensure_ascii=False))
+                return
+            while True:
+                await worker.run_once()
+    finally:
+        await queue.close()
+        await database.dispose()
+
+
+async def _run_agent_memory_vector_dispatcher(*, once: bool, poll_seconds: float) -> None:
+    settings = get_settings()
+    database = Database(settings)
+    queue = RedisMemoryVectorQueue(
+        redis_url=settings.redis_url,
+        stream=settings.agent_memory_vector_stream,
+        group=settings.agent_memory_vector_group,
+        consumer=f"dispatcher-{socket.gethostname()}-{uuid4().hex[:8]}",
+    )
+    try:
+        await queue.start()
+        dispatcher = MemoryVectorOutboxDispatcher(
+            repository=AgentConversationRepository(database),
+            queue=queue,
+        )
+        while True:
+            published = await dispatcher.dispatch_once()
+            if once:
+                typer.echo(json.dumps({"published": published}, ensure_ascii=False))
+                return
+            if published == 0:
+                await asyncio.sleep(poll_seconds)
+    finally:
+        await queue.close()
+        await database.dispose()
+
+
+async def _run_agent_memory_vector_worker(*, worker_id: str | None, once: bool) -> None:
+    settings = get_settings()
+    database = Database(settings)
+    resolved_worker_id = worker_id or f"{socket.gethostname()}-{uuid4().hex[:12]}"
+    queue = RedisMemoryVectorQueue(
+        redis_url=settings.redis_url,
+        stream=settings.agent_memory_vector_stream,
+        group=settings.agent_memory_vector_group,
+        consumer=resolved_worker_id,
+    )
+    try:
+        await queue.start()
+        async with DoubaoClient(settings) as model_client:
+            worker = MemoryVectorWorker(
+                worker_id=resolved_worker_id,
+                repository=AgentConversationRepository(database),
+                queue=queue,
+                embedder=model_client,
+                vector_store=AgentMemoryMilvusStore(settings),
+                lease_seconds=settings.agent_memory_vector_worker_lease_seconds,
             )
             if once:
                 processed = await worker.run_once()

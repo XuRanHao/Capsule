@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
 from capsule.agent.runtime import AgentRuntime
 from capsule.api.agent import router as agent_router
 from capsule.api.assets import router as assets_router
@@ -42,6 +43,7 @@ from capsule.search.repositories import PostgresAssetSearchRepository
 from capsule.search.service import SearchService
 from capsule.search.uploads import QueryImageService
 from capsule.storage.object_storage import ObjectStorage
+from capsule.vectorstore.agent_memory import AgentMemoryMilvusStore
 from capsule.vectorstore.milvus import MilvusVectorStore
 
 
@@ -94,12 +96,6 @@ def create_app(
                     resolved_settings.agent_memory_consolidation_token_threshold
                 ),
             )
-            resolved_agent_runtime.set_memory_store(
-                PostgresAgentMemoryStore(
-                    app.state.agent_conversation_repository,
-                    per_scope_limit=resolved_settings.agent_memory_context_per_scope,
-                )
-            )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()
         history = SearchHistoryRepository(database, resolved_settings)
@@ -110,6 +106,8 @@ def create_app(
         asset_repo = AssetRepository(database)
         embedding_repository = EmbeddingRepository(database)
         vectors = MilvusVectorStore(resolved_settings)
+        memory_vectors = AgentMemoryMilvusStore(resolved_settings)
+        app.state.agent_memory_vector_store = memory_vectors
         pipeline_runner = PipelineRunner(
             settings=resolved_settings,
             database=database,
@@ -148,9 +146,17 @@ def create_app(
             settings=resolved_settings,
             repository=asset_repo,
             vector_store=vectors,
+            memory_vector_store=memory_vectors,
             object_storage=storage,
         )
         if resolved_settings.ark_api_key is None:
+            if agent_runtime is None:
+                resolved_agent_runtime.set_memory_store(
+                    PostgresAgentMemoryStore(
+                        app.state.agent_conversation_repository,
+                        per_scope_limit=resolved_settings.agent_memory_context_per_scope,
+                    )
+                )
             logging.getLogger(__name__).warning(
                 "CAPSULE_ARK_API_KEY is not configured; search endpoint will return 503"
             )
@@ -170,6 +176,18 @@ def create_app(
             return
 
         embedding_client = DoubaoClient(resolved_settings)
+        if agent_runtime is None:
+            resolved_agent_runtime.set_memory_store(
+                MilvusAgentMemoryStore(
+                    repository=app.state.agent_conversation_repository,
+                    embedder=embedding_client,
+                    vector_store=memory_vectors,
+                    per_scope_limit=resolved_settings.agent_memory_context_per_scope,
+                    candidate_multiplier=(
+                        resolved_settings.agent_memory_vector_candidate_multiplier
+                    ),
+                )
+            )
         understanding_image_cache = ModelImageCache(
             target_bytes=resolved_settings.model_image_target_bytes,
             max_edge=resolved_settings.model_image_max_edge,

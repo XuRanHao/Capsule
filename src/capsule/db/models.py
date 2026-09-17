@@ -246,6 +246,8 @@ class AgentMemory(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
+    vector_lease_owner: Mapped[str | None] = mapped_column(String(128))
+    vector_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentMemorySource(Base):
@@ -308,6 +310,40 @@ class AgentMemoryOutbox(Base, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentMemoryVectorOutbox(Base, TimestampMixin):
+    """Durable request to synchronize one memory's current state into Milvus."""
+
+    __tablename__ = "agent_memory_vector_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "memory_id",
+            "memory_version",
+            name="uq_agent_memory_vector_outbox_memory_version",
+        ),
+        Index(
+            "ix_agent_memory_vector_outbox_pending",
+            "status",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=id_factory("memvecout")
+    )
+    # Intentionally no foreign key: a later physical memory/workspace deletion
+    # must leave enough information for the vector worker to remove stale IDs.
+    memory_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SourceFile(Base, TimestampMixin):

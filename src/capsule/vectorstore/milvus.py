@@ -1,6 +1,5 @@
 import asyncio
 import json
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +9,7 @@ from pymilvus import DataType, MilvusClient
 from capsule.config import Settings
 from capsule.enums import EmbeddingType
 from capsule.search.models import SearchFilters, VectorSearchHit
+from capsule.vectorstore._milvus_shared import delete_count, field_dimension, validate_vector
 
 
 @dataclass(slots=True, frozen=True)
@@ -203,12 +203,7 @@ class MilvusVectorStore:
         return True
 
     def validate_vector(self, vector: list[float]) -> None:
-        if len(vector) != self._dimension:
-            raise ValueError(f"expected {self._dimension} dimensions, got {len(vector)}")
-        if any(not math.isfinite(value) for value in vector):
-            raise ValueError("vector contains NaN or infinity")
-        if not any(value != 0.0 for value in vector):
-            raise ValueError("vector must not be all zeros")
+        validate_vector(vector, dimension=self._dimension)
 
     def upsert(self, records: list[VectorRecord]) -> None:
         """Persist model-produced raw vectors in the canonical collection."""
@@ -381,15 +376,7 @@ class MilvusVectorStore:
             collection_name=collection_name,
             filter=expression,
         )
-        if not isinstance(response, dict):
-            return 0
-        value = response.get("delete_count", response.get("delete_cnt", 0))
-        if not isinstance(value, (int, float, str)):
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        return delete_count(response)
 
     @property
     def _managed_collections(self) -> tuple[str, str]:
@@ -508,11 +495,6 @@ def _parse_search_hits(raw: Any) -> list[VectorSearchHit]:
 
 
 def _field_dimension(field: Any) -> int | None:
-    if not isinstance(field, dict):
-        return None
-    params = field.get("params")
-    if isinstance(params, dict) and params.get("dim") is not None:
-        return int(params["dim"])
-    if field.get("dim") is not None:
-        return int(field["dim"])
-    return None
+    """Compatibility wrapper kept for existing callers and focused tests."""
+
+    return field_dimension(field)

@@ -24,6 +24,7 @@ from capsule.db.models import (
     AgentMemory,
     AgentMemoryOutbox,
     AgentMemorySource,
+    AgentMemoryVectorOutbox,
     AgentMessage,
     AgentThread,
     Workspace,
@@ -85,6 +86,29 @@ class MemoryOutboxEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryVectorOutboxEvent:
+    event_id: str
+    memory_id: str
+    memory_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMemoryVectorDocument:
+    """Current PostgreSQL truth for one derived Milvus vector."""
+
+    memory_id: str
+    active: bool
+    scope: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    kind: str | None = None
+    memory_key: str | None = None
+    display_text: str | None = None
+    topics: list[str] | None = None
+    version: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedMemoryConsolidation:
     event: MemoryOutboxEvent
     messages: list[AgentMessageRecord]
@@ -93,6 +117,7 @@ class ClaimedMemoryConsolidation:
 
 
 MemoryClaimStatus = Literal["claimed", "already_consolidated", "lease_held"]
+MemoryVectorClaimStatus = Literal["claimed", "already_completed", "lease_held"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +126,14 @@ class MemoryConsolidationClaim:
 
     status: MemoryClaimStatus
     consolidation: ClaimedMemoryConsolidation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryVectorIndexClaim:
+    """The durable disposition of one vector-indexing delivery."""
+
+    status: MemoryVectorClaimStatus
+    document: AgentMemoryVectorDocument | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +393,30 @@ class AgentConversationRepository:
             )
         return [_outbox_event(row) for row in rows]
 
+    async def pending_vector_outbox_events(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[MemoryVectorOutboxEvent]:
+        """Return committed but not-yet-published Milvus synchronization events."""
+
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            rows = list(
+                await session.scalars(
+                    select(AgentMemoryVectorOutbox)
+                    .where(
+                        AgentMemoryVectorOutbox.status == "pending",
+                        AgentMemoryVectorOutbox.available_at <= now,
+                    )
+                    .order_by(AgentMemoryVectorOutbox.created_at)
+                    .limit(limit)
+                )
+            )
+        return [_vector_outbox_event(row) for row in rows]
+
     async def retrieve_memory_matches(
         self,
         *,
@@ -461,6 +518,45 @@ class AgentConversationRepository:
             *[_agent_memory_context(item) for item in global_matches],
         ]
 
+    async def retrieve_memory_context_from_vectors(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str,
+        workspace_candidates: Sequence[tuple[str, float, int]],
+        global_candidates: Sequence[tuple[str, float, int]],
+        per_scope_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Hydrate ANN candidate IDs through PostgreSQL before context injection.
+
+        Milvus only provides a best-effort candidate set.  PostgreSQL applies the
+        current user/workspace/status boundary and rejects an older vector version
+        before confidence and time decay decide the final order.
+        """
+
+        if per_scope_limit < 1 or per_scope_limit > 10:
+            raise ValueError("per_scope_limit must be between 1 and 10")
+        workspace_matches, global_matches = await asyncio.gather(
+            self._retrieve_memory_vector_scope(
+                scope="workspace",
+                user_id=user_id,
+                workspace_id=workspace_id,
+                candidates=workspace_candidates,
+                limit=per_scope_limit,
+            ),
+            self._retrieve_memory_vector_scope(
+                scope="global",
+                user_id=user_id,
+                workspace_id=workspace_id,
+                candidates=global_candidates,
+                limit=per_scope_limit,
+            ),
+        )
+        return [
+            *[_agent_memory_context(item) for item in workspace_matches],
+            *[_agent_memory_context(item) for item in global_matches],
+        ]
+
     async def _retrieve_memory_scope(
         self,
         *,
@@ -512,6 +608,52 @@ class AgentConversationRepository:
         )
         return matches[:limit]
 
+    async def _retrieve_memory_vector_scope(
+        self,
+        *,
+        scope: Literal["workspace", "global"],
+        user_id: str,
+        workspace_id: str,
+        candidates: Sequence[tuple[str, float, int]],
+        limit: int,
+    ) -> list[MemoryMatch]:
+        latest_by_id: dict[str, tuple[float, int]] = {}
+        for memory_id, similarity, vector_version in candidates:
+            if not memory_id or vector_version < 1:
+                continue
+            previous = latest_by_id.get(memory_id)
+            if previous is None or similarity > previous[0]:
+                latest_by_id[memory_id] = (similarity, vector_version)
+        if not latest_by_id:
+            return []
+        filters = [
+            AgentMemory.memory_id.in_(latest_by_id),
+            AgentMemory.scope == scope,
+            AgentMemory.user_id == user_id,
+            AgentMemory.status == "active",
+        ]
+        if scope == "workspace":
+            filters.append(AgentMemory.workspace_id == workspace_id)
+        else:
+            filters.append(AgentMemory.workspace_id.is_(None))
+        async with self._database.session() as session:
+            memories = list(await session.scalars(select(AgentMemory).where(*filters)))
+        now = datetime.now(UTC)
+        matches = [
+            _memory_match(
+                memory,
+                exact_key=False,
+                bm25_score=0.0,
+                maximum_bm25=0.0,
+                vector_similarity=latest_by_id[memory.memory_id][0],
+                now=now,
+            )
+            for memory in memories
+            if memory.version == latest_by_id[memory.memory_id][1]
+        ]
+        matches.sort(key=lambda item: (item.relevance, item.memory_id), reverse=True)
+        return matches[:limit]
+
     async def mark_outbox_published(self, *, event_id: str) -> None:
         async with self._database.session() as session, session.begin():
             event = await session.get(AgentMemoryOutbox, event_id, with_for_update=True)
@@ -520,6 +662,105 @@ class AgentConversationRepository:
             event.status = "published"
             event.attempts += 1
             event.published_at = datetime.now(UTC)
+
+    async def mark_vector_outbox_published(self, *, event_id: str) -> None:
+        async with self._database.session() as session, session.begin():
+            event = await session.get(AgentMemoryVectorOutbox, event_id, with_for_update=True)
+            if event is None or event.status != "pending":
+                return
+            event.status = "published"
+            event.attempts += 1
+            event.published_at = datetime.now(UTC)
+
+    async def claim_vector_index(
+        self,
+        *,
+        event: MemoryVectorOutboxEvent,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> MemoryVectorIndexClaim:
+        """Serialize derived-index writes for one memory without blocking mutations."""
+
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = datetime.now(UTC)
+        async with self._database.session() as session, session.begin():
+            outbox = await session.get(
+                AgentMemoryVectorOutbox,
+                event.event_id,
+                with_for_update=True,
+            )
+            if outbox is None or outbox.status == "completed":
+                return MemoryVectorIndexClaim(status="already_completed")
+            memory = await session.get(AgentMemory, event.memory_id, with_for_update=True)
+            if memory is None:
+                return MemoryVectorIndexClaim(
+                    status="claimed",
+                    document=AgentMemoryVectorDocument(
+                        memory_id=event.memory_id,
+                        active=False,
+                    ),
+                )
+            if (
+                memory.vector_lease_expires_at is not None
+                and memory.vector_lease_expires_at > now
+                and memory.vector_lease_owner != worker_id
+            ):
+                return MemoryVectorIndexClaim(status="lease_held")
+            memory.vector_lease_owner = worker_id
+            memory.vector_lease_expires_at = now + timedelta(seconds=lease_seconds)
+            return MemoryVectorIndexClaim(
+                status="claimed",
+                document=_memory_vector_document(memory),
+            )
+
+    async def renew_vector_index_lease(
+        self,
+        *,
+        event: MemoryVectorOutboxEvent,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> bool:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        async with self._database.session() as session, session.begin():
+            outbox = await session.get(AgentMemoryVectorOutbox, event.event_id)
+            if outbox is None or outbox.status == "completed":
+                return False
+            memory = await session.get(AgentMemory, event.memory_id, with_for_update=True)
+            if memory is None:
+                return True
+            if memory.vector_lease_owner != worker_id:
+                return False
+            memory.vector_lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_seconds)
+            return True
+
+    async def complete_vector_index(
+        self,
+        *,
+        event: MemoryVectorOutboxEvent,
+        worker_id: str,
+    ) -> None:
+        """Mark the outbox event complete only after Milvus accepted current truth."""
+
+        async with self._database.session() as session, session.begin():
+            outbox = await session.get(
+                AgentMemoryVectorOutbox,
+                event.event_id,
+                with_for_update=True,
+            )
+            if outbox is None or outbox.status == "completed":
+                return
+            memory = await session.get(AgentMemory, event.memory_id, with_for_update=True)
+            if memory is not None:
+                if memory.vector_lease_owner != worker_id:
+                    raise RuntimeError("memory vector lease is no longer owned by worker")
+                memory.vector_lease_owner = None
+                memory.vector_lease_expires_at = None
+            outbox.status = "completed"
+            outbox.completed_at = datetime.now(UTC)
 
     async def release_outbox_for_retry(
         self,
@@ -693,12 +934,19 @@ class AgentConversationRepository:
                 raise ValueError("summary must cover exactly the claimed message range")
             if thread.summary_covered_sequence != claimed.event.through_sequence:
                 raise RuntimeError("short-term summary must be committed before memory writes")
-            await self._apply_mutations(
+            changed_memories = await self._apply_mutations(
                 session,
                 thread=thread,
                 source_messages=claimed.messages,
                 mutations=consolidation.mutations,
             )
+            for memory in {item.memory_id: item for item in changed_memories}.values():
+                session.add(
+                    AgentMemoryVectorOutbox(
+                        memory_id=memory.memory_id,
+                        memory_version=memory.version,
+                    )
+                )
             thread.last_consolidated_sequence = claimed.event.through_sequence
             thread.memory_lease_owner = None
             thread.memory_lease_expires_at = None
@@ -723,11 +971,13 @@ class AgentConversationRepository:
         thread: AgentThread,
         source_messages: Sequence[AgentMessageRecord],
         mutations: Sequence[MemoryMutation],
-    ) -> None:
+    ) -> list[AgentMemory]:
+        changed: list[AgentMemory] = []
         for mutation in mutations:
             memory = await self._apply_mutation(session, thread=thread, mutation=mutation)
             if memory is None:
                 continue
+            changed.append(memory)
             for message in source_messages:
                 session.add(
                     AgentMemorySource(
@@ -738,6 +988,7 @@ class AgentConversationRepository:
                         confidence_delta=mutation.confidence_delta,
                     )
                 )
+        return changed
 
     async def _apply_mutation(
         self,
@@ -939,6 +1190,29 @@ def _outbox_event(event: AgentMemoryOutbox) -> MemoryOutboxEvent:
     )
 
 
+def _vector_outbox_event(event: AgentMemoryVectorOutbox) -> MemoryVectorOutboxEvent:
+    return MemoryVectorOutboxEvent(
+        event_id=event.event_id,
+        memory_id=event.memory_id,
+        memory_version=event.memory_version,
+    )
+
+
+def _memory_vector_document(memory: AgentMemory) -> AgentMemoryVectorDocument:
+    return AgentMemoryVectorDocument(
+        memory_id=memory.memory_id,
+        active=memory.status == "active",
+        scope=memory.scope,
+        user_id=memory.user_id,
+        workspace_id=memory.workspace_id,
+        kind=memory.kind,
+        memory_key=memory.memory_key,
+        display_text=memory.display_text,
+        topics=list(memory.topics),
+        version=memory.version,
+    )
+
+
 def _validate_memory_owner(memory: AgentMemory, *, thread: AgentThread) -> None:
     if memory.user_id != thread.user_id:
         raise PermissionError("memory does not belong to this user")
@@ -952,12 +1226,15 @@ def _memory_match(
     exact_key: bool,
     bm25_score: float,
     maximum_bm25: float,
+    vector_similarity: float = 0.0,
     now: datetime,
 ) -> MemoryMatch:
     age_days = max(0.0, (now - memory.last_reinforced_at).total_seconds() / 86_400)
     effective_confidence = memory.confidence * math.exp(-memory.decay_rate * age_days)
     normalized_bm25 = bm25_score / maximum_bm25 if maximum_bm25 > 0 else 0.0
-    relevance = (1.0 if exact_key else normalized_bm25) * effective_confidence
+    normalized_vector = min(1.0, max(0.0, vector_similarity))
+    relevance = max(1.0 if exact_key else 0.0, normalized_bm25, normalized_vector)
+    relevance *= effective_confidence
     return MemoryMatch(
         memory_id=memory.memory_id,
         scope=memory.scope,
