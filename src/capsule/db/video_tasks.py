@@ -240,7 +240,14 @@ class PostgresVideoTaskRepository:
         worker_id: str,
         receipt: str,
     ) -> VideoTaskLease | None:
-        """Claim only the delivery which represents the next database attempt."""
+        """Claim a queued task, or atomically take over an expired lease.
+
+        Redis may hand a stale PEL delivery to another consumer before the
+        original Worker has acknowledged it.  The database is authoritative:
+        a new Worker can take over only after the persisted lease itself has
+        expired.  Keeping that predicate inside this UPDATE prevents a
+        recovery scan and a new claimant from both accepting the same task.
+        """
         if not worker_id or not receipt:
             raise ValueError("worker_id and receipt are required")
         if not self._message_matches_identity(message):
@@ -259,8 +266,18 @@ class PostgresVideoTaskRepository:
                 VideoProcessingTask.result_version == message.result_version,
                 VideoProcessingTask.dispatch_round == message.dispatch_round,
                 *self._task_identity_clauses(),
-                VideoProcessingTask.owner_id.is_(None),
-                VideoProcessingTask.status.in_(("queued", "retry_wait")),
+                or_(
+                    and_(
+                        VideoProcessingTask.owner_id.is_(None),
+                        VideoProcessingTask.status.in_(("queued", "retry_wait")),
+                    ),
+                    and_(
+                        VideoProcessingTask.status == "processing",
+                        VideoProcessingTask.owner_id.is_not(None),
+                        VideoProcessingTask.lease_deadline_at.is_not(None),
+                        VideoProcessingTask.lease_deadline_at <= func.now(),
+                    ),
+                ),
             )
             .values(
                 status="processing",

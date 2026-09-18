@@ -296,6 +296,8 @@ async def test_claim_lease_uses_the_fenced_message_and_repository_identity() -> 
         rowcount = 1
 
     class _Session:
+        statement: Any | None = None
+
         async def __aenter__(self) -> _Session:
             return self
 
@@ -305,11 +307,13 @@ async def test_claim_lease_uses_the_fenced_message_and_repository_identity() -> 
         def begin(self) -> _Session:
             return self
 
-        async def execute(self, _statement: Any) -> _Result:
+        async def execute(self, statement: Any) -> _Result:
+            self.statement = statement
             return _Result()
 
+    session = _Session()
     repository = PostgresVideoTaskRepository(
-        cast(async_sessionmaker[AsyncSession], lambda: _Session()),
+        cast(async_sessionmaker[AsyncSession], lambda: session),
         processor_version=7,
     )
     message = VideoTaskMessage(
@@ -338,6 +342,13 @@ async def test_claim_lease_uses_the_fenced_message_and_repository_identity() -> 
     assert lease.lease_token.startswith("1:")
     assert reclaimed_lease.lease_token
     assert reclaimed_lease.lease_token != lease.lease_token
+    assert session.statement is not None
+    claim_sql = str(session.statement)
+    claim_where = claim_sql.split(" WHERE ", maxsplit=1)[1]
+    assert "processing_tasks.owner_id IS NULL" in claim_where
+    assert "processing_tasks.status IN" in claim_where
+    assert "processing_tasks.status =" in claim_where
+    assert "processing_tasks.lease_deadline_at <= now()" in claim_where
 
 
 def test_empty_lease_token_cannot_form_a_valid_repository_write_fence() -> None:
