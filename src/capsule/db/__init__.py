@@ -11,6 +11,7 @@ from capsule.db.models import (
     ProcessingJob,
     SourceFile,
     Workspace,
+    WorkspaceDirectory,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "ProcessingJob",
     "SourceFile",
     "Workspace",
+    "WorkspaceDirectory",
 ]

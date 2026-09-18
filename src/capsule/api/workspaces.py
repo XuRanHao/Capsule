@@ -5,9 +5,16 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
+from capsule.db.workspace_directories import WorkspaceDirectoryWorkspaceNotFoundError
 from capsule.pipeline.import_service import BrowserImportService
+from capsule.pipeline.workspace_directories import WorkspaceDirectoryService
 from capsule.pipeline.workspace_management import WorkspaceService
-from capsule.schemas import WorkspaceDeleteResult, WorkspaceListResponse, WorkspaceRecord
+from capsule.schemas import (
+    WorkspaceDeleteResult,
+    WorkspaceDirectoryListResponse,
+    WorkspaceListResponse,
+    WorkspaceRecord,
+)
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
 _WORKSPACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -37,6 +44,12 @@ class WorkspaceCreateRequest(BaseModel):
         return value
 
 
+class WorkspaceDirectoryCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=512)
+
+
 def _service(request: Request) -> WorkspaceService:
     service = getattr(request.app.state, "workspace_service", None)
     if service is None:
@@ -48,6 +61,19 @@ def _service(request: Request) -> WorkspaceService:
             },
         )
     return cast(WorkspaceService, service)
+
+
+def _directory_service(request: Request) -> WorkspaceDirectoryService:
+    service = getattr(request.app.state, "workspace_directory_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "workspace_directory_service_not_ready",
+                "message": "workspace directory service is not ready",
+            },
+        )
+    return cast(WorkspaceDirectoryService, service)
 
 
 @router.get("", response_model=WorkspaceListResponse)
@@ -68,6 +94,54 @@ async def create_workspace(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "workspace_already_exists", "message": "workspace_id already exists"},
+        ) from exc
+
+
+@router.get(
+    "/{workspace_id}/directories",
+    response_model=WorkspaceDirectoryListResponse,
+)
+async def list_workspace_directories(
+    workspace_id: str,
+    request: Request,
+) -> WorkspaceDirectoryListResponse:
+    try:
+        return WorkspaceDirectoryListResponse(
+            items=await _directory_service(request).list_directories(workspace_id=workspace_id)
+        )
+    except WorkspaceDirectoryWorkspaceNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "workspace_not_found", "message": str(exc)},
+        ) from exc
+
+
+@router.post(
+    "/{workspace_id}/directories",
+    response_model=WorkspaceDirectoryListResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_workspace_directory(
+    workspace_id: str,
+    payload: WorkspaceDirectoryCreateRequest,
+    request: Request,
+) -> WorkspaceDirectoryListResponse:
+    try:
+        return WorkspaceDirectoryListResponse(
+            items=await _directory_service(request).create(
+                workspace_id=workspace_id,
+                path=payload.path,
+            )
+        )
+    except WorkspaceDirectoryWorkspaceNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "workspace_not_found", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_workspace_directory_path", "message": str(exc)},
         ) from exc
 
 

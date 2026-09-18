@@ -220,6 +220,16 @@ class WorkspaceListResponse(BaseModel):
     items: list[WorkspaceRecord] = Field(default_factory=list)
 
 
+class WorkspaceDirectoryRecord(BaseModel):
+    path: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceDirectoryListResponse(BaseModel):
+    items: list[WorkspaceDirectoryRecord] = Field(default_factory=list)
+
+
 class WorkspaceDeleteResult(BaseModel):
     workspace_id: str
     workspace_deleted: bool

@@ -8,9 +8,7 @@ type Props = {
   selectedId: string | null;
   onSelect: (assetId: string) => void;
   activeGraph: NarrativeGraphRecord | null;
-  creatingGraph: boolean;
   graphError: string | null;
-  onCreateGraph: () => void;
 };
 
 type GraphNode = { id: string; label: string; kind: string; sourceFileId: string; x: number; y: number };
@@ -28,9 +26,7 @@ export default function GraphCanvas({
   selectedId,
   onSelect,
   activeGraph,
-  creatingGraph,
   graphError,
-  onCreateGraph,
 }: Props) {
   const [scale, setScale] = useState(1);
   const nodes = useMemo<GraphNode[]>(() => assets.slice(0, 8).map((asset, index) => ({
@@ -56,16 +52,11 @@ export default function GraphCanvas({
             {activeGraph ? `当前图谱：${activeGraph.name}` : "请先新建图谱后再让助手编辑"}
           </p>
         </div>
-        <div className="graph-actions">
-          <button type="button" className="graph-create" onClick={onCreateGraph} disabled={creatingGraph}>
-            {creatingGraph ? "正在创建…" : "新建图谱"}
-          </button>
-          <div className="graph-toolbar" aria-label="图谱缩放控制">
+        <div className="graph-toolbar" aria-label="图谱缩放控制">
             <button type="button" aria-label="缩小图谱" onClick={() => setScale((value) => Math.max(0.7, value - 0.1))}>−</button>
             <output>{Math.round(scale * 100)}%</output>
             <button type="button" aria-label="放大图谱" onClick={() => setScale((value) => Math.min(1.4, value + 0.1))}>＋</button>
             <button type="button" className="graph-reset" onClick={() => setScale(1)}>适配</button>
-          </div>
         </div>
       </header>
 

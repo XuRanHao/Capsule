@@ -47,6 +47,20 @@ class Workspace(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
+class WorkspaceDirectory(Base, TimestampMixin):
+    """A user-created directory in a workspace's logical resource tree."""
+
+    __tablename__ = "workspace_directories"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # This is a normalized, slash-separated path relative to the workspace.
+    # A composite primary key makes repeated create requests idempotent.
+    path: Mapped[str] = mapped_column(String(512), primary_key=True)
+
+
 class WorkspaceUser(Base, TimestampMixin):
     """User membership and graph permissions inside one Workspace."""
 

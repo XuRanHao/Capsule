@@ -92,6 +92,12 @@ export type NarrativeGraphRecord = {
   description: string;
 };
 
+export type WorkspaceDirectoryRecord = {
+  path: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ProcessingJob = {
   job_id: string;
   workspace_id: string;
@@ -186,4 +192,57 @@ export async function createNarrativeGraph(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+export async function loadWorkspaceDirectories(workspaceId: string) {
+  return apiFetch<{ items: WorkspaceDirectoryRecord[] }>(
+    `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/directories`,
+  );
+}
+
+export async function createWorkspaceDirectory(input: {
+  workspace_id: string;
+  path: string;
+}) {
+  return apiFetch<{ items: WorkspaceDirectoryRecord[] }>(
+    `/api/v1/workspaces/${encodeURIComponent(input.workspace_id)}/directories`,
+    { method: "POST", body: JSON.stringify({ path: input.path }) },
+  );
+}
+
+export async function createWorkspaceMarkdownFile(input: {
+  workspace_id: string;
+  relative_path: string;
+  content: string;
+}) {
+  const job = await apiFetch<{ job_id: string }>("/api/v1/import-jobs", {
+    method: "POST",
+    body: JSON.stringify({ workspace_id: input.workspace_id }),
+  });
+  const name = input.relative_path.split("/").at(-1) || "untitled.md";
+  const form = new FormData();
+  form.set("workspace_id", input.workspace_id);
+  form.set("relative_path", input.relative_path);
+  form.set(
+    "file",
+    new File([input.content], name, { type: "text/markdown;charset=utf-8" }),
+  );
+  const response = await fetch(endpoint(`/api/v1/import-jobs/${job.job_id}/files`), {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { detail?: string | { message?: string } }
+      | null;
+    const message = typeof payload?.detail === "string"
+      ? payload.detail
+      : payload?.detail?.message;
+    throw new ApiRequestError(message || `文件保存失败（${response.status}）`, response.status);
+  }
+  await apiFetch(`/api/v1/import-jobs/${job.job_id}/complete`, {
+    method: "POST",
+    body: JSON.stringify({ workspace_id: input.workspace_id }),
+  });
+  return { job_id: job.job_id };
 }

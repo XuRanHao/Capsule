@@ -85,6 +85,9 @@ export default function WorkspacePage() {
           loading={workspacesLoading}
           assets={assets}
           onWorkspaceChange={setWorkspaceId}
+          creatingGraph={creatingGraph}
+          onCreateGraph={() => { void createGraph(); }}
+          onAssetsRefresh={() => { void loadWorkspaceAssets(); }}
         />
         <section className="workbench-main">
           {(workspaceError || assetsError) && (
@@ -98,9 +101,7 @@ export default function WorkspacePage() {
             selectedId={selectedAssetId}
             onSelect={setSelectedAssetId}
             activeGraph={selectedGraph}
-            creatingGraph={creatingGraph}
             graphError={selectedGraphError}
-            onCreateGraph={() => { void createGraph(); }}
           />
         </section>
         <AgentChat key={workspaceId} workspaceId={workspaceId} selectedGraphId={selectedGraph?.graph_id ?? null} />

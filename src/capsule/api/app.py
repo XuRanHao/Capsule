@@ -39,6 +39,7 @@ from capsule.db.repositories import (
     WorkspaceUserRepository,
 )
 from capsule.db.session import Database
+from capsule.db.workspace_directories import WorkspaceDirectoryRepository
 from capsule.media.model_image import ModelImageCache
 from capsule.media.video_frames import FFmpegVideoFrameExtractor
 from capsule.model_clients.doubao import DoubaoClient
@@ -49,6 +50,7 @@ from capsule.pipeline.processing_task_service import BrowserProcessingTaskSubmis
 from capsule.pipeline.runner import PipelineRunner
 from capsule.pipeline.understanding import AssetUnderstandingService
 from capsule.pipeline.workspace_clear import LibraryClearService
+from capsule.pipeline.workspace_directories import WorkspaceDirectoryService
 from capsule.pipeline.workspace_management import WorkspaceService
 from capsule.search.history import SearchHistoryRepository
 from capsule.search.query_embedding import QueryEmbeddingService
@@ -70,6 +72,7 @@ def create_app(
     asset_repository: AssetRepository | None = None,
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
+    workspace_directory_service: WorkspaceDirectoryService | None = None,
     agent_runtime: AgentRuntime | None = None,
     graph_repository: RelationGraphRepository | None = None,
 ) -> FastAPI:
@@ -90,6 +93,7 @@ def create_app(
             or asset_repository is not None
             or library_clear_service is not None
             or workspace_service is not None
+            or workspace_directory_service is not None
             or agent_runtime is not None
             or graph_repository is not None
         ):
@@ -98,6 +102,7 @@ def create_app(
             app.state.asset_repository = asset_repository
             app.state.library_clear_service = library_clear_service
             app.state.workspace_service = workspace_service
+            app.state.workspace_directory_service = workspace_directory_service
             yield
             return
 
@@ -197,6 +202,9 @@ def create_app(
             vector_store=vectors,
             memory_vector_store=memory_vectors,
             object_storage=storage,
+        )
+        app.state.workspace_directory_service = WorkspaceDirectoryService(
+            repository=WorkspaceDirectoryRepository(database)
         )
         if resolved_settings.ark_api_key is None:
             if agent_runtime is None:
