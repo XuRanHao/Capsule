@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import runpy
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -179,6 +181,56 @@ async def test_can_ack_unclaimed_cleans_a_task_deleted_after_contract_validation
     )
 
     assert await repository.can_ack_unclaimed(message)
+
+
+@pytest.mark.asyncio
+async def test_pending_retry_wait_reads_the_optional_persisted_retry_record() -> None:
+    class _Result:
+        def __init__(self, row: object | None) -> None:
+            self._row = row
+
+        def one_or_none(self) -> object | None:
+            return self._row
+
+    class _Session:
+        def __init__(self, row: object | None) -> None:
+            self._row = row
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._row)
+
+    message = VideoTaskMessage(
+        task_id="task-1",
+        job_id="job-1",
+        workspace_id="workspace-1",
+        source_file_id="source-1",
+        generation=1,
+    )
+    no_retry = PostgresVideoTaskRepository(
+        cast(async_sessionmaker[AsyncSession], lambda: _Session(None))
+    )
+    assert await no_retry.pending_retry_wait(message) is None
+
+    retry_at = datetime.now(UTC) + timedelta(seconds=30)
+    waiting_retry = PostgresVideoTaskRepository(
+        cast(
+            async_sessionmaker[AsyncSession],
+            lambda: _Session(
+                SimpleNamespace(retry_event_id="task-1:0:1", next_retry_at=retry_at)
+            ),
+        )
+    )
+    retry = await waiting_retry.pending_retry_wait(message)
+
+    assert retry is not None
+    assert retry.failure_event_id == "task-1:0:1"
+    assert 0 <= retry.delay_seconds <= 30
 
 
 def test_video_repository_rejects_an_invalid_processor_identity() -> None:

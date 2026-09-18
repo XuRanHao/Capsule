@@ -1,4 +1,4 @@
-"""Worker-local materialization of trusted S3-compatible source objects."""
+"""Worker-local materialization of trusted canonical source objects."""
 
 import asyncio
 import shutil
@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from capsule.schemas import DiscoveredFile
 from capsule.storage.object_storage import ObjectStorage
@@ -41,10 +43,29 @@ async def load_postgres_object_source(
         or source.processing_generation != message.generation
     ):
         raise ValueError("task source is not the current canonical generation")
-    if not source.storage_uri.startswith("s3://"):
-        raise ValueError("task source storage must be an s3:// URI")
-
     suffix = Path(source.relative_path).suffix.lower()
+    parsed = urlparse(source.storage_uri)
+    if parsed.scheme == "file":
+        local_path = Path(url2pathname(parsed.path))
+        if not await asyncio.to_thread(local_path.is_file):
+            raise ValueError("task source local file is unavailable")
+
+        async def local_cleanup() -> None:
+            return None
+
+        return MaterializedSource(
+            source_file=DiscoveredFile(
+                path=str(local_path),
+                relative_path=source.relative_path,
+                extension=suffix,
+                size_bytes=source.file_size_bytes,
+            ),
+            sha256=source.sha256,
+            cleanup=local_cleanup,
+        )
+    if parsed.scheme != "s3":
+        raise ValueError("task source storage must be an s3:// or file:// URI")
+
     directory = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="capsule-source-"))
     local_path = directory / f"source{suffix}"
     try:

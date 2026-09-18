@@ -15,7 +15,15 @@ from capsule.pipeline.understanding import (
     AssetUnderstandingService,
     _asset_context_payload,
     _content_context_payload,
+    _read_local_source,
 )
+
+
+def test_read_local_source_accepts_a_windows_style_file_uri(tmp_path: Path) -> None:
+    source = tmp_path / "sunset.png"
+    source.write_bytes(b"image source")
+
+    assert _read_local_source(source.as_uri()) == b"image source"
 
 
 def test_asset_context_payload_includes_source_path_and_linked_paragraph() -> None:

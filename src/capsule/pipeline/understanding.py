@@ -9,7 +9,8 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from pydantic import BaseModel, Field
 
@@ -346,7 +347,7 @@ def _read_local_source(storage_uri: str) -> bytes:
     parsed = urlparse(storage_uri)
     if parsed.scheme != "file":
         raise ValueError("understanding currently requires a local source file")
-    path = Path(unquote(parsed.path))
+    path = Path(url2pathname(parsed.path))
     if not path.is_file():
         raise ValueError(f"source file no longer exists: {path}")
     return path.read_bytes()
@@ -372,7 +373,7 @@ def _audio_segment_data_uri(asset: EmbeddingAsset) -> str:
     parsed = urlparse(asset.source_storage_uri)
     if parsed.scheme != "file":
         raise ValueError("audio understanding currently requires a local source file")
-    source = Path(unquote(parsed.path))
+    source = Path(url2pathname(parsed.path))
     start_ms = int(asset.source_locator.get("start_ms", 0))
     end_ms = int(asset.source_locator.get("end_ms", 0))
     if not source.is_file() or end_ms <= start_ms:

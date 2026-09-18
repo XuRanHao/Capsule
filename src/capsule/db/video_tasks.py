@@ -475,7 +475,7 @@ class PostgresVideoTaskRepository:
             VideoProcessingTask.status == "retry_wait",
         )
         async with self._session_factory() as session:
-            await session.execute(stmt)
+            row = (await session.execute(stmt)).one_or_none()
         if row is None or not row.retry_event_id or row.retry_event_id == message.retry_event_id:
             return None
         retry_at = row.next_retry_at or datetime.now(UTC)
