@@ -1,8 +1,11 @@
 """HTTP entry point for the model-independent conversational Agent runtime."""
 
+import json
+from collections.abc import AsyncIterator
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from capsule.agent.contracts import (
     AgentMessageResponse,
@@ -37,6 +40,48 @@ async def invoke_agent(payload: AgentRequest, request: Request) -> AgentResponse
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except (PermissionError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.post("/invoke/stream")
+async def invoke_agent_stream(payload: AgentRequest, request: Request) -> StreamingResponse:
+    """Stream governed Agent phases and one complete final response over SSE."""
+
+    runtime = _agent_runtime(request)
+
+    async def events() -> AsyncIterator[str]:
+        yield _sse_event(
+            "phase",
+            {"phase": "planning", "message": "正在规划回复…"},
+        )
+        try:
+            response = await runtime.invoke(payload)
+        except AgentThreadStateError as exc:
+            yield _sse_event("error", {"message": str(exc), "code": "thread_state_error"})
+        except (PermissionError, ValueError) as exc:
+            yield _sse_event("error", {"message": str(exc), "code": "request_rejected"})
+        except Exception:
+            yield _sse_event(
+                "error",
+                {"message": "对话请求失败，请稍后重试。", "code": "agent_invocation_failed"},
+            )
+        else:
+            if response.tool_history:
+                yield _sse_event(
+                    "phase",
+                    {
+                        "phase": "tools_finished",
+                        "message": "已完成工具处理。",
+                        "tool_count": len(response.tool_history),
+                    },
+                )
+            yield _sse_event("result", response.model_dump(mode="json"))
+        yield _sse_event("done", {})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/threads", response_model=AgentThreadResponse, status_code=status.HTTP_201_CREATED)
@@ -205,6 +250,10 @@ def _agent_runtime(request: Request) -> AgentRuntime:
             },
         )
     return runtime
+
+
+def _sse_event(event: str, data: object) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _thread_response(thread: AgentThreadRecord) -> AgentThreadResponse:
