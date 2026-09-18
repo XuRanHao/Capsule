@@ -5316,6 +5316,7 @@ blockquote p {
 .workspace-library-link:hover { color: #2563eb; }
 
 .workspace-tree { min-height: 0; flex: 1; }
+.workspace-graph-category { margin-bottom: 18px; }
 
 .tree-section-heading {
   display: flex;
@@ -5394,6 +5395,59 @@ blockquote p {
 .workspace-tree-file-pending { cursor: default; color: #8190a5; }
 .workspace-tree-file-pending:hover { background: transparent; }
 .workspace-tree-error { margin: 0 0 9px; padding: 7px 8px; border-radius: 6px; background: #fff2f0; color: #b24435; font-size: 10px; line-height: 1.4; }
+.workspace-tree-graph {
+  display: flex;
+  width: 100%;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #4b5b71;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+}
+.workspace-tree-graph:hover,
+.workspace-tree-graph.selected { background: #edf4ff; color: #2563eb; }
+.workspace-tree-graph:focus-visible { outline: 2px solid #7aa8e8; outline-offset: 1px; }
+.workspace-tree-graph > span { overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-graph-icon { width: 16px; flex: 0 0 auto; color: #5d78a7; }
+.workspace-tree-graph.selected .workspace-graph-icon { color: #2563eb; }
+.workspace-graph-empty { margin: 0; padding: 7px 6px; color: #8190a5; font-size: 10px; line-height: 1.45; }
+.workspace-context-menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 138px;
+  padding: 4px;
+  border: 1px solid #d6e0ee;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 10px 26px rgb(32 50 77 / 18%);
+}
+.workspace-context-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #40506a;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  text-align: left;
+}
+.workspace-context-menu button:hover:not(:disabled) { background: #f0f5fc; color: #2563eb; }
+.workspace-context-menu button:disabled { cursor: wait; opacity: .6; }
 
 .workspace-dialog-backdrop {
   position: fixed;

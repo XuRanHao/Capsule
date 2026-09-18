@@ -194,6 +194,12 @@ export async function createNarrativeGraph(input: {
   });
 }
 
+export async function loadNarrativeGraphs(workspaceId: string) {
+  return apiFetch<NarrativeGraphRecord[]>(
+    `/api/v1/graphs?workspace_id=${encodeURIComponent(workspaceId)}`,
+  );
+}
+
 export async function loadWorkspaceDirectories(workspaceId: string) {
   return apiFetch<{ items: WorkspaceDirectoryRecord[] }>(
     `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/directories`,

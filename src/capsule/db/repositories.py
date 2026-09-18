@@ -394,6 +394,19 @@ class RelationGraphRepository:
             await session.refresh(graph)
         return _narrative_graph_payload(graph)
 
+    async def list_graphs(self, *, workspace_id: str) -> list[dict[str, Any]]:
+        """List the graphs fixed under one workspace's graph category."""
+
+        async with self._database.session() as session:
+            graphs = list(
+                await session.scalars(
+                    select(NarrativeGraph)
+                    .where(NarrativeGraph.workspace_id == workspace_id)
+                    .order_by(NarrativeGraph.created_at, NarrativeGraph.graph_id)
+                )
+            )
+        return [_narrative_graph_payload(graph) for graph in graphs]
+
     async def load_current_graph_context(
         self,
         *,

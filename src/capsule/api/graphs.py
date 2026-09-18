@@ -2,7 +2,7 @@
 
 from typing import cast
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from capsule.db.repositories import RelationGraphRepository
@@ -46,6 +46,17 @@ def _repository(request: Request) -> RelationGraphRepository:
             },
         )
     return cast(RelationGraphRepository, repository)
+
+
+@router.get("", response_model=list[NarrativeGraphResponse])
+async def list_narrative_graphs(
+    request: Request,
+    workspace_id: str = Query(min_length=1, max_length=64),
+) -> list[NarrativeGraphResponse]:
+    return [
+        NarrativeGraphResponse.model_validate(graph)
+        for graph in await _repository(request).list_graphs(workspace_id=workspace_id)
+    ]
 
 
 @router.post("", response_model=NarrativeGraphResponse, status_code=status.HTTP_201_CREATED)

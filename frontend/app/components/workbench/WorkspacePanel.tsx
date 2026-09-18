@@ -1,12 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   createWorkspaceDirectory,
   createWorkspaceMarkdownFile,
   loadWorkspaceDirectories,
   type AssetRecord,
+  type NarrativeGraphRecord,
   type WorkspaceDirectoryRecord,
 } from "../../lib/api";
 import type { WorkspaceRecord } from "../../lib/workspaces";
@@ -17,9 +18,12 @@ type Props = {
   workspaces: WorkspaceRecord[];
   loading: boolean;
   assets: AssetRecord[];
+  graphs: NarrativeGraphRecord[];
+  selectedGraphId: string | null;
   creatingGraph: boolean;
   onWorkspaceChange: (workspaceId: string) => void;
-  onCreateGraph: () => void;
+  onCreateGraph: () => Promise<void>;
+  onGraphSelect: (graph: NarrativeGraphRecord) => void;
   onAssetsRefresh: () => void;
 };
 
@@ -45,6 +49,17 @@ function FileIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true" className="workspace-file-icon">
       <path d="M5 3.5h8l4 4V20.5H5z" fill="none" stroke="currentColor" strokeWidth="1.6" />
       <path d="M13 3.5v4h4M8 14h8M8 17h5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+    </svg>
+  );
+}
+
+function GraphIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="workspace-graph-icon">
+      <circle cx="6" cy="7" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="17.5" cy="6" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="12" cy="17" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="m7.9 8.2 2.8 6.1M15.5 7.5l-2.3 6.7M8 7.1h7.3" fill="none" stroke="currentColor" strokeWidth="1.4" />
     </svg>
   );
 }
@@ -106,7 +121,13 @@ function treeFrom(
   return root;
 }
 
-function TreeChildren({ folder }: { folder: TreeFolder }) {
+function TreeChildren({
+  folder,
+  onContextMenu,
+}: {
+  folder: TreeFolder;
+  onContextMenu: (event: MouseEvent<HTMLElement>) => void;
+}) {
   const folders = [...folder.folders.values()].sort((left, right) => left.name.localeCompare(right.name));
   const files = [...folder.files].sort((left, right) => left.name.localeCompare(right.name));
   return (
@@ -114,12 +135,12 @@ function TreeChildren({ folder }: { folder: TreeFolder }) {
       {folders.map((child) => (
         <li key={child.path}>
           <details open>
-            <summary>
+            <summary onContextMenu={onContextMenu}>
               <FolderIcon />
               <span>{child.name}</span>
               <small>{child.files.length + child.folders.size}</small>
             </summary>
-            <TreeChildren folder={child} />
+            <TreeChildren folder={child} onContextMenu={onContextMenu} />
           </details>
         </li>
       ))}
@@ -145,9 +166,12 @@ export default function WorkspacePanel({
   workspaces,
   loading,
   assets,
+  graphs,
+  selectedGraphId,
   creatingGraph,
   onWorkspaceChange,
   onCreateGraph,
+  onGraphSelect,
   onAssetsRefresh,
 }: Props) {
   const [directories, setDirectories] = useState<WorkspaceDirectoryRecord[]>([]);
@@ -158,6 +182,7 @@ export default function WorkspacePanel({
   const [fileContent, setFileContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [treeError, setTreeError] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const currentWorkspace = workspaces.find((item) => item.workspace_id === workspaceId);
 
   const refreshDirectories = useCallback(async () => {
@@ -179,6 +204,20 @@ export default function WorkspacePanel({
     }, 0);
     return () => window.clearTimeout(timer);
   }, [refreshDirectories]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [contextMenu]);
 
   const visiblePendingFiles = useMemo(
     () => pendingFiles.filter((pending) => !assets.some(
@@ -244,6 +283,16 @@ export default function WorkspacePanel({
     }
   };
 
+  const openContextMenu = (event: MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY });
+  };
+
+  const createGraph = () => {
+    setContextMenu(null);
+    void onCreateGraph();
+  };
+
   return (
     <aside className="workbench-panel workspace-panel" aria-label="工作空间">
       <div className="panel-heading">
@@ -256,16 +305,47 @@ export default function WorkspacePanel({
       <div className="workspace-create-actions" aria-label="创建资源">
         <button type="button" className="workspace-create-primary" onClick={() => setDialog("file")}><PlusIcon /> 新建文件</button>
         <button type="button" className="workspace-create-icon" aria-label="新建文件夹" title="新建文件夹" onClick={() => setDialog("folder")}><FolderIcon /></button>
-        <button type="button" className="workspace-create-graph" onClick={onCreateGraph} disabled={creatingGraph}>{creatingGraph ? "正在创建…" : "新建图谱"}</button>
       </div>
 
       <div className="workspace-actions"><Link href="/import" className="workspace-import-link">导入文件或文件夹</Link><Link href="/assets" className="workspace-library-link">打开素材库</Link></div>
 
-      <section className="workspace-tree" aria-label="工作空间文件树">
+      <section className="workspace-tree" aria-label="工作空间文件树" onContextMenu={openContextMenu}>
+        <div className="workspace-graph-category" aria-label="图谱">
+          <div className="tree-section-heading"><span>图谱</span><small>{graphs.length} ITEMS</small></div>
+          {graphs.length ? (
+            <ul className="workspace-tree-list">
+              {graphs.map((graph) => (
+                <li key={graph.graph_id}>
+                  <button
+                    type="button"
+                    className={`workspace-tree-graph ${selectedGraphId === graph.graph_id ? "selected" : ""}`}
+                    onClick={() => onGraphSelect(graph)}
+                    title={`打开图谱：${graph.name}`}
+                  >
+                    <GraphIcon /><span>{graph.name}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="workspace-graph-empty">右键文件空间以新建图谱。</p>}
+        </div>
         <div className="tree-section-heading"><span>文件资源</span><small>{assets.length + visiblePendingFiles.length} ITEMS</small></div>
         {treeError && <p className="workspace-tree-error" role="status">{treeError}</p>}
-        {tree.folders.size || tree.files.length ? <TreeChildren folder={tree} /> : (
+        {tree.folders.size || tree.files.length ? <TreeChildren folder={tree} onContextMenu={openContextMenu} /> : (
           <div className="workspace-empty"><span>尚无文件或文件夹</span><p>新建 Markdown 文件后会自动进入素材处理链路。</p></div>
+        )}
+        {contextMenu && (
+          <div
+            className="workspace-context-menu"
+            role="menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button type="button" role="menuitem" onClick={createGraph} disabled={creatingGraph}>
+              <GraphIcon />{creatingGraph ? "正在创建图谱…" : "新建图谱"}
+            </button>
+          </div>
         )}
       </section>
 

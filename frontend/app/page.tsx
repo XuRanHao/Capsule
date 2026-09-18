@@ -7,6 +7,7 @@ import GraphCanvas from "./components/workbench/GraphCanvas";
 import WorkspacePanel from "./components/workbench/WorkspacePanel";
 import {
   createNarrativeGraph,
+  loadNarrativeGraphs,
   type AssetRecord,
   type NarrativeGraphRecord,
   loadAssets,
@@ -27,6 +28,7 @@ export default function WorkspacePage() {
   const [assetsError, setAssetsError] = useState<string | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [activeGraph, setActiveGraph] = useState<NarrativeGraphRecord | null>(null);
+  const [graphs, setGraphs] = useState<NarrativeGraphRecord[]>([]);
   const [creatingGraph, setCreatingGraph] = useState(false);
   const [graphError, setGraphError] = useState<{ workspaceId: string; message: string } | null>(null);
   const selectedGraph = activeGraph?.workspace_id === workspaceId ? activeGraph : null;
@@ -54,12 +56,39 @@ export default function WorkspacePage() {
     return () => window.clearTimeout(timer);
   }, [loadWorkspaceAssets]);
 
+  const loadWorkspaceGraphs = useCallback(async () => {
+    if (!ready || !workspaceId) return;
+    try {
+      const items = await loadNarrativeGraphs(workspaceId);
+      setGraphs(items);
+      setGraphError(null);
+      setActiveGraph((current) =>
+        current && items.some((graph) => graph.graph_id === current.graph_id)
+          ? current
+          : null,
+      );
+    } catch (error) {
+      setGraphs([]);
+      setGraphError({
+        workspaceId,
+        message: error instanceof Error ? error.message : "图谱加载失败",
+      });
+    }
+  }, [ready, workspaceId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadWorkspaceGraphs(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadWorkspaceGraphs]);
+
   const createGraph = useCallback(async () => {
     if (!workspaceId || creatingGraph) return;
     setCreatingGraph(true);
     setGraphError(null);
     try {
-      setActiveGraph(await createNarrativeGraph({ workspace_id: workspaceId }));
+      const graph = await createNarrativeGraph({ workspace_id: workspaceId });
+      setGraphs((current) => [...current, graph]);
+      setActiveGraph(graph);
     } catch (error) {
       setGraphError({
         workspaceId,
@@ -84,9 +113,12 @@ export default function WorkspacePage() {
           workspaces={workspaces}
           loading={workspacesLoading}
           assets={assets}
+          graphs={graphs}
+          selectedGraphId={selectedGraph?.graph_id ?? null}
           onWorkspaceChange={setWorkspaceId}
           creatingGraph={creatingGraph}
-          onCreateGraph={() => { void createGraph(); }}
+          onCreateGraph={createGraph}
+          onGraphSelect={setActiveGraph}
           onAssetsRefresh={() => { void loadWorkspaceAssets(); }}
         />
         <section className="workbench-main">
@@ -104,7 +136,11 @@ export default function WorkspacePage() {
             graphError={selectedGraphError}
           />
         </section>
-        <AgentChat key={workspaceId} workspaceId={workspaceId} selectedGraphId={selectedGraph?.graph_id ?? null} />
+        <AgentChat
+          key={`${workspaceId}:${selectedGraph?.graph_id ?? "no-graph"}`}
+          workspaceId={workspaceId}
+          selectedGraphId={selectedGraph?.graph_id ?? null}
+        />
       </div>
     </main>
   );
