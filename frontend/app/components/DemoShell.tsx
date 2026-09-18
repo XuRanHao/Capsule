@@ -6,8 +6,7 @@ export type DemoSection =
   | "import"
   | "tasks"
   | "assets"
-  | "search"
-  | "capsules";
+  | "search";
 
 const NAV_ITEMS: Array<{
   id: DemoSection;
@@ -19,7 +18,6 @@ const NAV_ITEMS: Array<{
   { id: "import", href: "/import", label: "导入", marker: "02" },
   { id: "tasks", href: "/tasks", label: "处理任务", marker: "03" },
   { id: "assets", href: "/assets", label: "Assets", marker: "04" },
-  { id: "capsules", href: "/capsules", label: "Capsule", marker: "05" },
 ];
 
 export function AppNavigation({
