@@ -54,6 +54,7 @@ PostgreSQL 是业务数据唯一权威来源。Milvus 只提供召回候选，Re
 5. 单个 `thread_id` 同时最多一个活跃 Runtime 回合；业务回合租约与 Memory Worker 租约互不替代。
 6. 一次 Runtime 请求内长期/通用记忆最多同步召回一次，工具循环复用同一批结果。
 7. 正常应用中的 Planner 只产出受 Schema 限制的 `PlanDecision`；它不能直接执行工具、写入记忆或改变会话状态。
+8. 默认 API Runtime 必须注册图谱工具目录；前端只能传已创建的 `NarrativeGraph.graph_id`，不能以素材 ID 代替。
 
 ## 配置与数据库升级
 

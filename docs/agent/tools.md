@@ -21,6 +21,22 @@
 
 注册时会校验工具名唯一、超时和重试参数合法、Schema 是 Pydantic 模型、锁模式有效。工具名是模型唯一可选择的标识，处理器函数不会暴露给模型。
 
+## 图谱工具的生产装配
+
+正常 API 启动会创建 `RelationGraphRepository` 与持久化的
+`AgentToolExecutionRepository`，并通过 `build_graph_tool_registry` 装配到默认
+`AgentRuntime`。当前目录包含 11 个图谱工具：4 个读取工具和 7 个写入或结构调整
+工具。模型收到的 `tools.catalog` 来自这个 Registry；空 Runtime 只允许在单元测试或
+显式轻量注入时使用，不能作为生产应用装配的替代。
+
+图谱工具的 `ToolContext.graph_id` 必须是 `narrative_graphs.graph_id`。前端的素材
+`asset_id` 只用于素材浏览，不能作为图谱 ID。工作台通过“新建图谱”创建空图谱并将
+返回的真实 ID 注入会话请求；图谱仍为空时，Agent 可以读取其上下文或创建实体，但
+不会自动把当前查看的素材写入图谱。
+
+工具执行还要求用户在 `workspace_users` 中具有对应工作区权限。图谱创建不改变成员
+权限，也不会为了演示界面自动授予 `graph:write` 或更高权限。
+
 ## 渐进式披露与规划合约
 
 规划器在首次调用时只收到轻量目录：

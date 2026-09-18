@@ -366,6 +366,34 @@ class RelationGraphRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    async def create_graph(
+        self,
+        *,
+        workspace_id: str,
+        name: str,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Create one empty narrative graph inside an existing workspace."""
+
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("narrative graph name must not be blank")
+        async with self._database.session() as session, session.begin():
+            workspace_exists = await session.scalar(
+                select(Workspace.workspace_id).where(Workspace.workspace_id == workspace_id)
+            )
+            if workspace_exists is None:
+                raise ValueError("workspace does not exist")
+            graph = NarrativeGraph(
+                workspace_id=workspace_id,
+                name=normalized_name,
+                description=description.strip(),
+            )
+            session.add(graph)
+            await session.flush()
+            await session.refresh(graph)
+        return _narrative_graph_payload(graph)
+
     async def load_current_graph_context(
         self,
         *,
@@ -948,6 +976,15 @@ async def _require_narrative_graph(
     )
     if graph is None:
         raise ValueError("narrative graph does not exist in workspace")
+
+
+def _narrative_graph_payload(graph: NarrativeGraph) -> dict[str, Any]:
+    return {
+        "graph_id": graph.graph_id,
+        "workspace_id": graph.workspace_id,
+        "name": graph.name,
+        "description": graph.description,
+    }
 
 
 def _normalize_permission_level(value: str) -> str:

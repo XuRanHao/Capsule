@@ -3,7 +3,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -12,13 +12,16 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from capsule.agent.checkpoints import postgres_checkpoint_url
 from capsule.agent.context_budget import ContextBudget
+from capsule.agent.graph_tools import build_graph_tool_registry
 from capsule.agent.memory_worker import MemoryOutboxDispatcher, RedisMemoryQueue
 from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
 from capsule.agent.model_planner import ModelAgentPlanner
 from capsule.agent.runtime import AgentRuntime
+from capsule.agent.tools import ToolExecutionStore
 from capsule.api.agent import router as agent_router
 from capsule.api.assets import router as assets_router
 from capsule.api.capsules import router as capsules_router
+from capsule.api.graphs import router as graphs_router
 from capsule.api.imports import router as imports_router
 from capsule.api.search import router as search_router
 from capsule.api.workspaces import router as workspaces_router
@@ -29,8 +32,10 @@ from capsule.db.agent_memory import (
     PostgresAgentMemoryStore,
 )
 from capsule.db.repositories import (
+    AgentToolExecutionRepository,
     AssetRepository,
     EmbeddingRepository,
+    RelationGraphRepository,
     WorkspaceUserRepository,
 )
 from capsule.db.session import Database
@@ -66,6 +71,7 @@ def create_app(
     library_clear_service: LibraryClearService | None = None,
     workspace_service: WorkspaceService | None = None,
     agent_runtime: AgentRuntime | None = None,
+    graph_repository: RelationGraphRepository | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     resolved_agent_runtime = agent_runtime or AgentRuntime()
@@ -74,6 +80,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = resolved_settings
         app.state.agent_runtime = resolved_agent_runtime
+        app.state.relation_graph_repository = graph_repository
         app.state.video_transcode_semaphore = asyncio.Semaphore(
             resolved_settings.video_transcode_concurrency
         )
@@ -84,6 +91,7 @@ def create_app(
             or library_clear_service is not None
             or workspace_service is not None
             or agent_runtime is not None
+            or graph_repository is not None
         ):
             app.state.search_service = search_service
             app.state.import_service = import_service
@@ -95,6 +103,8 @@ def create_app(
 
         database = Database(resolved_settings)
         app.state.agent_conversation_repository = AgentConversationRepository(database)
+        relation_graph_repository = RelationGraphRepository(database)
+        app.state.relation_graph_repository = relation_graph_repository
         memory_context_queue: RedisMemoryQueue | None = None
         memory_event_publisher = None
         try:
@@ -127,14 +137,13 @@ def create_app(
             )
         app.state.agent_memory_context_publisher_ready = memory_event_publisher is not None
         if agent_runtime is None:
-            resolved_agent_runtime.set_permission_loader(
-                WorkspaceUserRepository(database).load_granted_permissions
-            )
-            resolved_agent_runtime.set_conversation_repository(
-                app.state.agent_conversation_repository,
-                context_budget=_agent_context_budget(resolved_settings),
+            _configure_default_agent_runtime(
+                runtime=resolved_agent_runtime,
+                database=database,
+                conversation_repository=app.state.agent_conversation_repository,
+                graph_repository=relation_graph_repository,
+                settings=resolved_settings,
                 memory_event_publisher=memory_event_publisher,
-                turn_lease_seconds=resolved_settings.agent_turn_lease_seconds,
             )
         storage = ObjectStorage(resolved_settings)
         await storage.ensure_bucket()
@@ -353,6 +362,7 @@ def create_app(
     )
     application.include_router(search_router)
     application.include_router(agent_router)
+    application.include_router(graphs_router)
     application.include_router(assets_router)
     application.include_router(capsules_router)
     application.include_router(imports_router)
@@ -396,6 +406,35 @@ def _agent_context_budget(settings: Settings) -> ContextBudget:
         max_reduction_rounds=settings.agent_context_max_reduction_rounds,
         summary_wait_seconds=settings.agent_context_summary_wait_seconds,
         summary_poll_seconds=settings.agent_context_summary_poll_seconds,
+    )
+
+
+def _configure_default_agent_runtime(
+    *,
+    runtime: AgentRuntime,
+    database: Database,
+    conversation_repository: AgentConversationRepository,
+    graph_repository: RelationGraphRepository,
+    settings: Settings,
+    memory_event_publisher: Any | None,
+) -> None:
+    """Attach all server-owned dependencies to the normal API Runtime."""
+
+    runtime.set_permission_loader(WorkspaceUserRepository(database).load_granted_permissions)
+    runtime.set_conversation_repository(
+        conversation_repository,
+        context_budget=_agent_context_budget(settings),
+        memory_event_publisher=memory_event_publisher,
+        turn_lease_seconds=settings.agent_turn_lease_seconds,
+    )
+    runtime.set_tools(
+        build_graph_tool_registry(
+            graph_repository,
+            execution_store=cast(
+                ToolExecutionStore,
+                AgentToolExecutionRepository(database),
+            ),
+        )
     )
 
 async def _open_agent_checkpointer(

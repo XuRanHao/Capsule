@@ -85,6 +85,13 @@ export type AssetRecord = {
   updated_at: string;
 };
 
+export type NarrativeGraphRecord = {
+  graph_id: string;
+  workspace_id: string;
+  name: string;
+  description: string;
+};
+
 export type ProcessingJob = {
   job_id: string;
   workspace_id: string;
@@ -168,4 +175,15 @@ export async function loadAssets(params: URLSearchParams) {
     limit: number;
     offset: number;
   }>(`/api/v1/assets?${params}`);
+}
+
+export async function createNarrativeGraph(input: {
+  workspace_id: string;
+  name?: string;
+  description?: string;
+}) {
+  return apiFetch<NarrativeGraphRecord>("/api/v1/graphs", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }

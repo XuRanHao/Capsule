@@ -65,6 +65,9 @@ execute_tools
 
 `turn_id` 覆盖一个完整用户输出，内部工具循环不改变它；确认恢复沿用原 `turn_id`。`request_id` 用于一次 HTTP 请求及数据库消息幂等，确认恢复是新的请求，因此通常有新的 `request_id`。
 
+`graph_id` 不是会话或素材标识，而是用户在当前工作区选定的 `NarrativeGraph.graph_id`。
+若未创建或未选择图谱，模型仍可自然语言回复；图谱工具在服务端领域校验处返回“必须先选择图谱”，不会回退到任意素材。
+
 ## 普通文本回复
 
 1. Runtime 获取回合租约，读取 checkpoint，生成 `turn_id` 与 `request_id`。

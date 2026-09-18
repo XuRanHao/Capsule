@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { CREATED_BY, apiFetch } from "../../lib/api";
 
 type Message = { id: string; role: "user" | "assistant"; content: string };
-type Props = { workspaceId: string; selectedAssetId: string | null };
+type Props = { workspaceId: string; selectedGraphId: string | null };
 
 type AgentThread = { thread_id: string; title: string };
 type AgentResponse = { message: string | null; status: string; pending_action: unknown | null };
@@ -15,7 +15,7 @@ const STARTER: Message[] = [{
   content: "你好，我可以基于当前工作空间中的素材帮你查找线索、梳理关系，或继续追问图谱中的节点。",
 }];
 
-export default function AgentChat({ workspaceId, selectedAssetId }: Props) {
+export default function AgentChat({ workspaceId, selectedGraphId }: Props) {
   const [messages, setMessages] = useState<Message[]>(STARTER);
   const [input, setInput] = useState("");
   const [thread, setThread] = useState<AgentThread | null>(null);
@@ -48,7 +48,7 @@ export default function AgentChat({ workspaceId, selectedAssetId }: Props) {
           thread_id: currentThread.thread_id,
           user_id: CREATED_BY,
           workspace_id: workspaceId,
-          graph_id: selectedAssetId ?? undefined,
+          graph_id: selectedGraphId ?? undefined,
           message: content,
         }),
       });
@@ -67,7 +67,7 @@ export default function AgentChat({ workspaceId, selectedAssetId }: Props) {
         <div><span className="panel-kicker">CONVERSATION</span><h2>工作空间助手</h2></div>
         <span className="agent-status"><i />在线</span>
       </header>
-      {selectedAssetId && <div className="agent-context">已选中图谱节点 · {selectedAssetId.slice(0, 12)}</div>}
+      {selectedGraphId && <div className="agent-context">当前图谱 · {selectedGraphId.slice(0, 12)}</div>}
       <div className="chat-messages" aria-live="polite">
         {messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><p>{message.content}</p></article>)}
         {sending && <article className="chat-message assistant pending"><span>AI</span><p>正在分析当前工作空间…</p></article>}

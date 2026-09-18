@@ -5,7 +5,12 @@ import { ProductTopbar } from "./components/DemoShell";
 import AgentChat from "./components/workbench/AgentChat";
 import GraphCanvas from "./components/workbench/GraphCanvas";
 import WorkspacePanel from "./components/workbench/WorkspacePanel";
-import { type AssetRecord, loadAssets } from "./lib/api";
+import {
+  createNarrativeGraph,
+  type AssetRecord,
+  type NarrativeGraphRecord,
+  loadAssets,
+} from "./lib/api";
 import { useWorkspaceSelection, WorkspaceSelect } from "./lib/workspaces";
 
 export default function WorkspacePage() {
@@ -21,6 +26,11 @@ export default function WorkspacePage() {
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsError, setAssetsError] = useState<string | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [activeGraph, setActiveGraph] = useState<NarrativeGraphRecord | null>(null);
+  const [creatingGraph, setCreatingGraph] = useState(false);
+  const [graphError, setGraphError] = useState<{ workspaceId: string; message: string } | null>(null);
+  const selectedGraph = activeGraph?.workspace_id === workspaceId ? activeGraph : null;
+  const selectedGraphError = graphError?.workspaceId === workspaceId ? graphError.message : null;
 
   const loadWorkspaceAssets = useCallback(async () => {
     if (!ready || !workspaceId) return;
@@ -43,6 +53,22 @@ export default function WorkspacePage() {
     const timer = window.setTimeout(() => { void loadWorkspaceAssets(); }, 0);
     return () => window.clearTimeout(timer);
   }, [loadWorkspaceAssets]);
+
+  const createGraph = useCallback(async () => {
+    if (!workspaceId || creatingGraph) return;
+    setCreatingGraph(true);
+    setGraphError(null);
+    try {
+      setActiveGraph(await createNarrativeGraph({ workspace_id: workspaceId }));
+    } catch (error) {
+      setGraphError({
+        workspaceId,
+        message: error instanceof Error ? error.message : "创建图谱失败",
+      });
+    } finally {
+      setCreatingGraph(false);
+    }
+  }, [creatingGraph, workspaceId]);
 
   return (
     <main className="workbench-shell">
@@ -67,9 +93,17 @@ export default function WorkspacePage() {
               <span>{workspaceError || assetsError}。页面仍可用于检查布局；启动后端后会自动加载真实素材。</span>
             </div>
           )}
-          <GraphCanvas assets={assets} selectedId={selectedAssetId} onSelect={setSelectedAssetId} />
+          <GraphCanvas
+            assets={assets}
+            selectedId={selectedAssetId}
+            onSelect={setSelectedAssetId}
+            activeGraph={selectedGraph}
+            creatingGraph={creatingGraph}
+            graphError={selectedGraphError}
+            onCreateGraph={() => { void createGraph(); }}
+          />
         </section>
-        <AgentChat key={workspaceId} workspaceId={workspaceId} selectedAssetId={selectedAssetId} />
+        <AgentChat key={workspaceId} workspaceId={workspaceId} selectedGraphId={selectedGraph?.graph_id ?? null} />
       </div>
     </main>
   );

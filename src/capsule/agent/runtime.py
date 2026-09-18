@@ -72,6 +72,12 @@ class AgentRuntime:
         self._planner = planner
         self._graph = self._build_graph()
 
+    def set_tools(self, tools: ToolRegistry) -> None:
+        """Install the server-owned tool registry and rebuild its graph closure."""
+
+        self._tools = tools
+        self._graph = self._build_graph()
+
     def set_conversation_repository(
         self,
         repository: AgentConversationRepository,
