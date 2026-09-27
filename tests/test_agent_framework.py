@@ -157,16 +157,27 @@ class DependencyAwareBatchPlanner:
         if not values.get("tool_details"):
             return PlanDecision(
                 action="select_tools",
-                selected_tool_names=["fetch_value", "calculate_score", "compose_result"],
+                selected_tool_names=[
+                    "write_graph",
+                    "read_graph",
+                    "calculate_score",
+                    "compose_result",
+                ],
             )
         history = list(values.get("tool_history", []))
         if not history:
-            self.batches.append(["fetch_value", "fetch_value", "calculate_score"])
+            self.batches.append(["write_graph", "read_graph", "calculate_score"])
             return PlanDecision(
                 action="tool",
                 tool_calls=[
-                    ToolCall(name="fetch_value", arguments={"value": "alpha"}),
-                    ToolCall(name="fetch_value", arguments={"value": "beta"}),
+                    ToolCall(
+                        name="write_graph",
+                        arguments={"graph_id": "graph-a", "value": "alpha"},
+                    ),
+                    ToolCall(
+                        name="read_graph",
+                        arguments={"graph_id": "graph-a", "value": "beta"},
+                    ),
                     ToolCall(name="calculate_score", arguments={"value": "42"}),
                 ],
             )
@@ -395,20 +406,31 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_runs_independent_tools_then_replans_dependent_call() -> None:
+async def test_agent_waits_for_all_resource_slots_before_replanning_dependent_call() -> None:
     planner = DependencyAwareBatchPlanner()
     events: list[tuple[str, str]] = []
     active = 0
     max_active = 0
 
-    async def fetch(args: EchoArgs, context: ToolContext) -> str:
+    async def write(args: ResourceArgs, context: ToolContext) -> str:
         nonlocal active, max_active
         del context
         active += 1
         max_active = max(max_active, active)
-        events.append(("start", f"fetch:{args.value}"))
+        events.append(("start", f"write:{args.value}"))
         await asyncio.sleep(0.01)
-        events.append(("end", f"fetch:{args.value}"))
+        events.append(("end", f"write:{args.value}"))
+        active -= 1
+        return args.value
+
+    async def read(args: ResourceArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"read:{args.value}"))
+        await asyncio.sleep(0.01)
+        events.append(("end", f"read:{args.value}"))
         active -= 1
         return args.value
 
@@ -435,11 +457,22 @@ async def test_agent_runs_independent_tools_then_replans_dependent_call() -> Non
         tools=ToolRegistry(
             [
                 AgentTool(
-                    name="fetch_value",
-                    description="fetch one independent value",
-                    args_schema=EchoArgs,
-                    handler=fetch,
+                    name="write_graph",
+                    description="write graph data",
+                    args_schema=ResourceArgs,
+                    handler=write,
                     concurrency_mode="parallel",
+                    resource_id_field="graph_id",
+                    resource_operation="write",
+                ),
+                AgentTool(
+                    name="read_graph",
+                    description="read graph data",
+                    args_schema=ResourceArgs,
+                    handler=read,
+                    concurrency_mode="parallel",
+                    resource_id_field="graph_id",
+                    resource_operation="read",
                 ),
                 AgentTool(
                     name="calculate_score",
@@ -473,20 +506,21 @@ async def test_agent_runs_independent_tools_then_replans_dependent_call() -> Non
     assert result.status == "completed"
     assert result.message == "分批调用完成。"
     assert planner.batches == [
-        ["fetch_value", "fetch_value", "calculate_score"],
+        ["write_graph", "read_graph", "calculate_score"],
         ["compose_result"],
     ]
     assert planner.compose_arguments == {"left": "alpha", "right": "beta", "score": "42"}
     assert [item["name"] for item in result.tool_history] == [
-        "fetch_value",
-        "fetch_value",
+        "write_graph",
+        "read_graph",
         "calculate_score",
         "compose_result",
     ]
     assert result.tool_history[-1]["output"] == "alpha:beta:42"
-    assert max_active == 3
-    assert events.index(("end", "fetch:alpha")) < events.index(("start", "compose"))
-    assert events.index(("end", "fetch:beta")) < events.index(("start", "compose"))
+    assert max_active == 2
+    assert events.index(("end", "write:alpha")) < events.index(("start", "read:beta"))
+    assert events.index(("end", "write:alpha")) < events.index(("start", "compose"))
+    assert events.index(("end", "read:beta")) < events.index(("start", "compose"))
     assert events.index(("end", "calculate:42")) < events.index(("start", "compose"))
 
 
