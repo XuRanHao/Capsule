@@ -161,11 +161,11 @@ class DoubaoMemoryModel:
                         "你负责逐条比较一条候选记忆与最多三条 RAG 返回的既有记忆。仅输出 JSON。"
                         "必须为 existing_memories 中每个 memory_id 输出一条 adjustments 项，"
                         "不能遗漏、"
-                        "重复或编造 ID。语义一致或候选是更具体表述时用 merge；候选与既有记忆"
-                        "冲突且应"
-                        "删除旧记忆时用 deactivate；存在未证实冲突时用 lower_confidence 并给负 "
-                        "confidence_delta；"
-                        "与候选无关时用 ignore_rel；旧记忆仍然有效、候选不应新增时用 ignore_old。"
+                        "重复或编造 ID。候选与既有记忆表达同一事实时统一用 merge，"
+                        "不再区分候选表述更具体还是只是重复既有记忆；候选明确说明既有记忆"
+                        "已废弃、停用或被替代时用 deactivate；存在未证实冲突时用 "
+                        "lower_confidence 并给负 confidence_delta；"
+                        "与候选无关时用 ignore_rel。"
                         "不要输出 create。全部既有记忆为 ignore_rel 时系统才创建候选；merge 会创建"
                         "一条新的"
                         "合并记忆并停用被合并的旧记忆，deactivate 只停用冲突的旧记忆。"
@@ -324,7 +324,8 @@ def _mutations_from_adjustments(
             )
         )
 
-    if not mutations and all(item.action == "ignore_rel" for item in adjustments.values()):
+    if not mutations:
+        # 没有命中任何既有记忆，或全部判定为无关：候选本身是一条新事实。
         return [MemoryMutation(action="create", candidate=candidate)]
     return mutations
 

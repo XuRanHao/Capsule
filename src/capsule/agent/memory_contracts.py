@@ -13,7 +13,6 @@ MemoryAdjustmentAction = Literal[
     "deactivate",
     "lower_confidence",
     "ignore_rel",
-    "ignore_old",
 ]
 
 

@@ -270,7 +270,9 @@ def test_deactivate_removes_each_explicit_conflicting_old_memory() -> None:
     assert mutations[0].target_memory_id == "old-template"
 
 
-def test_ignore_old_does_not_create_candidate() -> None:
+def test_duplicate_restatement_still_merges_into_existing_memory() -> None:
+    """只重复既有记忆的候选也按 merge 处理：新建合并版本并停用被合并的旧记录。"""
+
     candidate = _candidate("workspace", "reply_language", 0.9)
     matches = [
         MemoryMatch(
@@ -293,12 +295,13 @@ def test_ignore_old_does_not_create_candidate() -> None:
         matches,
         MemoryAdjustmentBatch(
             adjustments=[
-                MemoryAdjustment(memory_id="existing-language", action="ignore_old")
+                MemoryAdjustment(memory_id="existing-language", action="merge")
             ]
         ),
     )
 
-    assert mutations == []
+    assert [item.action for item in mutations] == ["create", "deactivate"]
+    assert mutations[1].target_memory_id == "existing-language"
 
 
 @pytest.mark.asyncio
