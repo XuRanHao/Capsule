@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     # the Ark client and strict JSON output transport used elsewhere.
     agent_planner_model: str = "deepseek-v4-1-flash-260910"
     agent_planner_max_output_tokens: int = Field(default=1_024, ge=256, le=4_096)
+    # Intent recognition produces only two short supplemental recall queries.
+    # It is separate so model choice and output budget stay independently tunable.
+    agent_memory_intent_model: str = "deepseek-v4-1-flash-260910"
+    agent_memory_intent_max_output_tokens: int = Field(default=256, ge=64, le=1_024)
     # Maximum calls in one process-wide Agent tool slot.  A slot only contains
     # calls with no read/write contention; the next slot starts after it ends.
     agent_tool_slot_capacity: int = Field(default=4, ge=1, le=32)

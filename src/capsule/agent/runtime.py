@@ -20,6 +20,10 @@ from capsule.agent.context_budget import (
 from capsule.agent.contracts import AgentRequest, AgentResponse
 from capsule.agent.graph import AgentPlanner, ReadyPlanner, build_agent_graph
 from capsule.agent.memory import AgentMemoryStore, DelegatingMemoryStore, NullMemoryStore
+from capsule.agent.memory_intent import (
+    MemoryIntentRecognizer,
+    RawInputMemoryIntentRecognizer,
+)
 from capsule.agent.tools import ToolRegistry
 from capsule.db.agent_memory import (
     AgentConversationRepository,
@@ -45,6 +49,7 @@ class AgentRuntime:
         planner: AgentPlanner | None = None,
         tools: ToolRegistry | None = None,
         memory: AgentMemoryStore | None = None,
+        memory_intent: MemoryIntentRecognizer | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         permission_loader: PermissionLoader | None = None,
         conversation_repository: AgentConversationRepository | None = None,
@@ -58,6 +63,7 @@ class AgentRuntime:
         self._planner = planner or ReadyPlanner()
         self._tools = tools or ToolRegistry()
         self._memory_store = DelegatingMemoryStore(memory or NullMemoryStore())
+        self._memory_intent = memory_intent or RawInputMemoryIntentRecognizer()
         self._permission_loader = permission_loader
         self._conversation_repository = conversation_repository
         self._context_budget = context_budget or ContextBudget()
@@ -118,6 +124,12 @@ class AgentRuntime:
         """Swap the durable reader without rebuilding active graph checkpoints."""
 
         self._memory_store.set_delegate(memory)
+
+    def set_memory_intent_recognizer(self, recognizer: MemoryIntentRecognizer) -> None:
+        """Install the model-backed recall-query generator before normal invokes."""
+
+        self._memory_intent = recognizer
+        self._graph = self._build_graph()
 
     def set_checkpointer(self, checkpointer: BaseCheckpointSaver[Any]) -> None:
         """Install a durable saver during application startup before any invocation."""
@@ -449,6 +461,7 @@ class AgentRuntime:
             planner=self._planner,
             tools=self._tools,
             memory=self._memory_store,
+            memory_intent=self._memory_intent,
             checkpointer=self._checkpointer,
             context_budget=self._context_budget_controller,
         )
@@ -459,6 +472,7 @@ def create_agent_runtime(
     planner: AgentPlanner | None = None,
     tools: ToolRegistry | None = None,
     memory: AgentMemoryStore | None = None,
+    memory_intent: MemoryIntentRecognizer | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     permission_loader: PermissionLoader | None = None,
     conversation_repository: AgentConversationRepository | None = None,
@@ -470,6 +484,7 @@ def create_agent_runtime(
         planner=planner,
         tools=tools,
         memory=memory,
+        memory_intent=memory_intent,
         checkpointer=checkpointer,
         permission_loader=permission_loader,
         conversation_repository=conversation_repository,

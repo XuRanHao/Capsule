@@ -727,6 +727,69 @@ async def test_runtime_uses_memory_reader_attached_after_graph_creation() -> Non
 
 
 @pytest.mark.asyncio
+async def test_new_input_recalls_raw_and_intent_queries_once_before_tool_loop() -> None:
+    class IntentRecognizer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def recognize(self, **kwargs: object) -> list[str]:
+            self.calls.append(kwargs)
+            return ["项目导出格式", "用户语言偏好"]
+
+    class QueryMemory:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def load(self, *, query: str, **_: object) -> list[dict[str, object]]:
+            self.queries.append(query)
+            return [
+                {"memory_id": "shared", "text": "跨 Query 命中的项目规则"},
+                {"memory_id": query, "text": query},
+            ]
+
+        async def save(self, **_: object) -> None:
+            return None
+
+    recognizer = IntentRecognizer()
+    memory = QueryMemory()
+    runtime = create_agent_runtime(
+        planner=SequencePlanner(),
+        memory=memory,  # type: ignore[arg-type]
+        memory_intent=recognizer,  # type: ignore[arg-type]
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="echo",
+                    description="return the supplied value",
+                    args_schema=EchoArgs,
+                    handler=lambda args, context: args.value,
+                )
+            ]
+        ),
+    )
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="thread-memory-rrf",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="按上次格式导出",
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(recognizer.calls) == 1
+    assert memory.queries == ["按上次格式导出", "项目导出格式", "用户语言偏好"]
+    snapshot = await runtime.state("thread-memory-rrf")
+    assert snapshot is not None
+    assert snapshot["memory_recall_queries"] == memory.queries
+    assert [item["memory_id"] for item in snapshot["memory_context"]] == [
+        "shared",
+        "按上次格式导出",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_history_keeps_only_the_latest_two_agent_output_rounds() -> None:
     registry = ToolRegistry(
         [

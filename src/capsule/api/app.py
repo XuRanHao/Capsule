@@ -13,6 +13,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from capsule.agent.checkpoints import postgres_checkpoint_url
 from capsule.agent.context_budget import ContextBudget
 from capsule.agent.graph_tools import build_graph_tool_registry
+from capsule.agent.memory_intent import ModelMemoryIntentRecognizer
 from capsule.agent.memory_worker import MemoryOutboxDispatcher, RedisMemoryQueue
 from capsule.agent.milvus_memory_store import MilvusAgentMemoryStore
 from capsule.agent.model_planner import ModelAgentPlanner
@@ -256,6 +257,15 @@ def create_app(
                     model=embedding_client,
                     model_name=resolved_settings.agent_planner_model,
                     max_output_tokens=resolved_settings.agent_planner_max_output_tokens,
+                )
+            )
+            resolved_agent_runtime.set_memory_intent_recognizer(
+                ModelMemoryIntentRecognizer(
+                    model=embedding_client,
+                    model_name=resolved_settings.agent_memory_intent_model,
+                    max_output_tokens=(
+                        resolved_settings.agent_memory_intent_max_output_tokens
+                    ),
                 )
             )
             resolved_agent_runtime.set_memory_store(

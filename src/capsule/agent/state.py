@@ -32,6 +32,11 @@ class AgentState(TypedDict, total=False):
     graph_id: str | None
     granted_permissions: list[str]
     input_message: str | None
+    # The original message that starts this turn.  It remains stable after
+    # prepare clears input_message and is always the first recall query.
+    memory_recall_input: str | None
+    # Original input plus at most two intent-generated supplemental queries.
+    memory_recall_queries: list[str]
     confirmation_response: bool | None
     cancel_requested: bool
     messages: list[dict[str, Any]]

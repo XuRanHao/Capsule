@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -10,7 +11,8 @@ from langgraph.graph import END, START, StateGraph
 
 from capsule.agent.context_budget import ContextBudgetController
 from capsule.agent.contracts import PlanDecision, ToolCall
-from capsule.agent.memory import AgentMemoryStore
+from capsule.agent.memory import AgentMemoryStore, reciprocal_rank_fuse_memory_context
+from capsule.agent.memory_intent import MemoryIntentRecognizer
 from capsule.agent.model_planner import AgentPlanningError
 from capsule.agent.state import AgentState
 from capsule.agent.tools import ToolContext, ToolRegistry
@@ -91,11 +93,59 @@ def _cancel_queued_calls(
     return cancelled
 
 
+def _as_mapping(value: object) -> Mapping[str, object]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _as_strings(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _string_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _recent_short_term_messages(value: object, *, limit: int = 8) -> list[dict[str, str]]:
+    """Project bounded user/assistant context for intent recognition."""
+
+    if not isinstance(value, list):
+        return []
+    projected: list[dict[str, str]] = []
+    for item in value[-limit:]:
+        if not isinstance(item, Mapping):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        projected.append({"role": str(role), "content": content[:800]})
+    return projected
+
+
+def _recall_queries(user_input: str, supplemental: list[str]) -> list[str]:
+    """Keep raw user wording first and deduplicate model-provided short queries."""
+
+    queries = [user_input.strip()]
+    seen = {queries[0].casefold()}
+    for query in supplemental:
+        normalized = query.strip()
+        if not normalized or normalized.casefold() in seen:
+            continue
+        seen.add(normalized.casefold())
+        queries.append(normalized)
+        if len(queries) == 3:
+            break
+    return queries
+
+
 def build_agent_graph(
     *,
     planner: AgentPlanner,
     tools: ToolRegistry,
     memory: AgentMemoryStore,
+    memory_intent: MemoryIntentRecognizer,
     checkpointer: BaseCheckpointSaver[Any],
     context_budget: ContextBudgetController | None = None,
 ) -> Any:
@@ -120,6 +170,8 @@ def build_agent_graph(
             "start_new_turn": False,
             "tool_catalog": tools.catalog(),
         }
+        if input_message:
+            updates["memory_recall_input"] = input_message
         context = ToolContext(
             user_id=state["user_id"],
             workspace_id=state["workspace_id"],
@@ -183,21 +235,56 @@ def build_agent_graph(
                 if operation_id:
                     await tools.cancel_operation(str(operation_id), context)
 
+    async def recognize_memory_intent(state: AgentState) -> dict[str, object]:
+        """Freeze original and model-supplemented recall queries once per turn."""
+
+        input_message = state.get("memory_recall_input")
+        if not isinstance(input_message, str) or not input_message.strip():
+            return {"memory_recall_queries": []}
+        short_term_context = {
+            "summary": _string_or_none(
+                _as_mapping(state.get("working_context")).get("conversation_summary")
+            ),
+            "topic": _string_or_none(
+                _as_mapping(state.get("working_context")).get("conversation_topic")
+            ),
+            "recent_messages": _recent_short_term_messages(state.get("messages")),
+        }
+        supplemental = await memory_intent.recognize(
+            user_input=input_message,
+            short_term_context=short_term_context,
+        )
+        return {
+            "memory_recall_queries": _recall_queries(
+                input_message,
+                supplemental,
+            )
+        }
+
     async def load_context(state: AgentState) -> dict[str, object]:
+        """Recall each frozen query independently, then fuse their rankings with RRF."""
+
         request_id = state.get("request_id")
         if request_id and state.get("memory_context_request_id") == request_id:
             # Do not let a background Worker replace recalled long/global
             # memories half-way through a tool loop in this logical request.
             return {}
-        messages = state.get("messages", [])
-        query = str(messages[-1].get("content", "")) if messages else ""
-        context = await memory.load(
-            user_id=state["user_id"],
-            workspace_id=state["workspace_id"],
-            query=query,
+        queries = _as_strings(state.get("memory_recall_queries"))
+        if not queries:
+            raw_input = state.get("memory_recall_input")
+            queries = [raw_input] if isinstance(raw_input, str) and raw_input else []
+        result_lists = await asyncio.gather(
+            *(
+                memory.load(
+                    user_id=state["user_id"],
+                    workspace_id=state["workspace_id"],
+                    query=query,
+                )
+                for query in queries
+            )
         )
         return {
-            "memory_context": context,
+            "memory_context": reciprocal_rank_fuse_memory_context(result_lists),
             "memory_context_request_id": request_id,
         }
 
@@ -415,7 +502,9 @@ def build_agent_graph(
         # before the protected operation is submitted.
         if state.get("approved_action") is not None:
             return "execute_tools"
-        return "load_context"
+        if state.get("memory_context_request_id") == state.get("request_id"):
+            return "manage_context"
+        return "recognize_memory_intent"
 
     def route_after_context_management(state: AgentState) -> str:
         return "finalize" if state.get("status") == "failed" else "plan"
@@ -444,6 +533,7 @@ def build_agent_graph(
 
     graph = StateGraph(AgentState)
     graph.add_node("prepare", prepare)
+    graph.add_node("recognize_memory_intent", recognize_memory_intent)
     graph.add_node("load_context", load_context)
     graph.add_node("manage_context", manage_context)
     graph.add_node("plan", plan)
@@ -457,11 +547,14 @@ def build_agent_graph(
         "prepare",
         route_after_prepare,
         {
+            "recognize_memory_intent": "recognize_memory_intent",
             "load_context": "load_context",
+            "manage_context": "manage_context",
             "execute_tools": "execute_tools",
             "finalize": "finalize",
         },
     )
+    graph.add_edge("recognize_memory_intent", "load_context")
     graph.add_edge("load_context", "manage_context")
     graph.add_conditional_edges(
         "manage_context",
