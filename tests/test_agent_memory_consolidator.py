@@ -116,7 +116,7 @@ class _Model:
                 ]
             )
         return MemoryAdjustmentBatch(
-            adjustments=[MemoryAdjustment(memory_id="other", action="ignore")]
+            adjustments=[MemoryAdjustment(memory_id="other", action="ignore_rel")]
         )
 
 
@@ -162,12 +162,23 @@ async def test_consolidator_parallelizes_scope_and_candidate_work_with_a_batch_c
     assert result.summary.topic == "记忆主题"
     assert model.extract_scopes == ["workspace", "global"]
     assert set(repository.queries) == {"language", "style", "global_language"}
-    assert len(result.mutations) == 3
-    merge = next(item for item in result.mutations if item.action == "merge")
-    assert merge.target_memory_id == "existing-language"
-    assert merge.confidence_delta == 0.1
-    assert merge.candidate is not None
-    assert merge.candidate.decay_rate == 0.002
+    assert len(result.mutations) == 4
+    merged_create = next(
+        item
+        for item in result.mutations
+        if item.action == "create"
+        and item.candidate is not None
+        and item.candidate.memory_key == "language"
+    )
+    assert merged_create.candidate is not None
+    assert merged_create.candidate.decay_rate == 0.002
+    merged_deactivate = next(
+        item
+        for item in result.mutations
+        if item.action == "deactivate"
+        and item.target_memory_id == "existing-language"
+    )
+    assert merged_deactivate.target_memory_id == "existing-language"
     global_create = next(
         item
         for item in result.mutations
@@ -182,7 +193,7 @@ async def test_consolidator_parallelizes_scope_and_candidate_work_with_a_batch_c
 
 
 @pytest.mark.asyncio
-async def test_consolidator_falls_back_to_create_when_resolution_targets_unknown_memory() -> None:
+async def test_consolidator_drops_malformed_resolution_without_mutation() -> None:
     class UnknownTargetModel(_Model):
         async def extract_candidates(self, *, scope: str, claimed: object, summary: object):
             del claimed, summary
@@ -209,11 +220,10 @@ async def test_consolidator_falls_back_to_create_when_resolution_targets_unknown
     summary = await consolidator.summarize(claimed)
     result = await consolidator.consolidate(claimed, summary=summary)
 
-    assert len(result.mutations) == 1
-    assert result.mutations[0].action == "create"
+    assert result.mutations == []
 
 
-def test_replacement_creates_new_memory_and_deactivates_each_explicit_old_memory() -> None:
+def test_deactivate_removes_each_explicit_conflicting_old_memory() -> None:
     candidate = _candidate("workspace", "export_template", 0.9)
     matches = [
         MemoryMatch(
@@ -251,14 +261,44 @@ def test_replacement_creates_new_memory_and_deactivates_each_explicit_old_memory
         MemoryAdjustmentBatch(
             adjustments=[
                 MemoryAdjustment(memory_id="old-template", action="deactivate"),
-                MemoryAdjustment(memory_id="unrelated", action="ignore"),
+                MemoryAdjustment(memory_id="unrelated", action="ignore_rel"),
             ]
         ),
     )
 
-    assert [item.action for item in mutations] == ["create", "deactivate"]
-    assert mutations[0].candidate == candidate
-    assert mutations[1].target_memory_id == "old-template"
+    assert [item.action for item in mutations] == ["deactivate"]
+    assert mutations[0].target_memory_id == "old-template"
+
+
+def test_ignore_old_does_not_create_candidate() -> None:
+    candidate = _candidate("workspace", "reply_language", 0.9)
+    matches = [
+        MemoryMatch(
+            memory_id="existing-language",
+            scope="workspace",
+            kind="policy",
+            memory_key="reply_language",
+            value={},
+            display_text="项目回复默认使用中文",
+            topics=[],
+            confidence=0.8,
+            effective_confidence=0.8,
+            decay_rate=0.01,
+            status="active",
+            relevance=0.5,
+        )
+    ]
+    mutations = _mutations_from_adjustments(
+        candidate,
+        matches,
+        MemoryAdjustmentBatch(
+            adjustments=[
+                MemoryAdjustment(memory_id="existing-language", action="ignore_old")
+            ]
+        ),
+    )
+
+    assert mutations == []
 
 
 @pytest.mark.asyncio

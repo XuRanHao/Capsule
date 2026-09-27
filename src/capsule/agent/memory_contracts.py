@@ -8,7 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MemoryScope = Literal["workspace", "global"]
 MemoryMutationAction = Literal["create", "merge", "deactivate", "lower_confidence"]
-MemoryAdjustmentAction = Literal["merge", "deactivate", "lower_confidence", "ignore"]
+MemoryAdjustmentAction = Literal[
+    "merge",
+    "deactivate",
+    "lower_confidence",
+    "ignore_rel",
+    "ignore_old",
+]
 
 
 class ConversationSummary(BaseModel):

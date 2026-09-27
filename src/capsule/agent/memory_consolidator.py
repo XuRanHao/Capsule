@@ -161,11 +161,14 @@ class DoubaoMemoryModel:
                         "你负责逐条比较一条候选记忆与最多三条 RAG 返回的既有记忆。仅输出 JSON。"
                         "必须为 existing_memories 中每个 memory_id 输出一条 adjustments 项，"
                         "不能遗漏、"
-                        "重复或编造 ID。语义一致或候选是更具体表述时用 merge；候选明确说明既有记忆"
-                        "已废弃、停用或被替代时用 deactivate；存在未证实冲突时用 "
-                        "lower_confidence 并给负 confidence_delta；无关时用 ignore。"
-                        "不要输出 create，系统会在全部 ignore 时"
-                        "创建候选，在 deactivate 时创建候选并停用旧记忆。"
+                        "重复或编造 ID。语义一致或候选是更具体表述时用 merge；候选与既有记忆"
+                        "冲突且应"
+                        "删除旧记忆时用 deactivate；存在未证实冲突时用 lower_confidence 并给负 "
+                        "confidence_delta；"
+                        "与候选无关时用 ignore_rel；旧记忆仍然有效、候选不应新增时用 ignore_old。"
+                        "不要输出 create。全部既有记忆为 ignore_rel 时系统才创建候选；merge 会创建"
+                        "一条新的"
+                        "合并记忆并停用被合并的旧记忆，deactivate 只停用冲突的旧记忆。"
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -283,31 +286,25 @@ def _mutations_from_adjustments(
         or set(adjustments) != allowed_ids
     ):
         # A malformed model batch must not partially mutate durable memories.
-        return [MemoryMutation(action="create", candidate=candidate)]
+        return []
 
     merges = [item for item in adjustments.values() if item.action == "merge"]
     if len(merges) > 1:
-        return [MemoryMutation(action="create", candidate=candidate)]
+        return []
 
     mutations: list[MemoryMutation] = []
     if merges:
         merge = merges[0]
-        mutations.append(
-            MemoryMutation(
-                action="merge",
-                candidate=candidate,
-                target_memory_id=merge.memory_id,
-                confidence_delta=max(0.0, merge.confidence_delta),
-            )
+        mutations.extend(
+            [
+                MemoryMutation(action="create", candidate=candidate),
+                MemoryMutation(action="deactivate", target_memory_id=merge.memory_id),
+            ]
         )
 
     deactivations = [
         item for item in adjustments.values() if item.action == "deactivate"
     ]
-    if deactivations and not merges:
-        # A replacement is two facts: preserve the new fact before retiring
-        # every explicitly replaced old record.
-        mutations.append(MemoryMutation(action="create", candidate=candidate))
     for adjustment in deactivations:
         mutations.append(
             MemoryMutation(
@@ -327,7 +324,7 @@ def _mutations_from_adjustments(
             )
         )
 
-    if not mutations:
+    if not mutations and all(item.action == "ignore_rel" for item in adjustments.values()):
         return [MemoryMutation(action="create", candidate=candidate)]
     return mutations
 

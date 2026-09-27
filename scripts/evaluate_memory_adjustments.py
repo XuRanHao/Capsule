@@ -91,8 +91,8 @@ def _build_case(
         _memory(f"{action}_{index}_d2", second_key, second_text),
     ]
     matches.insert(index % 3, related)
-    expected = {item.memory_id: "ignore" for item in matches}
-    if action != "ignore":
+    expected = {item.memory_id: "ignore_rel" for item in matches}
+    if action not in {"ignore_rel"}:
         expected[related_id] = action
     return AdjustmentCase(
         case_id=f"{action}_{index}_{key}",
@@ -179,6 +179,19 @@ def _cases() -> list[AdjustmentCase]:
             "constraint",
         ),
     ]
+    ignore_old = [
+        ("reply_language", "项目回复仍然保持中文", "项目回复默认使用中文", "preference"),
+        (
+            "export_format",
+            "当前交付格式仍按既有约定执行",
+            "交付物默认采用 Markdown 格式",
+            "constraint",
+        ),
+        ("timezone", "现阶段继续沿用香港时区", "项目时间统一使用香港时区", "constraint"),
+        ("review_owner", "当前仍由项目负责人复核", "图谱写操作由项目负责人复核", "constraint"),
+        ("backup_period", "备份期限暂时维持现有设置", "项目备份保留 90 天", "constraint"),
+        ("video_sampling", "当前视频采样规则保持不变", "视频分析以每秒四帧采样", "constraint"),
+    ]
     deactivations = [
         (
             "legacy_template",
@@ -251,7 +264,7 @@ def _cases() -> list[AdjustmentCase]:
         ],
         *[
             _build_case(
-                action="ignore",
+                action="ignore_rel",
                 index=index,
                 key=key,
                 candidate_text=candidate_text,
@@ -269,6 +282,17 @@ def _cases() -> list[AdjustmentCase]:
                 retrieved_text=retrieved_text,
             )
             for index, (key, candidate_text, retrieved_text) in enumerate(deactivations, start=1)
+        ],
+        *[
+            _build_case(
+                action="ignore_old",
+                index=index,
+                key=key,
+                candidate_text=candidate_text,
+                retrieved_text=retrieved_text,
+                kind=kind,
+            )
+            for index, (key, candidate_text, retrieved_text, kind) in enumerate(ignore_old, start=1)
         ],
         *[
             _build_case(
