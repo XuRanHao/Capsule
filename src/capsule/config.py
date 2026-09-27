@@ -124,6 +124,8 @@ class Settings(BaseSettings):
     agent_memory_vector_candidate_multiplier: int = Field(default=4, ge=1, le=20)
     agent_memory_workspace_decay_rate: float = Field(default=0.002, ge=0)
     agent_memory_global_decay_rate: float = Field(default=0.0005, ge=0)
+    agent_memory_adjustment_max_attempts: int = Field(default=3, ge=1, le=10)
+    agent_memory_adjustment_retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
     agent_memory_worker_lease_seconds: float = Field(default=120.0, gt=0)
     agent_memory_stream: str = "capsule:agent-memory"
     agent_memory_group: str = "capsule-agent-memory-workers"

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from capsule.agent.memory_consolidator import (
     DoubaoMemoryModel,
     StructuredMemoryConsolidator,
     _mutations_from_adjustments,
+    _retry_delay_seconds,
 )
 from capsule.agent.memory_contracts import (
     MemoryAdjustment,
@@ -328,3 +330,128 @@ async def test_summary_generation_receives_existing_workspace_topics() -> None:
     assert summary.topic == "已有主题"
     assert "active_workspace_topics" in client.request_messages[1]["content"]
     assert "已有主题" in client.request_messages[1]["content"]
+
+
+class _InvalidAdjustmentModel(_Model):
+    """Always answer with a batch that does not cover the retrieved memories."""
+
+    async def resolve_candidate(self, *, candidate: MemoryCandidate, matches: list[MemoryMatch]):
+        del matches
+        self.resolved_keys.append(candidate.memory_key)
+        return MemoryAdjustmentBatch(
+            adjustments=[MemoryAdjustment(memory_id="unknown", action="ignore_rel")]
+        )
+
+
+def test_retry_delay_is_immediate_then_exponential() -> None:
+    delays = [
+        _retry_delay_seconds(attempt=attempt, base_seconds=0.5) for attempt in (2, 3, 4, 5)
+    ]
+
+    assert delays == [0.0, 0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_invalid_adjustment_batch_is_retried_until_it_matches() -> None:
+    class FlakyModel(_Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts: dict[str, int] = {}
+
+        async def resolve_candidate(
+            self, *, candidate: MemoryCandidate, matches: list[MemoryMatch]
+        ):
+            attempt = self.attempts.get(candidate.memory_key, 0) + 1
+            self.attempts[candidate.memory_key] = attempt
+            if candidate.memory_key == "language" and attempt == 1:
+                # Wrong count: the retrieved memory received no judgement.
+                return MemoryAdjustmentBatch(adjustments=[])
+            return await super().resolve_candidate(candidate=candidate, matches=matches)
+
+    model = FlakyModel()
+    consolidator = StructuredMemoryConsolidator(
+        model=model,  # type: ignore[arg-type]
+        repository=_Repository(),  # type: ignore[arg-type]
+        max_mutations=3,
+        adjustment_retry_base_seconds=0.0,
+    )
+
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    result = await consolidator.consolidate(claimed, summary=summary)
+
+    assert model.attempts["language"] == 2
+    assert len(result.mutations) == 4
+
+
+@pytest.mark.asyncio
+async def test_retry_ladder_skips_the_first_wait_and_backs_off_afterwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[int] = []
+
+    async def record_wait(self: StructuredMemoryConsolidator, attempt: int) -> None:
+        del self
+        waits.append(attempt)
+
+    monkeypatch.setattr(StructuredMemoryConsolidator, "_wait_before_retry", record_wait)
+    consolidator = StructuredMemoryConsolidator(
+        model=_InvalidAdjustmentModel(),  # type: ignore[arg-type]
+        repository=_Repository(),  # type: ignore[arg-type]
+        max_mutations=3,
+        adjustment_max_attempts=3,
+        adjustment_retry_base_seconds=0.0,
+    )
+
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    await consolidator.consolidate(claimed, summary=summary)
+
+    assert sorted(waits) == [2, 2, 2, 3, 3, 3]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_adjustment_retries_are_logged_and_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = _InvalidAdjustmentModel()
+    consolidator = StructuredMemoryConsolidator(
+        model=model,  # type: ignore[arg-type]
+        repository=_Repository(),  # type: ignore[arg-type]
+        max_mutations=3,
+        adjustment_max_attempts=3,
+        adjustment_retry_base_seconds=0.0,
+    )
+
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    with caplog.at_level(logging.WARNING):
+        result = await consolidator.consolidate(claimed, summary=summary)
+
+    assert result.mutations == []
+    assert len(model.resolved_keys) == 9
+    assert set(model.resolved_keys) == {"language", "style", "global_language"}
+    assert caplog.text.count("memory adjustment batch rejected") == 6
+    assert caplog.text.count("memory adjustment batch abandoned") == 3
+
+
+@pytest.mark.asyncio
+async def test_candidate_without_retrieved_memories_creates_without_model_call() -> None:
+    class EmptyRepository(_Repository):
+        async def retrieve_memory_matches(self, *, candidate: MemoryCandidate, **_: object):
+            self.queries.append(candidate.memory_key)
+            return []
+
+    model = _Model()
+    consolidator = StructuredMemoryConsolidator(
+        model=model,  # type: ignore[arg-type]
+        repository=EmptyRepository(),  # type: ignore[arg-type]
+        max_mutations=3,
+    )
+
+    claimed = _claimed()
+    summary = await consolidator.summarize(claimed)
+    result = await consolidator.consolidate(claimed, summary=summary)
+
+    assert model.resolved_keys == []
+    assert [item.action for item in result.mutations] == ["create", "create", "create"]

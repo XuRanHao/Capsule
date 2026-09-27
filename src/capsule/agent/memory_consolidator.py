@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import asdict
 from typing import Any, Literal, Protocol
 
@@ -23,6 +24,8 @@ from capsule.db.agent_memory import (
     MemoryMatch,
 )
 from capsule.model_clients.doubao import DoubaoClient
+
+logger = logging.getLogger(__name__)
 
 
 class _SummaryDraft(BaseModel):
@@ -180,7 +183,7 @@ class DoubaoMemoryModel:
 
 
 class StructuredMemoryConsolidator(MemoryConsolidator):
-    """Summary first, then parallel scope extraction and per-candidate RAG."""
+    """Summarize first, then extract both scopes and resolve each candidate."""
 
     def __init__(
         self,
@@ -190,12 +193,16 @@ class StructuredMemoryConsolidator(MemoryConsolidator):
         max_mutations: int,
         workspace_decay_rate: float = 0.002,
         global_decay_rate: float = 0.0005,
+        adjustment_max_attempts: int = 3,
+        adjustment_retry_base_seconds: float = 0.5,
     ) -> None:
         if (
             max_mutations < 1
             or workspace_decay_rate < 0
             or global_decay_rate < 0
             or global_decay_rate > workspace_decay_rate
+            or adjustment_max_attempts < 1
+            or adjustment_retry_base_seconds < 0
         ):
             raise ValueError("memory consolidation limits are invalid")
         self._model = model
@@ -203,6 +210,70 @@ class StructuredMemoryConsolidator(MemoryConsolidator):
         self._max_mutations = max_mutations
         self._workspace_decay_rate = workspace_decay_rate
         self._global_decay_rate = global_decay_rate
+        self._adjustment_max_attempts = adjustment_max_attempts
+        self._adjustment_retry_base_seconds = adjustment_retry_base_seconds
+
+    async def _resolve_candidate(
+        self,
+        *,
+        candidate: MemoryCandidate,
+        matches: list[MemoryMatch],
+    ) -> MemoryAdjustmentBatch | None:
+        """Resolve one candidate, retrying invalid adjustment batches.
+
+        The first retry runs immediately, later retries wait with exponential
+        backoff, and an exhausted ladder logs an error and drops the candidate.
+        """
+
+        if not matches:
+            # Without retrieved memories the candidate is simply a new fact.
+            return MemoryAdjustmentBatch(adjustments=[])
+
+        for attempt in range(1, self._adjustment_max_attempts + 1):
+            if attempt > 1:
+                await self._wait_before_retry(attempt)
+            resolution = await self._model.resolve_candidate(
+                candidate=candidate,
+                matches=list(matches),
+            )
+            if _adjustment_batch_is_usable(matches, resolution):
+                if attempt > 1:
+                    logger.info(
+                        "memory adjustment batch recovered candidate_key=%s scope=%s attempt=%d",
+                        candidate.memory_key,
+                        candidate.scope,
+                        attempt,
+                    )
+                return resolution
+            if attempt < self._adjustment_max_attempts:
+                logger.warning(
+                    "memory adjustment batch rejected candidate_key=%s scope=%s attempt=%d/%d "
+                    "expected=%d returned=%d",
+                    candidate.memory_key,
+                    candidate.scope,
+                    attempt,
+                    self._adjustment_max_attempts,
+                    len(matches),
+                    len(resolution.adjustments),
+                )
+
+        logger.error(
+            "memory adjustment batch abandoned candidate_key=%s scope=%s attempts=%d "
+            "expected_memory_ids=%s",
+            candidate.memory_key,
+            candidate.scope,
+            self._adjustment_max_attempts,
+            [item.memory_id for item in matches],
+        )
+        return None
+
+    async def _wait_before_retry(self, attempt: int) -> None:
+        delay = _retry_delay_seconds(
+            attempt=attempt,
+            base_seconds=self._adjustment_retry_base_seconds,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def summarize(
         self,
@@ -260,16 +331,40 @@ class StructuredMemoryConsolidator(MemoryConsolidator):
         )
         resolutions = await asyncio.gather(
             *[
-                self._model.resolve_candidate(candidate=candidate, matches=list(items))
+                self._resolve_candidate(candidate=candidate, matches=list(items))
                 for candidate, items in zip(candidates, matches, strict=True)
             ]
         )
-        mutations = [
-            mutation
-            for candidate, items, resolution in zip(candidates, matches, resolutions, strict=True)
-            for mutation in _mutations_from_adjustments(candidate, list(items), resolution)
-        ]
+        mutations: list[MemoryMutation] = []
+        for candidate, items, resolution in zip(candidates, matches, resolutions, strict=True):
+            if resolution is None:
+                # An exhausted validation ladder must not touch durable memories.
+                continue
+            mutations.extend(_mutations_from_adjustments(candidate, list(items), resolution))
         return MemoryConsolidation(summary=summary, mutations=mutations)
+
+
+def _adjustment_batch_is_usable(
+    matches: list[MemoryMatch],
+    resolution: MemoryAdjustmentBatch,
+) -> bool:
+    """Check that the model judged every retrieved memory exactly once."""
+
+    expected_ids = {item.memory_id for item in matches}
+    returned_ids = [item.memory_id for item in resolution.adjustments]
+    if len(returned_ids) != len(matches) or len(set(returned_ids)) != len(returned_ids):
+        return False
+    if set(returned_ids) != expected_ids:
+        return False
+    return sum(item.action == "merge" for item in resolution.adjustments) <= 1
+
+
+def _retry_delay_seconds(*, attempt: int, base_seconds: float) -> float:
+    """Return the wait before the given attempt: immediate, then exponential."""
+
+    if attempt <= 2:
+        return 0.0
+    return base_seconds * float(2 ** (attempt - 3))
 
 
 def _mutations_from_adjustments(
@@ -325,7 +420,7 @@ def _mutations_from_adjustments(
         )
 
     if not mutations:
-        # 没有命中任何既有记忆，或全部判定为无关：候选本身是一条新事实。
+        # No match, or every match unrelated: the candidate is a new fact.
         return [MemoryMutation(action="create", candidate=candidate)]
     return mutations
 

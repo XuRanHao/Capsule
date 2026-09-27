@@ -641,6 +641,10 @@ async def _run_agent_memory_worker(*, worker_id: str | None, once: bool) -> None
                     max_mutations=settings.agent_memory_batch_max_mutations,
                     workspace_decay_rate=settings.agent_memory_workspace_decay_rate,
                     global_decay_rate=settings.agent_memory_global_decay_rate,
+                    adjustment_max_attempts=settings.agent_memory_adjustment_max_attempts,
+                    adjustment_retry_base_seconds=(
+                        settings.agent_memory_adjustment_retry_base_seconds
+                    ),
                 ),
                 lease_seconds=settings.agent_memory_worker_lease_seconds,
                 max_active_topics=settings.agent_memory_max_active_topics,
