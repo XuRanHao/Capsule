@@ -42,6 +42,10 @@ class ResourceArgs(BaseModel):
     value: str
 
 
+class CalculationArgs(BaseModel):
+    value: str
+
+
 class MemoryToolExecutionStore:
     """Small lifecycle store for scheduler shutdown tests."""
 
@@ -1479,6 +1483,120 @@ async def test_shared_scheduler_merges_independent_calls_from_two_sessions() -> 
     assert first[0].ok is True
     assert second[0].ok is True
     assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduler_handles_many_tool_types_and_ten_calls_across_slots() -> None:
+    active = 0
+    max_active = 0
+    events: list[tuple[str, str]] = []
+
+    async def run_resource(operation: str, args: ResourceArgs) -> str:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"{operation}:{args.value}"))
+        await asyncio.sleep(0.01)
+        events.append(("end", f"{operation}:{args.value}"))
+        active -= 1
+        return args.value
+
+    async def read(args: ResourceArgs, context: ToolContext) -> str:
+        del context
+        return await run_resource("read", args)
+
+    async def write(args: ResourceArgs, context: ToolContext) -> str:
+        del context
+        return await run_resource("write", args)
+
+    async def delete(args: ResourceArgs, context: ToolContext) -> str:
+        del context
+        return await run_resource("delete", args)
+
+    async def calculate(args: CalculationArgs, context: ToolContext) -> str:
+        del context
+        return await run_resource("calculate", ResourceArgs(graph_id="", value=args.value))
+
+    async def normalize(args: CalculationArgs, context: ToolContext) -> str:
+        del context
+        return await run_resource("normalize", ResourceArgs(graph_id="", value=args.value))
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="read_graph",
+                description="read graph",
+                args_schema=ResourceArgs,
+                handler=read,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="read",
+            ),
+            AgentTool(
+                name="write_graph",
+                description="write graph",
+                args_schema=ResourceArgs,
+                handler=write,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="write",
+            ),
+            AgentTool(
+                name="delete_graph",
+                description="delete graph data",
+                args_schema=ResourceArgs,
+                handler=delete,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="write",
+            ),
+            AgentTool(
+                name="calculate_score",
+                description="pure calculation",
+                args_schema=CalculationArgs,
+                handler=calculate,
+                concurrency_mode="parallel",
+            ),
+            AgentTool(
+                name="normalize_text",
+                description="pure normalization",
+                args_schema=CalculationArgs,
+                handler=normalize,
+                concurrency_mode="parallel",
+            ),
+        ],
+        slot_capacity=3,
+    )
+    context = ToolContext(
+        user_id="user-a",
+        workspace_id="workspace-a",
+        thread_id="thread-a",
+        graph_id=None,
+        state={},
+    )
+
+    results = await registry.execute_batch(
+        [
+            ToolCall(name="write_graph", arguments={"graph_id": "a", "value": "write-a"}),
+            ToolCall(name="read_graph", arguments={"graph_id": "b", "value": "read-b"}),
+            ToolCall(name="calculate_score", arguments={"value": "calculate-1"}),
+            ToolCall(name="read_graph", arguments={"graph_id": "a", "value": "read-a"}),
+            ToolCall(name="delete_graph", arguments={"graph_id": "b", "value": "delete-b"}),
+            ToolCall(name="write_graph", arguments={"graph_id": "c", "value": "write-c"}),
+            ToolCall(name="normalize_text", arguments={"value": "normalize-1"}),
+            ToolCall(name="read_graph", arguments={"graph_id": "c", "value": "read-c"}),
+            ToolCall(name="write_graph", arguments={"graph_id": "d", "value": "write-d"}),
+            ToolCall(name="calculate_score", arguments={"value": "calculate-2"}),
+        ],
+        context=context,
+    )
+
+    assert len(results) == 10
+    assert all(result.ok for result in results)
+    assert max_active == 3
+    assert events.index(("end", "write:write-a")) < events.index(("start", "read:read-a"))
+    assert events.index(("end", "read:read-b")) < events.index(("start", "delete:delete-b"))
+    assert events.index(("end", "write:write-c")) < events.index(("start", "read:read-c"))
 
 
 @pytest.mark.asyncio
