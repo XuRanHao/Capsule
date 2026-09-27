@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from capsule.db.models import (
     AgentMemoryVectorOutbox,
     AgentMessage,
     AgentThread,
+    AgentTurn,
     Workspace,
     WorkspaceMemoryProfile,
 )
@@ -35,6 +36,14 @@ from capsule.db.session import Database
 
 MessageRole = Literal["user", "assistant", "tool", "system"]
 ThreadStatus = Literal["active", "archived", "deleted"]
+TurnStatus = Literal[
+    "running",
+    "awaiting_confirmation",
+    "completed",
+    "cancelled",
+    "failed",
+    "interrupted",
+]
 
 
 class AgentThreadStateError(ValueError):
@@ -94,6 +103,14 @@ class ConversationSyncState:
 
     last_message_sequence: int
     memory_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class StartedAgentTurn:
+    """The durable input boundary for one Agent invocation."""
+
+    turn_id: str
+    user_message: AgentMessageRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,37 +441,165 @@ class AgentConversationRepository:
                 create=True,
             )
             self._require_active(thread)
-            if request_id is not None:
-                existing = await session.scalar(
-                    select(AgentMessage).where(
-                        AgentMessage.thread_id == thread_id,
-                        AgentMessage.role == role,
-                        AgentMessage.request_id == request_id,
-                    )
-                )
-                if existing is not None:
-                    return _message_record(existing)
-            next_sequence = thread.last_message_sequence + 1
-            now = datetime.now(UTC)
-            message = AgentMessage(
-                thread_id=thread_id,
-                sequence=next_sequence,
-                turn_id=turn_id,
-                request_id=request_id,
+            return await self._append_message_in_session(
+                session,
+                thread=thread,
                 role=role,
-                name=name,
                 content=content,
-                estimated_tokens=(
-                    estimated_tokens
-                    if estimated_tokens is not None
-                    else estimate_message_tokens(content)
-                ),
+                request_id=request_id,
+                turn_id=turn_id,
+                name=name,
+                estimated_tokens=estimated_tokens,
             )
-            session.add(message)
-            thread.last_message_sequence = next_sequence
-            thread.last_message_at = now
+
+    async def start_turn(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        turn_id: str,
+        request_id: str,
+        user_content: Any,
+    ) -> StartedAgentTurn:
+        """Atomically persist the user input and a running turn record."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=True,
+            )
+            self._require_active(thread)
+            turn = await session.get(AgentTurn, turn_id, with_for_update=True)
+            if turn is None:
+                turn = await session.scalar(
+                    select(AgentTurn)
+                    .where(
+                        AgentTurn.thread_id == thread_id,
+                        AgentTurn.request_id == request_id,
+                    )
+                    .with_for_update()
+                )
+            if turn is None:
+                turn = AgentTurn(
+                    turn_id=turn_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    request_id=request_id,
+                    status="running",
+                )
+                session.add(turn)
+            else:
+                if turn.user_id != user_id or turn.workspace_id != workspace_id:
+                    raise AgentThreadStateError("turn identity does not match the conversation")
+                if turn.status == "awaiting_confirmation":
+                    turn.status = "running"
+                    turn.finished_at = None
+            message = await self._append_message_in_session(
+                session,
+                thread=thread,
+                role="user",
+                content=user_content,
+                request_id=request_id,
+                turn_id=turn.turn_id,
+            )
             await session.flush()
-            return _message_record(message)
+            return StartedAgentTurn(turn_id=turn.turn_id, user_message=message)
+
+    async def finish_turn(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        turn_id: str,
+        request_id: str,
+        status: TurnStatus,
+        assistant_content: Any | None,
+    ) -> AgentMessageRecord | None:
+        """Commit the final reply and turn state in one transaction."""
+
+        async with self._database.session() as session, session.begin():
+            thread = await self._locked_thread(
+                session,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                create=False,
+            )
+            turn = await session.get(AgentTurn, turn_id, with_for_update=True)
+            if turn is None:
+                raise AgentThreadStateError("Agent turn does not exist")
+            if turn.status == "interrupted":
+                return None
+            message: AgentMessageRecord | None = None
+            if assistant_content is not None:
+                message = await self._append_message_in_session(
+                    session,
+                    thread=thread,
+                    role="assistant",
+                    content=assistant_content,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                )
+            turn.status = status
+            if status != "awaiting_confirmation":
+                turn.finished_at = datetime.now(UTC)
+            await session.flush()
+            return message
+
+    async def interrupt_turn(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        workspace_id: str,
+        turn_id: str,
+    ) -> bool:
+        """Persist a shutdown interruption without waiting for execution."""
+
+        async with self._database.session() as session, session.begin():
+            turn = await session.get(AgentTurn, turn_id, with_for_update=True)
+            if turn is None or turn.status not in {"running", "awaiting_confirmation"}:
+                return False
+            if (
+                turn.thread_id != thread_id
+                or turn.user_id != user_id
+                or turn.workspace_id != workspace_id
+            ):
+                return False
+            turn.status = "interrupted"
+            turn.finished_at = datetime.now(UTC)
+            return True
+
+    async def recover_abandoned_turns(self) -> int:
+        """Expose only expired crashed turns rather than disrupting live instances."""
+
+        now = datetime.now(UTC)
+        async with self._database.session() as session, session.begin():
+            turns = list(
+                await session.scalars(
+                    select(AgentTurn)
+                    .join(AgentThread, AgentThread.thread_id == AgentTurn.thread_id)
+                    .where(AgentTurn.status == "running")
+                    .where(
+                        or_(
+                            AgentThread.turn_lease_owner.is_(None),
+                            AgentThread.turn_lease_expires_at.is_(None),
+                            AgentThread.turn_lease_expires_at < now,
+                        )
+                    )
+                    .with_for_update()
+                )
+            )
+            for turn in turns:
+                turn.status = "interrupted"
+                turn.finished_at = now
+        return len(turns)
 
     async def get_context(
         self,
@@ -1420,6 +1565,50 @@ class AgentConversationRepository:
         profile.primary_topic = str(profile.active_topics[0]["topic"])
         profile.revision += 1
         return [dict(item) for item in profile.active_topics]
+
+    async def _append_message_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        thread: AgentThread,
+        role: MessageRole,
+        content: Any,
+        request_id: str | None,
+        turn_id: str | None,
+        name: str | None = None,
+        estimated_tokens: int | None = None,
+    ) -> AgentMessageRecord:
+        if request_id is not None:
+            existing = await session.scalar(
+                select(AgentMessage).where(
+                    AgentMessage.thread_id == thread.thread_id,
+                    AgentMessage.role == role,
+                    AgentMessage.request_id == request_id,
+                )
+            )
+            if existing is not None:
+                return _message_record(existing)
+        next_sequence = thread.last_message_sequence + 1
+        now = datetime.now(UTC)
+        message = AgentMessage(
+            thread_id=thread.thread_id,
+            sequence=next_sequence,
+            turn_id=turn_id,
+            request_id=request_id,
+            role=role,
+            name=name,
+            content=content,
+            estimated_tokens=(
+                estimated_tokens
+                if estimated_tokens is not None
+                else estimate_message_tokens(content)
+            ),
+        )
+        session.add(message)
+        thread.last_message_sequence = next_sequence
+        thread.last_message_at = now
+        await session.flush()
+        return _message_record(message)
 
     async def _locked_thread(
         self,

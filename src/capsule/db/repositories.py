@@ -145,6 +145,7 @@ class AgentToolExecutionRepository:
         arguments_hash: str | None = None,
         call_id: str,
         thread_id: str,
+        turn_id: str | None,
         user_id: str,
         workspace_id: str,
         graph_id: str | None,
@@ -166,6 +167,7 @@ class AgentToolExecutionRepository:
                     arguments_hash=stable_hash,
                     call_id=call_id,
                     thread_id=thread_id,
+                    turn_id=turn_id,
                     user_id=user_id,
                     workspace_id=workspace_id,
                     graph_id=graph_id,
@@ -363,17 +365,17 @@ class AgentToolExecutionRepository:
             if output is not _UNSET:
                 record.output = _json_safe(output)
             if error_code is not _UNSET:
-                record.error_code = error_code
+                record.error_code = cast(str | None, error_code)
             if error_message is not _UNSET:
-                record.error_message = error_message
+                record.error_message = cast(str | None, error_message)
             if started_at is not _UNSET:
-                record.started_at = started_at
+                record.started_at = cast(datetime | None, started_at)
             if finished_at is not _UNSET:
-                record.finished_at = finished_at
+                record.finished_at = cast(datetime | None, finished_at)
             if lease_owner is not _UNSET:
-                record.lease_owner = lease_owner
+                record.lease_owner = cast(str | None, lease_owner)
             if lease_expires_at is not _UNSET:
-                record.lease_expires_at = lease_expires_at
+                record.lease_expires_at = cast(datetime | None, lease_expires_at)
         return True
 
     async def list_for_thread(
@@ -1076,6 +1078,7 @@ def _tool_execution_payload(record: AgentToolExecution) -> dict[str, Any]:
         "arguments_hash": record.arguments_hash,
         "call_id": record.call_id,
         "thread_id": record.thread_id,
+        "turn_id": record.turn_id,
         "user_id": record.user_id,
         "workspace_id": record.workspace_id,
         "graph_id": record.graph_id,

@@ -1019,6 +1019,7 @@ class ToolRegistry:
                 idempotency_key=idempotency_key,
                 call_id=call.call_id,
                 thread_id=context.thread_id,
+                turn_id=context.turn_id or None,
                 user_id=context.user_id,
                 workspace_id=context.workspace_id,
                 graph_id=context.graph_id,

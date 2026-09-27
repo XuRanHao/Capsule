@@ -3,6 +3,7 @@ from sqlalchemy import ForeignKeyConstraint
 from capsule.db.base import Base
 from capsule.db.models import (
     AgentToolExecution,
+    AgentTurn,
     GraphAsset,
     GraphAssetBinding,
     LogicalEntity,
@@ -98,7 +99,28 @@ def test_agent_tool_execution_has_session_identity_and_lifecycle_fields() -> Non
         "user_id",
         "workspace_id",
         "thread_id",
+        "turn_id",
         "tool_name",
         "execution_status",
         "attempts",
     } <= columns
+
+
+def test_agent_turn_records_recoverable_lifecycle_per_request() -> None:
+    columns = {column.name for column in AgentTurn.__table__.columns}
+    unique_constraints = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in AgentTurn.__table__.constraints
+        if getattr(constraint, "columns", None) is not None
+    }
+
+    assert {
+        "turn_id",
+        "thread_id",
+        "user_id",
+        "workspace_id",
+        "request_id",
+        "status",
+        "finished_at",
+    } <= columns
+    assert ("thread_id", "request_id") in unique_constraints

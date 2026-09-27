@@ -106,6 +106,7 @@ class AgentToolExecution(Base, TimestampMixin):
     arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     call_id: Mapped[str] = mapped_column(String(128), nullable=False)
     thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    turn_id: Mapped[str | None] = mapped_column(String(128), index=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     workspace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     graph_id: Mapped[str | None] = mapped_column(String(64))
@@ -173,6 +174,39 @@ class AgentThread(Base, TimestampMixin):
     )
     memory_lease_owner: Mapped[str | None] = mapped_column(String(128))
     memory_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentTurn(Base, TimestampMixin):
+    """One user-initiated Agent turn and its terminal recovery state."""
+
+    __tablename__ = "agent_turns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'awaiting_confirmation', 'completed', "
+            "'cancelled', 'failed', 'interrupted')",
+            name="ck_agent_turns_status",
+        ),
+        UniqueConstraint(
+            "thread_id",
+            "request_id",
+            name="uq_agent_turns_thread_request",
+        ),
+        Index("ix_agent_turns_thread_status", "thread_id", "status", "created_at"),
+    )
+
+    turn_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True, default=id_factory("turn")
+    )
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_threads.thread_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentMessage(Base):

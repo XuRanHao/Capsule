@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 from uuid import uuid4
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -24,9 +25,17 @@ from capsule.db.agent_memory import (
     AgentConversationRepository,
     ConversationContext,
     ConversationSyncState,
+    TurnStatus,
 )
 
 PermissionLoader = Callable[..., Awaitable[Iterable[str]]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveTurn:
+    request: AgentRequest
+    turn_id: str
+    repository: AgentConversationRepository
 
 
 class AgentRuntime:
@@ -59,6 +68,8 @@ class AgentRuntime:
             repository=conversation_repository,
             publish_event=memory_event_publisher,
         )
+        self._active_turns: dict[str, _ActiveTurn] = {}
+        self._stopping = False
         self._graph = self._build_graph()
 
     def set_permission_loader(self, loader: PermissionLoader) -> None:
@@ -121,14 +132,45 @@ class AgentRuntime:
     async def start_tools(self) -> None:
         """Start shared tool scheduling after durable dependencies are ready."""
 
+        if self._conversation_repository is not None:
+            await self._conversation_repository.recover_abandoned_turns()
         await self._tools.start()
 
     async def shutdown_tools(self) -> None:
-        """Persist unfinished tool calls before application resources close."""
+        """Checkpoint and interrupt active turns before closing tool resources."""
+
+        self._stopping = True
+        active_turns = list(self._active_turns.values())
+        for active in active_turns:
+            config = {"configurable": {"thread_id": active.request.thread_id}}
+            try:
+                # Explicitly persist an interruption boundary.  We do not wait
+                # for a model or external handler to finish during shutdown.
+                await self._graph.aupdate_state(
+                    config,
+                    {"error": "application_shutdown"},
+                )
+            except Exception:
+                # A turn can be between initial input persistence and its first
+                # checkpoint.  Its durable turn record remains authoritative.
+                pass
+            try:
+                await active.repository.interrupt_turn(
+                    thread_id=active.request.thread_id,
+                    user_id=active.request.user_id,
+                    workspace_id=active.request.workspace_id,
+                    turn_id=active.turn_id,
+                )
+            except Exception:
+                # Keep draining other active turns and tool resources even if
+                # this database write is unavailable during process teardown.
+                pass
 
         await self._tools.shutdown()
 
     async def invoke(self, request: AgentRequest) -> AgentResponse:
+        if self._stopping:
+            raise RuntimeError("Agent runtime is shutting down")
         conversation = self._conversation_repository
         turn_lease_owner: str | None = None
         turn_lease_lost = asyncio.Event()
@@ -200,15 +242,16 @@ class AgentRuntime:
                         user_id=request.user_id,
                         workspace_id=request.workspace_id,
                     )
-            persisted_user = await conversation.append_message(
+            started_turn = await conversation.start_turn(
                 thread_id=request.thread_id,
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
-                role="user",
-                content=request.message,
-                request_id=request_id,
                 turn_id=turn_id,
+                request_id=request_id,
+                user_content=request.message,
             )
+            turn_id = started_turn.turn_id
+            persisted_user = started_turn.user_message
             if not previous:
                 durable = await conversation.get_context(
                     thread_id=request.thread_id,
@@ -259,16 +302,23 @@ class AgentRuntime:
                         ),
                     },
                 )
-        granted_permissions: frozenset[str] = frozenset()
-        if self._permission_loader is not None:
-            granted_permissions = frozenset(
-                await self._permission_loader(
-                    user_id=request.user_id,
-                    workspace_id=request.workspace_id,
-                )
+        if conversation is not None:
+            self._active_turns[turn_id] = _ActiveTurn(
+                request=request,
+                turn_id=turn_id,
+                repository=conversation,
             )
-        state = await self._graph.ainvoke(
-            {
+        try:
+            granted_permissions: frozenset[str] = frozenset()
+            if self._permission_loader is not None:
+                granted_permissions = frozenset(
+                    await self._permission_loader(
+                        user_id=request.user_id,
+                        workspace_id=request.workspace_id,
+                    )
+                )
+            state = await self._graph.ainvoke(
+                {
                 "thread_id": request.thread_id,
                 # A complete runtime invocation is one Agent output round.
                 # Tool loops inside this invocation keep the same turn ID.
@@ -292,30 +342,56 @@ class AgentRuntime:
                     else None
                 ),
                 **durable_context,
-            },
-            config=config,
-        )
+                },
+                config=config,
+            )
+        except BaseException:
+            if conversation is not None:
+                await conversation.finish_turn(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    status="failed",
+                    assistant_content=None,
+                )
+            self._active_turns.pop(turn_id, None)
+            raise
         if turn_lease_lost.is_set():
+            if conversation is not None:
+                await conversation.finish_turn(
+                    thread_id=request.thread_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    status="failed",
+                    assistant_content=None,
+                )
+            self._active_turns.pop(turn_id, None)
             raise RuntimeError("agent turn lease was lost before the response completed")
-        if conversation is not None and state.get("response") is not None:
-            persisted_assistant = await conversation.append_message(
+        if conversation is not None:
+            persisted_assistant = await conversation.finish_turn(
                 thread_id=request.thread_id,
                 user_id=request.user_id,
                 workspace_id=request.workspace_id,
-                role="assistant",
-                content=state["response"],
-                request_id=request_id,
                 turn_id=turn_id,
+                request_id=request_id,
+                status=_turn_status(state.get("status")),
+                assistant_content=state.get("response"),
             )
-            await self._graph.aupdate_state(
-                config,
-                {
-                    "working_context": _with_hot_mirror_sequence(
-                        state.get("working_context"),
-                        persisted_assistant.sequence,
-                    )
-                },
-            )
+            if persisted_assistant is not None:
+                await self._graph.aupdate_state(
+                    config,
+                    {
+                        "working_context": _with_hot_mirror_sequence(
+                            state.get("working_context"),
+                            persisted_assistant.sequence,
+                        )
+                    },
+                )
+        self._active_turns.pop(turn_id, None)
         return AgentResponse(
             thread_id=request.thread_id,
             status=state.get("status", "failed"),
@@ -415,6 +491,14 @@ def _working_context(
         "memory_revision": context.thread.memory_revision,
         "hot_mirror_through_sequence": hot_mirror_through_sequence,
     }
+
+
+def _turn_status(value: object) -> TurnStatus:
+    """Map graph-only terminal labels onto durable AgentTurn states."""
+
+    if value in {"awaiting_confirmation", "completed", "cancelled", "failed"}:
+        return cast(TurnStatus, value)
+    return "failed" if value == "max_steps" else "completed"
 
 
 def _memory_revision(state: dict[str, Any]) -> int:

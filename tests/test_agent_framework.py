@@ -26,6 +26,7 @@ from capsule.db.agent_memory import (
     AgentTurnBusyError,
     ConversationContext,
     ConversationSyncState,
+    StartedAgentTurn,
 )
 
 
@@ -314,6 +315,7 @@ class FakeConversationRepository:
             memory_revision=revision,
         )
         self.turn_lease_owner: str | None = None
+        self.interrupted_turn_ids: list[str] = []
 
     async def acquire_turn_lease(self, *, owner: str, **_: object) -> None:
         if self.turn_lease_owner is not None and self.turn_lease_owner != owner:
@@ -332,6 +334,26 @@ class FakeConversationRepository:
 
     async def append_message(self, *, role: str, **_: object) -> AgentMessageRecord:
         return self.current_user if role == "user" else self.assistant
+
+    async def start_turn(self, *, turn_id: str, **kwargs: object) -> StartedAgentTurn:
+        return StartedAgentTurn(
+            turn_id=turn_id,
+            user_message=await self.append_message(role="user", **kwargs),
+        )
+
+    async def finish_turn(
+        self, *, assistant_content: object | None, **kwargs: object
+    ) -> AgentMessageRecord | None:
+        if assistant_content is None:
+            return None
+        return await self.append_message(role="assistant", **kwargs)
+
+    async def interrupt_turn(self, *, turn_id: str, **_: object) -> bool:
+        self.interrupted_turn_ids.append(turn_id)
+        return True
+
+    async def recover_abandoned_turns(self) -> int:
+        return 0
 
     async def get_context(self, **_: object) -> ConversationContext:
         self.context_reads += 1
@@ -842,6 +864,34 @@ async def test_runtime_turn_lease_rejects_an_overlapping_invocation() -> None:
         await runtime.invoke(request.model_copy(update={"message": "重叠请求"}))
     planner.release.set()
     assert (await first).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_checkpoints_and_interrupts_active_turn() -> None:
+    planner = BlockingPlanner()
+    repository = FakeConversationRepository(revision=1)
+    runtime = create_agent_runtime(
+        planner=planner,
+        conversation_repository=repository,  # type: ignore[arg-type]
+    )
+    request = AgentRequest(
+        thread_id="durable-thread",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="等待关闭",
+    )
+
+    invocation = asyncio.create_task(runtime.invoke(request))
+    await planner.started.wait()
+    await runtime.shutdown_tools()
+
+    assert len(repository.interrupted_turn_ids) == 1
+    snapshot = await runtime.state(request.thread_id)
+    assert snapshot is not None
+    assert snapshot["error"] == "application_shutdown"
+
+    planner.release.set()
+    assert (await invocation).status == "completed"
 
 
 @pytest.mark.asyncio
@@ -1486,6 +1536,7 @@ async def test_registry_claims_idempotent_operation_before_handler() -> None:
         ),
         call_id=result.call_id,
         thread_id="thread-a",
+        turn_id="turn-a",
         user_id="user-a",
         workspace_id="workspace-a",
         graph_id=None,
