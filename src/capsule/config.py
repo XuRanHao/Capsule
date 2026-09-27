@@ -107,6 +107,9 @@ class Settings(BaseSettings):
     # the Ark client and strict JSON output transport used elsewhere.
     agent_planner_model: str = "deepseek-v4-1-flash-260910"
     agent_planner_max_output_tokens: int = Field(default=1_024, ge=256, le=4_096)
+    # Maximum calls in one process-wide Agent tool slot.  A slot only contains
+    # calls with no read/write contention; the next slot starts after it ends.
+    agent_tool_slot_capacity: int = Field(default=4, ge=1, le=32)
     # A lease is refreshed while one LangGraph invocation may span model and
     # tool waits. It is deliberately independent from memory-worker leases.
     agent_turn_lease_seconds: float = Field(default=300.0, gt=0)

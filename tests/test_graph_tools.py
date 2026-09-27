@@ -57,6 +57,16 @@ def test_graph_tool_registry_exposes_only_current_graph_tools() -> None:
         "list_entity_relations",
         "list_recent_tool_operations",
     }
+    resource_modes = {
+        description["name"]: (
+            description["resource_id_field"],
+            description["resource_operation"],
+        )
+        for description in descriptions
+    }
+    assert resource_modes["load_current_graph_context"] == ("graph_id", "read")
+    assert resource_modes["create_entity"] == ("graph_id", "write")
+    assert resource_modes["list_recent_tool_operations"] == (None, "none")
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,7 @@ def build_graph_tool_registry(
     execution_store: ToolExecutionStore | None = None,
     hooks: ToolHooks | None = None,
     lock_provider: ToolLockProvider | None = None,
+    slot_capacity: int = 4,
 ) -> ToolRegistry:
     """Register only tools that operate inside the user-selected graph."""
 
@@ -224,6 +225,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectOutput,
             concurrency_mode="parallel",
             lock_scope="none",
+            resource_id_field="graph_id",
+            resource_operation="read",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -236,6 +239,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectOutput,
             concurrency_mode="parallel",
             lock_scope="none",
+            resource_id_field="graph_id",
+            resource_operation="read",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -248,6 +253,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectListOutput,
             concurrency_mode="parallel",
             lock_scope="none",
+            resource_id_field="graph_id",
+            resource_operation="read",
             required_permission="graph:read",
         ),
         AgentTool(
@@ -274,6 +281,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -287,6 +296,8 @@ def build_graph_tool_registry(
             requires_confirmation=True,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -300,6 +311,8 @@ def build_graph_tool_registry(
             requires_confirmation=True,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -313,6 +326,8 @@ def build_graph_tool_registry(
             requires_confirmation=True,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:destructive",
         ),
         AgentTool(
@@ -325,6 +340,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -337,6 +354,8 @@ def build_graph_tool_registry(
             output_schema=_JsonObjectOutput,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:write",
         ),
         AgentTool(
@@ -350,6 +369,8 @@ def build_graph_tool_registry(
             requires_confirmation=True,
             concurrency_mode="exclusive",
             lock_scope="graph",
+            resource_id_field="graph_id",
+            resource_operation="write",
             required_permission="graph:destructive",
         ),
     ]
@@ -358,4 +379,5 @@ def build_graph_tool_registry(
         execution_store=execution_store,
         hooks=hooks,
         lock_provider=lock_provider,
+        slot_capacity=slot_capacity,
     )

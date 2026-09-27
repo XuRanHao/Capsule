@@ -37,6 +37,53 @@ class EchoOutput(BaseModel):
     value: str
 
 
+class ResourceArgs(BaseModel):
+    graph_id: str
+    value: str
+
+
+class MemoryToolExecutionStore:
+    """Small lifecycle store for scheduler shutdown tests."""
+
+    supports_atomic_claim = True
+
+    def __init__(self) -> None:
+        self.records: dict[str, dict[str, object]] = {}
+
+    async def create_operation(self, **kwargs: object) -> str:
+        operation_id = str(kwargs.get("operation_id") or f"op_{len(self.records) + 1}")
+        self.records.setdefault(
+            operation_id,
+            {
+                "operation_id": operation_id,
+                "execution_status": str(kwargs["execution_status"]),
+                "attempts": 0,
+            },
+        )
+        return operation_id
+
+    async def get_operation(self, **kwargs: object) -> dict[str, object] | None:
+        return self.records.get(str(kwargs["operation_id"]))
+
+    async def update_operation(self, **kwargs: object) -> bool:
+        record = self.records[str(kwargs["operation_id"])]
+        record.update({key: value for key, value in kwargs.items() if key != "operation_id"})
+        return True
+
+    async def claim_operation(self, **kwargs: object) -> dict[str, object]:
+        record = self.records[str(kwargs["operation_id"])]
+        record["execution_status"] = "running"
+        return {"claimed": True, "operation_id": kwargs["operation_id"]}
+
+    async def list_for_thread(self, **kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return []
+
+    async def recover_abandoned_operations(self, **kwargs: object) -> dict[str, int]:
+        del kwargs
+        return {"not_executed": 0, "interrupted": 0}
+
+
 class SequencePlanner:
     def __init__(self, *, confirmation: bool = False) -> None:
         self.calls = 0
@@ -1306,3 +1353,187 @@ async def test_custom_input_validator_runs_after_schema_validation() -> None:
     assert result.error_code == "invalid_arguments"
     assert result.error_message == "value cannot be empty"
     handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_scheduler_keeps_prior_same_resource_conflicts_out_of_slot() -> None:
+    active = 0
+    max_active = 0
+    events: list[tuple[str, str]] = []
+
+    async def read(args: ResourceArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"read:{args.value}"))
+        await asyncio.sleep(0.02)
+        events.append(("end", f"read:{args.value}"))
+        active -= 1
+        return args.value
+
+    async def write(args: ResourceArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"write:{args.value}"))
+        await asyncio.sleep(0.02)
+        events.append(("end", f"write:{args.value}"))
+        active -= 1
+        return args.value
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="read",
+                description="read graph",
+                args_schema=ResourceArgs,
+                handler=read,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="read",
+            ),
+            AgentTool(
+                name="write",
+                description="write graph",
+                args_schema=ResourceArgs,
+                handler=write,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="write",
+            ),
+        ],
+        slot_capacity=2,
+    )
+    context = ToolContext(
+        user_id="user-a",
+        workspace_id="workspace-a",
+        thread_id="thread-a",
+        graph_id=None,
+        state={},
+    )
+
+    results = await registry.execute_batch(
+        [
+            ToolCall(name="write", arguments={"graph_id": "graph-a", "value": "a"}),
+            ToolCall(name="write", arguments={"graph_id": "graph-a", "value": "b"}),
+            ToolCall(name="read", arguments={"graph_id": "graph-b", "value": "c"}),
+        ],
+        context=context,
+    )
+
+    assert [result.ok for result in results] == [True, True, True]
+    assert max_active == 2
+    assert events.index(("end", "write:a")) < events.index(("start", "write:b"))
+
+
+@pytest.mark.asyncio
+async def test_shared_scheduler_merges_independent_calls_from_two_sessions() -> None:
+    active = 0
+    max_active = 0
+
+    async def handler(args: ResourceArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return args.value
+
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="write",
+                description="write graph",
+                args_schema=ResourceArgs,
+                handler=handler,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="write",
+            )
+        ],
+        slot_capacity=2,
+    )
+    first_context = ToolContext(
+        user_id="user-a",
+        workspace_id="workspace-a",
+        thread_id="thread-a",
+        graph_id=None,
+        state={},
+    )
+    second_context = replace(first_context, thread_id="thread-b")
+
+    first, second = await asyncio.gather(
+        registry.execute_batch(
+            [ToolCall(name="write", arguments={"graph_id": "graph-a", "value": "a"})],
+            context=first_context,
+        ),
+        registry.execute_batch(
+            [ToolCall(name="write", arguments={"graph_id": "graph-b", "value": "b"})],
+            context=second_context,
+        ),
+    )
+
+    assert first[0].ok is True
+    assert second[0].ok is True
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_shutdown_marks_running_and_queued_calls_without_waiting_for_handler() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(args: ResourceArgs, context: ToolContext) -> str:
+        del args, context
+        started.set()
+        await release.wait()
+        return "late-result"
+
+    store = MemoryToolExecutionStore()
+    registry = ToolRegistry(
+        [
+            AgentTool(
+                name="write",
+                description="slow write",
+                args_schema=ResourceArgs,
+                handler=handler,
+                concurrency_mode="parallel",
+                resource_id_field="graph_id",
+                resource_operation="write",
+            )
+        ],
+        execution_store=store,
+        slot_capacity=1,
+    )
+    context = ToolContext(
+        user_id="user-a",
+        workspace_id="workspace-a",
+        thread_id="thread-a",
+        graph_id=None,
+        state={},
+    )
+    batch = asyncio.create_task(
+        registry.execute_batch(
+            [
+                ToolCall(name="write", arguments={"graph_id": "graph-a", "value": "a"}),
+                ToolCall(name="write", arguments={"graph_id": "graph-b", "value": "b"}),
+            ],
+            context=context,
+        )
+    )
+    await started.wait()
+
+    await registry.shutdown()
+
+    assert store.records["op_1"]["execution_status"] == "interrupted"
+    assert store.records["op_2"]["execution_status"] == "not_executed"
+    release.set()
+    results = await batch
+    assert results[0].ok is True
+    assert results[1].error_code == "not_executed"
+    # A handler may return after shutdown, but it cannot overwrite the
+    # deliberately conservative interrupted audit state.
+    assert store.records["op_1"]["execution_status"] == "interrupted"

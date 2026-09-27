@@ -212,7 +212,7 @@ class AgentToolExecutionRepository:
         lease_owner: str,
         lease_seconds: int = 60,
     ) -> dict[str, Any]:
-        """Atomically claim a created or expired operation for one Worker."""
+        """Atomically claim an operation that has not begun execution."""
 
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
@@ -237,15 +237,20 @@ class AgentToolExecutionRepository:
                     "reason": "already_succeeded",
                     **_tool_execution_payload(record),
                 }
-            lease_active = (
-                record.execution_status == "running"
-                and record.lease_expires_at is not None
-                and record.lease_expires_at > now
-            )
-            if lease_active and record.lease_owner != lease_owner:
+            if record.execution_status == "running":
                 return {
                     "claimed": False,
                     "reason": "in_progress",
+                    **_tool_execution_payload(record),
+                }
+            if record.execution_status not in {
+                "created",
+                "queued",
+                "awaiting_confirmation",
+            }:
+                return {
+                    "claimed": False,
+                    "reason": "not_claimable",
                     **_tool_execution_payload(record),
                 }
             record.execution_status = "running"
@@ -258,6 +263,46 @@ class AgentToolExecutionRepository:
                 "execution_status": record.execution_status,
                 "lease_expires_at": lease_expiry.isoformat(),
             }
+
+    async def recover_abandoned_operations(self) -> dict[str, int]:
+        """Make records left by a crashed process explicit on the next start.
+
+        The scheduler is process-local, so queued work belongs to a process
+        that no longer exists.  A restarted application also cannot know
+        whether a running external call reached its side effect; it records it
+        as interrupted immediately instead of silently reclaiming it.
+        """
+
+        now = datetime.now(UTC)
+        counts = {"not_executed": 0, "interrupted": 0}
+        async with self._database.session() as session, session.begin():
+            records = list(
+                await session.scalars(
+                    select(AgentToolExecution).where(
+                        or_(
+                            AgentToolExecution.execution_status.in_(("created", "queued")),
+                            AgentToolExecution.execution_status == "running",
+                        )
+                    )
+                )
+            )
+            for record in records:
+                if record.execution_status == "running":
+                    record.execution_status = "interrupted"
+                    record.error_code = "interrupted"
+                    record.error_message = (
+                        "application restarted before the tool result was confirmed"
+                    )
+                    counts["interrupted"] += 1
+                else:
+                    record.execution_status = "not_executed"
+                    record.error_code = "not_executed"
+                    record.error_message = "scheduler stopped before dispatch"
+                    counts["not_executed"] += 1
+                record.finished_at = now
+                record.lease_owner = None
+                record.lease_expires_at = None
+        return counts
 
     async def get_operation(
         self,

@@ -248,33 +248,38 @@ def build_agent_graph(
             _queued_tool_call(call, turn_id=turn_id) for call in plan_data.tool_calls
         ]
         results: list[dict[str, object]] = []
-        for index, call in enumerate(plan_data.tool_calls):
-            # Cancellation is checked immediately before every handler. A
-            # running handler cannot be forcefully rolled back here; queued
-            # calls are marked cancelled and are never submitted to Registry.
-            if state.get("cancel_requested"):
-                for queued in pending_calls[index:]:
-                    queued["status"] = "cancelled"
-                break
-            pending_calls[index]["status"] = "running"
-            execution_result = await tools.execute(
-                call,
+        if state.get("cancel_requested"):
+            for queued in pending_calls:
+                queued["status"] = "cancelled"
+        else:
+            # The planner is instructed to put only calls with fully-known
+            # arguments in one group.  ToolRegistry then submits the whole
+            # group to the process-wide scheduler, shared by every session.
+            for queued in pending_calls:
+                queued["status"] = "queued"
+            execution_results = await tools.execute_batch(
+                plan_data.tool_calls,
                 context=context,
                 confirmed=confirmed,
             )
-            result_data = execution_result.model_dump(mode="json")
-            result_data["turn_id"] = turn_id
-            results.append(result_data)
-            pending_calls[index]["operation_id"] = execution_result.operation_id
-            pending_calls[index]["status"] = (
-                "awaiting_confirmation"
-                if execution_result.needs_confirmation
-                else "cancelled"
-                if execution_result.error_code == "cancelled"
-                else "succeeded"
-                if execution_result.ok
-                else "failed"
-            )
+            for index, execution_result in enumerate(execution_results):
+                result_data = execution_result.model_dump(mode="json")
+                result_data["turn_id"] = turn_id
+                results.append(result_data)
+                pending_calls[index]["operation_id"] = execution_result.operation_id
+                pending_calls[index]["status"] = (
+                    "awaiting_confirmation"
+                    if execution_result.needs_confirmation
+                    else "cancelled"
+                    if execution_result.error_code == "cancelled"
+                    else "succeeded"
+                    if execution_result.ok
+                    else "not_executed"
+                    if execution_result.error_code == "not_executed"
+                    else "interrupted"
+                    if execution_result.error_code == "interrupted"
+                    else "failed"
+                )
         history = list(state.get("tool_history", []))
         history.extend(results)
         history = _retain_recent_tool_rounds(history)

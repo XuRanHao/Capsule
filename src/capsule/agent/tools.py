@@ -7,7 +7,7 @@ import hashlib
 import inspect
 import json
 import random
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -87,7 +87,7 @@ class RedisToolLockProvider:
         *,
         lease_seconds: float,
         wait_seconds: float,
-    ):
+    ) -> AsyncIterator[None]:
         lock = self._client.lock(
             f"{self._prefix}:{key}",
             timeout=max(lease_seconds, 1.0),
@@ -155,6 +155,12 @@ class AgentTool:
     max_output_bytes: int = 64 * 1024
     concurrency_mode: Literal["parallel", "exclusive"] = "exclusive"
     lock_scope: Literal["none", "graph", "entity", "asset"] = "graph"
+    # The scheduler only needs the smallest identifier that distinguishes the
+    # mutable resource.  It is deliberately separate from permissions: a
+    # graph_id identifies scheduling contention while workspace membership is
+    # still verified by the tool itself.
+    resource_id_field: str | None = None
+    resource_operation: Literal["read", "write", "none"] = "none"
 
 
 class ToolExecutionResult(BaseModel):
@@ -202,6 +208,8 @@ class ToolExecutionStore(Protocol):
 
     async def list_for_thread(self, **kwargs: Any) -> list[dict[str, Any]]: ...
 
+    async def recover_abandoned_operations(self, **kwargs: Any) -> dict[str, int]: ...
+
 
 class ToolRegistry:
     """Server-side tool registry; the model only selects registered names."""
@@ -213,6 +221,7 @@ class ToolRegistry:
         hooks: ToolHooks | None = None,
         lock_provider: ToolLockProvider | None = None,
         lock_wait_seconds: float = 5.0,
+        slot_capacity: int = 4,
     ) -> None:
         self._tools: dict[str, AgentTool] = {}
         self._execution_store = execution_store
@@ -220,10 +229,15 @@ class ToolRegistry:
         self._lock_provider = lock_provider
         self._lock_wait_seconds = lock_wait_seconds
         self._worker_id = f"worker_{uuid4().hex}"
+        if slot_capacity < 1:
+            raise ValueError("tool slot_capacity must be at least one")
+        self._slot_capacity = slot_capacity
         self._locks: dict[str, asyncio.Lock] = {}
         self._cancellation_tokens: dict[str, ToolCancellationToken] = {}
+        self._interrupted_operation_ids: set[str] = set()
         for tool in tools or []:
             self.register(tool)
+        self._scheduler = _ToolSlotScheduler(self, slot_capacity=slot_capacity)
 
     def register(self, tool: AgentTool) -> None:
         if not tool.name or tool.name in self._tools:
@@ -261,6 +275,12 @@ class ToolRegistry:
             raise ValueError("tool concurrency_mode must be parallel or exclusive")
         if tool.lock_scope not in {"none", "graph", "entity", "asset"}:
             raise ValueError("tool lock_scope must be none, graph, entity, or asset")
+        if tool.resource_operation not in {"read", "write", "none"}:
+            raise ValueError("tool resource_operation must be read, write, or none")
+        if tool.resource_operation == "none" and tool.resource_id_field is not None:
+            raise ValueError("resource_id_field requires a read or write operation")
+        if tool.resource_operation != "none" and not tool.resource_id_field:
+            raise ValueError("read/write tools require resource_id_field")
         self._tools[tool.name] = tool
 
     def describe(self) -> list[dict[str, Any]]:
@@ -309,12 +329,73 @@ class ToolRegistry:
                     "max_output_bytes": tool.max_output_bytes,
                     "concurrency_mode": tool.concurrency_mode,
                     "lock_scope": tool.lock_scope,
+                    "resource_id_field": tool.resource_id_field,
+                    "resource_operation": tool.resource_operation,
                     "max_attempts": tool.max_attempts,
                     "retry_timeouts": tool.retry_timeouts,
                     "retry_backoff_seconds": tool.retry_backoff_seconds,
                 }
             )
         return selected
+
+    async def start(self) -> None:
+        """Recover abandoned audits and accept shared scheduler submissions."""
+
+        if self._execution_store is not None:
+            recover = getattr(self._execution_store, "recover_abandoned_operations", None)
+            if recover is not None:
+                await recover()
+        await self._scheduler.start()
+
+    async def shutdown(self) -> None:
+        """Stop dispatching and persist queued/running calls as unfinished."""
+
+        await self._scheduler.shutdown()
+
+    async def execute_batch(
+        self,
+        calls: list[ToolCall],
+        *,
+        context: ToolContext,
+        confirmed: bool = False,
+    ) -> list[ToolExecutionResult]:
+        """Submit one planner batch to the process-wide resource scheduler.
+
+        The planner promises that every argument is already known.  The
+        scheduler may therefore place independent calls into one slot while
+        preserving all read/write conflicts with earlier calls in the batch.
+        """
+
+        if not calls:
+            return []
+        immediate: dict[int, ToolExecutionResult] = {}
+        scheduled: list[_ScheduledToolCall] = []
+        for index, call in enumerate(calls):
+            tool = self._tools.get(call.name)
+            if tool is not None and tool.requires_confirmation and not confirmed:
+                immediate[index] = await self.execute(
+                    call,
+                    context=context,
+                    confirmed=False,
+                )
+                continue
+            prepared = await self._queue_operation(call, tool, context)
+            if isinstance(prepared, ToolExecutionResult):
+                immediate[index] = prepared
+                continue
+            scheduled.append(
+                _ScheduledToolCall(
+                    index=index,
+                    call=prepared,
+                    context=context,
+                    confirmed=confirmed,
+                    resource=self._resource_access(tool, prepared, context),
+                )
+            )
+        scheduled_results = await self._scheduler.submit(scheduled)
+        results = immediate
+        results.update({item.index: result for item, result in scheduled_results})
+        return [results[index] for index in range(len(calls))]
 
     async def execute(
         self,
@@ -323,6 +404,8 @@ class ToolRegistry:
         context: ToolContext,
         confirmed: bool = False,
     ) -> ToolExecutionResult:
+        if self._scheduler.is_stopping:
+            return _unfinished_result(call, status="not_executed")
         tool = self._tools.get(call.name)
         cancellation_token = self._cancellation_tokens.setdefault(
             call.call_id, ToolCancellationToken()
@@ -424,6 +507,22 @@ class ToolRegistry:
                 ok=True,
                 output=existing.get("output"),
                 attempts=int(existing.get("attempts", 1)),
+            )
+        if existing is not None and existing.get("execution_status") in {
+            "interrupted",
+            "not_executed",
+        }:
+            self._clear_cancellation(call.call_id)
+            return ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="execution_interrupted",
+                error_message=(
+                    "the prior execution was not confirmed; inspect current data "
+                    "and submit a new tool call"
+                ),
             )
         if tool.requires_confirmation and not confirmed:
             if self._execution_store is not None:
@@ -529,6 +628,119 @@ class ToolRegistry:
             lease_expires_at=None,
         )
 
+    async def _queue_operation(
+        self,
+        call: ToolCall,
+        tool: AgentTool | None,
+        context: ToolContext,
+    ) -> ToolCall | ToolExecutionResult:
+        """Create the audit before a call becomes visible in the scheduler."""
+
+        if self._scheduler.is_stopping:
+            return _unfinished_result(call, status="not_executed")
+        operation_id, audit_error, existing = await self._start_operation(call, tool, context)
+        if audit_error is not None:
+            return ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="execution_audit_failed",
+                error_message=audit_error,
+            )
+        if existing is not None and existing.get("execution_status") == "succeeded":
+            return ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=True,
+                output=existing.get("output"),
+                attempts=int(existing.get("attempts", 1)),
+            )
+        if existing is not None and existing.get("execution_status") in {
+            "interrupted",
+            "not_executed",
+        }:
+            return ToolExecutionResult(
+                call_id=call.call_id,
+                operation_id=operation_id,
+                name=call.name,
+                ok=False,
+                error_code="execution_interrupted",
+                error_message="the prior execution was not confirmed; submit a new call",
+            )
+        prepared = call.model_copy(update={"operation_id": operation_id})
+        if self._execution_store is not None and operation_id is not None:
+            await self._execution_store.update_operation(
+                operation_id=operation_id,
+                user_id=context.user_id,
+                workspace_id=context.workspace_id,
+                thread_id=context.thread_id,
+                execution_status="queued",
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        return prepared
+
+    def _resource_access(
+        self,
+        tool: AgentTool | None,
+        call: ToolCall,
+        context: ToolContext,
+    ) -> _ResourceAccess:
+        if tool is None or tool.resource_operation == "none":
+            return _ResourceAccess(resource_id=None, operation="none")
+        values = call.arguments if isinstance(call.arguments, Mapping) else {}
+        field_name = tool.resource_id_field or "unknown"
+        value = values.get(field_name)
+        if value is None:
+            value = getattr(context, field_name, None)
+        # Missing identifiers must serialize conservatively rather than let two
+        # malformed calls bypass the resource scheduler.
+        resource_id = (
+            f"{field_name}:{value}"
+            if value not in {None, ""}
+            else f"unresolved:{field_name}"
+        )
+        return _ResourceAccess(resource_id=resource_id, operation=tool.resource_operation)
+
+    async def _mark_not_executed(self, item: _ScheduledToolCall) -> ToolExecutionResult:
+        result = _unfinished_result(item.call, status="not_executed")
+        await self._persist_unfinished(result, item.context, status="not_executed")
+        return result
+
+    async def _mark_interrupted(self, item: _ScheduledToolCall) -> None:
+        if item.call.operation_id is not None:
+            self._interrupted_operation_ids.add(item.call.operation_id)
+        result = _unfinished_result(item.call, status="interrupted")
+        await self._persist_unfinished(result, item.context, status="interrupted")
+
+    async def _persist_unfinished(
+        self,
+        result: ToolExecutionResult,
+        context: ToolContext,
+        *,
+        status: Literal["interrupted", "not_executed"],
+    ) -> None:
+        if self._execution_store is None or result.operation_id is None:
+            return
+        await self._execution_store.update_operation(
+            operation_id=result.operation_id,
+            user_id=context.user_id,
+            workspace_id=context.workspace_id,
+            thread_id=context.thread_id,
+            execution_status=status,
+            error_code=status,
+            error_message=(
+                "process shutdown while the tool was running; result is unknown"
+                if status == "interrupted"
+                else "process shutdown before the tool started"
+            ),
+            finished_at=datetime.now(UTC),
+            lease_owner=None,
+            lease_expires_at=None,
+        )
+
     async def _run_with_retries(
         self,
         call: ToolCall,
@@ -564,8 +776,11 @@ class ToolRegistry:
                     value = tool.handler(arguments, context)
                     value = await self._await_with_timeout(value, tool.timeout_seconds)
                 else:
+                    def invoke_sync_handler() -> Any:
+                        return tool.handler(arguments, context)
+
                     value = await asyncio.wait_for(
-                        asyncio.to_thread(tool.handler, arguments, context),
+                        asyncio.to_thread(invoke_sync_handler),
                         timeout=tool.timeout_seconds,
                     )
                     if inspect.isawaitable(value):
@@ -843,6 +1058,8 @@ class ToolRegistry:
         try:
             if self._execution_store is None or result.operation_id is None:
                 return
+            if result.operation_id in self._interrupted_operation_ids:
+                return
             await self._execution_store.update_operation(
                 operation_id=result.operation_id,
                 user_id=context.user_id,
@@ -868,6 +1085,182 @@ class ToolRegistry:
 
     def _clear_cancellation(self, call_id: str) -> None:
         self._cancellation_tokens.pop(call_id, None)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceAccess:
+    resource_id: str | None
+    operation: Literal["read", "write", "none"]
+
+
+@dataclass(slots=True)
+class _ScheduledToolCall:
+    index: int
+    call: ToolCall
+    context: ToolContext
+    confirmed: bool
+    resource: _ResourceAccess
+    future: asyncio.Future[ToolExecutionResult] | None = None
+
+
+class _ToolSlotScheduler:
+    """One in-process queue shared by all Agent sessions.
+
+    A slot is built from planner order, not merely from the calls already in
+    the slot.  Therefore ``read(graph A), write(graph A), read(graph A)``
+    cannot turn into two concurrent reads around the pending write.
+    """
+
+    def __init__(self, registry: ToolRegistry, *, slot_capacity: int) -> None:
+        self._registry = registry
+        self._slot_capacity = slot_capacity
+        self._pending: list[list[_ScheduledToolCall]] = []
+        self._running: list[_ScheduledToolCall] = []
+        self._condition = asyncio.Condition()
+        self._worker: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    @property
+    def is_stopping(self) -> bool:
+        return self._stopping
+
+    async def start(self) -> None:
+        if self._stopping:
+            raise RuntimeError("tool scheduler cannot restart after shutdown")
+
+    async def submit(
+        self, items: list[_ScheduledToolCall]
+    ) -> list[tuple[_ScheduledToolCall, ToolExecutionResult]]:
+        if not items:
+            return []
+        loop = asyncio.get_running_loop()
+        for item in items:
+            item.future = loop.create_future()
+        async with self._condition:
+            if self._stopping:
+                stopped_results = [
+                    (item, await self._registry._mark_not_executed(item)) for item in items
+                ]
+                return stopped_results
+            self._pending.append(items)
+            if self._worker is None or self._worker.done():
+                self._worker = asyncio.create_task(self._run())
+            self._condition.notify_all()
+        futures: list[asyncio.Future[ToolExecutionResult]] = []
+        for item in items:
+            if item.future is None:
+                raise RuntimeError("scheduled tool call has no completion future")
+            futures.append(item.future)
+        tool_results = await asyncio.gather(*futures)
+        return list(zip(items, tool_results, strict=True))
+
+    async def shutdown(self) -> None:
+        async with self._condition:
+            if self._stopping:
+                return
+            self._stopping = True
+            queued = [item for batch in self._pending for item in batch]
+            self._pending.clear()
+            running = list(self._running)
+            self._condition.notify_all()
+        # Do not await current handlers.  Their external side effect may or
+        # may not complete after shutdown, so the only truthful audit state is
+        # ``interrupted``.
+        for item in running:
+            await self._registry._mark_interrupted(item)
+        for item in queued:
+            result = await self._registry._mark_not_executed(item)
+            if item.future is not None and not item.future.done():
+                item.future.set_result(result)
+
+    async def _run(self) -> None:
+        while True:
+            async with self._condition:
+                if self._stopping or not self._pending:
+                    return
+                slot = self._take_slot()
+                self._running = slot
+            results = await asyncio.gather(
+                *(
+                    self._registry.execute(
+                        item.call,
+                        context=item.context,
+                        confirmed=item.confirmed,
+                    )
+                    for item in slot
+                ),
+                return_exceptions=True,
+            )
+            async with self._condition:
+                self._running = []
+            for item, result in zip(slot, results, strict=True):
+                if isinstance(result, BaseException):
+                    result = ToolExecutionResult(
+                        call_id=item.call.call_id,
+                        operation_id=item.call.operation_id,
+                        name=item.call.name,
+                        ok=False,
+                        error_code="scheduler_execution_failed",
+                        error_message=str(result) or type(result).__name__,
+                    )
+                if item.future is not None and not item.future.done():
+                    item.future.set_result(result)
+
+    def _take_slot(self) -> list[_ScheduledToolCall]:
+        slot: list[_ScheduledToolCall] = []
+        retained: list[list[_ScheduledToolCall]] = []
+        for batch in self._pending:
+            deferred_earlier: list[_ScheduledToolCall] = []
+            remaining: list[_ScheduledToolCall] = []
+            for item in batch:
+                conflicts_with_earlier = any(
+                    _resources_conflict(item.resource, earlier.resource)
+                    for earlier in deferred_earlier
+                )
+                conflicts_with_slot = any(
+                    _resources_conflict(item.resource, selected.resource)
+                    for selected in slot
+                )
+                if (
+                    len(slot) < self._slot_capacity
+                    and not conflicts_with_earlier
+                    and not conflicts_with_slot
+                ):
+                    slot.append(item)
+                else:
+                    deferred_earlier.append(item)
+                    remaining.append(item)
+            if remaining:
+                retained.append(remaining)
+        self._pending = retained
+        return slot
+
+
+def _resources_conflict(left: _ResourceAccess, right: _ResourceAccess) -> bool:
+    if left.resource_id is None or right.resource_id is None:
+        return False
+    if left.resource_id != right.resource_id:
+        return False
+    return left.operation == "write" or right.operation == "write"
+
+
+def _unfinished_result(
+    call: ToolCall,
+    *,
+    status: Literal["interrupted", "not_executed"],
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        call_id=call.call_id,
+        operation_id=call.operation_id,
+        name=call.name,
+        ok=False,
+        error_code=status,
+        error_message=(
+            "tool execution was interrupted; inspect current data before retrying"
+            if status == "interrupted"
+            else "tool execution was not started before shutdown"
+        ),
+    )
 
 
 def _has_permission(granted: frozenset[str], required: str) -> bool:

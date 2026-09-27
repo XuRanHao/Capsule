@@ -118,6 +118,16 @@ class AgentRuntime:
     def graph(self) -> Any:
         return self._graph
 
+    async def start_tools(self) -> None:
+        """Start shared tool scheduling after durable dependencies are ready."""
+
+        await self._tools.start()
+
+    async def shutdown_tools(self) -> None:
+        """Persist unfinished tool calls before application resources close."""
+
+        await self._tools.shutdown()
+
     async def invoke(self, request: AgentRequest) -> AgentResponse:
         conversation = self._conversation_repository
         turn_lease_owner: str | None = None

@@ -103,7 +103,11 @@ def create_app(
             app.state.library_clear_service = library_clear_service
             app.state.workspace_service = workspace_service
             app.state.workspace_directory_service = workspace_directory_service
-            yield
+            await resolved_agent_runtime.start_tools()
+            try:
+                yield
+            finally:
+                await resolved_agent_runtime.shutdown_tools()
             return
 
         database = Database(resolved_settings)
@@ -232,8 +236,10 @@ def create_app(
                 )
                 app.state.agent_checkpointer = checkpointer
             try:
+                await resolved_agent_runtime.start_tools()
                 yield
             finally:
+                await resolved_agent_runtime.shutdown_tools()
                 if durable_task_supervisor is not None:
                     await durable_task_supervisor.close()
                 if memory_context_queue is not None:
@@ -332,8 +338,10 @@ def create_app(
             )
             app.state.agent_checkpointer = checkpointer
         try:
+            await resolved_agent_runtime.start_tools()
             yield
         finally:
+            await resolved_agent_runtime.shutdown_tools()
             await import_workflow_coordinator.close()
             import_workflow_task.cancel()
             await asyncio.gather(import_workflow_task, return_exceptions=True)
@@ -442,6 +450,7 @@ def _configure_default_agent_runtime(
                 ToolExecutionStore,
                 AgentToolExecutionRepository(database),
             ),
+            slot_capacity=settings.agent_tool_slot_capacity,
         )
     )
 
