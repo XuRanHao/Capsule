@@ -46,6 +46,12 @@ class CalculationArgs(BaseModel):
     value: str
 
 
+class ComposeArgs(BaseModel):
+    left: str
+    right: str
+    score: str
+
+
 class MemoryToolExecutionStore:
     """Small lifecycle store for scheduler shutdown tests."""
 
@@ -137,6 +143,47 @@ class OneToolPerOutputPlanner:
                 tool_calls=[ToolCall(name="echo", arguments={"value": "round"})],
             )
         return PlanDecision(action="respond", message="本轮完成。")
+
+
+class DependencyAwareBatchPlanner:
+    """Plans dependent work only after its source tool results are visible."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+        self.compose_arguments: dict[str, str] | None = None
+
+    async def plan(self, state: object) -> PlanDecision:
+        values = state if isinstance(state, dict) else {}
+        if not values.get("tool_details"):
+            return PlanDecision(
+                action="select_tools",
+                selected_tool_names=["fetch_value", "calculate_score", "compose_result"],
+            )
+        history = list(values.get("tool_history", []))
+        if not history:
+            self.batches.append(["fetch_value", "fetch_value", "calculate_score"])
+            return PlanDecision(
+                action="tool",
+                tool_calls=[
+                    ToolCall(name="fetch_value", arguments={"value": "alpha"}),
+                    ToolCall(name="fetch_value", arguments={"value": "beta"}),
+                    ToolCall(name="calculate_score", arguments={"value": "42"}),
+                ],
+            )
+        if len(history) == 3:
+            values_by_name = [str(item["output"]) for item in history]
+            arguments = {
+                "left": values_by_name[0],
+                "right": values_by_name[1],
+                "score": values_by_name[2],
+            }
+            self.compose_arguments = arguments
+            self.batches.append(["compose_result"])
+            return PlanDecision(
+                action="tool",
+                tool_calls=[ToolCall(name="compose_result", arguments=arguments)],
+            )
+        return PlanDecision(action="respond", message="分批调用完成。")
 
 
 class ConfirmationThenRespondPlanner:
@@ -345,6 +392,102 @@ async def test_runtime_runs_tool_loop_and_persists_thread_state() -> None:
     assert snapshot["messages"][-1]["role"] == "assistant"
     assert "args_schema" not in snapshot["tool_catalog"][0]
     assert snapshot["tool_details"][0]["args_schema"]["title"] == "EchoArgs"
+
+
+@pytest.mark.asyncio
+async def test_agent_runs_independent_tools_then_replans_dependent_call() -> None:
+    planner = DependencyAwareBatchPlanner()
+    events: list[tuple[str, str]] = []
+    active = 0
+    max_active = 0
+
+    async def fetch(args: EchoArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"fetch:{args.value}"))
+        await asyncio.sleep(0.01)
+        events.append(("end", f"fetch:{args.value}"))
+        active -= 1
+        return args.value
+
+    async def calculate(args: EchoArgs, context: ToolContext) -> str:
+        nonlocal active, max_active
+        del context
+        active += 1
+        max_active = max(max_active, active)
+        events.append(("start", f"calculate:{args.value}"))
+        await asyncio.sleep(0.01)
+        events.append(("end", f"calculate:{args.value}"))
+        active -= 1
+        return args.value
+
+    async def compose(args: ComposeArgs, context: ToolContext) -> str:
+        del context
+        events.append(("start", "compose"))
+        assert args.model_dump() == {"left": "alpha", "right": "beta", "score": "42"}
+        events.append(("end", "compose"))
+        return f"{args.left}:{args.right}:{args.score}"
+
+    runtime = create_agent_runtime(
+        planner=planner,
+        tools=ToolRegistry(
+            [
+                AgentTool(
+                    name="fetch_value",
+                    description="fetch one independent value",
+                    args_schema=EchoArgs,
+                    handler=fetch,
+                    concurrency_mode="parallel",
+                ),
+                AgentTool(
+                    name="calculate_score",
+                    description="calculate one independent score",
+                    args_schema=EchoArgs,
+                    handler=calculate,
+                    concurrency_mode="parallel",
+                ),
+                AgentTool(
+                    name="compose_result",
+                    description="combine prior tool results",
+                    args_schema=ComposeArgs,
+                    handler=compose,
+                    concurrency_mode="parallel",
+                ),
+            ],
+            slot_capacity=3,
+        ),
+    )
+
+    result = await runtime.invoke(
+        AgentRequest(
+            thread_id="dependency-batches",
+            user_id="user-a",
+            workspace_id="workspace-a",
+            message="读取两个值、计算分数后再汇总。",
+            max_steps=12,
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.message == "分批调用完成。"
+    assert planner.batches == [
+        ["fetch_value", "fetch_value", "calculate_score"],
+        ["compose_result"],
+    ]
+    assert planner.compose_arguments == {"left": "alpha", "right": "beta", "score": "42"}
+    assert [item["name"] for item in result.tool_history] == [
+        "fetch_value",
+        "fetch_value",
+        "calculate_score",
+        "compose_result",
+    ]
+    assert result.tool_history[-1]["output"] == "alpha:beta:42"
+    assert max_active == 3
+    assert events.index(("end", "fetch:alpha")) < events.index(("start", "compose"))
+    assert events.index(("end", "fetch:beta")) < events.index(("start", "compose"))
+    assert events.index(("end", "calculate:42")) < events.index(("start", "compose"))
 
 
 @pytest.mark.asyncio
