@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MemoryScope = Literal["workspace", "global"]
 MemoryMutationAction = Literal["create", "merge", "deactivate", "lower_confidence"]
+MemoryAdjustmentAction = Literal["merge", "deactivate", "lower_confidence", "ignore"]
 
 
 class ConversationSummary(BaseModel):
@@ -54,10 +55,30 @@ class MemoryMutation(BaseModel):
         return self
 
 
+class MemoryAdjustment(BaseModel):
+    """One candidate-to-retrieved-memory decision; not itself a write command."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str = Field(min_length=1, max_length=64)
+    action: MemoryAdjustmentAction
+    confidence_delta: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+
+class MemoryAdjustmentBatch(BaseModel):
+    """Model output covering every RAG-retrieved memory for one candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    adjustments: list[MemoryAdjustment] = Field(default_factory=list, max_length=3)
+
+
 class MemoryConsolidation(BaseModel):
     """Complete output of one memory-worker run for one message range."""
 
     model_config = ConfigDict(extra="forbid")
 
     summary: ConversationSummary
-    mutations: list[MemoryMutation] = Field(default_factory=list, max_length=3)
+    # Up to three candidates can each produce a create/merge plus changes to
+    # all three retrieved memories.
+    mutations: list[MemoryMutation] = Field(default_factory=list, max_length=12)

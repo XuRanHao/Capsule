@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from capsule.agent.memory_contracts import (
     ConversationSummary,
+    MemoryAdjustmentBatch,
     MemoryCandidate,
     MemoryConsolidation,
     MemoryMutation,
@@ -37,14 +38,6 @@ class _CandidateBatch(BaseModel):
     candidates: list[MemoryCandidate] = Field(default_factory=list, max_length=3)
 
 
-class _ResolutionDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["create", "merge", "deactivate", "lower_confidence"]
-    target_memory_id: str | None = Field(default=None, max_length=64)
-    confidence_delta: float = Field(default=0.0, ge=-1.0, le=1.0)
-
-
 class MemoryModel(Protocol):
     async def summarize(
         self,
@@ -65,7 +58,7 @@ class MemoryModel(Protocol):
         *,
         candidate: MemoryCandidate,
         matches: list[MemoryMatch],
-    ) -> _ResolutionDraft: ...
+    ) -> MemoryAdjustmentBatch: ...
 
 
 class DoubaoMemoryModel:
@@ -155,7 +148,7 @@ class DoubaoMemoryModel:
         *,
         candidate: MemoryCandidate,
         matches: list[MemoryMatch],
-    ) -> _ResolutionDraft:
+    ) -> MemoryAdjustmentBatch:
         payload = {
             "candidate": candidate.model_dump(mode="json"),
             "existing_memories": [asdict(item) for item in matches],
@@ -165,15 +158,20 @@ class DoubaoMemoryModel:
                 {
                     "role": "system",
                     "content": (
-                        "你负责整合一条候选记忆与最多三条既有记忆。仅输出 JSON。"
-                        "语义一致时 merge；没有关联时 create；明显过时或被替代时 deactivate；"
-                        "冲突但不能判真伪时 lower_confidence。target_memory_id 必须来自既有记忆。"
+                        "你负责逐条比较一条候选记忆与最多三条 RAG 返回的既有记忆。仅输出 JSON。"
+                        "必须为 existing_memories 中每个 memory_id 输出一条 adjustments 项，"
+                        "不能遗漏、"
+                        "重复或编造 ID。语义一致或候选是更具体表述时用 merge；候选明确说明既有记忆"
+                        "已废弃、停用或被替代时用 deactivate；存在未证实冲突时用 "
+                        "lower_confidence 并给负 confidence_delta；无关时用 ignore。"
+                        "不要输出 create，系统会在全部 ignore 时"
+                        "创建候选，在 deactivate 时创建候选并停用旧记忆。"
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            output_type=_ResolutionDraft,
-            schema_name="agent_memory_resolution",
+            output_type=MemoryAdjustmentBatch,
+            schema_name="agent_memory_adjustments",
             max_output_tokens=500,
         )
 
@@ -264,34 +262,74 @@ class StructuredMemoryConsolidator(MemoryConsolidator):
             ]
         )
         mutations = [
-            _mutation_from_resolution(candidate, list(items), resolution)
+            mutation
             for candidate, items, resolution in zip(candidates, matches, resolutions, strict=True)
+            for mutation in _mutations_from_adjustments(candidate, list(items), resolution)
         ]
         return MemoryConsolidation(summary=summary, mutations=mutations)
 
 
-def _mutation_from_resolution(
+def _mutations_from_adjustments(
     candidate: MemoryCandidate,
     matches: list[MemoryMatch],
-    resolution: _ResolutionDraft,
-) -> MemoryMutation:
+    resolution: MemoryAdjustmentBatch,
+) -> list[MemoryMutation]:
+    """Validate per-memory decisions and reduce them to durable mutations."""
+
     allowed_ids = {item.memory_id for item in matches}
-    if resolution.action == "create":
-        return MemoryMutation(action="create", candidate=candidate)
-    if resolution.target_memory_id not in allowed_ids:
-        return MemoryMutation(action="create", candidate=candidate)
-    if resolution.action == "merge":
-        return MemoryMutation(
-            action="merge",
-            candidate=candidate,
-            target_memory_id=resolution.target_memory_id,
-            confidence_delta=max(0.0, resolution.confidence_delta),
+    adjustments = {item.memory_id: item for item in resolution.adjustments}
+    if (
+        len(adjustments) != len(resolution.adjustments)
+        or set(adjustments) != allowed_ids
+    ):
+        # A malformed model batch must not partially mutate durable memories.
+        return [MemoryMutation(action="create", candidate=candidate)]
+
+    merges = [item for item in adjustments.values() if item.action == "merge"]
+    if len(merges) > 1:
+        return [MemoryMutation(action="create", candidate=candidate)]
+
+    mutations: list[MemoryMutation] = []
+    if merges:
+        merge = merges[0]
+        mutations.append(
+            MemoryMutation(
+                action="merge",
+                candidate=candidate,
+                target_memory_id=merge.memory_id,
+                confidence_delta=max(0.0, merge.confidence_delta),
+            )
         )
-    return MemoryMutation(
-        action=resolution.action,
-        target_memory_id=resolution.target_memory_id,
-        confidence_delta=resolution.confidence_delta,
-    )
+
+    deactivations = [
+        item for item in adjustments.values() if item.action == "deactivate"
+    ]
+    if deactivations and not merges:
+        # A replacement is two facts: preserve the new fact before retiring
+        # every explicitly replaced old record.
+        mutations.append(MemoryMutation(action="create", candidate=candidate))
+    for adjustment in deactivations:
+        mutations.append(
+            MemoryMutation(
+                action="deactivate",
+                target_memory_id=adjustment.memory_id,
+            )
+        )
+
+    for adjustment in adjustments.values():
+        if adjustment.action != "lower_confidence":
+            continue
+        mutations.append(
+            MemoryMutation(
+                action="lower_confidence",
+                target_memory_id=adjustment.memory_id,
+                confidence_delta=min(0.0, adjustment.confidence_delta),
+            )
+        )
+
+    if not mutations:
+        return [MemoryMutation(action="create", candidate=candidate)]
+    return mutations
 
 
 def _message_payload(message: Any) -> dict[str, Any]:

@@ -5,8 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from capsule.agent.memory_consolidator import DoubaoMemoryModel, StructuredMemoryConsolidator
-from capsule.agent.memory_contracts import MemoryCandidate
+from capsule.agent.memory_consolidator import (
+    DoubaoMemoryModel,
+    StructuredMemoryConsolidator,
+    _mutations_from_adjustments,
+)
+from capsule.agent.memory_contracts import (
+    MemoryAdjustment,
+    MemoryAdjustmentBatch,
+    MemoryCandidate,
+)
 from capsule.db.agent_memory import (
     AgentMessageRecord,
     AgentThreadRecord,
@@ -20,13 +28,6 @@ from capsule.db.agent_memory import (
 class _SummaryDraft:
     summary: str
     topic: str | None
-
-
-@dataclass
-class _Resolution:
-    action: str
-    target_memory_id: str | None = None
-    confidence_delta: float = 0.0
 
 
 def _candidate(scope: str, key: str, confidence: float) -> MemoryCandidate:
@@ -105,8 +106,18 @@ class _Model:
         self.resolved_keys.append(candidate.memory_key)
         if candidate.memory_key == "language":
             assert matches[0].memory_id == "existing-language"
-            return _Resolution("merge", "existing-language", 0.1)
-        return _Resolution("create")
+            return MemoryAdjustmentBatch(
+                adjustments=[
+                    MemoryAdjustment(
+                        memory_id="existing-language",
+                        action="merge",
+                        confidence_delta=0.1,
+                    )
+                ]
+            )
+        return MemoryAdjustmentBatch(
+            adjustments=[MemoryAdjustment(memory_id="other", action="ignore")]
+        )
 
 
 class _Repository:
@@ -184,7 +195,9 @@ async def test_consolidator_falls_back_to_create_when_resolution_targets_unknown
             matches: list[MemoryMatch],
         ):
             del candidate, matches
-            return _Resolution("merge", "unknown", 0.2)
+            return MemoryAdjustmentBatch(
+                adjustments=[MemoryAdjustment(memory_id="unknown", action="merge")]
+            )
 
     consolidator = StructuredMemoryConsolidator(
         model=UnknownTargetModel(),  # type: ignore[arg-type]
@@ -198,6 +211,54 @@ async def test_consolidator_falls_back_to_create_when_resolution_targets_unknown
 
     assert len(result.mutations) == 1
     assert result.mutations[0].action == "create"
+
+
+def test_replacement_creates_new_memory_and_deactivates_each_explicit_old_memory() -> None:
+    candidate = _candidate("workspace", "export_template", 0.9)
+    matches = [
+        MemoryMatch(
+            memory_id="old-template",
+            scope="workspace",
+            kind="policy",
+            memory_key="export_template",
+            value={},
+            display_text="旧模板",
+            topics=[],
+            confidence=0.8,
+            effective_confidence=0.8,
+            decay_rate=0.01,
+            status="active",
+            relevance=0.5,
+        ),
+        MemoryMatch(
+            memory_id="unrelated",
+            scope="workspace",
+            kind="policy",
+            memory_key="language",
+            value={},
+            display_text="中文回复",
+            topics=[],
+            confidence=0.8,
+            effective_confidence=0.8,
+            decay_rate=0.01,
+            status="active",
+            relevance=0.5,
+        ),
+    ]
+    mutations = _mutations_from_adjustments(
+        candidate,
+        matches,
+        MemoryAdjustmentBatch(
+            adjustments=[
+                MemoryAdjustment(memory_id="old-template", action="deactivate"),
+                MemoryAdjustment(memory_id="unrelated", action="ignore"),
+            ]
+        ),
+    )
+
+    assert [item.action for item in mutations] == ["create", "deactivate"]
+    assert mutations[0].candidate == candidate
+    assert mutations[1].target_memory_id == "old-template"
 
 
 @pytest.mark.asyncio
